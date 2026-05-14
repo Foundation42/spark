@@ -36,24 +36,43 @@ const std = @import("std");
 const registry_mod = @import("font/registry.zig");
 const tp = @import("gpu/text_pipeline.zig");
 
-/// Per-run text styling. The same `Style` an inline `text` element
-/// carries; future emphasis/strong/link inline kinds derive a child
-/// style from the parent's.
+/// Per-run text styling. Every `text` leaf carries one; inline
+/// structural kinds (`emphasis` / `strong` / `code` / `link`) are
+/// render-time transparent — the parser/builder bakes the cascade
+/// into each text leaf's `Style` ahead of time via `Theme.apply*`.
 ///
-/// Lives here (not in `text/layout.zig` any more) because it's part
-/// of the public element vocabulary — every `text` element has one.
+/// The semantic flags (`emphasis`, `strong`, `code_inline`, `link`)
+/// are markers, not visual switches. They let the cascade helpers
+/// resolve correctly (emphasis-inside-strong → bold-italic font) and
+/// future fx_kind effects (link hover, code-span background)
+/// distinguish the runs. Rendering reads `font_id` + `color` +
+/// `hot_color` + `attention` — the flags don't directly drive shape
+/// math.
 pub const Style = struct {
     font_id: registry_mod.FontId,
     color: [4]f32,
     /// Target colour at `attention == 1.0`. Mono + SDF shader
     /// branches lerp `color → hot_color` by attention; colour-atlas
-    /// glyphs (emoji) ignore it. Default warm yellow reads as the
-    /// conventional "this is hot / important" cue.
+    /// glyphs (emoji) ignore it.
     hot_color: [4]f32 = .{ 1.0, 0.85, 0.40, 1.0 },
     /// LM-driven [0..1] (shader clamps). Default 0 = no visible
-    /// effect even with `hot_color` set; opt in by setting non-zero
-    /// or by animating the SSBO per-frame for live signals.
+    /// effect even with `hot_color` set.
     attention: f32 = 0.0,
+
+    /// Set when this run sits inside an `emphasis` inline container.
+    /// `Theme.applyEmphasis` writes it; the cascade helpers consult
+    /// it to pick bold-italic when `strong` is also true.
+    emphasis: bool = false,
+    /// Set when this run sits inside a `strong` inline container.
+    strong: bool = false,
+    /// Set when this run sits inside an inline `code` span. Drives
+    /// font swap to mono + colour override at apply time; future
+    /// stage will draw a code-span background quad.
+    code_inline: bool = false,
+    /// Set when this run sits inside a `link`. Drives colour
+    /// override at apply time; future stage adds underline via
+    /// fx_kind and hover state.
+    link: bool = false,
 };
 
 /// How a `container` element arranges its children. Stage 1 ships
@@ -102,6 +121,31 @@ pub const Element = union(enum) {
     /// by the line's `max(line_height)`.
     line_break,
 
+    // ── inline structural containers ────────────────────────────────
+    // Render-time transparent: the walker recurses into their content
+    // without changing anything. The cascade — picking italic /
+    // bold / mono / link-colour fonts — is the parser/builder's job,
+    // baked into the descendant `text` leaves via `Theme.apply*`.
+    // These exist so semantic structure survives in the tree for
+    // future hit-testing, semantic queries, and effects (link hover,
+    // code-span backgrounds).
+
+    /// Italic / "emphasis" span. Container of inline content.
+    emphasis: []const Element,
+
+    /// Bold / "strong" span. Container of inline content.
+    strong: []const Element,
+
+    /// Inline monospace code span (e.g. `` `foo` `` in markdown).
+    /// Container of inline content; in practice almost always a
+    /// single `text` leaf, but kept as a slice for symmetry.
+    code: []const Element,
+
+    /// Hyperlink. `target` is the URI; `content` is the visible
+    /// inline content. Underline rendering and click handling land
+    /// later — for stage 2c this just colours the descendant runs.
+    link: struct { target: []const u8, content: []const Element },
+
     // ── block containers ────────────────────────────────────────────
     /// Block of inline content laid out into one or more lines.
     /// Children must be inline (`text` / `line_break` for stage 1;
@@ -131,13 +175,13 @@ pub const Element = union(enum) {
 
     /// Ordered or unordered list. Items are typically `list_item`
     /// elements; the walker renders a marker (• for unordered, "N."
-    /// for ordered) at a fixed indent and recurses item content at a
-    /// deeper indent. `start` selects the first number for ordered
-    /// lists (defaults to 1).
+    /// for ordered) at the theme's `list_marker_indent` and recurses
+    /// item content at `list_content_indent`. Marker style comes
+    /// from `theme.list_marker`. `start` selects the first number
+    /// for ordered lists.
     list: struct {
         ordered: bool,
         items: []const Element,
-        marker_style: Style,
         start: u32 = 1,
     },
 
@@ -219,6 +263,115 @@ pub const Box = struct {
     baseline: f32 = 0,
 };
 
+/// Visual + layout policy. Two distinct roles:
+///   * **Walker reads:** layout constants (indents, gaps), block
+///     defaults (`list_marker`, `code_block`, `heading_styles`) it
+///     might consult directly.
+///   * **Parser / builder reads:** baseline styles + cascade helpers
+///     (`applyEmphasis`, `applyStrong`, etc.) when constructing the
+///     tree. Cascade is *not* performed at render time — descendant
+///     `text` leaves carry their pre-resolved Style.
+///
+/// Built once after the font registry is populated; the host hands
+/// it explicit font IDs for italic / bold / bold-italic / mono /
+/// heading variants. Slots that don't have a distinct font (e.g.
+/// loading only `regular`) point back at `body.font_id` and the
+/// cascade becomes a semantic no-op — emphasis renders identical to
+/// body, the `emphasis: true` flag still rides along for future
+/// effects.
+///
+/// Stage 2c caveat: cascade is body-context-relative. Applying
+/// emphasis to a heading style swaps to the body italic font rather
+/// than a heading italic. A future per-block "font family" abstraction
+/// fixes this — but most real docs don't nest emphasis inside
+/// headings, and the parser can pick its battles in stage 3.
+pub const Theme = struct {
+    // ── Baseline styles ─────────────────────────────────────────────
+    /// Default body text — the starting point for the inline cascade.
+    body: Style,
+    /// Heading by level. Index 0 = h1, 5 = h6.
+    heading: [6]Style,
+    /// Default code-block style (full-block preformatted).
+    code_block: Style,
+    /// Style the walker uses for list markers (• / "N.").
+    list_marker: Style,
+
+    // ── Cascade variant font IDs ────────────────────────────────────
+    /// Italic variant of the body font.
+    emphasis_font_id: registry_mod.FontId,
+    /// Bold variant of the body font.
+    strong_font_id: registry_mod.FontId,
+    /// Bold-italic variant. Selected when both `emphasis` and
+    /// `strong` are active.
+    bold_italic_font_id: registry_mod.FontId,
+    /// Mono variant at body display size, for inline code spans.
+    code_inline_font_id: registry_mod.FontId,
+
+    // ── Cascade colour overrides ────────────────────────────────────
+    code_inline_color: [4]f32 = .{ 0.72, 0.88, 1.0, 1.0 },
+    link_color: [4]f32 = .{ 0.45, 0.72, 1.0, 1.0 },
+
+    // ── Layout constants the walker reads ───────────────────────────
+    list_marker_indent: f32 = 8,
+    list_content_indent: f32 = 32,
+    list_item_gap: f32 = 2,
+    quote_indent: f32 = 20,
+    block_child_gap: f32 = 4,
+
+    // ── Cascade helpers (parser / hand-builder uses these) ──────────
+
+    /// Apply emphasis (italic) modifier. Sets the flag and recomputes
+    /// the font ID so emphasis-inside-strong correctly picks the
+    /// bold-italic variant.
+    pub fn applyEmphasis(self: Theme, s: Style) Style {
+        var out = s;
+        out.emphasis = true;
+        out.font_id = self.resolveInlineFontId(out);
+        return out;
+    }
+
+    /// Apply strong (bold) modifier. Same flag-and-recompute pattern.
+    pub fn applyStrong(self: Theme, s: Style) Style {
+        var out = s;
+        out.strong = true;
+        out.font_id = self.resolveInlineFontId(out);
+        return out;
+    }
+
+    /// Apply inline-code modifier — swaps font to mono and overrides
+    /// colour. `code_inline` is mutually exclusive with emphasis /
+    /// strong at the renderer level (CommonMark doesn't allow nesting
+    /// emphasis inside an inline-code span anyway).
+    pub fn applyCodeInline(self: Theme, s: Style) Style {
+        var out = s;
+        out.code_inline = true;
+        out.font_id = self.code_inline_font_id;
+        out.color = self.code_inline_color;
+        return out;
+    }
+
+    /// Apply link styling. Currently colour-only; underline lands
+    /// with fx_kind in a later stage.
+    pub fn applyLink(self: Theme, s: Style) Style {
+        var out = s;
+        out.link = true;
+        out.color = self.link_color;
+        return out;
+    }
+
+    /// Resolve the right cascade font for the active inline flags.
+    /// `code_inline` wins exclusively; otherwise `strong` × `emphasis`
+    /// pick from regular / italic / bold / bold-italic. Body-relative —
+    /// the heading caveat at the top of `Theme` applies.
+    fn resolveInlineFontId(self: Theme, s: Style) registry_mod.FontId {
+        if (s.code_inline) return self.code_inline_font_id;
+        if (s.strong and s.emphasis) return self.bold_italic_font_id;
+        if (s.strong) return self.strong_font_id;
+        if (s.emphasis) return self.emphasis_font_id;
+        return self.body.font_id;
+    }
+};
+
 /// Read-only handle elements use to ask text_engine for shaping +
 /// atlas placement. Walker fills it once at the top of a frame and
 /// passes by pointer through the tree. Owns nothing — every field
@@ -229,6 +382,7 @@ pub const LayoutCtx = struct {
     cache: *glyph_cache_mod.GlyphCache,
     mono_atlas: *atlas_mod.Atlas,
     color_atlas: *atlas_mod.Atlas,
+    theme: *const Theme,
 };
 
 /// GPU draw work accumulated during the walk. Stage 1 only fills

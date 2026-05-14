@@ -90,7 +90,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 2 / stage 2b (block nesting + wrap)\n", .{});
+    try stdout.print("text_engine demo — session 2 / stage 2c (theme + inline kinds)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
 
@@ -114,6 +114,12 @@ pub fn main() !void {
 
     const font_path = std.posix.getenv("TEXT_ENGINE_FONT") orelse
         "/usr/share/fonts/TTF/DejaVuSans.ttf";
+    const italic_path = std.posix.getenv("TEXT_ENGINE_ITALIC_FONT") orelse
+        "/usr/share/fonts/TTF/DejaVuSans-Oblique.ttf";
+    const bold_path = std.posix.getenv("TEXT_ENGINE_BOLD_FONT") orelse
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf";
+    const bold_italic_path = std.posix.getenv("TEXT_ENGINE_BOLD_ITALIC_FONT") orelse
+        "/usr/share/fonts/TTF/DejaVuSans-BoldOblique.ttf";
     const mono_path = std.posix.getenv("TEXT_ENGINE_MONO_FONT") orelse
         "/usr/share/fonts/TTF/DejaVuSansMono.ttf";
     const emoji_path = std.posix.getenv("TEXT_ENGINE_EMOJI_FONT") orelse
@@ -128,39 +134,69 @@ pub fn main() !void {
     const heading_id = try fonts.load(font_path.ptr, 56);
     const subtitle_id = try fonts.load(font_path.ptr, 18);
     const body_id = try fonts.load(font_path.ptr, 22);
+    const italic_id = try fonts.load(italic_path.ptr, 22);
+    const bold_id = try fonts.load(bold_path.ptr, 22);
+    const bold_italic_id = try fonts.load(bold_italic_path.ptr, 22);
+    const code_inline_id = try fonts.load(mono_path.ptr, 22);
     const accent_id = try fonts.load(font_path.ptr, 28);
     const emoji_id = try fonts.load(emoji_path.ptr, 28);
-    const mono_id = try fonts.load(mono_path.ptr, 18);
+    const code_block_id = try fonts.load(mono_path.ptr, 18);
     const sdf_id = try fonts.loadSdf(font_path.ptr, 44);
 
     var cache = glyph_cache_mod.GlyphCache.init(allocator);
     defer cache.deinit();
 
-    // ── Compose the document as an Element tree ────────────────────
-    // Stage 2a torture test: every block kind nested at least once so
-    // the contract sees the shapes it'll have to handle from a real
-    // markdown parser. Hand-crafted by construction — stage 3's
-    // parser will produce the same tree from a `.md` file.
+    // ── Build the Theme ────────────────────────────────────────────
+    // Single visual policy the rest of the demo cascades from. Stage
+    // 3's markdown parser will look the same — load fonts, build a
+    // Theme, hand it to LayoutCtx, parser uses `theme.apply*` to
+    // resolve inline cascade onto text leaves.
     const white: [4]f32 = .{ 0.95, 0.95, 0.98, 1.0 };
     const grey: [4]f32 = .{ 0.58, 0.62, 0.72, 1.0 };
     const yellow: [4]f32 = .{ 0.99, 0.84, 0.32, 1.0 };
     const orange: [4]f32 = .{ 0.99, 0.55, 0.30, 1.0 };
-    const code_color: [4]f32 = .{ 0.72, 0.88, 1.0, 1.0 };
     const marker_color: [4]f32 = .{ 0.65, 0.72, 0.85, 1.0 };
 
-    const body_style: element.Style = .{ .font_id = body_id, .color = white };
-    const marker_style: element.Style = .{ .font_id = body_id, .color = marker_color };
-    const code_style: element.Style = .{ .font_id = mono_id, .color = code_color };
+    const theme: element.Theme = .{
+        .body = .{ .font_id = body_id, .color = white },
+        .heading = .{
+            // h1..h6 — stage 2c demo only uses h1, others fall back
+            // to heading-1 styling. The parser in stage 3 will fill
+            // these with distinct sizes.
+            .{ .font_id = heading_id, .color = white },
+            .{ .font_id = heading_id, .color = white },
+            .{ .font_id = heading_id, .color = white },
+            .{ .font_id = heading_id, .color = white },
+            .{ .font_id = heading_id, .color = white },
+            .{ .font_id = heading_id, .color = white },
+        },
+        .code_block = .{ .font_id = code_block_id, .color = .{ 0.72, 0.88, 1.0, 1.0 } },
+        .list_marker = .{ .font_id = body_id, .color = marker_color },
+        .emphasis_font_id = italic_id,
+        .strong_font_id = bold_id,
+        .bold_italic_font_id = bold_italic_id,
+        .code_inline_font_id = code_inline_id,
+    };
+
+    // Convenience locals derived from the theme — caller-side
+    // cascade for the hand-built tree. Stage 3's parser does the
+    // same calls but from CommonMark events instead of by hand.
+    const body_style = theme.body;
+    const em_style = theme.applyEmphasis(theme.body);
+    const strong_style = theme.applyStrong(theme.body);
+    const bold_italic_style = theme.applyEmphasis(theme.applyStrong(theme.body));
+    const code_inline_style = theme.applyCodeInline(theme.body);
+    const link_style = theme.applyLink(theme.body);
 
     // Heading.
     const heading_children = [_]element.Element{
-        .{ .text = .{ .content = "text_engine", .style = .{ .font_id = heading_id, .color = white } } },
+        .{ .text = .{ .content = "text_engine", .style = theme.heading[0] } },
     };
     const heading_block = element.Element{ .heading = .{ .level = 1, .content = &heading_children } };
 
     // Subtitle.
     const subtitle_children = [_]element.Element{
-        .{ .text = .{ .content = "Stage 2b — block nesting + word wrap", .style = .{ .font_id = subtitle_id, .color = grey } } },
+        .{ .text = .{ .content = "Stage 2c — Theme + inline structural kinds", .style = .{ .font_id = subtitle_id, .color = grey } } },
     };
     const subtitle_block = element.Element{ .paragraph = &subtitle_children };
 
@@ -177,6 +213,42 @@ pub fn main() !void {
     };
     const mixed_block = element.Element{ .paragraph = &mixed_children };
 
+    // ── Inline structural kinds via theme cascade ──────────────────
+    // Each styled span is an inline structural Element whose
+    // descendant text leaf carries the cascade-resolved Style. The
+    // walker treats emphasis / strong / code / link as transparent
+    // at render time — the visual distinction is purely in the
+    // child text leaves' Style, which `theme.apply*` produced.
+    const em_inner = [_]element.Element{
+        .{ .text = .{ .content = "italic", .style = em_style } },
+    };
+    const strong_inner = [_]element.Element{
+        .{ .text = .{ .content = "bold", .style = strong_style } },
+    };
+    const bold_italic_inner = [_]element.Element{
+        .{ .text = .{ .content = "bold-italic", .style = bold_italic_style } },
+    };
+    const code_inner = [_]element.Element{
+        .{ .text = .{ .content = "inline code", .style = code_inline_style } },
+    };
+    const link_inner = [_]element.Element{
+        .{ .text = .{ .content = "link", .style = link_style } },
+    };
+    const styled_children = [_]element.Element{
+        .{ .text = .{ .content = "Inline cascade: ", .style = body_style } },
+        .{ .emphasis = &em_inner },
+        .{ .text = .{ .content = ", ", .style = body_style } },
+        .{ .strong = &strong_inner },
+        .{ .text = .{ .content = ", ", .style = body_style } },
+        .{ .strong = &bold_italic_inner },
+        .{ .text = .{ .content = ", ", .style = body_style } },
+        .{ .code = &code_inner },
+        .{ .text = .{ .content = ", and a ", .style = body_style } },
+        .{ .link = .{ .target = "https://example.com", .content = &link_inner } },
+        .{ .text = .{ .content = ".", .style = body_style } },
+    };
+    const styled_block = element.Element{ .paragraph = &styled_children };
+
     // ── Unordered list with nested ordered list ────────────────────
     // Builds bottom-up because each list_item carries a child slice
     // that needs to live before its parent references it.
@@ -187,9 +259,12 @@ pub fn main() !void {
         .{ .paragraph = &item1_p_children },
     };
 
+    const max_w_code = [_]element.Element{
+        .{ .text = .{ .content = "max_w", .style = code_inline_style } },
+    };
     const item2_p_children = [_]element.Element{
         .{ .text = .{ .content = "indent shrinks ", .style = body_style } },
-        .{ .text = .{ .content = "max_w", .style = code_style } },
+        .{ .code = &max_w_code },
         .{ .text = .{ .content = " for nested content", .style = body_style } },
     };
     const item2_children = [_]element.Element{
@@ -220,7 +295,6 @@ pub fn main() !void {
     const nested_list = element.Element{ .list = .{
         .ordered = true,
         .items = &nested_items,
-        .marker_style = marker_style,
         .start = 1,
     } };
     const item3_children = [_]element.Element{
@@ -236,7 +310,6 @@ pub fn main() !void {
     const unordered_list = element.Element{ .list = .{
         .ordered = false,
         .items = &unordered_items,
-        .marker_style = marker_style,
     } };
 
     // ── Block quote containing a paragraph ─────────────────────────
@@ -257,7 +330,7 @@ pub fn main() !void {
         \\    // code blocks: monospace, preformatted
         \\}
         ,
-        .style = code_style,
+        .style = theme.code_block,
     } } } };
 
     // ── Top stack assembling everything ────────────────────────────
@@ -269,6 +342,8 @@ pub fn main() !void {
         subtitle_block,
         sp12,
         mixed_block,
+        sp8,
+        styled_block,
         sp12,
         unordered_list,
         sp12,
@@ -306,6 +381,7 @@ pub fn main() !void {
         .cache = &cache,
         .mono_atlas = &atlas_mono,
         .color_atlas = &atlas_color,
+        .theme = &theme,
     };
 
     // Viewport-anchored content width — 40px left + 40px right gutter

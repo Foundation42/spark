@@ -44,26 +44,10 @@ pub const Error = error{
     CodeBlockSubBlockNotImplemented,
 } || std.mem.Allocator.Error || error{ Overflow, SsboOverflow };
 
-// ── Stage-2a layout constants ──────────────────────────────────────
-// Hardcoded indents and gaps used by block kinds that don't carry
-// their own. These move into a `Theme` struct in LayoutCtx during
-// stage 2c — they're walker-baked for now so we can ship nesting
-// without inventing the theme abstraction yet.
-
-/// Horizontal offset from the list's left edge to where the marker
-/// glyph starts.
-const LIST_MARKER_INDENT: f32 = 8;
-/// Horizontal offset from the list's left edge to where item content
-/// starts. The marker sits in the gap between this and
-/// `LIST_MARKER_INDENT`.
-const LIST_CONTENT_INDENT: f32 = 32;
-/// Vertical space between adjacent list items.
-const LIST_ITEM_GAP: f32 = 2;
-/// Horizontal indent applied to block-quote children.
-const QUOTE_INDENT: f32 = 20;
-/// Vertical space between siblings inside a list_item / quote when
-/// they don't already have margins of their own.
-const BLOCK_CHILD_GAP: f32 = 4;
+// Layout constants now live in `element.Theme` and are read via
+// `ctx.theme.*` — see element.zig for the named fields. Walker
+// reaches them through LayoutCtx so the host can swap themes
+// without touching engine internals.
 
 /// Lay out + render `elem` with its top-left at `origin`. Returns the
 /// element's measured `Box` (in display pixels). Constraints are
@@ -77,7 +61,9 @@ pub fn layoutAndRender(
     out: *element.DrawList,
 ) anyerror!element.Box {
     switch (elem) {
-        .text, .line_break => return error.InlineElementOutsideInlineContext,
+        // Inline kinds — leaf and structural — are only valid inside
+        // an inline-flow context (paragraph / heading content).
+        .text, .line_break, .emphasis, .strong, .code, .link => return error.InlineElementOutsideInlineContext,
 
         .paragraph => |children| return layoutInlineFlow(
             children,
@@ -109,7 +95,7 @@ pub fn layoutAndRender(
 
         .list => |li| return layoutList(li, origin, constraints, ctx, out),
 
-        .list_item => |it| return layoutStackV(it.children, BLOCK_CHILD_GAP, origin, constraints, ctx, out),
+        .list_item => |it| return layoutStackV(it.children, ctx.theme.block_child_gap, origin, constraints, ctx, out),
 
         .quote => |q| return layoutQuote(q.children, origin, constraints, ctx, out),
 
@@ -145,21 +131,23 @@ fn layoutQuote(
     ctx: *element.LayoutCtx,
     out: *element.DrawList,
 ) !element.Box {
-    const inner_origin: [2]f32 = .{ origin[0] + QUOTE_INDENT, origin[1] };
-    const inner_constraints = shrinkConstraints(constraints, QUOTE_INDENT);
-    const inner_box = try layoutStackV(children, BLOCK_CHILD_GAP, inner_origin, inner_constraints, ctx, out);
+    const indent = ctx.theme.quote_indent;
+    const inner_origin: [2]f32 = .{ origin[0] + indent, origin[1] };
+    const inner_constraints = shrinkConstraints(constraints, indent);
+    const inner_box = try layoutStackV(children, ctx.theme.block_child_gap, inner_origin, inner_constraints, ctx, out);
     return .{
         .x = origin[0],
         .y = origin[1],
-        .w = inner_box.w + QUOTE_INDENT,
+        .w = inner_box.w + indent,
         .h = inner_box.h,
         .baseline = 0,
     };
 }
 
 /// List — iterate items, render a marker (• for unordered, "N." for
-/// ordered) at `LIST_MARKER_INDENT`, then recurse each item's content
-/// at `LIST_CONTENT_INDENT`. Marker baseline alignment with the first
+/// ordered) at `theme.list_marker_indent`, then recurse each item's
+/// content at `theme.list_content_indent`. Marker style is
+/// `theme.list_marker`. Marker baseline alignment with the first
 /// line of item content is implicit: both lay out from the same y,
 /// and per-line baseline resolution lands them on the same baseline
 /// when they share line metrics.
@@ -172,10 +160,12 @@ fn layoutList(
 ) !element.Box {
     var y = origin[1];
     var index: u32 = li.start;
-    const inner_constraints = shrinkConstraints(constraints, LIST_CONTENT_INDENT);
+    const marker_indent = ctx.theme.list_marker_indent;
+    const content_indent = ctx.theme.list_content_indent;
+    const inner_constraints = shrinkConstraints(constraints, content_indent);
 
     for (li.items, 0..) |item, i| {
-        if (i != 0) y += LIST_ITEM_GAP;
+        if (i != 0) y += ctx.theme.list_item_gap;
 
         // ── Marker ─────────────────────────────────────────────────
         // Compose a tiny inline-flow on the fly: one text run with the
@@ -186,7 +176,7 @@ fn layoutList(
         } else "•";
 
         const marker_children = [_]element.Element{
-            .{ .text = .{ .content = marker_text, .style = li.marker_style } },
+            .{ .text = .{ .content = marker_text, .style = ctx.theme.list_marker } },
         };
         const marker_paragraph = element.Element{ .paragraph = &marker_children };
         // Marker's glyphs land in the draw list; its returned Box.h
@@ -195,7 +185,7 @@ fn layoutList(
         // above).
         _ = try layoutAndRender(
             marker_paragraph,
-            .{ origin[0] + LIST_MARKER_INDENT, y },
+            .{ origin[0] + marker_indent, y },
             constraints,
             ctx,
             out,
@@ -204,7 +194,7 @@ fn layoutList(
         // ── Item content ───────────────────────────────────────────
         const item_box = try layoutAndRender(
             item,
-            .{ origin[0] + LIST_CONTENT_INDENT, y },
+            .{ origin[0] + content_indent, y },
             inner_constraints,
             ctx,
             out,
@@ -365,13 +355,7 @@ fn layoutInlineFlow(
 
     // ── 1 & 2: tokenize + shape ────────────────────────────────────
     var tokens = std.ArrayList(InlineToken).init(arena_alloc);
-    for (children) |child| {
-        switch (child) {
-            .text => |t| try tokenizeText(t.content, t.style, &tokens, arena_alloc, ctx),
-            .line_break => try tokens.append(.line_break),
-            else => return error.InlineElementOutsideInlineContext,
-        }
-    }
+    try collectInlineTokens(children, &tokens, arena_alloc, ctx);
 
     // Handle the empty-paragraph case before the wrap loop. Picks up
     // the first font's line_height; falls back to 16 if no fonts are
@@ -522,6 +506,36 @@ fn tokenAtom(t: InlineToken) ?ShapedAtom {
         .gap => |g| g,
         .line_break => null,
     };
+}
+
+/// Recursively walk an inline-context element list, flattening
+/// inline structural containers (`emphasis` / `strong` / `code` /
+/// `link`) into their constituent leaves. Each `text` leaf becomes a
+/// stream of Word + Gap atoms; `line_break` becomes one
+/// `InlineToken.line_break`. The structural kinds are render-time
+/// transparent — the cascade that gives them visual distinction was
+/// already baked into the descendant text leaves' Style by the
+/// parser / builder.
+///
+/// Block elements at an inline position are a tree-construction
+/// error and surface as `InlineElementOutsideInlineContext`.
+fn collectInlineTokens(
+    children: []const element.Element,
+    tokens: *std.ArrayList(InlineToken),
+    allocator: std.mem.Allocator,
+    ctx: *element.LayoutCtx,
+) !void {
+    for (children) |child| {
+        switch (child) {
+            .text => |t| try tokenizeText(t.content, t.style, tokens, allocator, ctx),
+            .line_break => try tokens.append(.line_break),
+            .emphasis => |inner| try collectInlineTokens(inner, tokens, allocator, ctx),
+            .strong => |inner| try collectInlineTokens(inner, tokens, allocator, ctx),
+            .code => |inner| try collectInlineTokens(inner, tokens, allocator, ctx),
+            .link => |l| try collectInlineTokens(l.content, tokens, allocator, ctx),
+            else => return error.InlineElementOutsideInlineContext,
+        }
+    }
 }
 
 /// Walk one text element's content, splitting on runs of ASCII space
