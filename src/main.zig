@@ -156,9 +156,18 @@ const FrameCtx = struct {
     // because we stretch bitmap glyphs. SDF text (ATTENTION) stays
     // crisp. Documented as v0 limitation — proper crisp-zoom is a
     // multi-size atlas + re-layout-on-zoom rebuild.
+    /// Rendered scroll position — what the transform pass uses.
+    /// Eased toward `target_scroll_y` each frame so wheel input
+    /// floats to its destination instead of snapping.
     scroll_y: f32 = 0,
+    /// Destination the scroll callback writes to. The tween in
+    /// drawCb closes the gap toward it.
+    target_scroll_y: f32 = 0,
     zoom: f32 = 1.0,
     max_scroll_y: f32 = 0,
+    /// Wall-clock of the previous drawCb invocation, for time-
+    /// based tween easing.
+    last_frame_ms: i64 = 0,
 
     /// Re-run the layout pass for the current viewport. Clears the
     /// DrawList, lays out all three sub-trees at the new `max_w`,
@@ -175,6 +184,10 @@ const FrameCtx = struct {
             .mono_atlas = self.mono_atlas,
             .color_atlas = self.color_atlas,
             .theme = self.theme,
+            // Top-level walks stamp the host state onto every Hit
+            // they emit. Embedded-doc layoutAndRender save+swap+
+            // restores around its child subtree.
+            .state = @ptrCast(self.state),
         };
         var ansi_lc = lc;
         ansi_lc.theme = self.ansi_theme;
@@ -249,11 +262,36 @@ const FrameCtx = struct {
 fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) void {
     const fc: *FrameCtx = @ptrCast(@alignCast(ctx.?));
 
+    // ── Scroll tween ───────────────────────────────────────────────
+    // Ease `scroll_y` toward `target_scroll_y` so wheel input floats
+    // instead of snapping. Frame-rate-independent (uses wall-clock
+    // dt). While the gap is open, mark state dirty so runLayout
+    // re-applies the transform with the new offset; snap + stop
+    // dirtying once within sub-pixel range.
+    const now_ms = std.time.milliTimestamp();
+    if (fc.last_frame_ms == 0) fc.last_frame_ms = now_ms;
+    const dt_ms: f32 = @floatFromInt(@max(now_ms - fc.last_frame_ms, 0));
+    fc.last_frame_ms = now_ms;
+    if (@abs(fc.target_scroll_y - fc.scroll_y) > 0.25) {
+        // tau = 60ms — about 100ms to converge visually. Decay
+        // formula: alpha = 1 - exp(-dt/tau). Clamp dt at one frame
+        // worth of decay so a hitched frame doesn't overshoot the
+        // visual budget.
+        const tau_ms: f32 = 60.0;
+        const clamped_dt = @min(dt_ms, 50.0);
+        const alpha = 1.0 - std.math.exp(-clamped_dt / tau_ms);
+        fc.scroll_y += (fc.target_scroll_y - fc.scroll_y) * alpha;
+        fc.state.dirty = true;
+    } else if (fc.scroll_y != fc.target_scroll_y) {
+        fc.scroll_y = fc.target_scroll_y;
+        fc.state.dirty = true;
+    }
+
     // ── Event-driven relayout ──────────────────────────────────────
     // Two triggers: viewport changed (resize), or state mutated
-    // (input-driven via the slider component, stage 7f). First
-    // call's last_extent={0,0} guarantees an initial layout before
-    // the first draw.
+    // (input-driven via the slider component, stage 7f, or by the
+    // scroll tween above). First call's last_extent={0,0}
+    // guarantees an initial layout before the first draw.
     const extent_changed = extent.width != fc.last_extent.width or extent.height != fc.last_extent.height;
     if (extent_changed or fc.state.dirty) {
         fc.runLayout(extent) catch {
@@ -380,7 +418,11 @@ fn findHit(hits: []const element.Hit, x: f32, y: f32) ?element.Hit {
 
 fn dispatch(hit: element.Hit, event: element.InputEvent, state: *state_mod.State) !void {
     const on_input = hit.vtable.on_input orelse return;
-    try on_input(hit.ctx, event, @ptrCast(state));
+    // If the layout walk stamped a state pointer onto this Hit
+    // (top-level → host state; embedded-doc → child state), use it.
+    // Otherwise fall back to the dispatcher's default.
+    const eff: *anyopaque = hit.state orelse @ptrCast(state);
+    try on_input(hit.ctx, event, eff);
 }
 
 // GLFW scroll callback. Ctrl-held → zoom; plain → vertical scroll.
@@ -405,10 +447,11 @@ fn scrollCb(window: ?*win.c.GLFWwindow, _: f64, yoffset: f64) callconv(.C) void 
         fc.zoom = std.math.clamp(fc.zoom, 0.25, 4.0);
     } else {
         const px_per_notch: f32 = 60.0;
-        fc.scroll_y -= @as(f32, @floatCast(yoffset)) * px_per_notch;
+        fc.target_scroll_y -= @as(f32, @floatCast(yoffset)) * px_per_notch;
         // Clamp against the most recent layout's known max; runLayout
-        // will clamp again once it has the new content height.
-        fc.scroll_y = std.math.clamp(fc.scroll_y, 0, fc.max_scroll_y);
+        // will clamp again once it has the new content height. The
+        // tween in drawCb closes the gap toward target_scroll_y.
+        fc.target_scroll_y = std.math.clamp(fc.target_scroll_y, 0, fc.max_scroll_y);
     }
 
     fc.state.dirty = true;

@@ -295,45 +295,59 @@ pub const Registry = struct {
             break :blk std.fmt.bufPrint(&key_buf, "auto:{d}", .{sentinel_idx}) catch unreachable;
         };
 
-        const gop = try self.instances.getOrPut(self.allocator, id);
-        if (gop.found_existing) {
-            // Cache hit. Factory-name change → destroy + recreate.
-            if (!std.mem.eql(u8, gop.value_ptr.factory_name, spec.name)) {
-                if (self.factories.get(gop.value_ptr.factory_name)) |old_factory| {
+        // Cache-hit path first, by lookup. We can't hold a getOrPut
+        // pointer across `buildEntry` / `invokeUpdate` — those can
+        // recursively resolve nested `:::` blocks (e.g. inside an
+        // `:::embedded-document` factory.create), which insert new
+        // map entries and may rehash, invalidating any held pointer.
+        // Painful lesson learned during stage 9 — dangling
+        // `gop.value_ptr.*` writes after rehash corrupted the
+        // newly-resized slot and the next gc tripped on garbage
+        // `parses_unused`.
+        if (self.instances.getPtr(id)) |entry_ptr| {
+            // Factory-name change → destroy + recreate.
+            if (!std.mem.eql(u8, entry_ptr.factory_name, spec.name)) {
+                if (self.factories.get(entry_ptr.factory_name)) |old_factory| {
                     if (old_factory.deinit) |d|
-                        d(gop.value_ptr.instance.ctx, self.allocator);
+                        d(entry_ptr.instance.ctx, self.allocator);
                 }
-                if (gop.value_ptr.binding) |b| b.destroy();
-                gop.value_ptr.* = try self.buildEntry(factory, spec, state);
+                if (entry_ptr.binding) |b| b.destroy();
+                // Build the replacement FIRST (may grow the map);
+                // then look up again because entry_ptr is now stale.
+                const fresh = try self.buildEntry(factory, spec, state);
+                const reaq = self.instances.getPtr(id) orelse unreachable;
+                reaq.* = fresh;
                 return .{
-                    .vtable = gop.value_ptr.instance.vtable,
-                    .ctx = gop.value_ptr.instance.ctx,
+                    .vtable = reaq.instance.vtable,
+                    .ctx = reaq.instance.ctx,
                 };
             }
-            // Same factory — update path. Build a fresh substituted
-            // spec, hand to factory.update.
-            try self.invokeUpdate(factory, gop.value_ptr.instance.ctx, spec, state);
-            gop.value_ptr.parses_unused = 0;
-            return .{
-                .vtable = gop.value_ptr.instance.vtable,
-                .ctx = gop.value_ptr.instance.ctx,
-            };
+            // Same factory — update path. The instance ctx pointer is
+            // stable across `invokeUpdate` even if the map rehashes
+            // (factories store their own state externally), but the
+            // entry_ptr is not — re-acquire it before mutating
+            // `parses_unused`.
+            const ctx_stable = entry_ptr.instance.ctx;
+            const vtable_stable = entry_ptr.instance.vtable;
+            try self.invokeUpdate(factory, ctx_stable, spec, state);
+            if (self.instances.getPtr(id)) |reaq| reaq.parses_unused = 0;
+            return .{ .vtable = vtable_stable, .ctx = ctx_stable };
         }
 
-        // Cache miss. Stable id, then full create + (maybe) binding.
-        const stable_id = self.allocator.dupe(u8, id) catch |err| {
-            _ = self.instances.remove(id);
-            return err;
-        };
-        gop.key_ptr.* = stable_id;
-        gop.value_ptr.* = self.buildEntry(factory, spec, state) catch |err| {
-            self.allocator.free(stable_id);
-            _ = self.instances.remove(stable_id);
-            return err;
-        };
+        // Cache miss. Build the entry FIRST (recursive resolves grow
+        // the map safely — we're holding no pointers into it). Then
+        // put once via `putNoClobber`.
+        const built = try self.buildEntry(factory, spec, state);
+        errdefer {
+            if (built.binding) |b| b.destroy();
+            if (factory.deinit) |d| d(built.instance.ctx, self.allocator);
+        }
+        const stable_id = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(stable_id);
+        try self.instances.putNoClobber(self.allocator, stable_id, built);
         return .{
-            .vtable = gop.value_ptr.instance.vtable,
-            .ctx = gop.value_ptr.instance.ctx,
+            .vtable = built.instance.vtable,
+            .ctx = built.instance.ctx,
         };
     }
 

@@ -333,6 +333,15 @@ fn layoutAndRender(
     out: *element.DrawList,
 ) anyerror!element.Box {
     const c: *const Component = @ptrCast(@alignCast(ctx));
+
+    // Input-scope swap: while we walk the embedded subtree, any Hit
+    // emitted by an interactive child component should carry our
+    // child_state pointer (not the host's). Save+restore so peers
+    // after us in the parent's layout get the parent's state back.
+    const saved = lc.state;
+    lc.state = @ptrCast(c.child_state);
+    defer lc.state = saved;
+
     return try element_layout.layoutAndRender(c.root, origin, constraints, lc, out);
 }
 

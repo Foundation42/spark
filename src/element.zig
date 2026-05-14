@@ -282,6 +282,14 @@ pub const Hit = struct {
     box: Box,
     vtable: *const ElementVTable,
     ctx: *anyopaque,
+    /// State pointer to deliver to `on_input` (stage-9 follow-up).
+    /// Top-level elements get the host's state; elements inside an
+    /// `:::embedded-document` get that doc's child state. Walker
+    /// copies `LayoutCtx.state` into here when emitting the Hit.
+    /// `null` means "use the dispatcher's default" — preserves the
+    /// pre-input-scoping behaviour for callers that haven't wired
+    /// LayoutCtx.state yet.
+    state: ?*anyopaque = null,
 };
 
 /// Parent-imposed bounds. Stage 1 walker mostly ignores these — text
@@ -455,6 +463,14 @@ pub const LayoutCtx = struct {
     mono_atlas: *atlas_mod.Atlas,
     color_atlas: *atlas_mod.Atlas,
     theme: *const Theme,
+    /// Optional state pointer for input-event scoping. The walker
+    /// stamps this onto every Hit it emits, so `:::slider` inside
+    /// an `:::embedded-document` mutates the embedded doc's child
+    /// state, not the parent's. Top-level layout sets this to
+    /// `&host_state`; the embedded-doc factory swaps it to its
+    /// child state before delegating into the child element tree.
+    /// `null` keeps the dispatcher on its fallback path.
+    state: ?*anyopaque = null,
 };
 
 /// GPU draw work accumulated during the walk. Quads land first

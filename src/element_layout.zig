@@ -120,6 +120,12 @@ pub fn layoutAndRender(
                     .box = box,
                     .vtable = cu.vtable,
                     .ctx = cu.ctx,
+                    // Stamp the layout-time state pointer onto the
+                    // Hit so dispatch routes input to the right
+                    // state. Top-level walks have `lc.state` set to
+                    // the host state; embedded-doc walks swap it to
+                    // the doc's child state before delegating.
+                    .state = ctx.state,
                 });
             }
             return box;
