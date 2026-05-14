@@ -346,18 +346,33 @@ through `ansi.parse`, output stuffed into `CodeContent.sub_block`;
 `layoutCodeBlock` recurses into it. Closes the markdown-↔-ANSI
 loop. Small commit (~50 LOC). Lands when convenient.
 
-## Parallel — scrolling (escalated by stage 11)
+## Shipped — scroll + zoom (post-stage-11)
 
-The other half of session-3's resize concern, now load-bearing.
-Stage 11's `:::embedded-document`s push the demo's total height
-well past the typical viewport — the remote-composition section
-sits off-screen on a 720p window. Without scroll, embedded docs
-are visible only on tall windows.
+Scroll wheel scrolls; Ctrl+scroll zooms. Both implemented as a
+post-layout transform pass on the DrawList: `screen = (world - scroll) * zoom`
+applied to every glyph + quad's position and size in one O(N)
+walk per layout. World-space layout stays unchanged; mouse coords
+un-transform on the input side so `Hit.box` comparisons stay in
+world coords.
 
-Mouse-wheel / keyboard scrolls a viewport offset; renderer applies
-it before NDC mapping (cleanest) or walker subtracts it from glyph
-y at emit (cheaper). No vision-track dependency; ready to land any
-time.
+`FrameCtx` grew `scroll_y` / `zoom` / `max_scroll_y` fields. GLFW
+scroll callback (registered via window user pointer) dispatches on
+`GLFW_KEY_LEFT_CONTROL` / `GLFW_KEY_RIGHT_CONTROL` state. Bounds
+clamping happens at the callback (scroll) and at the end of
+`runLayout` (recomputed `max_scroll_y` against new content height).
+
+Zoom range 0.25× – 4×, 10% per wheel-notch step. Scroll: 60 px per
+wheel-notch.
+
+**v0 limitation: pre-rasterized text becomes fuzzy at non-1.0 zoom.**
+The atlas glyphs are at fixed pixel sizes; the transform stretches
+them. SDF glyphs (ATTENTION) stay crisp because the SDF shader
+re-resolves at any scale. The proper crisp-zoom fix is a
+multi-size font atlas + re-layout-on-zoom-change — moderate
+rebuild, deferred.
+
+~10k fps Release with active scroll/zoom + all of 8a/8b/9/11
+running.
 
 ## Eventually — LM connection (tier 3)
 

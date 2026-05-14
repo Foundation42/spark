@@ -145,6 +145,21 @@ const FrameCtx = struct {
     glyph_overflow_logged: bool = false,
     quad_overflow_logged: bool = false,
 
+    // Scroll + zoom (stage post-11, ad-hoc — the demo's full doc
+    // height now exceeds typical viewport once embedded docs are
+    // in). Plain scroll wheel → scroll_y; Ctrl+scroll → zoom.
+    // Applied as a post-layout transform on DrawList glyphs + quads
+    // (one O(N) pass per re-layout). World-space layout stays
+    // unchanged; mouse coords un-transform for hit-test.
+    //
+    // Trade-off: pre-rasterized text becomes fuzzy at non-1.0 zoom
+    // because we stretch bitmap glyphs. SDF text (ATTENTION) stays
+    // crisp. Documented as v0 limitation — proper crisp-zoom is a
+    // multi-size atlas + re-layout-on-zoom rebuild.
+    scroll_y: f32 = 0,
+    zoom: f32 = 1.0,
+    max_scroll_y: f32 = 0,
+
     /// Re-run the layout pass for the current viewport. Clears the
     /// DrawList, lays out all three sub-trees at the new `max_w`,
     /// uploads the quads (static for the lifetime of a layout —
@@ -171,12 +186,46 @@ const FrameCtx = struct {
         const max_w: f32 = @max(w - 80.0, 200.0);
         const c: element.Constraints = .{ .max_w = max_w };
 
+        // Layout in WORLD coordinates — no scroll/zoom applied here.
+        // The transform pass at the bottom of this function maps
+        // world → screen.
         const top_box = try element_layout.layoutAndRender(self.top_stack, .{ 40, 40 }, c, &lc, self.dl);
         const ansi_box = try element_layout.layoutAndRender(self.ansi_tree, .{ 40, top_box.y + top_box.h + 8 }, c, &ansi_lc, self.dl);
 
         self.pulse_start = @intCast(self.dl.glyphs.items.len);
-        _ = try element_layout.layoutAndRender(self.sdf_block, .{ 40, ansi_box.y + ansi_box.h }, c, &lc, self.dl);
+        const sdf_box = try element_layout.layoutAndRender(self.sdf_block, .{ 40, ansi_box.y + ansi_box.h }, c, &lc, self.dl);
         self.pulse_count = @intCast(self.dl.glyphs.items.len - self.pulse_start);
+
+        // Recompute max scrollable distance from world content height
+        // vs world-space viewport height (`viewport_h / zoom` because
+        // the transform scales positions). Clamp current scroll if
+        // it now exceeds the new max (e.g. content shortened).
+        const content_bottom_world = sdf_box.y + sdf_box.h;
+        const viewport_h_world: f32 = @as(f32, @floatFromInt(extent.height)) / self.zoom;
+        const bottom_margin: f32 = 40;
+        self.max_scroll_y = @max(@as(f32, 0), content_bottom_world + bottom_margin - viewport_h_world);
+        if (self.scroll_y > self.max_scroll_y) self.scroll_y = self.max_scroll_y;
+        if (self.scroll_y < 0) self.scroll_y = 0;
+
+        // World → screen transform on DrawList. screen = (world - scroll) * zoom.
+        // Single O(N) pass per layout — chart at 60Hz survives this comfortably.
+        const sy = self.scroll_y;
+        const z = self.zoom;
+        for (self.dl.glyphs.items) |*g| {
+            g.dst_pos[1] -= sy;
+            g.dst_pos[0] *= z;
+            g.dst_pos[1] *= z;
+            g.dst_size[0] *= z;
+            g.dst_size[1] *= z;
+        }
+        for (self.dl.quads.items) |*q| {
+            q.dst_pos[1] -= sy;
+            q.dst_pos[0] *= z;
+            q.dst_pos[1] *= z;
+            q.dst_size[0] *= z;
+            q.dst_size[1] *= z;
+            q.radius *= z;
+        }
 
         // Quads stay frozen between layouts (no animation on them);
         // upload once per layout instead of per frame.
@@ -267,8 +316,12 @@ fn processInput(window: *win.Window, fc: *FrameCtx) !void {
     var x_raw: f64 = 0;
     var y_raw: f64 = 0;
     win.c.glfwGetCursorPos(window.handle, &x_raw, &y_raw);
-    const x: f32 = @floatCast(x_raw);
-    const y: f32 = @floatCast(y_raw);
+    // Un-transform: screen mouse → world coords so hit-test compares
+    // against the un-transformed Hit.box stored on the DrawList.
+    // Inverse of `screen = (world - scroll) * zoom`:
+    //   world = screen / zoom + scroll
+    const x: f32 = @as(f32, @floatCast(x_raw)) / fc.zoom;
+    const y: f32 = @as(f32, @floatCast(y_raw)) / fc.zoom + fc.scroll_y;
     const button_now = win.c.glfwGetMouseButton(window.handle, win.c.GLFW_MOUSE_BUTTON_LEFT) == win.c.GLFW_PRESS;
 
     const prev_down = fc.mouse_down;
@@ -328,6 +381,37 @@ fn findHit(hits: []const element.Hit, x: f32, y: f32) ?element.Hit {
 fn dispatch(hit: element.Hit, event: element.InputEvent, state: *state_mod.State) !void {
     const on_input = hit.vtable.on_input orelse return;
     try on_input(hit.ctx, event, @ptrCast(state));
+}
+
+// GLFW scroll callback. Ctrl-held → zoom; plain → vertical scroll.
+// Reads FrameCtx from the window user pointer (set in main()).
+//
+// Sets `state.dirty` so drawCb's next frame triggers runLayout
+// (which redoes the world→screen transform pass). Bounds clamped
+// here so user input can't push them outside the legal range.
+fn scrollCb(window: ?*win.c.GLFWwindow, _: f64, yoffset: f64) callconv(.C) void {
+    const ud = win.c.glfwGetWindowUserPointer(window);
+    if (ud == null) return;
+    const fc: *FrameCtx = @ptrCast(@alignCast(ud));
+
+    const ctrl = win.c.glfwGetKey(window, win.c.GLFW_KEY_LEFT_CONTROL) == win.c.GLFW_PRESS or
+        win.c.glfwGetKey(window, win.c.GLFW_KEY_RIGHT_CONTROL) == win.c.GLFW_PRESS;
+
+    if (ctrl) {
+        const step: f32 = 1.10;
+        const dy: f32 = @floatCast(yoffset);
+        if (dy > 0) fc.zoom *= std.math.pow(f32, step, dy);
+        if (dy < 0) fc.zoom /= std.math.pow(f32, step, -dy);
+        fc.zoom = std.math.clamp(fc.zoom, 0.25, 4.0);
+    } else {
+        const px_per_notch: f32 = 60.0;
+        fc.scroll_y -= @as(f32, @floatCast(yoffset)) * px_per_notch;
+        // Clamp against the most recent layout's known max; runLayout
+        // will clamp again once it has the new content height.
+        fc.scroll_y = std.math.clamp(fc.scroll_y, 0, fc.max_scroll_y);
+    }
+
+    fc.state.dirty = true;
 }
 
 /// HSV → RGB conversion using the standard six-sextant formula. `h`
@@ -555,6 +639,12 @@ pub fn main() !void {
     };
     rdr.draw_fn = drawCb;
     rdr.draw_ctx = @ptrCast(&frame_ctx);
+
+    // Scroll + ctrl-scroll-zoom: register the glfw scroll callback
+    // and stash the FrameCtx on the window's user-pointer so the
+    // callback can find it without a global.
+    win.c.glfwSetWindowUserPointer(window.handle, @ptrCast(&frame_ctx));
+    _ = win.c.glfwSetScrollCallback(window.handle, scrollCb);
 
     const exit_after_ms: ?i64 = if (std.process.getEnvVarOwned(allocator, "TEXT_ENGINE_EXIT_AFTER")) |s| blk: {
         defer allocator.free(s);
