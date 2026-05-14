@@ -10,6 +10,7 @@ const text_engine = @import("text_engine");
 const win = @import("window.zig");
 const vk = @import("gpu/vk.zig");
 const swap = @import("gpu/swapchain.zig");
+const renderer = @import("gpu/renderer.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -17,7 +18,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — phase 1a\n", .{});
+    try stdout.print("text_engine demo — phase 1b\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
 
@@ -36,10 +37,9 @@ pub fn main() !void {
         swapchain.images.len,
     });
 
-    // No frame loop yet — Phase 1b. Spin on glfwPollEvents so the
-    // window stays responsive (closeable) while we verify the context
-    // and swapchain set up clean against validation layers.
-    //
+    var rdr = try renderer.Renderer.init(allocator, &ctx, &swapchain, &window);
+    defer rdr.deinit();
+
     // TEXT_ENGINE_EXIT_AFTER=<seconds> auto-closes after a delay so
     // automated test runs (and `timeout`-less probes) actually exit
     // through the defer chain — SIGTERM skips deferred destruction,
@@ -49,11 +49,22 @@ pub fn main() !void {
         const secs = std.fmt.parseFloat(f64, s) catch break :blk null;
         break :blk @intFromFloat(secs * 1000.0);
     } else |_| null;
+
     const start_ms = std.time.milliTimestamp();
+    var frame_count: u64 = 0;
     while (!window.shouldClose()) {
         window.pollEvents();
+        try rdr.drawFrame();
+        frame_count += 1;
         if (exit_after_ms) |limit| {
             if (std.time.milliTimestamp() - start_ms >= limit) break;
         }
     }
+
+    const elapsed_ms = std.time.milliTimestamp() - start_ms;
+    try stdout.print("  frames:                {d} in {d}ms ({d:.1} fps)\n", .{
+        frame_count,
+        elapsed_ms,
+        if (elapsed_ms > 0) @as(f64, @floatFromInt(frame_count)) * 1000.0 / @as(f64, @floatFromInt(elapsed_ms)) else 0,
+    });
 }

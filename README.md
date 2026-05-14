@@ -51,7 +51,9 @@ Vulkan (loader + headers).
   narrow public module surface.
 - [x] **Phase 1a** — glfw window + Vulkan 1.3 instance/device/swapchain,
   validation layer in Debug, debug-utils messenger. Validation clean.
-- [ ] **Phase 1b** — clear-color frame loop via dynamic rendering.
+- [x] **Phase 1b** — clear-color frame loop via dynamic rendering +
+  synchronization2 barriers, frames-in-flight, swapchain recreate on
+  OUT_OF_DATE / SUBOPTIMAL. ~7600 fps uncapped at 1280×720.
 - [ ] **Phase 2** — FreeType-rasterised first glyph, textured quad.
 - [ ] **Phase 3** — HarfBuzz shaping, per-glyph SSBO, instanced draw,
   crisp body text. v1 "rich text on screen" milestone.
