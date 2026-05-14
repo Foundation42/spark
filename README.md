@@ -70,9 +70,13 @@ Vulkan (loader + headers).
   body text. Bitmap path (CBDT/sbix). COLRv1 vector path is a
   later option if we need bigger emoji.
 - [x] **Phase 6** — SDF lane (single-channel, generated from FT
-  bitmap at 64 px source) sharing the R8 mono atlas. Per-glyph
-  `attention` attribute in the SSBO modulates the SDF threshold +
-  drives a warm halo so high-attention glyphs visibly bloom. First
+  bitmap at 64 px source, padded for halo room) sharing the R8 mono
+  atlas. Per-glyph `attention` attribute in the SSBO modulates the
+  SDF threshold so high-attention glyphs visibly thicken into a
+  weight pulse rolling through a span without re-layout. First
   piece of the chat.md LM-driven rendering vision wired up
-  end-to-end. True MSDF (corner-preserving via msdfgen) is a future
-  swap if needed.
+  end-to-end. (A halo glow lane was prototyped and pulled — single-
+  channel SDF at radius 8 doesn't have the byte-value resolution
+  to make it look smooth. Richer attention effects will land via
+  underlines, size-with-reflow, or per-character PBR in later
+  phases — see the discussion thread, not the original chat.md.)
