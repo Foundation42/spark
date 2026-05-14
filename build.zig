@@ -56,6 +56,56 @@ pub fn build(b: *std.Build) void {
     });
     text_engine_mod.addImport("shaders", shaders_module);
 
+    // ── Vendored cmark (CommonMark reference parser) ───────────────
+    // Static archive linked into the demo. Vendored at 0.31.2 under
+    // `vendor/cmark/` — we maintain hand-authored cmark_export.h
+    // and cmark_version.h replacements for the CMake-generated ones.
+    // Source files reach each other via local "..." includes; the
+    // public header uses <cmark_export.h> + <cmark_version.h> from
+    // the same dir via -I. CMARK_STATIC_DEFINE collapses the export
+    // visibility macros to no-ops.
+    const cmark_lib = b.addStaticLibrary(.{
+        .name = "cmark",
+        .target = target,
+        .optimize = optimize,
+    });
+    const cmark_flags = &[_][]const u8{
+        "-std=c99",
+        "-DCMARK_STATIC_DEFINE",
+        // Suppress upstream's strict-aliasing / sign-compare /
+        // unused-parameter noise — third-party code, not ours to
+        // chase clean.
+        "-Wno-unused-parameter",
+        "-Wno-unused-but-set-variable",
+        "-Wno-sign-compare",
+    };
+    cmark_lib.addCSourceFiles(.{
+        .files = &.{
+            "vendor/cmark/blocks.c",
+            "vendor/cmark/buffer.c",
+            "vendor/cmark/cmark.c",
+            "vendor/cmark/cmark_ctype.c",
+            "vendor/cmark/commonmark.c",
+            "vendor/cmark/houdini_href_e.c",
+            "vendor/cmark/houdini_html_e.c",
+            "vendor/cmark/houdini_html_u.c",
+            "vendor/cmark/html.c",
+            "vendor/cmark/inlines.c",
+            "vendor/cmark/iterator.c",
+            "vendor/cmark/latex.c",
+            "vendor/cmark/man.c",
+            "vendor/cmark/node.c",
+            "vendor/cmark/references.c",
+            "vendor/cmark/render.c",
+            "vendor/cmark/scanners.c",
+            "vendor/cmark/utf8.c",
+            "vendor/cmark/xml.c",
+        },
+        .flags = cmark_flags,
+    });
+    cmark_lib.addIncludePath(b.path("vendor/cmark"));
+    cmark_lib.linkLibC();
+
     // ── Standalone demo executable ─────────────────────────────────
     // Owns its own glfw window + Vulkan context, exercises the library
     // via the same module a host engine would. Build-system stress test
@@ -85,6 +135,8 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("glfw");
     exe.linkSystemLibrary("freetype2");
     exe.linkSystemLibrary("harfbuzz");
+    exe.linkLibrary(cmark_lib);
+    exe.addIncludePath(b.path("vendor/cmark"));
     exe.linkLibC();
 
     b.installArtifact(exe);

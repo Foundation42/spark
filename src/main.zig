@@ -27,6 +27,12 @@ const glyph_cache_mod = @import("text/glyph_cache.zig");
 const element = @import("element.zig");
 const element_layout = @import("element_layout.zig");
 
+// Vendored cmark — see vendor/cmark/. Smoke-tested below; the actual
+// markdown → Element mapper lands in stage 3b.
+const cmark = @cImport({
+    @cInclude("cmark.h");
+});
+
 const ATLAS_MONO_SIZE: u32 = 768;
 const ATLAS_COLOR_SIZE: u32 = 1024;
 const MAX_GLYPHS: u32 = 2048;
@@ -90,9 +96,38 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 2 / stage 2c (theme + inline kinds)\n", .{});
+    try stdout.print("text_engine demo — session 2 / stage 3a (cmark vendored)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
+
+    // ── cmark smoke test ───────────────────────────────────────────
+    // Proves the vendored library links + parses + walks before we
+    // build the markdown→Element mapper on top of it. Counts the
+    // top-level block nodes the parser produces from a small input.
+    {
+        const src =
+            \\# Hello
+            \\
+            \\A paragraph with **bold** and *italic*.
+            \\
+            \\- one
+            \\- two
+        ;
+        const root = cmark.cmark_parse_document(src, src.len, cmark.CMARK_OPT_DEFAULT) orelse {
+            try stdout.print("  cmark parse FAILED\n", .{});
+            return error.CmarkParseFailed;
+        };
+        defer cmark.cmark_node_free(root);
+        var n_blocks: u32 = 0;
+        var child = cmark.cmark_node_first_child(root);
+        while (child != null) : (child = cmark.cmark_node_next(child)) {
+            n_blocks += 1;
+        }
+        try stdout.print("  cmark {s}: {d} top-level blocks\n", .{
+            std.mem.sliceTo(cmark.cmark_version_string(), 0),
+            n_blocks,
+        });
+    }
 
     var window = try win.Window.init(1280, 720, "text_engine_demo");
     defer window.deinit();
