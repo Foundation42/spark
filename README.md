@@ -56,8 +56,9 @@ Vulkan (loader + headers).
   OUT_OF_DATE / SUBOPTIMAL. ~7600 fps uncapped at 1280×720.
 - [x] **Phase 2** — FreeType-rasterised first glyph, textured quad
   via R8_UNORM atlas + linear sampler + straight-alpha blend.
-- [ ] **Phase 3** — HarfBuzz shaping, per-glyph SSBO, instanced draw,
-  crisp body text. v1 "rich text on screen" milestone.
+- [x] **Phase 3** — HarfBuzz shaping, per-glyph SSBO, instanced draw,
+  shelf-packed atlas, baseline-relative layout. v1 "rich text on
+  screen" milestone — one `vkCmdDraw(6, n_glyphs, 0, 0)` per frame.
 - [ ] **Phase 4** — styled spans, multiple sizes/weights.
 - [ ] **Phase 5** — emoji (COLRv1 + sbix fallback).
 - [ ] **Phase 6** — MSDF lane + per-glyph attention attribute hooked

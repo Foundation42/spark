@@ -69,10 +69,27 @@ pub const Face = struct {
     /// internal glyph slot — valid until the next load on this face.
     pub fn rasterizeChar(self: *Face, codepoint: u32) !GlyphBitmap {
         try checkFt(c.FT_Load_Char(self.handle, codepoint, c.FT_LOAD_RENDER));
+        return self.slotBitmap();
+    }
+
+    /// Same as `rasterizeChar` but indexed by glyph id (post-shaping).
+    /// HarfBuzz produces glyph ids; FreeType wants them via Load_Glyph
+    /// rather than Load_Char (which does its own cmap lookup that
+    /// would double-count what the shaper already did).
+    pub fn rasterizeGlyph(self: *Face, glyph_id: u32) !GlyphBitmap {
+        try checkFt(c.FT_Load_Glyph(self.handle, glyph_id, c.FT_LOAD_RENDER));
+        return self.slotBitmap();
+    }
+
+    fn slotBitmap(self: *Face) !GlyphBitmap {
         const slot = self.handle.*.glyph;
         const bm = slot.*.bitmap;
-        if (bm.pixel_mode != c.FT_PIXEL_MODE_GRAY) return error.UnsupportedPixelMode;
-
+        // Allow zero-size glyphs (e.g. U+0020 space) — they have a
+        // valid advance but no pixels, and HarfBuzz still emits them
+        // in the output run so the caller can advance the pen.
+        if (bm.width != 0 and bm.rows != 0 and bm.pixel_mode != c.FT_PIXEL_MODE_GRAY) {
+            return error.UnsupportedPixelMode;
+        }
         // FreeType stores grayscale as 1 byte/pixel; pitch may be
         // negative (bottom-up) or larger than width (row padding).
         // We expose the raw buffer + pitch so the uploader can copy
@@ -88,6 +105,25 @@ pub const Face = struct {
             .advance_px = @as(f32, @floatFromInt(slot.*.advance.x)) / 64.0,
         };
     }
+
+    /// Vertical metrics in pixels for the current pixel size.
+    /// `ascender` is positive above baseline, `descender` is negative
+    /// below. `line_height` is the recommended line-to-line distance
+    /// (face->size->metrics.height in 26.6 fp).
+    pub fn metrics(self: *const Face) Metrics {
+        const m = self.handle.*.size.*.metrics;
+        return .{
+            .ascender = @as(f32, @floatFromInt(m.ascender)) / 64.0,
+            .descender = @as(f32, @floatFromInt(m.descender)) / 64.0,
+            .line_height = @as(f32, @floatFromInt(m.height)) / 64.0,
+        };
+    }
+};
+
+pub const Metrics = struct {
+    ascender: f32,
+    descender: f32,
+    line_height: f32,
 };
 
 pub const GlyphBitmap = struct {

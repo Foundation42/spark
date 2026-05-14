@@ -1,14 +1,19 @@
-//! Graphics pipeline that draws a textured quad sampling the glyph
-//! atlas. Phase 2 issues one quad per `recordDraw` call via push
-//! constants; Phase 3 will replace this with an instanced draw
-//! consuming a per-glyph SSBO so we can render whole paragraphs in
-//! one submit.
+//! Graphics pipeline that draws a paragraph as one instanced quad
+//! draw, indexing into a per-glyph SSBO. One `vkCmdDraw(6, n, 0, 0)`
+//! issues `n` glyphs in one submit — the right shape for body text
+//! where a screenful is hundreds-to-thousands of glyphs.
 //!
-//! The pipeline targets vkCmdBeginRendering directly (no VkRenderPass
-//! / VkFramebuffer) — it just declares the swapchain colour format
-//! via `VkPipelineRenderingCreateInfo`. Viewport + scissor are
-//! dynamic so the renderer doesn't have to recreate the pipeline on
-//! window resize.
+//! Phase 3 ships a single SSBO sized at `init` time and host-visible
+//! so callers can `writeGlyphs(slice)` straight into mapped memory.
+//! Phase 4 will add a ring of double-buffered SSBOs so dynamic text
+//! (typing, cursor blink, log streams) doesn't sync with the GPU on
+//! every update.
+//!
+//! Targets `vkCmdBeginRendering` directly — no VkRenderPass / no
+//! VkFramebuffer. Viewport + scissor are dynamic state. Push
+//! constants carry just the viewport pixel size for the NDC
+//! conversion in the vertex stage; per-glyph colour, atlas UV, and
+//! pixel rect all travel in the SSBO.
 
 const std = @import("std");
 const vk = @import("vk.zig");
@@ -17,22 +22,27 @@ const shaders = @import("shaders");
 
 const c = vk.c;
 
-/// Push-constant block. Layout must match shaders/text.{vert,frag}'s
-/// `layout(push_constant) uniform PC { ... }` exactly. extern struct
-/// + manual field ordering keeps std430 happy: vec4 first (16-byte
-/// align), then six vec2s back-to-back (each 8 bytes, no padding).
-pub const TextPushConsts = extern struct {
-    color: [4]f32,
+/// Per-glyph SSBO entry. Layout must match the GLSL `GlyphInstance`
+/// struct in `shaders/text.vert` under std430:
+///   * each `vec2` is 8-byte aligned (8 bytes wide → no padding)
+///   * the trailing `vec4` is 16-byte aligned; the four preceding
+///     vec2s have already landed it at offset 32 so it's natural.
+/// Total stride: 48 bytes.
+pub const GlyphInstance = extern struct {
     dst_pos: [2]f32,
     dst_size: [2]f32,
-    viewport_size: [2]f32,
     uv_min: [2]f32,
     uv_max: [2]f32,
+    color: [4]f32,
 };
 
 comptime {
-    std.debug.assert(@sizeOf(TextPushConsts) == 56);
+    std.debug.assert(@sizeOf(GlyphInstance) == 48);
 }
+
+pub const TextPushConsts = extern struct {
+    viewport_size: [2]f32,
+};
 
 pub const TextPipeline = struct {
     descriptor_set_layout: c.VkDescriptorSetLayout,
@@ -40,12 +50,19 @@ pub const TextPipeline = struct {
     descriptor_set: c.VkDescriptorSet,
     pipeline_layout: c.VkPipelineLayout,
     pipeline: c.VkPipeline,
+
+    glyph_buffer: c.VkBuffer,
+    glyph_memory: c.VkDeviceMemory,
+    glyph_mapped: [*]GlyphInstance,
+    glyph_capacity: u32,
+
     device: c.VkDevice, // borrowed
 
     pub fn init(
         ctx: *const vk.Context,
         color_format: c.VkFormat,
         atlas: *const atlas_mod.Atlas,
+        max_glyphs: u32,
     ) !TextPipeline {
         const dev = ctx.device;
         var self: TextPipeline = .{
@@ -54,34 +71,78 @@ pub const TextPipeline = struct {
             .descriptor_set = null,
             .pipeline_layout = null,
             .pipeline = null,
+            .glyph_buffer = null,
+            .glyph_memory = null,
+            .glyph_mapped = undefined,
+            .glyph_capacity = max_glyphs,
             .device = dev,
         };
         errdefer self.deinit();
 
-        // ── Descriptor set layout: one combined image sampler ───────
-        var binding = std.mem.zeroes(c.VkDescriptorSetLayoutBinding);
-        binding.binding = 0;
-        binding.descriptorType = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        binding.descriptorCount = 1;
-        binding.stageFlags = c.VK_SHADER_STAGE_FRAGMENT_BIT;
+        // ── SSBO: host-visible, host-coherent so writes from the CPU
+        // are immediately visible to subsequent submits without
+        // explicit flush. Sized for `max_glyphs` entries up-front. ─
+        const bytes: u64 = @as(u64, max_glyphs) * @sizeOf(GlyphInstance);
+        var bci = std.mem.zeroes(c.VkBufferCreateInfo);
+        bci.sType = c.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bci.size = bytes;
+        bci.usage = c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        bci.sharingMode = c.VK_SHARING_MODE_EXCLUSIVE;
+        try vk.check(c.vkCreateBuffer(dev, &bci, null, &self.glyph_buffer));
+
+        var req: c.VkMemoryRequirements = undefined;
+        c.vkGetBufferMemoryRequirements(dev, self.glyph_buffer, &req);
+        const mt = try findMemoryType(
+            ctx.physical_device,
+            req.memoryTypeBits,
+            c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        );
+        var mai = std.mem.zeroes(c.VkMemoryAllocateInfo);
+        mai.sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = mt;
+        try vk.check(c.vkAllocateMemory(dev, &mai, null, &self.glyph_memory));
+        try vk.check(c.vkBindBufferMemory(dev, self.glyph_buffer, self.glyph_memory, 0));
+
+        var raw: ?*anyopaque = null;
+        try vk.check(c.vkMapMemory(dev, self.glyph_memory, 0, bytes, 0, &raw));
+        self.glyph_mapped = @ptrCast(@alignCast(raw.?));
+
+        // ── Descriptor set layout: image+sampler (frag) + SSBO (vert)
+        // Two bindings, one set. Hand-coded array because Zig structs
+        // mapped to Vulkan can't sit in `&[_]X{...}` while being
+        // pre-zeroed via std.mem.zeroes — easier to fill fields. ─
+        var bindings = [_]c.VkDescriptorSetLayoutBinding{
+            std.mem.zeroes(c.VkDescriptorSetLayoutBinding),
+            std.mem.zeroes(c.VkDescriptorSetLayoutBinding),
+        };
+        bindings[0].binding = 0;
+        bindings[0].descriptorType = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[0].descriptorCount = 1;
+        bindings[0].stageFlags = c.VK_SHADER_STAGE_FRAGMENT_BIT;
+        bindings[1].binding = 1;
+        bindings[1].descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[1].descriptorCount = 1;
+        bindings[1].stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT;
+
         var dsl_ci = std.mem.zeroes(c.VkDescriptorSetLayoutCreateInfo);
         dsl_ci.sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        dsl_ci.bindingCount = 1;
-        dsl_ci.pBindings = &binding;
+        dsl_ci.bindingCount = bindings.len;
+        dsl_ci.pBindings = &bindings;
         try vk.check(c.vkCreateDescriptorSetLayout(dev, &dsl_ci, null, &self.descriptor_set_layout));
 
-        // ── Descriptor pool: one set, one sampler binding ───────────
-        var ps = std.mem.zeroes(c.VkDescriptorPoolSize);
-        ps.type = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        ps.descriptorCount = 1;
+        // ── Descriptor pool: one set with two bindings ──────────────
+        var pool_sizes = [_]c.VkDescriptorPoolSize{
+            .{ .type = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1 },
+            .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1 },
+        };
         var dp_ci = std.mem.zeroes(c.VkDescriptorPoolCreateInfo);
         dp_ci.sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        dp_ci.poolSizeCount = 1;
-        dp_ci.pPoolSizes = &ps;
+        dp_ci.poolSizeCount = pool_sizes.len;
+        dp_ci.pPoolSizes = &pool_sizes;
         dp_ci.maxSets = 1;
         try vk.check(c.vkCreateDescriptorPool(dev, &dp_ci, null, &self.descriptor_pool));
 
-        // ── Allocate + update the descriptor set with the atlas ─────
         var ds_ai = std.mem.zeroes(c.VkDescriptorSetAllocateInfo);
         ds_ai.sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         ds_ai.descriptorPool = self.descriptor_pool;
@@ -89,24 +150,40 @@ pub const TextPipeline = struct {
         ds_ai.pSetLayouts = &self.descriptor_set_layout;
         try vk.check(c.vkAllocateDescriptorSets(dev, &ds_ai, &self.descriptor_set));
 
-        var img_info = std.mem.zeroes(c.VkDescriptorImageInfo);
-        img_info.sampler = atlas.sampler;
-        img_info.imageView = atlas.view;
-        img_info.imageLayout = c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        var write = std.mem.zeroes(c.VkWriteDescriptorSet);
-        write.sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        write.dstSet = self.descriptor_set;
-        write.dstBinding = 0;
-        write.descriptorCount = 1;
-        write.descriptorType = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        write.pImageInfo = &img_info;
-        c.vkUpdateDescriptorSets(dev, 1, &write, 0, null);
+        var img_info = c.VkDescriptorImageInfo{
+            .sampler = atlas.sampler,
+            .imageView = atlas.view,
+            .imageLayout = c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        var buf_info = c.VkDescriptorBufferInfo{
+            .buffer = self.glyph_buffer,
+            .offset = 0,
+            .range = bytes,
+        };
+        var writes = [_]c.VkWriteDescriptorSet{
+            std.mem.zeroes(c.VkWriteDescriptorSet),
+            std.mem.zeroes(c.VkWriteDescriptorSet),
+        };
+        writes[0].sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = self.descriptor_set;
+        writes[0].dstBinding = 0;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[0].pImageInfo = &img_info;
+        writes[1].sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = self.descriptor_set;
+        writes[1].dstBinding = 1;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[1].pBufferInfo = &buf_info;
+        c.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
 
-        // ── Pipeline layout: descriptor set + push constants ────────
-        var pc_range = std.mem.zeroes(c.VkPushConstantRange);
-        pc_range.stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT;
-        pc_range.offset = 0;
-        pc_range.size = @sizeOf(TextPushConsts);
+        // ── Pipeline layout: descriptor set + viewport push consts ──
+        var pc_range = c.VkPushConstantRange{
+            .stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT,
+            .offset = 0,
+            .size = @sizeOf(TextPushConsts),
+        };
         var pl_ci = std.mem.zeroes(c.VkPipelineLayoutCreateInfo);
         pl_ci.sType = c.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         pl_ci.setLayoutCount = 1;
@@ -126,7 +203,6 @@ pub const TextPipeline = struct {
             stageInfo(c.VK_SHADER_STAGE_FRAGMENT_BIT, frag_mod),
         };
 
-        // No vertex buffer — positions come from gl_VertexIndex.
         var vis = std.mem.zeroes(c.VkPipelineVertexInputStateCreateInfo);
         vis.sType = c.VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
 
@@ -134,7 +210,6 @@ pub const TextPipeline = struct {
         ias.sType = c.VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
         ias.topology = c.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 
-        // Viewport + scissor are dynamic; sizes set per-frame.
         var vps = std.mem.zeroes(c.VkPipelineViewportStateCreateInfo);
         vps.sType = c.VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
         vps.viewportCount = 1;
@@ -151,10 +226,7 @@ pub const TextPipeline = struct {
         ms.sType = c.VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
         ms.rasterizationSamples = c.VK_SAMPLE_COUNT_1_BIT;
 
-        // Straight-alpha blend: out_rgb = src.rgb * src.a + dst.rgb * (1 - src.a)
-        // out_a = src.a + dst.a * (1 - src.a). Fine for opaque
-        // backgrounds; Phase 3 may switch to pre-multiplied alpha if
-        // we add layered effects (glow / drop shadow) on top.
+        // Straight-alpha blend (see Phase 2 commit for rationale).
         var cba = std.mem.zeroes(c.VkPipelineColorBlendAttachmentState);
         cba.blendEnable = c.VK_TRUE;
         cba.srcColorBlendFactor = c.VK_BLEND_FACTOR_SRC_ALPHA;
@@ -179,8 +251,6 @@ pub const TextPipeline = struct {
         dys.dynamicStateCount = dyn_states.len;
         dys.pDynamicStates = &dyn_states;
 
-        // Dynamic-rendering attachment formats — substitute for
-        // VkRenderPass / VkSubpassDescription.
         var rendering_info = std.mem.zeroes(c.VkPipelineRenderingCreateInfo);
         rendering_info.sType = c.VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
         rendering_info.colorAttachmentCount = 1;
@@ -199,31 +269,43 @@ pub const TextPipeline = struct {
         gpci.pColorBlendState = &cbs;
         gpci.pDynamicState = &dys;
         gpci.layout = self.pipeline_layout;
-
         try vk.check(c.vkCreateGraphicsPipelines(dev, null, 1, &gpci, null, &self.pipeline));
         return self;
     }
 
     pub fn deinit(self: *TextPipeline) void {
+        if (self.glyph_memory != null) {
+            c.vkUnmapMemory(self.device, self.glyph_memory);
+            c.vkFreeMemory(self.device, self.glyph_memory, null);
+        }
+        if (self.glyph_buffer != null) c.vkDestroyBuffer(self.device, self.glyph_buffer, null);
         if (self.pipeline != null) c.vkDestroyPipeline(self.device, self.pipeline, null);
         if (self.pipeline_layout != null) c.vkDestroyPipelineLayout(self.device, self.pipeline_layout, null);
-        // Descriptor sets are freed when their pool is destroyed.
         if (self.descriptor_pool != null) c.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);
         if (self.descriptor_set_layout != null) c.vkDestroyDescriptorSetLayout(self.device, self.descriptor_set_layout, null);
         self.* = undefined;
     }
 
-    /// Bind the pipeline + descriptor set, set viewport/scissor for
-    /// `extent`, push the per-glyph constants, draw 6 verts (one
-    /// quad). Must be called inside an active vkCmdBeginRendering
-    /// block whose colour format matches the `color_format` passed
-    /// to `init`.
+    /// Copy `glyphs` into the mapped SSBO. Memory is host-coherent, so
+    /// no explicit flush is needed before submitting a frame that
+    /// reads it. Returns `error.SsboOverflow` if the slice doesn't
+    /// fit — caller should bump `max_glyphs` at init time.
+    pub fn writeGlyphs(self: *TextPipeline, glyphs: []const GlyphInstance) !void {
+        if (glyphs.len > self.glyph_capacity) return error.SsboOverflow;
+        @memcpy(self.glyph_mapped[0..glyphs.len], glyphs);
+    }
+
+    /// Bind pipeline + descriptor set, set viewport/scissor, push
+    /// viewport size, draw 6 verts × `n_glyphs` instances. Must be
+    /// called inside an active vkCmdBeginRendering block whose colour
+    /// format matches `init`'s `color_format`.
     pub fn recordDraw(
         self: *const TextPipeline,
         cmd: c.VkCommandBuffer,
         extent: c.VkExtent2D,
-        pc: TextPushConsts,
+        n_glyphs: u32,
     ) void {
+        if (n_glyphs == 0) return;
         c.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipeline);
         c.vkCmdBindDescriptorSets(
             cmd,
@@ -235,7 +317,6 @@ pub const TextPipeline = struct {
             0,
             null,
         );
-
         var viewport = c.VkViewport{
             .x = 0,
             .y = 0,
@@ -245,21 +326,22 @@ pub const TextPipeline = struct {
             .maxDepth = 1,
         };
         c.vkCmdSetViewport(cmd, 0, 1, &viewport);
-        var scissor = c.VkRect2D{
-            .offset = .{ .x = 0, .y = 0 },
-            .extent = extent,
-        };
+        var scissor = c.VkRect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = extent };
         c.vkCmdSetScissor(cmd, 0, 1, &scissor);
 
+        const pc = TextPushConsts{ .viewport_size = .{
+            @floatFromInt(extent.width),
+            @floatFromInt(extent.height),
+        } };
         c.vkCmdPushConstants(
             cmd,
             self.pipeline_layout,
-            c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT,
+            c.VK_SHADER_STAGE_VERTEX_BIT,
             0,
             @sizeOf(TextPushConsts),
             &pc,
         );
-        c.vkCmdDraw(cmd, 6, 1, 0, 0);
+        c.vkCmdDraw(cmd, 6, n_glyphs, 0, 0);
     }
 };
 
@@ -280,4 +362,20 @@ fn stageInfo(stage: c.VkShaderStageFlagBits, module: c.VkShaderModule) c.VkPipel
     s.module = module;
     s.pName = "main";
     return s;
+}
+
+fn findMemoryType(
+    pd: c.VkPhysicalDevice,
+    type_bits: u32,
+    required: c.VkMemoryPropertyFlags,
+) !u32 {
+    var props: c.VkPhysicalDeviceMemoryProperties = undefined;
+    c.vkGetPhysicalDeviceMemoryProperties(pd, &props);
+    var i: u32 = 0;
+    while (i < props.memoryTypeCount) : (i += 1) {
+        const bit: u32 = @as(u32, 1) << @intCast(i);
+        if ((type_bits & bit) == 0) continue;
+        if ((props.memoryTypes[i].propertyFlags & required) == required) return i;
+    }
+    return error.NoSuitableMemoryType;
 }

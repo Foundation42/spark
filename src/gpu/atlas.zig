@@ -22,6 +22,24 @@ const vk = @import("vk.zig");
 
 const c = vk.c;
 
+pub const Rect = struct { x: u32, y: u32, w: u32, h: u32 };
+
+/// Shelf-packer state. Glyphs flow left-to-right on a "shelf"; when
+/// a glyph doesn't fit the current shelf's remaining width, a new
+/// shelf starts below the previous one. `shelf_height` grows when a
+/// taller glyph lands in the current shelf so shorter glyphs to its
+/// right still have a valid baseline above the next shelf. Wastes
+/// some space at the right edge of each shelf when widths don't add
+/// up to the atlas width — fine trade-off for the simplicity. A
+/// real packer (Skyline-MaxRects) is Phase ≥4 work.
+const Shelf = struct {
+    cursor_x: u32 = 0,
+    top_y: u32 = 0,
+    height: u32 = 0,
+};
+
+const GLYPH_PAD: u32 = 1;
+
 pub const Atlas = struct {
     image: c.VkImage,
     memory: c.VkDeviceMemory,
@@ -34,6 +52,8 @@ pub const Atlas = struct {
     physical_device: c.VkPhysicalDevice,
     queue: c.VkQueue,
     queue_family: u32,
+
+    shelf: Shelf = .{},
 
     pub fn init(
         ctx: *const vk.Context,
@@ -131,6 +151,39 @@ pub const Atlas = struct {
         if (self.image != null) c.vkDestroyImage(self.device, self.image, null);
         if (self.memory != null) c.vkFreeMemory(self.device, self.memory, null);
         self.* = undefined;
+    }
+
+    /// Reserve and upload an `w*h` grayscale bitmap into the next
+    /// free spot in the atlas. Returns the placed rectangle, or
+    /// `error.AtlasFull` if there's no room. For zero-size glyphs
+    /// (e.g. U+0020 space) returns a degenerate rect at the current
+    /// shelf cursor without packing or uploading — callers can still
+    /// use the rect as a valid UV (zero width/height = zero coverage).
+    pub fn addGlyph(self: *Atlas, w: u32, h: u32, pixels: []const u8) !Rect {
+        if (w == 0 or h == 0) {
+            return .{ .x = self.shelf.cursor_x, .y = self.shelf.top_y, .w = 0, .h = 0 };
+        }
+        const rect = self.pack(w, h) orelse return error.AtlasFull;
+        try self.uploadRegion(rect.x, rect.y, w, h, pixels);
+        return rect;
+    }
+
+    fn pack(self: *Atlas, w: u32, h: u32) ?Rect {
+        if (w > self.extent.width or h > self.extent.height) return null;
+        // Try the current shelf first.
+        if (self.shelf.cursor_x + w <= self.extent.width) {
+            const x = self.shelf.cursor_x;
+            const y = self.shelf.top_y;
+            self.shelf.cursor_x += w + GLYPH_PAD;
+            if (h > self.shelf.height) self.shelf.height = h;
+            if (self.shelf.top_y + self.shelf.height > self.extent.height) return null;
+            return .{ .x = x, .y = y, .w = w, .h = h };
+        }
+        // Start a new shelf below.
+        const new_top = self.shelf.top_y + self.shelf.height + GLYPH_PAD;
+        if (new_top + h > self.extent.height) return null;
+        self.shelf = .{ .cursor_x = w + GLYPH_PAD, .top_y = new_top, .height = h };
+        return .{ .x = 0, .y = new_top, .w = w, .h = h };
     }
 
     /// Upload an 8-bit grayscale `pixels` buffer of size `w*h` (row
