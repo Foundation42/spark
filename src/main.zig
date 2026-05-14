@@ -425,6 +425,54 @@ fn dispatch(hit: element.Hit, event: element.InputEvent, state: *state_mod.State
     try on_input(hit.ctx, event, eff);
 }
 
+// GLFW key callback — keyboard equivalents of the mouse-wheel
+// scroll / zoom inputs. PgUp/PgDn/Home/End drive scroll; Ctrl+= /
+// Ctrl+- / Ctrl+0 drive zoom. Discrete steps, so they tween to the
+// new target same as wheel input (drawCb's scroll easing handles
+// both paths uniformly).
+fn keyCb(window: ?*win.c.GLFWwindow, key: c_int, _: c_int, action: c_int, mods: c_int) callconv(.C) void {
+    if (action != win.c.GLFW_PRESS and action != win.c.GLFW_REPEAT) return;
+    const ud = win.c.glfwGetWindowUserPointer(window);
+    if (ud == null) return;
+    const fc: *FrameCtx = @ptrCast(@alignCast(ud));
+
+    const ctrl = (mods & win.c.GLFW_MOD_CONTROL) != 0;
+
+    if (ctrl) {
+        switch (key) {
+            // GLFW_KEY_EQUAL is the unshifted `=` key, which is
+            // where `+` sits on US/UK keyboards — accept both forms
+            // so Ctrl+= and Ctrl++ feel like the same gesture.
+            win.c.GLFW_KEY_EQUAL, win.c.GLFW_KEY_KP_ADD => {
+                fc.zoom = std.math.clamp(fc.zoom * 1.10, 0.25, 4.0);
+                fc.state.dirty = true;
+            },
+            win.c.GLFW_KEY_MINUS, win.c.GLFW_KEY_KP_SUBTRACT => {
+                fc.zoom = std.math.clamp(fc.zoom / 1.10, 0.25, 4.0);
+                fc.state.dirty = true;
+            },
+            win.c.GLFW_KEY_0, win.c.GLFW_KEY_KP_0 => {
+                fc.zoom = 1.0;
+                fc.state.dirty = true;
+            },
+            else => {},
+        }
+        return;
+    }
+
+    // Non-Ctrl navigation: page / home / end. Page step ≈ viewport
+    // height (less a slim overlap so the eye keeps continuity).
+    const viewport_h: f32 = @as(f32, @floatFromInt(fc.last_extent.height)) / fc.zoom;
+    const page: f32 = @max(viewport_h - 80, 100);
+    switch (key) {
+        win.c.GLFW_KEY_PAGE_DOWN => fc.target_scroll_y = std.math.clamp(fc.target_scroll_y + page, 0, fc.max_scroll_y),
+        win.c.GLFW_KEY_PAGE_UP => fc.target_scroll_y = std.math.clamp(fc.target_scroll_y - page, 0, fc.max_scroll_y),
+        win.c.GLFW_KEY_HOME => fc.target_scroll_y = 0,
+        win.c.GLFW_KEY_END => fc.target_scroll_y = fc.max_scroll_y,
+        else => return,
+    }
+}
+
 // GLFW scroll callback. Ctrl-held → zoom; plain → vertical scroll.
 // Reads FrameCtx from the window user pointer (set in main()).
 //
@@ -683,11 +731,12 @@ pub fn main() !void {
     rdr.draw_fn = drawCb;
     rdr.draw_ctx = @ptrCast(&frame_ctx);
 
-    // Scroll + ctrl-scroll-zoom: register the glfw scroll callback
-    // and stash the FrameCtx on the window's user-pointer so the
-    // callback can find it without a global.
+    // Scroll + ctrl-scroll-zoom + keyboard navigation: register
+    // both glfw callbacks and stash the FrameCtx on the window's
+    // user-pointer so they can find it without a global.
     win.c.glfwSetWindowUserPointer(window.handle, @ptrCast(&frame_ctx));
     _ = win.c.glfwSetScrollCallback(window.handle, scrollCb);
+    _ = win.c.glfwSetKeyCallback(window.handle, keyCb);
 
     const exit_after_ms: ?i64 = if (std.process.getEnvVarOwned(allocator, "TEXT_ENGINE_EXIT_AFTER")) |s| blk: {
         defer allocator.free(s);

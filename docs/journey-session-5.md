@@ -647,28 +647,160 @@ stage 8b — extra layout work for two more sub-trees of content).
 2437 glyphs, 148 quads, 100% cache hit rate, 512 updates
 dispatched.
 
+## Polish — scroll + zoom + keyboard nav
+
+Stage 11's content overflowed the typical viewport: the remote
+composition section sat below the visible window on 720p. Scroll
+became load-bearing rather than nice-to-have.
+
+The shape: post-layout transform pass. Layout lays content out in
+world coordinates (origin still `(40, 40)`); a single O(N) walk at
+the end of `runLayout` applies `screen = (world - scroll) * zoom`
+to every glyph + quad's position and size. Mouse coords un-
+transform symmetrically (`world = screen / zoom + scroll`) before
+hit-testing so `Hit.box` stays in world space and slider local
+coords still make sense.
+
+Inputs:
+- **Mouse wheel** → vertical scroll. Wheel notch = 60 world px.
+- **Ctrl + wheel** → zoom. Each notch = ×1.10 / ÷1.10. Clamped
+  0.25 – 4.
+- **PgUp / PgDn** → page-height scroll.
+- **Home / End** → scroll to top / bottom.
+- **Ctrl + = / Ctrl + - / Ctrl + 0** → zoom in / out / reset.
+
+Scroll input feels nicer with a small tween, so wheel + keyboard
+both write to `target_scroll_y`; `drawCb` eases `scroll_y` toward
+it with an exponential decay (τ=60ms, ≈100ms to converge visually).
+Frame-rate-independent via wall-clock `dt`. Snaps + stops dirtying
+once within sub-pixel range so we don't sustain re-layout
+needlessly.
+
+`max_scroll_y` recomputed at the end of `runLayout` from world
+content bottom vs `viewport_h / zoom`. The callbacks clamp against
+the most recent value so user input can't push the destination out
+of range.
+
+**Trade-off (v0):** pre-rasterized text gets fuzzy at non-1.0 zoom
+because the atlas glyphs stretch. SDF text (`ATTENTION`) stays
+crisp at any zoom. Documented; proper crisp-zoom is a multi-size
+atlas + re-layout-on-zoom rebuild deferred to its own stage.
+
+## Embedded-doc input scope
+
+Sliders inside an `:::embedded-document` used to mutate parent
+state because the walker dispatched input with the host state
+pointer regardless of where the Hit came from. Visible
+consequence: drop a `:::slider` into `orbit_panel.md` with
+`target=panel_height`, drag it, watch the **parent's** state get
+mutated instead of the embed's.
+
+Fix: thread state through the layout pipeline.
+
+- `LayoutCtx` grew an optional `state: ?*anyopaque`. Top-level
+  walks set it to `&host_state`. The embedded-doc's
+  `layoutAndRender` does a save+swap+restore around the child
+  subtree.
+- `Hit` grew a matching optional `state` field. The walker stamps
+  `ctx.state` onto every Hit at emit time.
+- `dispatch` uses `hit.state` if non-null, else falls back to the
+  dispatcher's default.
+
+Result: dragging the slider inside the orbit widget calls
+`child_state.set("panel_height", "...")`, the child's binding
+fires, the embedded outer box resizes. The dirty bubble (stage 9)
+takes care of waking the renderer. Fully self-contained
+interactive widget. Demo shows it: drag the embedded slider,
+embedded panel resizes, parent state untouched.
+
+## The map-rehash bug
+
+Wiring the embedded slider triggered a crash that surfaced a
+latent stage-9 bug — small in code, instructive in shape.
+
+Symptom: `registry.gc()` crashes with a GPE in `Binding.destroy`.
+Trace shows a dead entry with `parses_unused = 0xAAAAAAAA` (Zig's
+undefined-fill pattern) and `has_binding = true` despite the spec
+having no `${state.x}` references.
+
+Root cause: `Registry.resolve` was holding `gop.value_ptr` across
+`buildEntry`. For `:::embedded-document`, `buildEntry` calls into
+`factory.create`, which recursively calls
+`markdown.parseWithStateAndScope`, which calls `resolve` on every
+nested `:::` block. Each nested insert may rehash
+`StringHashMapUnmanaged` — at which point `gop.value_ptr` is a
+dangling pointer into freed storage. The post-recurse write
+`gop.value_ptr.* = entry` lands in old memory; the actual slot in
+the new storage retains its unwritten state. Next `gc` iterates,
+finds a slot with garbage `parses_unused`, tries to destroy
+garbage. Boom.
+
+Fix: build first, put once. Resolve no longer holds a getOrPut
+pointer across recursion. The cache-hit + update path captures
+stable `instance.{ctx,vtable}` before any call that can rehash
+and re-acquires the entry pointer afterward.
+
+Saved as `memory/project_registry_pointer_rules.md` with the
+symptom signature so a future regression doesn't take ten minutes
+of debug-print bisection to track down.
+
+The deeper lesson: any factory whose `create` or `update`
+recursively reaches back into the registry hits this trap. The
+list will grow — remote loaders, WASM components, AI-inferred
+factories. The discipline of "build first, put once" carries
+forward.
+
 ## What ships at session 5 close
 
-Stages 8a, 8b, 9, *and* 11. The wire format, the streaming
-component, recursive document composition, *and* remote document
-composition. Four of the five pieces from session 4's vision
-close.
+The substrate is recursive, streaming, networked, navigable, and
+fully interactively composable.
 
-~10,800 LOC, 70 unit tests passing, ~11.5k fps Release. The
-substrate is recursive, streaming, live, and *networked*.
+- **8a** — `:::update` micro-stream wire format. State-target +
+  component-target dispatch through one parser/dispatcher.
+- **8b** — `:::chart` streaming sparkline. 60 Hz component-target
+  feed through the wire format.
+- **9** — `:::embedded-document` (filesystem). Recursive
+  composition with scope-prefixed cache keys, parent-overlay,
+  child state with parent-dirty bubble.
+- **11 v0** — remote `:::embedded-document` over HTTP. URL loader
+  via `std.http.Client.fetch`, in-memory cache, self-contained
+  local server for the demo. Parent reactive state crosses the
+  network boundary.
+- **Scroll + zoom + keyboard nav.** Mouse wheel + Ctrl + scroll +
+  PgUp/PgDn/Home/End + Ctrl+= / - / 0. Post-layout transform pass;
+  eased scroll tween.
+- **Embedded-doc input scope.** State pointer threaded through
+  `LayoutCtx` + `Hit` so embedded sliders mutate the right state.
 
-Next entry points:
+Plus three load-bearing bug-fixes documented for future-us:
+- SSBO overflow surfacing (log-once at writeGlyphs / writeQuads).
+- `posix.shutdown` before `close` on Linux server sockets.
+- Map-rehash invalidates `getOrPut` pointers — build first, put
+  once.
 
-1. **Stage 12 — async I/O channel.** Already overdue. Lock-free
-   bidirectional channel + dedicated worker thread for HTTP /
-   LLM streams / file watch / MCP pipes. The right shape for
-   every async surface.
-2. **Scrolling.** Newly escalated. Embedded docs push the demo
-   off-viewport on 720p windows; scroll unblocks the visual
-   payoff.
-3. **Stage 10 — headless documents.** Pure state-machine docs
-   with no viewport. Cleanest split from stage 9.
-4. **Retained layout cache.** Still queued for the per-frame
-   re-layout cost.
-5. **Plumbing for embedded-doc input handling.** When someone
-   wants a `:::slider` inside an embedded doc.
+And three architectural notes saved as memory:
+- `feedback_async_io.md` — I/O off the main thread, lock-free
+  channel back.
+- `project_registry_pointer_rules.md` — the rehash discipline.
+- Updated `project_text_engine.md` with the full session-5
+  outcome.
+
+**~11,000 LOC, ~70 unit tests, 11.5k fps Release with the full
+stack live + smooth scroll/zoom.**
+
+The Live Document Runtime, in one Thursday across five sessions.
+
+Next entry points for session 6:
+
+1. **Stage 12 — async I/O channel.** Captured. The right shape for
+   every future blocking surface. LLM streams, file watch, MCP
+   subprocess pipes, remote loaders.
+2. **Stage 10 — headless documents.** Cleanest composition-track
+   completion. Pure state docs subscribed across documents.
+3. **Retained layout cache.** Per-Element caching to reclaim the
+   per-tick re-layout cost.
+4. **Crisp zoom.** Multi-size atlas + re-layout on zoom change.
+5. **Persistent URL cache.** Content-addressable disk cache for
+   remote sources.
+
+Each is its own stage. None is blocking the others.

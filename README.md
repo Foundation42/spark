@@ -292,17 +292,31 @@ TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
   embed works dependency-free. Parent reactive state crosses the
   network boundary: `primary=${state.box_color}` on the URL embed
   drives the remote widget's first bar through the colour cycle.
-  ~11.5k fps Release with everything (8a + 8b + 9 + 11) live. 70
-  unit tests. **v0 limitations** captured on the roadmap: the
-  fetch is synchronous on the main thread (stage 12 fix), and
-  there's no persistent cache yet.
+  ~11.5k fps Release with everything (8a + 8b + 9 + 11) live.
+  **v0 limitations** captured on the roadmap: the fetch is
+  synchronous on the main thread (stage 12 fix), and there's no
+  persistent cache yet.
+- [x] **Polish — scroll, zoom, keyboard nav, embedded-input
+  scope.** Mouse wheel scrolls (60 px / notch, eased tween toward
+  target); Ctrl+wheel zooms (×1.10 / notch, clamped 0.25–4);
+  PgUp/PgDn/Home/End drive scroll, Ctrl+= / Ctrl+- / Ctrl+0 drive
+  zoom. Post-layout `world → screen` transform pass; mouse coords
+  un-transform for hit-test. `LayoutCtx` + `Hit` grew optional
+  state pointers so a `:::slider` inside an
+  `:::embedded-document` mutates **child state** not parent's —
+  the demo's orbit widget grew a slider that resizes its own
+  outer panel. Plus a load-bearing fix to a latent
+  hashmap-rehash invalidation in `Registry.resolve` that surfaced
+  when stress-tested through nested resolves; rule captured in
+  memory as `project_registry_pointer_rules.md` so future
+  recursive factories don't rederive it.
 
 ## What's next
 
-[`docs/roadmap.md`](docs/roadmap.md). **Stage 12** is the async
-I/O channel — a dedicated worker thread + lock-free bidirectional
-channel so HTTP fetch, LLM streams, and file-watcher events all
-get off the main loop. Scrolling is also escalated: with embedded
-docs, the demo's content height now overflows typical viewports.
-Headless documents (stage 10) and retained layout cache stay
-queued.
+[`docs/roadmap.md`](docs/roadmap.md). **Stage 12 — async I/O
+channel** is the headline rebuild: a dedicated worker thread +
+lock-free bidirectional channel so HTTP fetch, LLM streams, and
+file-watcher events all run off the main loop. Stage 10 (headless
+documents), retained layout cache, and crisp-zoom (multi-size
+atlas + re-layout on zoom change) round out the queue. None of
+them block each other.
