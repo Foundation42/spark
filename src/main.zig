@@ -53,30 +53,133 @@ const ATLAS_COLOR_SIZE: u32 = 1024;
 const MAX_GLYPHS: u32 = 2048;
 const MAX_QUADS: u32 = 2048;
 
+/// Per-frame context owned by main(), borrowed by `drawCb` through
+/// the renderer's `*anyopaque` slot. Carries everything `drawCb`
+/// needs to (a) detect viewport changes and re-run the layout pass,
+/// (b) animate the SDF "ATTENTION" wave each frame.
+///
+/// **Resize policy.** Layout is event-driven, not per-frame: we
+/// cache `last_extent`, and `drawCb` only re-runs the layout pass
+/// when the swapchain's current extent differs. Steady-state at a
+/// fixed window size is just animate + upload glyphs + record draw —
+/// no HB reshaping, no atlas lookups, no token tree rebuild.
+///
+/// **Parse tree lifetime.** `top_stack` / `ansi_tree` / `sdf_block`
+/// are constructed once at startup and stay valid for the lifetime
+/// of the frame loop. The slices they reference live in
+/// `doc_arena` which the host's main() owns. layoutAndRender reads
+/// them each layout pass without mutating.
 const FrameCtx = struct {
+    // GPU
     text_pipeline: *tp.TextPipeline,
     quad_pipeline: *qp.QuadPipeline,
-    n_glyphs: u32,
-    n_quads: u32,
-    /// Borrowed slice into the DrawList's glyph buffer — mutated per
-    /// frame for the attention wave. Stable for the lifetime of the
-    /// frame loop because we don't append after the layout pass.
-    glyphs: []tp.GlyphInstance,
-    /// Index range covering the animated SDF span — the wave
-    /// rewrites only these entries each frame.
-    pulse_start: u32,
-    pulse_count: u32,
-    /// Frame loop start time so the wave's phase is consistent.
+
+    // Layout prerequisites (borrowed from main)
+    allocator: std.mem.Allocator,
+    fonts: *registry_mod.FontRegistry,
+    cache: *glyph_cache_mod.GlyphCache,
+    mono_atlas: *atlas_mod.Atlas,
+    color_atlas: *atlas_mod.Atlas,
+    theme: *const element.Theme,
+    ansi_theme: *const element.Theme,
+
+    // Parse trees (constructed once at startup)
+    top_stack: element.Element,
+    ansi_tree: element.Element,
+    sdf_block: element.Element,
+
+    // Mutable scratch — `dl` accumulates this layout pass's draw work
+    dl: *element.DrawList,
+
+    // Cached viewport for resize detection. Starts at {0,0} so the
+    // first `drawCb` call sees a mismatch and triggers the initial
+    // layout, unifying init and resize paths.
+    last_extent: vk.c.VkExtent2D = .{ .width = 0, .height = 0 },
+
+    // Animation state — the SDF wave's index range comes out of
+    // runLayout(); the wave function reads these to animate the
+    // right glyphs each frame.
+    pulse_start: u32 = 0,
+    pulse_count: u32 = 0,
     start_ms: i64,
+
+    /// Re-run the layout pass for the current viewport. Clears the
+    /// DrawList, lays out all three sub-trees at the new `max_w`,
+    /// uploads the quads (static for the lifetime of a layout —
+    /// they don't animate so we only push them when the layout
+    /// changes), and caches the new pulse range.
+    fn runLayout(self: *FrameCtx, extent: vk.c.VkExtent2D) !void {
+        self.dl.clearRetainingCapacity();
+
+        var lc = element.LayoutCtx{
+            .allocator = self.allocator,
+            .fonts = self.fonts,
+            .cache = self.cache,
+            .mono_atlas = self.mono_atlas,
+            .color_atlas = self.color_atlas,
+            .theme = self.theme,
+        };
+        var ansi_lc = lc;
+        ansi_lc.theme = self.ansi_theme;
+
+        // 40px gutter on each side; clamp to a sane minimum so an
+        // accidentally-zero-width extent (minimised window) doesn't
+        // wrap every word to its own line forever.
+        const w: f32 = @floatFromInt(extent.width);
+        const max_w: f32 = @max(w - 80.0, 200.0);
+        const c: element.Constraints = .{ .max_w = max_w };
+
+        const top_box = try element_layout.layoutAndRender(self.top_stack, .{ 40, 40 }, c, &lc, self.dl);
+        const ansi_box = try element_layout.layoutAndRender(self.ansi_tree, .{ 40, top_box.y + top_box.h + 8 }, c, &ansi_lc, self.dl);
+
+        self.pulse_start = @intCast(self.dl.glyphs.items.len);
+        _ = try element_layout.layoutAndRender(self.sdf_block, .{ 40, ansi_box.y + ansi_box.h }, c, &lc, self.dl);
+        self.pulse_count = @intCast(self.dl.glyphs.items.len - self.pulse_start);
+
+        // Quads stay frozen between layouts (no animation on them);
+        // upload once per layout instead of per frame.
+        try self.quad_pipeline.writeQuads(self.dl.quads.items);
+    }
 };
 
 fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) void {
-    const fc: *const FrameCtx = @ptrCast(@alignCast(ctx.?));
-    // Quads first (backgrounds, bars, rules), then glyphs on top —
-    // ordering inside one vkCmdBeginRendering block, so the blend
-    // hardware lays the text correctly over the chrome.
-    fc.quad_pipeline.recordDraw(cmd, extent, fc.n_quads);
-    fc.text_pipeline.recordDraw(cmd, extent, fc.n_glyphs);
+    const fc: *FrameCtx = @ptrCast(@alignCast(ctx.?));
+
+    // ── Event-driven relayout ──────────────────────────────────────
+    // Compare against cached extent; relayout only when the viewport
+    // actually changed. First call's last_extent={0,0} guarantees
+    // an initial layout before the first draw.
+    if (extent.width != fc.last_extent.width or extent.height != fc.last_extent.height) {
+        fc.runLayout(extent) catch {
+            // SsboOverflow / AtlasFull etc. — drop this frame quietly.
+            // A production path would surface this; for the demo we
+            // never approach the caps so it shouldn't fire.
+            return;
+        };
+        fc.last_extent = extent;
+    }
+
+    // ── Per-frame SDF wave animation ───────────────────────────────
+    // Runs every frame; mutates the laid-out glyph slice in place
+    // and re-uploads. Cheap — ~9 glyphs writing two fields each.
+    const elapsed: f32 = @floatFromInt(std.time.milliTimestamp() - fc.start_ms);
+    const t_sec: f32 = elapsed * 0.001;
+    var i: u32 = 0;
+    while (i < fc.pulse_count) : (i += 1) {
+        const idx = fc.pulse_start + i;
+        const phase = t_sec * 3.0 - @as(f32, @floatFromInt(i)) * 0.6;
+        const w = (std.math.sin(phase) + 1.0) * 0.5;
+        fc.dl.glyphs.items[idx].attention = w;
+
+        const hue = @mod(@as(f32, @floatFromInt(i)) * 40.0 + t_sec * 30.0, 360.0);
+        const rgb = hsvToRgb(hue, 0.85, 1.0);
+        fc.dl.glyphs.items[idx].hot_color = .{ rgb[0], rgb[1], rgb[2], 1.0 };
+    }
+    fc.text_pipeline.writeGlyphs(fc.dl.glyphs.items) catch return;
+
+    // ── Record draws — quads first, glyphs on top ──────────────────
+    fc.quad_pipeline.recordDraw(cmd, extent, @intCast(fc.dl.quads.items.len));
+    fc.text_pipeline.recordDraw(cmd, extent, @intCast(fc.dl.glyphs.items.len));
 }
 
 /// HSV → RGB conversion using the standard six-sextant formula. `h`
@@ -118,7 +221,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 3 / stage 5a (ansi engine)\n", .{});
+    try stdout.print("text_engine demo — session 3 / stage 6a (resize-aware layout)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
     try stdout.print("  demo.md bytes:         {d}\n", .{demo_md.len});
@@ -228,77 +331,17 @@ pub fn main() !void {
     };
     const sdf_block = element.Element{ .paragraph = &sdf_children };
 
-    // ── Lay out + render ───────────────────────────────────────────
+    // ── Parse-time content (constructed once, re-laid each resize) ─
     var dl = element.DrawList.init(allocator);
     defer dl.deinit();
 
-    var lc = element.LayoutCtx{
-        .allocator = allocator,
-        .fonts = &fonts,
-        .cache = &cache,
-        .mono_atlas = &atlas_mono,
-        .color_atlas = &atlas_color,
-        .theme = &theme,
-    };
-
-    // Viewport-anchored content width — 40px left + 40px right gutter
-    // on a 1280px window gives ~1200px for the document. Wrap
-    // decisions inside the tree honour this, with quotes / lists
-    // further shrinking it as their indents accumulate.
-    const content_max_w: f32 = 1280.0 - 80.0;
-    const top_constraints: element.Constraints = .{ .max_w = content_max_w };
-
-    const top_box = try element_layout.layoutAndRender(
-        top_stack,
-        .{ 40, 40 },
-        top_constraints,
-        &lc,
-        &dl,
-    );
-
-    // ── ANSI fixture between markdown and the SDF "ATTENTION" ──────
-    // Derives a theme with body pointed at the mono font so spacing
-    // is terminal-like; bold + italic fall back to proportional
-    // variants for now (mono bold/italic loads belong to a refinement
-    // later — see the project memory's "ansi font mismatch" note).
+    // ANSI uses a mono-bodied derivation of the theme so spacing is
+    // terminal-like. Bold + italic still fall back to the proportional
+    // variants of the main theme — mono bold / italic font loads are
+    // a future refinement.
     var ansi_theme = theme;
     ansi_theme.body = .{ .font_id = code_inline_id, .color = .{ 0.92, 0.94, 0.98, 1.0 } };
-    var ansi_lc = lc;
-    ansi_lc.theme = &ansi_theme;
-
     const ansi_tree = try ansi.parse(doc_arena.allocator(), ansi_demo, &ansi_theme);
-    const ansi_box = try element_layout.layoutAndRender(
-        ansi_tree,
-        .{ 40, top_box.y + top_box.h + 8 },
-        top_constraints,
-        &ansi_lc,
-        &dl,
-    );
-
-    const sdf_y = ansi_box.y + ansi_box.h;
-
-    const pulse_start: u32 = @intCast(dl.glyphs.items.len);
-    _ = try element_layout.layoutAndRender(
-        sdf_block,
-        .{ 40, sdf_y },
-        top_constraints,
-        &lc,
-        &dl,
-    );
-    const pulse_count: u32 = @intCast(dl.glyphs.items.len - pulse_start);
-
-    try pipeline.writeGlyphs(dl.glyphs.items);
-    try quad_pipeline.writeQuads(dl.quads.items);
-    try stdout.print("  glyphs:                {d} (pulse span: {d} glyphs)\n", .{
-        dl.glyphs.items.len,
-        pulse_count,
-    });
-    try stdout.print("  quads:                 {d}\n", .{dl.quads.items.len});
-    try stdout.print("  cache:                 {d} miss / {d} hit ({d:.1}% hit rate)\n", .{
-        cache.misses,
-        cache.hits,
-        cache.hitRate() * 100.0,
-    });
 
     var rdr = try renderer.Renderer.init(allocator, &ctx, &swapchain, &window);
     defer rdr.deinit();
@@ -306,11 +349,17 @@ pub fn main() !void {
     var frame_ctx = FrameCtx{
         .text_pipeline = &pipeline,
         .quad_pipeline = &quad_pipeline,
-        .n_glyphs = @intCast(dl.glyphs.items.len),
-        .n_quads = @intCast(dl.quads.items.len),
-        .glyphs = dl.glyphs.items,
-        .pulse_start = pulse_start,
-        .pulse_count = pulse_count,
+        .allocator = allocator,
+        .fonts = &fonts,
+        .cache = &cache,
+        .mono_atlas = &atlas_mono,
+        .color_atlas = &atlas_color,
+        .theme = &theme,
+        .ansi_theme = &ansi_theme,
+        .top_stack = top_stack,
+        .ansi_tree = ansi_tree,
+        .sdf_block = sdf_block,
+        .dl = &dl,
         .start_ms = std.time.milliTimestamp(),
     };
     rdr.draw_fn = drawCb;
@@ -322,26 +371,13 @@ pub fn main() !void {
         break :blk @intFromFloat(secs * 1000.0);
     } else |_| null;
 
+    // Steady-state loop: poll glfw + present. All layout +
+    // animation + upload + record work lives in `drawCb` now,
+    // keyed off the swapchain's current `extent` so it auto-reflows
+    // when the user resizes the window.
     var frame_count: u64 = 0;
     while (!window.shouldClose()) {
         window.pollEvents();
-
-        // ── Per-frame attention wave ────────────────────────────────
-        const elapsed: f32 = @floatFromInt(std.time.milliTimestamp() - frame_ctx.start_ms);
-        const t_sec: f32 = elapsed * 0.001;
-        var i: u32 = 0;
-        while (i < pulse_count) : (i += 1) {
-            const idx = pulse_start + i;
-            const phase = t_sec * 3.0 - @as(f32, @floatFromInt(i)) * 0.6;
-            const w = (std.math.sin(phase) + 1.0) * 0.5;
-            frame_ctx.glyphs[idx].attention = w;
-
-            const hue = @mod(@as(f32, @floatFromInt(i)) * 40.0 + t_sec * 30.0, 360.0);
-            const rgb = hsvToRgb(hue, 0.85, 1.0);
-            frame_ctx.glyphs[idx].hot_color = .{ rgb[0], rgb[1], rgb[2], 1.0 };
-        }
-        try pipeline.writeGlyphs(frame_ctx.glyphs);
-
         try rdr.drawFrame();
         frame_count += 1;
         if (exit_after_ms) |limit| {
@@ -350,6 +386,16 @@ pub fn main() !void {
     }
 
     const elapsed_ms = std.time.milliTimestamp() - frame_ctx.start_ms;
+    try stdout.print("  glyphs:                {d} (pulse span: {d} glyphs)\n", .{
+        frame_ctx.dl.glyphs.items.len,
+        frame_ctx.pulse_count,
+    });
+    try stdout.print("  quads:                 {d}\n", .{frame_ctx.dl.quads.items.len});
+    try stdout.print("  cache:                 {d} miss / {d} hit ({d:.1}% hit rate)\n", .{
+        cache.misses,
+        cache.hits,
+        cache.hitRate() * 100.0,
+    });
     try stdout.print("  frames:                {d} in {d}ms ({d:.1} fps)\n", .{
         frame_count,
         elapsed_ms,

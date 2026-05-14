@@ -129,9 +129,27 @@ pub const Renderer = struct {
     /// Drive one frame: acquire → record → submit → present. Returns
     /// when the GPU work is queued; the caller can use this as the
     /// loop body. Handles swapchain recreation transparently on
-    /// VK_ERROR_OUT_OF_DATE_KHR / SUBOPTIMAL.
+    /// VK_ERROR_OUT_OF_DATE_KHR / SUBOPTIMAL, and also on framebuffer
+    /// size drift (the Wayland-friendly belt-and-braces detection —
+    /// some compositors don't reliably signal OUT_OF_DATE through
+    /// vkAcquireNextImage / vkQueuePresent on resize, so we poll the
+    /// window's reported framebuffer size each frame too).
     pub fn drawFrame(self: *Renderer) !void {
         const device = self.ctx.device;
+
+        // Poll-based resize detection. If GLFW reports a different
+        // framebuffer size than what the swapchain was created for,
+        // force a recreate before we acquire — otherwise we'd render
+        // for the old extent against a surface that's already moved on.
+        {
+            const fb = self.window.framebufferSize();
+            if (fb.w != 0 and fb.h != 0 and
+                (fb.w != self.swapchain.extent.width or fb.h != self.swapchain.extent.height))
+            {
+                try self.recreateSwapchain();
+            }
+        }
+
         const frame = self.frame_index;
 
         try vk.check(c.vkWaitForFences(device, 1, &self.in_flight[frame], c.VK_TRUE, std.math.maxInt(u64)));
