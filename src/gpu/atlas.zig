@@ -64,7 +64,12 @@ const Shelf = struct {
     height: u32 = 0,
 };
 
-const GLYPH_PAD: u32 = 1;
+// Shelf-pack padding between glyphs. Phase 6 bumped from 1 → 2 so
+// the bilinear sampler at quad edges has at least one neighbour
+// texel of cleared atlas between it and the next glyph's bitmap —
+// otherwise downscaled SDF/mono quads can bleed one glyph's edge
+// values into the next's silhouette (visible as halos / fuzz).
+const GLYPH_PAD: u32 = 2;
 
 pub const Atlas = struct {
     image: c.VkImage,
@@ -351,14 +356,48 @@ pub const Atlas = struct {
         bi.sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         bi.flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         try vk.check(c.vkBeginCommandBuffer(cmd, &bi));
+
+        // UNDEFINED → TRANSFER_DST so we can clear the atlas to all
+        // zeros. Without this clear, unused atlas regions contain
+        // whatever GPU memory the driver gave us — for the SDF lane
+        // those random bytes can sample as values inside the glow
+        // band (~0.3..0.5) and light up as a scatter of warm yellow
+        // dots around real text (Phase 6 bring-up bug). Zero in all
+        // three lanes is a safe "far outside / transparent" sentinel.
         cmdImageBarrier(
             cmd,
             self.image,
             c.VK_IMAGE_LAYOUT_UNDEFINED,
-            c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             c.VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
-            c.VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            c.VK_PIPELINE_STAGE_2_CLEAR_BIT,
             0,
+            c.VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        );
+        const clear_color = c.VkClearColorValue{ .float32 = .{ 0, 0, 0, 0 } };
+        var clear_range = c.VkImageSubresourceRange{
+            .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        };
+        c.vkCmdClearColorImage(
+            cmd,
+            self.image,
+            c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            &clear_color,
+            1,
+            &clear_range,
+        );
+        cmdImageBarrier(
+            cmd,
+            self.image,
+            c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            c.VK_PIPELINE_STAGE_2_CLEAR_BIT,
+            c.VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            c.VK_ACCESS_2_TRANSFER_WRITE_BIT,
             c.VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
         );
         try vk.check(c.vkEndCommandBuffer(cmd));

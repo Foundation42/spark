@@ -40,21 +40,22 @@ void main() {
         // scaled.
         float dist = texture(u_atlas_mono, v_uv).r;
 
-        // Attention modulates the threshold around 0.5. Higher
-        // attention shifts the cutoff lower → more pixels survive →
-        // bolder stroke. Range [0.3, 0.7] keeps the effect tasteful
-        // and never collapses the glyph or thickens it into mush.
-        float threshold = mix(0.55, 0.40, clamp(v_attention, 0.0, 1.0));
+        // Attention modulates the SDF threshold around 0.5. Tight
+        // range (0.52 → 0.45) keeps the weight wave subtle —
+        // visible variation in stroke thickness without the glyph
+        // pumping noticeably wider or thinner. Phase 6 first pass
+        // used 0.55 → 0.40 and looked too bouncy at mid-attention.
+        float threshold = mix(0.52, 0.45, clamp(v_attention, 0.0, 1.0));
 
         float aa = max(fwidth(dist), 1e-4);
         float coverage = smoothstep(threshold - aa, threshold + aa, dist);
 
-        // Subtle outer glow scaled by attention. Sample the same
-        // distance and grow a soft halo outside the glyph silhouette
-        // (dist < threshold). Halo intensity climbs with attention
-        // so high-attention glyphs visibly bloom.
-        float glow_band = smoothstep(threshold - 0.20, threshold - aa, dist);
-        float glow = glow_band * v_attention * 0.6;
+        // Outer glow band — narrow (0.10 wide vs 0.20 originally) so
+        // the halo reads as "this glyph is hot" rather than a fuzzy
+        // smear. Intensity caps lower too (0.4 vs 0.6) so the
+        // brightest letter doesn't wash out its neighbours.
+        float glow_band = smoothstep(threshold - 0.10, threshold - aa, dist);
+        float glow = glow_band * v_attention * 0.4;
 
         vec3 tint = v_color.rgb;
         // Glow shifts hue slightly warmer than the base tint — gives
