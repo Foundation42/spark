@@ -1,8 +1,11 @@
-//! text_engine_demo — Phase 5: colour emoji via dual-atlas
-//! (R8 grayscale + RGBA8 premultiplied) routed by per-glyph
-//! `tex_select`. Noto Color Emoji is a strike-only CBDT font, so
-//! the registry tracks an actual-vs-display scale factor and the
-//! layout pass shrinks the 136-px native bitmaps inline.
+//! text_engine_demo — Phase 6: SDF lane + per-glyph attention.
+//!
+//! Adds a new bottom paragraph "ATTENTION" rendered through the SDF
+//! lane, with each glyph's `attention` SSBO field animated per frame
+//! as a sine wave. The fragment shader thickens the SDF threshold +
+//! grows a warm halo for high-attention glyphs, so we see a visible
+//! "wave of heat" rolling left-to-right through the word — first
+//! piece of the chat.md vision wired up end-to-end.
 
 const std = @import("std");
 const text_engine = @import("text_engine");
@@ -17,13 +20,21 @@ const registry_mod = @import("font/registry.zig");
 const glyph_cache_mod = @import("text/glyph_cache.zig");
 const layout = @import("text/layout.zig");
 
-const ATLAS_MONO_SIZE: u32 = 512;
-const ATLAS_COLOR_SIZE: u32 = 1024; // emoji bitmaps are 136 px native, give them room
+const ATLAS_MONO_SIZE: u32 = 768;
+const ATLAS_COLOR_SIZE: u32 = 1024;
 const MAX_GLYPHS: u32 = 2048;
 
 const FrameCtx = struct {
-    pipeline: *const tp.TextPipeline,
+    pipeline: *tp.TextPipeline,
     n_glyphs: u32,
+    /// All glyph instances, mutated per frame for the attention wave.
+    glyphs: []tp.GlyphInstance,
+    /// Index range covering the animated SDF span — the wave
+    /// rewrites only these entries each frame.
+    pulse_start: u32,
+    pulse_count: u32,
+    /// Frame loop start time so the wave's phase is consistent.
+    start_ms: i64,
 };
 
 fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) void {
@@ -37,7 +48,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — phase 5\n", .{});
+    try stdout.print("text_engine demo — phase 6\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
 
@@ -74,15 +85,12 @@ pub fn main() !void {
     const subtitle_id = try fonts.load(font_path.ptr, 18);
     const body_id = try fonts.load(font_path.ptr, 22);
     const accent_id = try fonts.load(font_path.ptr, 28);
-    // Asking for 28-px emoji from a 136-px-strike CBDT font: the
-    // registry stores actual=136, display=28, scale≈0.206. Layout
-    // shrinks the bitmaps inline with the surrounding 22-px body.
     const emoji_id = try fonts.load(emoji_path.ptr, 28);
-    try stdout.print("  emoji font:            actual {d}px, display {d}px, scale {d:.3}\n", .{
-        fonts.entries.items[emoji_id].actual_px,
-        fonts.entries.items[emoji_id].display_px,
-        fonts.scale(emoji_id),
-    });
+    // SDF lane at 44 px display — large enough that the attention
+    // glow + threshold modulation is visible; small enough to share
+    // a line with body text without overwhelming it. Source-px is
+    // fixed at 64 inside `loadSdf` regardless.
+    const sdf_id = try fonts.loadSdf(font_path.ptr, 44);
 
     var cache = glyph_cache_mod.GlyphCache.init(allocator);
     defer cache.deinit();
@@ -92,13 +100,12 @@ pub fn main() !void {
     const grey: [4]f32 = .{ 0.58, 0.62, 0.72, 1.0 };
     const yellow: [4]f32 = .{ 0.99, 0.84, 0.32, 1.0 };
     const orange: [4]f32 = .{ 0.99, 0.55, 0.30, 1.0 };
-    const green: [4]f32 = .{ 0.55, 0.85, 0.50, 1.0 };
 
     const heading_line = layout.Line{ .spans = &.{
         .{ .text = "text_engine", .style = .{ .font_id = heading_id, .color = white } },
     } };
     const subtitle_line = layout.Line{ .spans = &.{
-        .{ .text = "Phase 5 — colour emoji via dual atlas", .style = .{ .font_id = subtitle_id, .color = grey } },
+        .{ .text = "Phase 6 — SDF lane + per-glyph attention", .style = .{ .font_id = subtitle_id, .color = grey } },
     } };
     const blank_line = layout.Line{ .spans = &.{} };
     const mixed_line = layout.Line{ .spans = &.{
@@ -113,24 +120,40 @@ pub fn main() !void {
         .{ .text = "🎉🦊🚀❤️🎨🌍", .style = .{ .font_id = emoji_id, .color = white } },
         .{ .text = "  in body text.", .style = .{ .font_id = body_id, .color = white } },
     } };
-    const ligature_line = layout.Line{ .spans = &.{
-        .{ .text = "Ligatures still: fi fl ff ffi  •  Cache hits keep ", .style = .{ .font_id = body_id, .color = white } },
-        .{ .text = "warm", .style = .{ .font_id = body_id, .color = green } },
-        .{ .text = " across the paragraph.", .style = .{ .font_id = body_id, .color = white } },
-    } };
-
-    const paragraph = layout.Paragraph{ .lines = &.{
-        heading_line,
-        subtitle_line,
-        blank_line,
-        mixed_line,
-        emoji_line,
-        ligature_line,
+    // The SDF span. Default per-span attention is 0.5; the per-frame
+    // update below overwrites the .attention field of every glyph in
+    // this span individually so each letter rides a different phase.
+    const sdf_line = layout.Line{ .spans = &.{
+        .{ .text = "ATTENTION", .style = .{ .font_id = sdf_id, .color = white, .attention = 0.5 } },
     } };
 
     var glyphs = std.ArrayList(tp.GlyphInstance).init(allocator);
     defer glyphs.deinit();
 
+    // Layout the top part of the paragraph, then capture the index
+    // range for the SDF line, then layout the SDF line, then we know
+    // exactly which entries to animate per frame.
+    const top_paragraph = layout.Paragraph{ .lines = &.{
+        heading_line,
+        subtitle_line,
+        blank_line,
+        mixed_line,
+        emoji_line,
+        blank_line,
+    } };
+    const sdf_y = try layout.layoutParagraph(
+        &glyphs,
+        allocator,
+        &fonts,
+        &cache,
+        &atlas_mono,
+        &atlas_color,
+        top_paragraph,
+        40,
+        40,
+    );
+
+    const pulse_start: u32 = @intCast(glyphs.items.len);
     _ = try layout.layoutParagraph(
         &glyphs,
         allocator,
@@ -138,13 +161,17 @@ pub fn main() !void {
         &cache,
         &atlas_mono,
         &atlas_color,
-        paragraph,
+        .{ .lines = &.{sdf_line} },
         40,
-        40,
+        sdf_y,
     );
+    const pulse_count: u32 = @intCast(glyphs.items.len - pulse_start);
 
     try pipeline.writeGlyphs(glyphs.items);
-    try stdout.print("  glyphs:                {d}\n", .{glyphs.items.len});
+    try stdout.print("  glyphs:                {d} (pulse span: {d} glyphs)\n", .{
+        glyphs.items.len,
+        pulse_count,
+    });
     try stdout.print("  cache:                 {d} miss / {d} hit ({d:.1}% hit rate)\n", .{
         cache.misses,
         cache.hits,
@@ -154,7 +181,14 @@ pub fn main() !void {
     var rdr = try renderer.Renderer.init(allocator, &ctx, &swapchain, &window);
     defer rdr.deinit();
 
-    var frame_ctx = FrameCtx{ .pipeline = &pipeline, .n_glyphs = @intCast(glyphs.items.len) };
+    var frame_ctx = FrameCtx{
+        .pipeline = &pipeline,
+        .n_glyphs = @intCast(glyphs.items.len),
+        .glyphs = glyphs.items,
+        .pulse_start = pulse_start,
+        .pulse_count = pulse_count,
+        .start_ms = std.time.milliTimestamp(),
+    };
     rdr.draw_fn = drawCb;
     rdr.draw_ctx = @ptrCast(&frame_ctx);
 
@@ -164,18 +198,35 @@ pub fn main() !void {
         break :blk @intFromFloat(secs * 1000.0);
     } else |_| null;
 
-    const start_ms = std.time.milliTimestamp();
     var frame_count: u64 = 0;
     while (!window.shouldClose()) {
         window.pollEvents();
+
+        // ── Per-frame attention wave ────────────────────────────────
+        // Each glyph in the pulse span gets a sine-driven attention
+        // value, phase-offset by index — a single wave rolls
+        // left-to-right through the word. The SSBO is host-coherent,
+        // so the memcpy in writeGlyphs becomes visible to the GPU
+        // before the next submit without any explicit flush.
+        const elapsed: f32 = @floatFromInt(std.time.milliTimestamp() - frame_ctx.start_ms);
+        const t_sec: f32 = elapsed * 0.001;
+        var i: u32 = 0;
+        while (i < pulse_count) : (i += 1) {
+            const idx = pulse_start + i;
+            const phase = t_sec * 3.0 - @as(f32, @floatFromInt(i)) * 0.6;
+            const w = (std.math.sin(phase) + 1.0) * 0.5;
+            frame_ctx.glyphs[idx].attention = w;
+        }
+        try pipeline.writeGlyphs(frame_ctx.glyphs);
+
         try rdr.drawFrame();
         frame_count += 1;
         if (exit_after_ms) |limit| {
-            if (std.time.milliTimestamp() - start_ms >= limit) break;
+            if (std.time.milliTimestamp() - frame_ctx.start_ms >= limit) break;
         }
     }
 
-    const elapsed_ms = std.time.milliTimestamp() - start_ms;
+    const elapsed_ms = std.time.milliTimestamp() - frame_ctx.start_ms;
     try stdout.print("  frames:                {d} in {d}ms ({d:.1} fps)\n", .{
         frame_count,
         elapsed_ms,

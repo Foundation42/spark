@@ -69,5 +69,10 @@ Vulkan (loader + headers).
   strike-aware FontRegistry scale factor so CBDT bitmaps inline with
   body text. Bitmap path (CBDT/sbix). COLRv1 vector path is a
   later option if we need bigger emoji.
-- [ ] **Phase 6** — MSDF lane + per-glyph attention attribute hooked
-  to the fragment threshold.
+- [x] **Phase 6** — SDF lane (single-channel, generated from FT
+  bitmap at 64 px source) sharing the R8 mono atlas. Per-glyph
+  `attention` attribute in the SSBO modulates the SDF threshold +
+  drives a warm halo so high-attention glyphs visibly bloom. First
+  piece of the chat.md LM-driven rendering vision wired up
+  end-to-end. True MSDF (corner-preserving via msdfgen) is a future
+  swap if needed.

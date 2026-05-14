@@ -28,20 +28,33 @@ const c = vk.c;
 ///   * the `vec4` is 16-byte aligned; four preceding vec2s have
 ///     already landed it at offset 32 so it's natural.
 ///   * `tex_select` (uint, 4 bytes) at offset 48.
+///   * `attention` (float, 4 bytes) at offset 52.
+///   * `fx_kind` (uint, 4 bytes) at offset 56 — reserved for Phase
+///     7+ effect-type dispatch (glow / pulse / shimmer / drop-shadow).
 ///   * Struct stride aligns to the struct's max-member alignment
 ///     (16, from the vec4) — so std430 pads to 64 bytes total. We
-///     declare the padding explicitly to keep Zig's `extern struct`
-///     size matching the GLSL stride.
+///     declare the trailing pad explicitly to keep Zig's `extern
+///     struct` size matching the GLSL stride.
 pub const GlyphInstance = extern struct {
     dst_pos: [2]f32,
     dst_size: [2]f32,
     uv_min: [2]f32,
     uv_max: [2]f32,
     color: [4]f32,
-    /// 0 = mono atlas (R8 coverage), 1 = color atlas (RGBA8). See
+    /// 0 = mono atlas (R8 coverage), 1 = colour atlas (RGBA8), 2 =
+    /// SDF (R8 atlas, distance-field sampling). See
     /// `glyph_cache.AtlasKind` — the int values are kept in sync.
     tex_select: u32,
-    _pad: [3]u32,
+    /// LM-driven attribute the shader can read. Phase 6 wires it to
+    /// the SDF threshold so high-attention glyphs render bolder /
+    /// glow brighter. Range nominally [0, 1] but unclamped — the
+    /// shader handles saturation.
+    attention: f32,
+    /// Reserved for future per-glyph effect dispatch — Phase 7+.
+    /// 0 = no effect (pass-through). Other values will route to
+    /// glow / shimmer / drop-shadow / colour-warp branches.
+    fx_kind: u32,
+    _pad: u32,
 };
 
 comptime {

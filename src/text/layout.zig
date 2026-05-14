@@ -42,6 +42,10 @@ const glyph_cache_mod = @import("glyph_cache.zig");
 pub const Style = struct {
     font_id: registry_mod.FontId,
     color: [4]f32,
+    /// Phase 6: LM-driven attention attribute. Per-span default;
+    /// the demo can mutate per-glyph in the SSBO at frame time for
+    /// animation. Range nominally 0..1, shader doesn't clamp.
+    attention: f32 = 0.5,
 };
 
 pub const Span = struct {
@@ -71,6 +75,7 @@ pub fn appendShapedRun(
     pen_x: f32,
     baseline_y: f32,
     color: [4]f32,
+    attention: f32,
 ) !f32 {
     var x = pen_x;
     const fscale = fonts.scale(font_id);
@@ -109,7 +114,9 @@ pub fn appendShapedRun(
                 },
                 .color = color,
                 .tex_select = @intFromEnum(entry.kind),
-                ._pad = .{ 0, 0, 0 },
+                .attention = attention,
+                .fx_kind = 0,
+                ._pad = 0,
             });
         }
         x += g.x_advance * fscale;
@@ -147,6 +154,7 @@ pub fn appendLineFromSpans(
             x,
             baseline_y,
             span.style.color,
+            span.style.attention,
         );
     }
     return x;
