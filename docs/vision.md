@@ -309,6 +309,105 @@ That's the deepest signal that the contract was right: a vision
 this much larger than the original "rich text rendering" goal
 slots in without needing to break the shape we landed.
 
+## Document composition + the flywheel
+
+Surfaced end-of-session-4, after stages 7a–7f shipped the
+substrate end-to-end (parse → registry → cache → static
+interpolation → reactivity → input). Once a document is a *live*
+runtime, the next step writes itself:
+
+> **A document can be a component.**
+
+A built-in directive — call it `:::embedded-document {src=...}` —
+loads another markdown file, parses it the same way, and grafts
+its rendered output into the host document's layout. Attributes
+from the parent flow in as state-overrides on the child's
+frontmatter:
+
+````markdown
+# Master Dashboard
+
+Below is the nested telemetry control center built by the agent.
+
+:::embedded-document {#sub-system src="orbit_controls.md"}
+target_orbit: 420
+:::
+````
+
+`orbit_controls.md` is a normal markdown document with its own
+`:::3d-scene`, `:::chart`, `:::slider` directives + frontmatter
+state. Embedded inside the dashboard, it becomes one composable
+panel in a larger UI. Parent state overrides cascade into the
+child; the child's components keep their own identity + reactive
+lifecycle.
+
+Source can come from anywhere the host resolves: filesystem path,
+URL of a remote component store, content-addressed hash, AI-agent
+output. The registry's `name → Factory` map is provenance-
+agnostic by design ([[project-component-provenance]]) — the
+loader for `:::embedded-document` is just another factory that
+happens to fetch + parse markdown when it builds its instance.
+
+### Headless documents
+
+A document doesn't need to be rendered to be useful. An AI agent
+(or a human, or another document) can spin up a markdown file as
+a pure **background state machine** — frontmatter declares the
+state shape, directives wire up the logic, no visual layout pass
+runs. The document exists as live state + behaviour without a
+viewport.
+
+Active documents query the headless one's state directly via the
+same `state.get` / `state.subscribe` surface that lives in
+[`src/state.zig`](../src/state.zig). No serialisation, no
+network protocol — fast in-process pointers between document
+instances. A headless config document feeds a fleet of visible
+documents reactively. A headless data-router document
+aggregates ten streams into one. A headless rule-engine document
+gates which UI panels are live.
+
+### The flywheel
+
+Every new document adds something the rest of the substrate can
+borrow: a custom component, a new directive, a state pattern, a
+shader, a domain-specific layout. Because the surface is plain
+markdown — not HTML, not JSX, not a framework — the friction to
+publish a new component-as-document is roughly the friction of
+writing the markdown that uses it.
+
+That's the network effect: the substrate gets richer every time
+someone writes a document. No JavaScript hydration, no bundler,
+no virtual DOM, no framework lock-in. Just collaborative
+documents flowing and interacting with each other — local, remote,
+visible, headless — as free as the data itself.
+
+For text_engine specifically this means:
+
+- **`:::embedded-document` is a real factory in the registry** —
+  not magic. It opens a `src=` URL, parses with the same
+  `markdown.parseWithState` we already have, and grafts the
+  resulting Element subtree under its own slot. The substrate
+  side is "one more component, modest scope."
+- **State scoping** becomes interesting. Child documents need
+  isolated state by default with explicit pass-through from the
+  parent. Vision-level decision deferred to whichever stage
+  introduces composition — likely 9+ after stage 8's
+  `:::update` micro-stream stabilises the mutation hot path.
+- **Lifecycle policy** for embedded documents matches the rest of
+  the registry: cached by `#id`, GC'd when no longer referenced,
+  hot-reloadable when the source URL changes.
+
+The vision continues to *not require contract changes*. Embedded
+documents are a producer pattern; the loader is a factory; the
+state isolation is a state-engine policy. The Element contract,
+the registry shape, the reactive primitives — none of them move.
+
+This is the deepest validation of the substrate. Six stages this
+session shipped without contract churn; the next architectural
+leap (documents-as-components, headless documents, flywheel
+substrate) requires zero foundational changes — just another
+component factory and a state-scoping policy.
+
 ## Naming
 
 `text_engine` is now visibly the wrong name. The destination is a

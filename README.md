@@ -63,6 +63,10 @@ cmark.
 - [`docs/journey-session-3.md`](docs/journey-session-3.md) — the
   chrome and the vision: quad pipeline, link underlines, ANSI
   engine, resize reflow, live-documents pitch.
+- [`docs/journey-session-4.md`](docs/journey-session-4.md) — the
+  substrate ships: block extension parser, component registry,
+  reactive state, input handling, sliders driving live geometry.
+  Plus the document-composition flywheel.
 - [`docs/roadmap.md`](docs/roadmap.md) — staging path from current
   state to live-documents runtime.
 - [`chat.md`](chat.md) — the original brainstorm that started it.

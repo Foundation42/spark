@@ -7,9 +7,12 @@ extensions, reactive frontmatter state, targeted LLM-streamed
 micro-updates. Full pitch + architectural mapping +
 design-decision rationale lives in [`vision.md`](vision.md).
 
-This roadmap is the staging path from where we are (markdown
-rendering + chrome + ANSI + resize + `:::` parser) to where we're
-going (live documents). Session 4 starts on stage 7b.
+This roadmap is the staging path from where we are (the full
+live-document substrate: parse → registry → cache → static
+interpolation → reactivity → input → first interactive component)
+to where we're going (composable documents, micro-streamed updates,
+remote/headless components). Session 5 picks up stage 8 or the
+document-composition track — see headlines below.
 
 ## Shipped — block extension parser (stage 7a)
 
@@ -158,14 +161,44 @@ and height for the box. Drag → state.set → registry binding
 fires → factory.update on `:::box` → `state.dirty` triggers
 re-layout → new quad. 43 unit tests.
 
-## Then — `:::update` micro-stream path (stage 8)
+## Next — `:::update` micro-stream path (stage 8)
 
 The LLM-streamed-delta-into-live-component hot path. Markdown
 recognises `:::update {#id action=...}` and routes the body to
 the target component's handler directly — bypasses cmark, bypasses
 text layout, microsecond hot path.
 
-## Then — real components (stages 9+)
+- Reuses the registry's instance cache from 7b — `#id` lookup is
+  the entire dispatch.
+- New `Factory.handle_update: ?fn(ctx, action, body) anyerror!void`
+  vtable slot. Components opt-in; missing handlers log + drop.
+- Demo target: a `:::chart` component (next concrete component
+  after `:::box` + `:::slider`) that accepts `action=append` with
+  a CSV row body and pushes it onto a live trace at 15k fps.
+
+## Parallel track — document composition (stages 9–11)
+
+Surfaced end-of-session-4 alongside stage 7f. See
+[`vision.md`](vision.md) "Document composition + the flywheel"
+for the full pitch.
+
+- **Stage 9 — `:::embedded-document {src=...}`.** Built-in
+  component factory that loads another markdown file, parses
+  through `markdown.parseWithState` with parent attrs
+  overlaying child frontmatter, and grafts the resulting Element
+  subtree into the host document. Caching keyed by `src` + `#id`.
+- **Stage 10 — headless documents.** A document parsed without
+  a viewport: factories instantiate, state lives, subscribers
+  fire, but no `layoutAndRender` runs. Other documents subscribe
+  to its state paths or read its AST via `markdown.parse`'s
+  return value.
+- **Stage 11 — remote component sources.** The `src=` of a
+  `:::embedded-document` (or even a `:::name {...}` directive
+  that resolves to a remote factory) can be a URL. Loader is a
+  factory that fetches + parses + caches. Local-first; offline
+  fallbacks; content-addressed caching layer.
+
+## Then — real components (stages 12+)
 
 3D scene (eventually integrates with matryoshka), live chart,
 slider, input field, button. Each is a self-contained component
