@@ -79,14 +79,43 @@ as red missing-component placeholders (factories not registered).
 `../`-style relative imports without hitting Zig's module-root
 guard. 21 tests total: parser + registry + box parsing helpers.
 
-## Next — frontmatter state + bindings (stage 7d → 7e)
+## Shipped — frontmatter state + static `${}` interpolation (stage 7d)
 
-YAML frontmatter (a small hand-rolled subset — `key: value` pairs
-under a `state:` block — until we need lists / nested maps).
-`${state.x}` interpolation in attribute values, resolved at
-component construction (7d), then reactive: state mutations
-notify subscribers, bindings re-evaluate, component setters fire
-(7e).
+YAML frontmatter (hand-rolled subset — `key: value` pairs under a
+`state:` block; quoted/bare strings; comments honoured; nested
+maps + lists deferred). `${path}` interpolation in attribute
+values, resolved at component construction time. Bare `${path}`
+and `${state.path}` both work — `state.` prefix is optional.
+
+- `src/state.zig` — `State { set, get }`, `parseFrontmatter`,
+  `extractFrontmatter`. Hand-rolled rather than vendoring a YAML
+  parser because the surface we need is tiny.
+- `markdown.parse` peels the `--- ... ---` block off the source
+  head, parses it into a temporary State, threads through to
+  `preprocess` so attribute values get substituted at parse time.
+  Bare-value scanner is now `${...}`-aware so template `}` doesn't
+  truncate values.
+- Unresolved `${path}` leaves the literal in place — loud failure
+  mode, easier for authors / LLMs to notice typos.
+- Demo's `:::box` block now sources color / width / radius from
+  frontmatter; `:::3d-scene`'s `src` interpolates `target_id`.
+
+## Next — reactive state (stage 7e)
+
+State becomes observable. `state.set(path, value)` fires
+subscribers. The registry auto-subscribes a callback per `${}`
+reference during `resolve`: when the path mutates, the registry
+re-resolves the cached instance's templated attrs and calls
+`factory.update` with the fresh Spec.
+
+- Templated attrs duped into registry's allocator at instance
+  create time so they survive parse-arena resets.
+- Demo: drawCb cycles `box_color` on a timer; the box re-renders
+  without re-parsing.
+- Subscriber model now (not "mark dirty, host re-parses") because
+  the subscriber substrate is exactly what stage 8's
+  `:::update` micro-stream consumes — shipping it twice would be
+  wasted work.
 
 ## Then — input handling (stage 7f)
 

@@ -43,6 +43,7 @@ const std = @import("std");
 const element = @import("element.zig");
 const components = @import("markdown_components.zig");
 const component_mod = @import("component.zig");
+const state_mod = @import("state.zig");
 
 pub const cmark = @cImport({
     @cInclude("cmark.h");
@@ -103,7 +104,44 @@ pub fn parse(
     theme: *const element.Theme,
     registry: ?*component_mod.Registry,
 ) anyerror!element.Element {
-    const pre = try components.preprocess(arena, source);
+    return parseWithState(arena, source, theme, registry, null);
+}
+
+/// Same as `parse` but with an explicit `?*const State` to use for
+/// `${path}` interpolation in component attribute values. When
+/// `state` is null and the source begins with a `---` YAML
+/// frontmatter block, the frontmatter is parsed into a temporary
+/// State and used for substitution — the simplest path for static
+/// docs that declare their state inline. When `state` is non-null,
+/// any frontmatter in the source is still stripped (so cmark never
+/// sees it as a `---` thematic break) but the host's state takes
+/// precedence — the right shape for stage 7e when the host owns the
+/// state across re-parses.
+///
+/// The temporary state built from inline frontmatter lives in
+/// `arena` and is freed when the arena is.
+pub fn parseWithState(
+    arena: std.mem.Allocator,
+    source: []const u8,
+    theme: *const element.Theme,
+    registry: ?*component_mod.Registry,
+    state: ?*const state_mod.State,
+) anyerror!element.Element {
+    var body: []const u8 = source;
+    var local_state: ?state_mod.State = null;
+    defer if (local_state) |*s| s.deinit();
+
+    if (state_mod.extractFrontmatter(source)) |fm| {
+        body = fm.rest;
+        if (state == null) {
+            local_state = try state_mod.parseFrontmatter(arena, fm.body);
+        }
+    }
+    const effective_state: ?*const state_mod.State = if (state) |s|
+        s
+    else if (local_state) |*s| s else null;
+
+    const pre = try components.preprocess(arena, body, effective_state);
 
     const root = cmark.cmark_parse_document(
         pre.source.ptr,

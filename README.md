@@ -206,12 +206,21 @@ TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
   later). Demo's `:::box` block renders as a 200×80 blue rounded
   rectangle alongside the two red placeholders for the still-
   unregistered `:::3d-scene` / `:::chart`. 21 unit tests.
+- [x] **Stage 7d** — frontmatter state + static `${}` interpolation.
+  YAML `state:` block parsed into a `State { set, get }` map;
+  `${path}` (or `${state.path}`) in attribute values resolves
+  through it at parse time. Hand-rolled YAML subset — `key: value`
+  with quoted/bare strings, comments. Bare-value scanner
+  `${...}`-aware so template `}` doesn't truncate. Unresolved
+  paths stay literal so authors notice typos. Demo's `:::box`
+  attrs now flow from frontmatter; edit YAML → rebuild → box
+  reflects the new state. 31 unit tests.
 
 ## What's next
 
 [`docs/roadmap.md`](docs/roadmap.md). Headline for the rest of
-session 4: **reactive frontmatter state + bindings** (`${state.x}`
-substitution + observable store + per-binding subscribers), then
+session 4: **reactive state** (subscribers auto-register per `${}`
+reference, mutations fire targeted factory.update calls), then
 **input handling**, then the **`:::update` micro-stream hot path**
 that lets an LLM push deltas into a live chart at 15k fps without
 touching the document layout.

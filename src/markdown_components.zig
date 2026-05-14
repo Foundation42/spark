@@ -26,6 +26,7 @@ const std = @import("std");
 const element = @import("element.zig");
 const text_layout = @import("text/layout.zig");
 const shape = @import("font/shape.zig");
+const state_mod = @import("state.zig");
 
 pub const Error = error{
     UnterminatedComponentBlock,
@@ -76,7 +77,12 @@ pub const Preprocessed = struct {
 /// passes through them verbatim so embedded `:::` in code samples
 /// doesn't get hijacked. Nesting `:::` inside another `:::` is not
 /// supported at this stage — first `:::` close ends the block.
-pub fn preprocess(arena: std.mem.Allocator, source: []const u8) Error!Preprocessed {
+///
+/// `state` is optional; when non-null, attribute values containing
+/// `${path}` are looked up in the state and substituted at parse
+/// time (stage 7d static interpolation). Reactive re-substitution
+/// on state mutation is stage 7e.
+pub fn preprocess(arena: std.mem.Allocator, source: []const u8, state: ?*const state_mod.State) Error!Preprocessed {
     var specs = std.ArrayList(Spec).init(arena);
     var out = std.ArrayList(u8).init(arena);
     try out.ensureUnusedCapacity(source.len);
@@ -134,7 +140,7 @@ pub fn preprocess(arena: std.mem.Allocator, source: []const u8) Error!Preprocess
         if (std.mem.startsWith(u8, trimmed, ":::")) {
             const after = std.mem.trimLeft(u8, trimmed[3..], " \t");
             if (after.len > 0 and isNameStart(after[0])) {
-                current = try parseDirectiveLine(arena, after);
+                current = try parseDirectiveLine(arena, after, state);
                 in_block = true;
                 continue;
             }
@@ -168,7 +174,7 @@ pub fn preprocess(arena: std.mem.Allocator, source: []const u8) Error!Preprocess
 ///                | IDENT                          -- key with ""
 ///   IDENT      := [A-Za-z][A-Za-z0-9_-]*
 ///   BARE       := [^ \t}]+
-pub fn parseDirectiveLine(arena: std.mem.Allocator, content: []const u8) Error!Spec {
+pub fn parseDirectiveLine(arena: std.mem.Allocator, content: []const u8, state: ?*const state_mod.State) Error!Spec {
     var i: usize = 0;
 
     // Name — allows digit-leading names like "3d-scene". Keys / ids
@@ -219,12 +225,26 @@ pub fn parseDirectiveLine(arena: std.mem.Allocator, content: []const u8) Error!S
                     const v_start = i;
                     while (i < content.len and content[i] != '"') : (i += 1) {}
                     if (i >= content.len) return error.InvalidAttribute;
-                    value = try arena.dupe(u8, content[v_start..i]);
+                    value = try substituteState(arena, content[v_start..i], state);
                     i += 1; // consume closing quote
                 } else {
+                    // Bare value scanner — terminates on whitespace
+                    // or the closing `}` of the attribute block, but
+                    // treats `${...}` as a single opaque unit so
+                    // template `}` doesn't truncate the value.
                     const v_start = i;
-                    while (i < content.len and !isAttrTerminator(content[i])) : (i += 1) {}
-                    value = try arena.dupe(u8, content[v_start..i]);
+                    var depth: u32 = 0;
+                    while (i < content.len) : (i += 1) {
+                        const ch = content[i];
+                        if (depth == 0 and isAttrTerminator(ch)) break;
+                        if (ch == '$' and i + 1 < content.len and content[i + 1] == '{') {
+                            depth += 1;
+                            i += 1; // consume the `{` too (loop increments past `$`)
+                            continue;
+                        }
+                        if (depth > 0 and ch == '}') depth -= 1;
+                    }
+                    value = try substituteState(arena, content[v_start..i], state);
                 }
             }
             try attrs.append(.{ .key = key, .value = value });
@@ -241,6 +261,58 @@ pub fn parseDirectiveLine(arena: std.mem.Allocator, content: []const u8) Error!S
         .attrs = try attrs.toOwnedSlice(),
         .body = "",
     };
+}
+
+/// Walk `raw` substituting any `${path}` segments with the matching
+/// value from `state`. Unresolved paths (state is null, or the path
+/// isn't set) leave the `${...}` token in place — louder than silent
+/// emptiness, easier for authors / LLMs to notice they typo'd a key.
+/// Always returns an arena-allocated string so the caller's
+/// lifetime contract is uniform regardless of whether substitution
+/// happened.
+fn substituteState(arena: std.mem.Allocator, raw: []const u8, state: ?*const state_mod.State) Error![]const u8 {
+    // Fast path: no `$` → straight dupe, skip the rebuild.
+    if (std.mem.indexOfScalar(u8, raw, '$') == null) {
+        return try arena.dupe(u8, raw);
+    }
+
+    var out = std.ArrayList(u8).init(arena);
+    var i: usize = 0;
+    while (i < raw.len) {
+        if (raw[i] == '$' and i + 1 < raw.len and raw[i + 1] == '{') {
+            const close = std.mem.indexOfScalarPos(u8, raw, i + 2, '}');
+            if (close) |end| {
+                const path_raw = raw[i + 2 .. end];
+                const path = std.mem.trim(u8, path_raw, " \t");
+                // `state.` prefix is optional — both `${state.x}` and
+                // `${x}` resolve against the same flat map. Vision
+                // examples lean on the prefixed form; tolerating both
+                // costs nothing.
+                const lookup_key: []const u8 = if (std.mem.startsWith(u8, path, "state."))
+                    path["state.".len..]
+                else
+                    path;
+                if (state) |s| {
+                    if (s.get(lookup_key)) |val| {
+                        try out.appendSlice(val);
+                        i = end + 1;
+                        continue;
+                    }
+                }
+                // Unresolved — leave the literal `${...}` so the
+                // typo is visible downstream.
+                try out.appendSlice(raw[i .. end + 1]);
+                i = end + 1;
+                continue;
+            }
+            // Unterminated `${` — emit verbatim and bail out.
+            try out.appendSlice(raw[i..]);
+            break;
+        }
+        try out.append(raw[i]);
+        i += 1;
+    }
+    return try out.toOwnedSlice();
 }
 
 /// Recognise the sentinel HTML comment emitted by `preprocess` inside
@@ -401,7 +473,7 @@ fn fenceMarkerOf(trimmed: []const u8) ?[]const u8 {
 test "parseDirectiveLine: name only" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const s = try parseDirectiveLine(arena.allocator(), "box");
+    const s = try parseDirectiveLine(arena.allocator(), "box", null);
     try std.testing.expectEqualStrings("box", s.name);
     try std.testing.expect(s.id == null);
     try std.testing.expectEqual(@as(usize, 0), s.attrs.len);
@@ -410,7 +482,7 @@ test "parseDirectiveLine: name only" {
 test "parseDirectiveLine: digit-leading name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const s = try parseDirectiveLine(arena.allocator(), "3d-scene {#orbit}");
+    const s = try parseDirectiveLine(arena.allocator(), "3d-scene {#orbit}", null);
     try std.testing.expectEqualStrings("3d-scene", s.name);
     try std.testing.expectEqualStrings("orbit", s.id.?);
 }
@@ -418,7 +490,7 @@ test "parseDirectiveLine: digit-leading name" {
 test "parseDirectiveLine: id + attrs" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const s = try parseDirectiveLine(arena.allocator(), "3d-scene {#orbit-view width=100% src=\"sat.gltf\"}");
+    const s = try parseDirectiveLine(arena.allocator(), "3d-scene {#orbit-view width=100% src=\"sat.gltf\"}", null);
     try std.testing.expectEqualStrings("3d-scene", s.name);
     try std.testing.expectEqualStrings("orbit-view", s.id.?);
     try std.testing.expectEqual(@as(usize, 2), s.attrs.len);
@@ -438,7 +510,7 @@ test "preprocess: extracts one block" {
         \\:::
         \\after
         \\
-    );
+    , null);
     try std.testing.expectEqual(@as(usize, 1), p.specs.len);
     try std.testing.expectEqualStrings("box", p.specs[0].name);
     try std.testing.expectEqualStrings("bx", p.specs[0].id.?);
@@ -456,7 +528,7 @@ test "preprocess: leaves fenced code alone" {
         \\:::
         \\```
         \\
-    );
+    , null);
     try std.testing.expectEqual(@as(usize, 0), p.specs.len);
     try std.testing.expect(std.mem.indexOf(u8, p.source, ":::not-a-directive") != null);
 }
@@ -468,7 +540,7 @@ test "preprocess: unterminated block errors" {
         \\:::box
         \\never closed
         \\
-    ));
+    , null));
 }
 
 test "extractSentinelIndex" {
@@ -476,4 +548,27 @@ test "extractSentinelIndex" {
     try std.testing.expectEqual(@as(?usize, 42), extractSentinelIndex("<!--te:42-->\n"));
     try std.testing.expectEqual(@as(?usize, null), extractSentinelIndex("<!-- something else -->"));
     try std.testing.expectEqual(@as(?usize, null), extractSentinelIndex("<!--te:abc-->"));
+}
+
+test "parseDirectiveLine: ${state.x} substitution" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var state = state_mod.State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.set("box_color", "blue");
+    try state.set("target_id", "SAT-04");
+
+    // `state.` prefix and bare paths both resolve.
+    const s = try parseDirectiveLine(arena.allocator(), "box {color=${state.box_color} src=\"models/${target_id}.gltf\"}", &state);
+    try std.testing.expectEqualStrings("blue", s.attrs[0].value);
+    try std.testing.expectEqualStrings("models/SAT-04.gltf", s.attrs[1].value);
+}
+
+test "parseDirectiveLine: unresolved ${} stays literal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var state = state_mod.State.init(std.testing.allocator);
+    defer state.deinit();
+    const s = try parseDirectiveLine(arena.allocator(), "box {color=${state.missing}}", &state);
+    try std.testing.expectEqualStrings("${state.missing}", s.attrs[0].value);
 }
