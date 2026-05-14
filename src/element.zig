@@ -173,6 +173,11 @@ pub const Element = union(enum) {
     /// margins aren't quite right.
     spacer: struct { height: f32 },
 
+    /// Horizontal rule — markdown's `---` / `***` / `___`. Rendered
+    /// as a thin filled quad spanning the available width, centred
+    /// vertically within `theme.thematic_break_height`.
+    thematic_break,
+
     /// Ordered or unordered list. Items are typically `list_item`
     /// elements; the walker renders a marker (• for unordered, "N."
     /// for ordered) at the theme's `list_marker_indent` and recurses
@@ -311,6 +316,23 @@ pub const Theme = struct {
     code_inline_color: [4]f32 = .{ 0.72, 0.88, 1.0, 1.0 },
     link_color: [4]f32 = .{ 0.45, 0.72, 1.0, 1.0 },
 
+    // ── Block chrome (quad primitives) ──────────────────────────────
+    // All colours straight-RGBA — the quad fragment premultiplies at
+    // output. Alpha < 1 produces a subtle panel; the demo's defaults
+    // sit at ~15% opacity so backgrounds read as a tint without
+    // muddying foreground text contrast.
+    code_block_bg: [4]f32 = .{ 0.45, 0.55, 0.75, 0.15 },
+    code_block_radius: f32 = 6,
+    code_block_pad_x: f32 = 10,
+    code_block_pad_y: f32 = 8,
+
+    quote_bar_color: [4]f32 = .{ 0.45, 0.55, 0.75, 0.6 },
+    quote_bar_width: f32 = 3,
+
+    thematic_break_color: [4]f32 = .{ 0.45, 0.50, 0.62, 0.7 },
+    thematic_break_height: f32 = 12,
+    thematic_break_thickness: f32 = 2,
+
     // ── Layout constants the walker reads ───────────────────────────
     list_marker_indent: f32 = 8,
     list_content_indent: f32 = 32,
@@ -385,26 +407,30 @@ pub const LayoutCtx = struct {
     theme: *const Theme,
 };
 
-/// GPU draw work accumulated during the walk. Stage 1 only fills
-/// `glyphs`. When widgets land we add `quads` (rounded-rect chrome,
-/// solid backgrounds), `lines` (borders, separators), `images`
-/// (icons, textured panels). Element implementations don't need to
-/// change to opt in — they just start filling more fields.
+/// GPU draw work accumulated during the walk. Quads land first
+/// (backgrounds, bars, rules) then glyphs on top — the host's frame
+/// loop records them in that order inside one render pass.
+///
+/// Future fields slot in unchanged: `lines` (borders, separators),
+/// `images` (markdown images, widget icons). Element handlers grow
+/// into the new fields without breaking the contract.
 pub const DrawList = struct {
     glyphs: std.ArrayList(tp.GlyphInstance),
+    quads: std.ArrayList(qp.QuadInstance),
     // future:
-    // quads:  std.ArrayList(QuadInstance),
     // lines:  std.ArrayList(LineInstance),
     // images: std.ArrayList(ImageInstance),
 
     pub fn init(allocator: std.mem.Allocator) DrawList {
         return .{
             .glyphs = std.ArrayList(tp.GlyphInstance).init(allocator),
+            .quads = std.ArrayList(qp.QuadInstance).init(allocator),
         };
     }
 
     pub fn deinit(self: *DrawList) void {
         self.glyphs.deinit();
+        self.quads.deinit();
         self.* = undefined;
     }
 
@@ -412,8 +438,10 @@ pub const DrawList = struct {
     /// the common case at frame start.
     pub fn clearRetainingCapacity(self: *DrawList) void {
         self.glyphs.clearRetainingCapacity();
+        self.quads.clearRetainingCapacity();
     }
 };
 
 const glyph_cache_mod = @import("text/glyph_cache.zig");
 const atlas_mod = @import("gpu/atlas.zig");
+const qp = @import("gpu/quad_pipeline.zig");

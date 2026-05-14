@@ -12,6 +12,8 @@ pub fn build(b: *std.Build) void {
     // would trigger a recompile.
     const text_vert_spv = compileShaderStage(b, "text", "vert");
     const text_frag_spv = compileShaderStage(b, "text", "frag");
+    const quad_vert_spv = compileShaderStage(b, "quad", "vert");
+    const quad_frag_spv = compileShaderStage(b, "quad", "frag");
 
     // ── Bundle SPIR-V into a generated Zig module ──────────────────
     // The compiled blobs need `align(4)` because Vulkan's `pCode` field
@@ -21,9 +23,13 @@ pub fn build(b: *std.Build) void {
     const wf = b.addWriteFiles();
     _ = wf.addCopyFile(text_vert_spv, "text.vert.spv");
     _ = wf.addCopyFile(text_frag_spv, "text.frag.spv");
+    _ = wf.addCopyFile(quad_vert_spv, "quad.vert.spv");
+    _ = wf.addCopyFile(quad_frag_spv, "quad.frag.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const text_vert align(4) = @embedFile("text.vert.spv").*;
         \\pub const text_frag align(4) = @embedFile("text.frag.spv").*;
+        \\pub const quad_vert align(4) = @embedFile("quad.vert.spv").*;
+        \\pub const quad_frag align(4) = @embedFile("quad.frag.spv").*;
         \\
     );
 

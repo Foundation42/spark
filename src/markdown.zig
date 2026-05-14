@@ -149,8 +149,7 @@ fn mapBlock(
         },
 
         cmark.CMARK_NODE_THEMATIC_BREAK => {
-            // Visual line deferred until the quad/line pipeline ships.
-            return .{ .spacer = .{ .height = 12 } };
+            return .thematic_break;
         },
 
         else => return error.UnsupportedNodeKind,

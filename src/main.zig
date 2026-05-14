@@ -21,6 +21,7 @@ const swap = @import("gpu/swapchain.zig");
 const renderer = @import("gpu/renderer.zig");
 const atlas_mod = @import("gpu/atlas.zig");
 const tp = @import("gpu/text_pipeline.zig");
+const qp = @import("gpu/quad_pipeline.zig");
 const face_mod = @import("font/face.zig");
 const registry_mod = @import("font/registry.zig");
 const glyph_cache_mod = @import("text/glyph_cache.zig");
@@ -36,10 +37,13 @@ const demo_md = @embedFile("demo.md");
 const ATLAS_MONO_SIZE: u32 = 768;
 const ATLAS_COLOR_SIZE: u32 = 1024;
 const MAX_GLYPHS: u32 = 2048;
+const MAX_QUADS: u32 = 256;
 
 const FrameCtx = struct {
-    pipeline: *tp.TextPipeline,
+    text_pipeline: *tp.TextPipeline,
+    quad_pipeline: *qp.QuadPipeline,
     n_glyphs: u32,
+    n_quads: u32,
     /// Borrowed slice into the DrawList's glyph buffer — mutated per
     /// frame for the attention wave. Stable for the lifetime of the
     /// frame loop because we don't append after the layout pass.
@@ -54,7 +58,11 @@ const FrameCtx = struct {
 
 fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) void {
     const fc: *const FrameCtx = @ptrCast(@alignCast(ctx.?));
-    fc.pipeline.recordDraw(cmd, extent, fc.n_glyphs);
+    // Quads first (backgrounds, bars, rules), then glyphs on top —
+    // ordering inside one vkCmdBeginRendering block, so the blend
+    // hardware lays the text correctly over the chrome.
+    fc.quad_pipeline.recordDraw(cmd, extent, fc.n_quads);
+    fc.text_pipeline.recordDraw(cmd, extent, fc.n_glyphs);
 }
 
 /// HSV → RGB conversion using the standard six-sextant formula. `h`
@@ -96,7 +104,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 2 / stage 3b (markdown parser)\n", .{});
+    try stdout.print("text_engine demo — session 3 / stage 4a (quad chrome)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
     try stdout.print("  demo.md bytes:         {d}\n", .{demo_md.len});
@@ -118,6 +126,9 @@ pub fn main() !void {
 
     var pipeline = try tp.TextPipeline.init(&ctx, swapchain.format, &atlas_mono, &atlas_color, MAX_GLYPHS);
     defer pipeline.deinit();
+
+    var quad_pipeline = try qp.QuadPipeline.init(&ctx, swapchain.format, MAX_QUADS);
+    defer quad_pipeline.deinit();
 
     const font_path = std.posix.getenv("TEXT_ENGINE_FONT") orelse
         "/usr/share/fonts/TTF/DejaVuSans.ttf";
@@ -243,10 +254,12 @@ pub fn main() !void {
     const pulse_count: u32 = @intCast(dl.glyphs.items.len - pulse_start);
 
     try pipeline.writeGlyphs(dl.glyphs.items);
+    try quad_pipeline.writeQuads(dl.quads.items);
     try stdout.print("  glyphs:                {d} (pulse span: {d} glyphs)\n", .{
         dl.glyphs.items.len,
         pulse_count,
     });
+    try stdout.print("  quads:                 {d}\n", .{dl.quads.items.len});
     try stdout.print("  cache:                 {d} miss / {d} hit ({d:.1}% hit rate)\n", .{
         cache.misses,
         cache.hits,
@@ -257,8 +270,10 @@ pub fn main() !void {
     defer rdr.deinit();
 
     var frame_ctx = FrameCtx{
-        .pipeline = &pipeline,
+        .text_pipeline = &pipeline,
+        .quad_pipeline = &quad_pipeline,
         .n_glyphs = @intCast(dl.glyphs.items.len),
+        .n_quads = @intCast(dl.quads.items.len),
         .glyphs = dl.glyphs.items,
         .pulse_start = pulse_start,
         .pulse_count = pulse_count,

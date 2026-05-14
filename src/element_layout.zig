@@ -32,6 +32,7 @@ const std = @import("std");
 const element = @import("element.zig");
 const text_layout = @import("text/layout.zig");
 const shape = @import("font/shape.zig");
+const qp = @import("gpu/quad_pipeline.zig");
 
 pub const Error = error{
     /// `text` or `line_break` appeared at a position where only block
@@ -93,6 +94,8 @@ pub fn layoutAndRender(
             .baseline = 0,
         },
 
+        .thematic_break => return layoutThematicBreak(origin, constraints, ctx, out),
+
         .list => |li| return layoutList(li, origin, constraints, ctx, out),
 
         .list_item => |it| return layoutStackV(it.children, ctx.theme.block_child_gap, origin, constraints, ctx, out),
@@ -122,8 +125,11 @@ fn shrinkConstraints(c: element.Constraints, indent: f32) element.Constraints {
     return out_c;
 }
 
-/// Block quote — indent children horizontally, recurse as stack_v.
-/// Left-bar visual is deferred until quad/line primitives land.
+/// Block quote — indent children horizontally, recurse as stack_v,
+/// then emit a thin vertical bar quad spanning the laid-out height
+/// at `origin.x`. Bar quad sits in the gap between the document
+/// edge and the indented content — looks like the conventional
+/// "vertical accent line" mark for quotes.
 fn layoutQuote(
     children: []const element.Element,
     origin: [2]f32,
@@ -135,11 +141,53 @@ fn layoutQuote(
     const inner_origin: [2]f32 = .{ origin[0] + indent, origin[1] };
     const inner_constraints = shrinkConstraints(constraints, indent);
     const inner_box = try layoutStackV(children, ctx.theme.block_child_gap, inner_origin, inner_constraints, ctx, out);
+
+    // Emit the bar AFTER child layout so we know its height. Quads
+    // render before glyphs in the frame loop, so the bar still
+    // appears under any text that happens to overlap it (it doesn't,
+    // but the ordering is correct regardless).
+    try out.quads.append(.{
+        .dst_pos = .{ origin[0], origin[1] },
+        .dst_size = .{ ctx.theme.quote_bar_width, inner_box.h },
+        .color = ctx.theme.quote_bar_color,
+        .radius = 0,
+    });
+
     return .{
         .x = origin[0],
         .y = origin[1],
         .w = inner_box.w + indent,
         .h = inner_box.h,
+        .baseline = 0,
+    };
+}
+
+/// Thematic break — markdown's `---`. Emits a thin horizontal quad
+/// spanning the available width, centred vertically within
+/// `theme.thematic_break_height`. Falls back to a small fixed width
+/// when constraints are unbounded.
+fn layoutThematicBreak(
+    origin: [2]f32,
+    constraints: element.Constraints,
+    ctx: *element.LayoutCtx,
+    out: *element.DrawList,
+) !element.Box {
+    const h = ctx.theme.thematic_break_height;
+    const thickness = ctx.theme.thematic_break_thickness;
+    const w: f32 = if (std.math.isFinite(constraints.max_w)) constraints.max_w else 320.0;
+
+    try out.quads.append(.{
+        .dst_pos = .{ origin[0], origin[1] + (h - thickness) * 0.5 },
+        .dst_size = .{ w, thickness },
+        .color = ctx.theme.thematic_break_color,
+        .radius = 0,
+    });
+
+    return .{
+        .x = origin[0],
+        .y = origin[1],
+        .w = w,
+        .h = h,
         .baseline = 0,
     };
 }
@@ -230,13 +278,29 @@ fn layoutCodeBlock(
     ctx: *element.LayoutCtx,
     out: *element.DrawList,
 ) !element.Box {
-    _ = constraints;
     switch (content) {
         .sub_block => return error.CodeBlockSubBlockNotImplemented,
         .raw => |r| {
+            const pad_x = ctx.theme.code_block_pad_x;
+            const pad_y = ctx.theme.code_block_pad_y;
+            // Reserve the background quad slot up front, fill in
+            // size once we know the final height. Appending now
+            // means the background is BEFORE all the glyphs in the
+            // draw-order — the host's frame loop already draws
+            // quads-before-glyphs, but keeping insertion-order
+            // background-then-content matches mental model.
+            const bg_idx = out.quads.items.len;
+            try out.quads.append(.{
+                .dst_pos = .{ origin[0], origin[1] },
+                .dst_size = .{ 0, 0 },
+                .color = ctx.theme.code_block_bg,
+                .radius = ctx.theme.code_block_radius,
+            });
+
             const m = ctx.fonts.metrics(r.style.font_id);
             const hb = ctx.fonts.hbFont(r.style.font_id);
-            var y = origin[1];
+            var y = origin[1] + pad_y;
+            const text_x = origin[0] + pad_x;
             var it = std.mem.splitScalar(u8, r.text, '\n');
             while (it.next()) |line| {
                 const baseline_y = y + m.ascender;
@@ -251,7 +315,7 @@ fn layoutCodeBlock(
                         ctx.color_atlas,
                         run,
                         r.style.font_id,
-                        origin[0],
+                        text_x,
                         baseline_y,
                         r.style.color,
                         r.style.hot_color,
@@ -260,11 +324,21 @@ fn layoutCodeBlock(
                 }
                 y += m.line_height;
             }
+            y += pad_y;
+
+            // Background quad spans full available width (the
+            // conventional code-block look — panel reaches the
+            // right edge regardless of content length). Falls back
+            // to "content + 2*pad_x" when constraints are unbounded.
+            const total_h = y - origin[1];
+            const total_w: f32 = if (std.math.isFinite(constraints.max_w)) constraints.max_w else 320.0;
+            out.quads.items[bg_idx].dst_size = .{ total_w, total_h };
+
             return .{
                 .x = origin[0],
                 .y = origin[1],
-                .w = 0,
-                .h = y - origin[1],
+                .w = total_w,
+                .h = total_h,
                 .baseline = 0,
             };
         },

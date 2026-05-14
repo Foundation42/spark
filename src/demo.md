@@ -18,6 +18,8 @@ This paragraph uses *italic* and **bold** and ***bold-italic*** and `inline code
 
 > Quotes indent their content, and indent propagates through Constraints so the inline-flow inside this quote wraps on the narrower available width — not on the full viewport width.
 
+---
+
 ## Code
 
 ```zig
