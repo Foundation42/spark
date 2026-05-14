@@ -152,6 +152,39 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("run", "Run text_engine_demo");
     run_step.dependOn(&run_cmd.step);
+
+    // ── Unit tests ─────────────────────────────────────────────────
+    // `zig build test` compiles + runs the in-source `test {}` blocks
+    // we leave throughout the library. Same link config as the demo
+    // exe because most modules transitively reach face / shape / vk
+    // through `element.LayoutCtx` even when the test only touches
+    // pure-logic code paths — Zig resolves type layouts eagerly.
+    const test_files = [_][]const u8{
+        "src/markdown_components.zig",
+        "src/component.zig",
+    };
+    const test_step = b.step("test", "Run unit tests");
+    for (test_files) |path| {
+        const t = b.addTest(.{
+            .root_source_file = b.path(path),
+            .target = target,
+            .optimize = optimize,
+        });
+        t.root_module.addImport("shaders", shaders_module);
+        if (target.result.os.tag == .windows) {
+            t.linkSystemLibrary("vulkan-1");
+        } else {
+            t.linkSystemLibrary("vulkan");
+        }
+        t.linkSystemLibrary("glfw");
+        t.linkSystemLibrary("freetype2");
+        t.linkSystemLibrary("harfbuzz");
+        t.linkLibrary(cmark_lib);
+        t.addIncludePath(b.path("vendor/cmark"));
+        t.linkLibC();
+        const run_t = b.addRunArtifact(t);
+        test_step.dependOn(&run_t.step);
+    }
 }
 
 // Compile one shader stage (`name.<stage>` → `name.<stage>.spv`) via

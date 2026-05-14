@@ -29,6 +29,7 @@ const element = @import("element.zig");
 const element_layout = @import("element_layout.zig");
 const markdown = @import("markdown.zig");
 const ansi = @import("ansi.zig");
+const component = @import("component.zig");
 
 /// Demo document — parsed by the vendored cmark + mapper into an
 /// Element tree at startup. Same render path as the hand-built
@@ -309,6 +310,15 @@ pub fn main() !void {
         .code_inline_font_id = code_inline_id,
     };
 
+    // ── Component registry (stage 7b) ──────────────────────────────
+    // Owned by the host across the entire program lifetime so cached
+    // component instances persist over re-parses. No factories
+    // registered yet — every `:::` block falls through to the 7a
+    // missing-component placeholder. Stage 7c registers `:::box` as
+    // the first real factory; visible change lands then.
+    var registry = component.Registry.init(allocator);
+    defer registry.deinit();
+
     // ── Parse demo.md into an Element tree ─────────────────────────
     // All slices + strings the tree references live in `doc_arena`;
     // freed in one shot at scope exit. The parser also frees the
@@ -316,7 +326,7 @@ pub fn main() !void {
     // memory survives the call.
     var doc_arena = std.heap.ArenaAllocator.init(allocator);
     defer doc_arena.deinit();
-    const top_stack = try markdown.parse(doc_arena.allocator(), demo_md, &theme);
+    const top_stack = try markdown.parse(doc_arena.allocator(), demo_md, &theme, &registry);
 
     // SDF "ATTENTION" paragraph — separate from the top stack so we
     // can capture the glyph index range for per-frame animation.
@@ -342,6 +352,12 @@ pub fn main() !void {
     var ansi_theme = theme;
     ansi_theme.body = .{ .font_id = code_inline_id, .color = .{ 0.92, 0.94, 0.98, 1.0 } };
     const ansi_tree = try ansi.parse(doc_arena.allocator(), ansi_demo, &ansi_theme);
+
+    // Tree swap is complete — no live Element references the old
+    // (non-existent, this is the first parse) cached instances. Any
+    // future re-parse would do the same gc() right after replacing
+    // the tree pointer.
+    registry.gc();
 
     var rdr = try renderer.Renderer.init(allocator, &ctx, &swapchain, &window);
     defer rdr.deinit();

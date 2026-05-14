@@ -189,15 +189,21 @@ TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
   `custom` Element. No registry yet — every directive renders as a
   red-bordered "missing component: NAME" placeholder panel. cmark
   itself stays untouched.
+- [x] **Stage 7b** — component registry + persistent instance cache.
+  `Registry { register, beginParse, resolve, gc }` with `Factory {
+  create, update?, deinit? }`. Cache keyed by explicit `Spec.id` or
+  `auto:N` derived from sentinel index (order-based — position-
+  based when needed). `update` lets cached instances absorb attr
+  changes across parses without being destroyed. `markdown.parse`
+  takes an optional registry; null preserves 7a placeholder
+  behaviour. `zig build test` step added. Demo unchanged — no
+  factories registered yet, dormant infrastructure ready for 7c.
 
 ## What's next
 
 [`docs/roadmap.md`](docs/roadmap.md). Headline for the rest of
-session 4: **component registry + cache** (host registers
-`name → factory`, cache keyed by `#id` or auto-generated stable
-position ID, persists instances across re-layouts), then a
-**first concrete component** to validate the end-to-end loop, then
-**reactive frontmatter state + bindings**, then **input handling**,
-then the **`:::update` micro-stream hot path** that lets an LLM
-push deltas into a live chart at 15k fps without touching the
-document layout.
+session 4: **first concrete component** (`:::box` with color + size
+attrs), then **reactive frontmatter state + bindings**, then **input
+handling**, then the **`:::update` micro-stream hot path** that
+lets an LLM push deltas into a live chart at 15k fps without
+touching the document layout.

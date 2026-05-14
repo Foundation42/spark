@@ -33,20 +33,34 @@ Keeps vendored cmark completely untouched.
   fenced-code passthrough + unterminated-block error,
   `extractSentinelIndex`. All passing.
 
-## Next — component registry + cache (stage 7b)
+## Shipped — component registry + persistent cache (stage 7b)
 
-Host registers `name → ComponentFactory`. Cache keyed by `#id`
-(or auto-generated stable position-based ID) persists instances
-across re-layouts. `custom.ctx` carries the cached instance.
+Host registers `name → Factory`. Cache keyed by `Spec.id` or by
+auto-generated `auto:N` (where N is the sentinel index of the
+`:::` block — order-based, simpler than position-based, swap to
+position-based when LLM-driven structural rewrites prove the
+simple scheme isn't enough). `custom.ctx` carries the
+factory-produced instance pointer.
 
-- Components without `#id` get an auto-generated stable ID from
-  position in the tree (parent's ID + sibling index). Stable
-  across trivial edits; not stable across structural reorders —
-  right trade-off for stage 7b.
-- Lifecycle: instantiated on first appearance, destroyed after N
-  consecutive layouts without appearing. Avoids thrashing on edits.
+- `src/component.zig` — `Instance`, `Factory { create, update?,
+  deinit? }`, `Registry { register, beginParse, resolve, gc }`.
+  `update` is the cache-hit path so an instance can react to attr
+  changes between parses without being destroyed.
+- `markdown.parse` gained `?*Registry` param + calls
+  `registry.beginParse()` at the top. HTML_BLOCK arm tries
+  `resolve` first, falls back to placeholder.
+- Host calls `registry.gc()` after swapping the new Element tree
+  into place — destroys instances unused for more than
+  `sweep_threshold` consecutive parses (default 4).
+- Tests cover register/resolve, cache-hit reuse, gc threshold,
+  factory-name-change destroy-and-recreate, update-sees-latest.
+- `zig build test` step added so unit tests can resolve the
+  transitive C-header chain through `element.LayoutCtx`.
 
-## Then — first concrete component (stage 7c)
+Demo unchanged: no factories registered yet, every `:::` still
+hits the placeholder. Infrastructure is dormant, ready for 7c.
+
+## Next — first concrete component (stage 7c)
 
 `:::box {color, width, height}` as the minimal loop validator.
 Renders a coloured quad. Proves: parse → registry → cached

@@ -42,6 +42,7 @@
 const std = @import("std");
 const element = @import("element.zig");
 const components = @import("markdown_components.zig");
+const component_mod = @import("component.zig");
 
 pub const cmark = @cImport({
     @cInclude("cmark.h");
@@ -51,6 +52,11 @@ pub const Error = error{
     CmarkParseFailed,
     UnsupportedNodeKind,
 } || std.mem.Allocator.Error || components.Error;
+
+// Once a registry is involved, host-supplied factory closures can
+// throw anything — collapse our return type to `anyerror!Element`.
+// Public error set above stays for callers that don't pass a
+// registry and want a narrow signature later.
 
 /// Threaded through the block-mapping recursion. Replaces the old
 /// `arena + theme` pair (one struct ptr is cheaper to pass than two
@@ -63,6 +69,12 @@ const MapCtx = struct {
     /// Specs for `:::` component blocks, indexed by sentinel N.
     /// Populated by `components.preprocess` ahead of the cmark parse.
     specs: []const components.Spec,
+    /// Host-supplied component registry. When null, every `:::` block
+    /// renders as the missing-component placeholder (stage-7a
+    /// behaviour). When non-null, `mapBlock` tries `registry.resolve`
+    /// first and falls back to the placeholder only for unregistered
+    /// directive names.
+    registry: ?*component_mod.Registry,
 };
 
 /// Parse `source` (UTF-8 CommonMark) into an Element tree owned by
@@ -76,11 +88,21 @@ const MapCtx = struct {
 /// extracted specs ride along through the mapper as a sidecar slice
 /// and get re-materialised as `custom` Elements when the mapper hits
 /// the matching sentinel HTML comment.
+///
+/// `registry` is the optional component registry. Passing null gets
+/// the 7a placeholder behaviour for every directive. Passing one
+/// instructs the mapper to consult it for each `:::` block: hits
+/// produce real component instances (vtable + ctx from the
+/// host-registered factory); misses still fall through to the
+/// placeholder. The registry's `beginParse` is invoked before the
+/// mapper runs; the host is responsible for calling `gc()` once it
+/// has swapped the new Element tree into place.
 pub fn parse(
     arena: std.mem.Allocator,
     source: []const u8,
     theme: *const element.Theme,
-) Error!element.Element {
+    registry: ?*component_mod.Registry,
+) anyerror!element.Element {
     const pre = try components.preprocess(arena, source);
 
     const root = cmark.cmark_parse_document(
@@ -90,10 +112,13 @@ pub fn parse(
     ) orelse return error.CmarkParseFailed;
     defer cmark.cmark_node_free(root);
 
+    if (registry) |r| r.beginParse();
+
     const mc: MapCtx = .{
         .arena = arena,
         .theme = theme,
         .specs = pre.specs,
+        .registry = registry,
     };
     return try mapBlock(&mc, root, theme.body);
 }
@@ -107,7 +132,7 @@ fn mapBlock(
     mc: *const MapCtx,
     node: *cmark.cmark_node,
     cascade: element.Style,
-) Error!element.Element {
+) anyerror!element.Element {
     const t = cmark.cmark_node_get_type(node);
 
     switch (t) {
@@ -178,13 +203,26 @@ fn mapBlock(
                 "";
             if (components.extractSentinelIndex(literal)) |idx| {
                 if (idx < mc.specs.len) {
-                    // Specs live in arena-backed storage owned by the
-                    // same arena as the Element tree, so taking the
-                    // address of one is stable for the tree's
-                    // lifetime. `*anyopaque` discards const because
-                    // the vtable signature is non-const for symmetry
-                    // with mutable widgets that'll arrive at stage 7c.
                     const spec_ptr = &mc.specs[idx];
+                    // Try the registered factory first. Cache hit
+                    // reuses a persistent instance; miss invokes the
+                    // factory's create. Either way the Element holds
+                    // the factory-supplied vtable + ctx — the cached
+                    // instance state lives in the registry's
+                    // allocator, stable across many parses.
+                    if (mc.registry) |reg| {
+                        if (try reg.resolve(spec_ptr, idx)) |inst| {
+                            return .{ .custom = .{
+                                .vtable = inst.vtable,
+                                .ctx = inst.ctx,
+                            } };
+                        }
+                    }
+                    // No registry, or no factory for this directive
+                    // name — fall back to the missing-component
+                    // placeholder. Spec lives in arena memory; its
+                    // address is stable for the Element tree's
+                    // lifetime.
                     return .{ .custom = .{
                         .vtable = &components.placeholder_vtable,
                         .ctx = @ptrCast(@constCast(spec_ptr)),
@@ -209,7 +247,7 @@ fn mapBlock(
 fn makePreformattedBlock(
     mc: *const MapCtx,
     node: *cmark.cmark_node,
-) Error!element.Element {
+) anyerror!element.Element {
     const literal_ptr = cmark.cmark_node_get_literal(node);
     const raw: []const u8 = if (literal_ptr != null)
         std.mem.span(literal_ptr)
@@ -230,7 +268,7 @@ fn mapBlockChildren(
     mc: *const MapCtx,
     parent: *cmark.cmark_node,
     cascade: element.Style,
-) Error![]const element.Element {
+) anyerror![]const element.Element {
     var list = std.ArrayList(element.Element).init(mc.arena);
     var child: ?*cmark.cmark_node = cmark.cmark_node_first_child(parent);
     while (child) |c| : (child = cmark.cmark_node_next(c)) {
