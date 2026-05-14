@@ -241,6 +241,103 @@ documents-as-components, headless documents, remote sources. Those
 slot in cleanly because the `Factory` shape stays provenance-
 agnostic (see `memory/project_component_provenance.md`).
 
+## Stage 8b — `:::chart` streaming showcase
+
+The visceral demo for component-target dispatch. A real streaming
+component, real data flowing through `Factory.handle_update`, no
+state Binding in the way.
+
+### Design choices
+
+**Ring buffer, not an ArrayList.** The chart's steady-state cost is
+append. Append-with-occasional-realloc has a long tail; append-into-
+ring-buffer is O(1) with zero allocation after `create`. At 60 Hz
+the difference doesn't matter; at 13k Hz (one append per frame) the
+ArrayList would start showing memmove pauses.
+
+**Filled columns, not connected lines.** Each sample renders as a
+thin vertical quad anchored at the chart's bottom edge. Line charts
+need rotated geometry which the rounded-quad pipeline doesn't have
+yet; columns are axis-aligned so the existing pipeline carries
+them. Visually the column sparkline reads like a histogram /
+"audio waveform" — appropriate for the demo's signal-with-noise
+synthetic data.
+
+**No state binding.** Chart attrs (min/max/width/height/color) are
+static-at-author-time by design; the data lives entirely in the
+component's opaque ring buffer. So the chart runs *without* a
+`Binding` allocated by the registry — no `${state.x}` references
+means `collectReferencedPaths` returns empty and the binding step
+is skipped. The 8a pitfall (component-target updates fighting
+templated attrs) doesn't apply because there's nothing to fight.
+
+This is the architecturally correct shape for streaming components:
+state for declarative scalars, opaque-handler for streamed payloads.
+The two paths complement each other.
+
+### Synthetic data source
+
+In `main.zig`:
+
+```zig
+const CHART_TICK_MS: i64 = 16;  // 60 Hz
+var last_chart_ms = std.time.milliTimestamp();
+var chart_phase: f32 = 0;
+var chart_rng = std.Random.DefaultPrng.init(0xC04EE);
+
+// In the main loop:
+if (now_ms - last_chart_ms >= CHART_TICK_MS) {
+    chart_phase += 0.06;
+    const base = std.math.sin(chart_phase);
+    const harmonic = 0.40 * std.math.sin(chart_phase * 3.1);
+    const detail = 0.18 * std.math.sin(chart_phase * 7.7);
+    const noise = (chart_rng.random().float(f32) - 0.5) * 0.15;
+    const sample = std.math.clamp(base * 0.6 + harmonic + detail + noise, -1.0, 1.0);
+
+    var buf: [128]u8 = undefined;
+    const directive = std.fmt.bufPrint(&buf,
+        \\:::update {{#telemetry action=append}}
+        \\{d:.4}
+        \\:::
+    , .{sample}) catch unreachable;
+    _ = update.applyAll(update_arena.allocator(), &host_state, &registry, directive) catch 0;
+    _ = update_arena.reset(.retain_capacity);
+    last_chart_ms = now_ms;
+}
+```
+
+Three sines at different frequencies plus noise — looks more like
+real data than a pure sine would. The seed 0xC04EE keeps runs
+reproducible.
+
+### Numbers
+
+4-second smoke run, Release, 1280×720:
+
+- **48,101 frames** = 12,025 fps.
+- **241 updates dispatched** through the wire format (240 expected
+  at 60 Hz / 4 s, plus 1 colour-cycle update — accounting matches).
+- **144 quads** total (1 chart bg + ~127 columns + box + sliders +
+  chrome). Cache hit rate jumped to 99.9% because the chart adds
+  quad work, not glyph work.
+
+The 13.3k → 12.0k drop is `state.dirty` triggering full document
+re-layout on every chart append. That's the cost of routing through
+the unified reactive substrate; for a 60-Hz feed it's acceptable.
+For the eventual >1 kHz feeds we'll want a retained-layout cache
+that only re-walks elements whose ctx changed — bumped to
+"parallel — active watch" priority on the roadmap.
+
+### Lesson re-confirmed: separation of concerns is cheap to add later
+
+The fact that 8b needed *zero* changes to the wire-format code in
+`update.zig` is the design payoff. The chart is just a factory.
+Future components — 3D scenes, charts of charts, ML inferred
+visualisations — slot in the same way: register a factory,
+optionally implement `handle_update`, done.
+
+The substrate is doing what the vision asked it to do.
+
 ## Patterns from session 4 that paid off
 
 Three habits from the previous session carried over and made this
@@ -248,10 +345,27 @@ one fast:
 
 1. **Single test entry point at `src/tests.zig`.** New file →
    one-line addition → `zig build test` covers it. Took ~5 seconds
-   to wire `update.zig` into the test build.
+   to wire `update.zig` (and later `chart.zig`) into the test build.
 2. **Arena-first allocation policy.** `applyAll` takes an arena,
    doesn't worry about per-update churn. The host's single-arena-
-   with-reset pattern just works.
+   with-reset pattern just works — and worked again for 8b's 60 Hz
+   feed without any change.
 3. **Stage-by-stage commits with clear deliverables.** 8a → 8b is
    a one-stage delta. Each commit is reversible. Builds confidence
    the contract holds.
+
+## What ships at session 5 close
+
+Stages 8a + 8b. Both dispatch paths of the `:::update` wire
+format live and demonstrated. ~9,500 LOC, 62 unit tests passing,
+~12k fps Release with a colour cycle + 60 Hz chart feed both
+active.
+
+Next entry points (in order of expected payoff):
+
+1. **Stage 9 — `:::embedded-document`.** Composition track kickoff.
+   Pure factory implementation; no contract change.
+2. **Retained layout cache.** Bumped to active-watch by 8b's perf
+   measurements. Will unblock higher-rate streaming.
+3. **Stage 10 — headless documents.** Slots in after 9.
+4. **Stage 11 — remote sources.** Slots in after 9.

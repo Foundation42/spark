@@ -31,6 +31,7 @@ const markdown = @import("markdown.zig");
 const ansi = @import("ansi.zig");
 const component = @import("component.zig");
 const box_component = @import("components/box.zig");
+const chart_component = @import("components/chart.zig");
 const slider_component = @import("components/slider.zig");
 const state_mod = @import("state.zig");
 const update = @import("update.zig");
@@ -324,7 +325,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 5 / stage 8a (:::update micro-stream)\n", .{});
+    try stdout.print("text_engine demo — session 5 / stage 8b (:::chart streaming)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
     try stdout.print("  demo.md bytes:         {d}\n", .{demo_md.len});
@@ -420,6 +421,7 @@ pub fn main() !void {
     var registry = component.Registry.init(allocator);
     defer registry.deinit();
     try registry.register("box", box_component.factory);
+    try registry.register("chart", chart_component.factory);
     try registry.register("slider", slider_component.factory);
 
     // ── Host-owned reactive state (stage 7e) ───────────────────────
@@ -526,6 +528,22 @@ pub fn main() !void {
     var color_idx: usize = 0;
     var last_update_ms = std.time.milliTimestamp();
 
+    // Stage 8b — :::chart synthetic feed. 60 Hz tick rate (sample
+    // ~every 16ms); each tick emits a `:::update {#telemetry
+    // action=append}` directive through the same `update.applyAll`
+    // hot path the colour cycle uses. The chart's `handle_update`
+    // pushes the sample onto its ring buffer; `state.dirty` flips,
+    // re-layout fires, the new column shows up next frame.
+    //
+    // The data signal layers three sines at different frequencies
+    // plus low-amplitude noise to make the trace visually rich. A
+    // pure constant or a single sine would look like a steady line
+    // — not a useful demo of "live streaming data".
+    const CHART_TICK_MS: i64 = 16;
+    var last_chart_ms = std.time.milliTimestamp();
+    var chart_phase: f32 = 0;
+    var chart_rng = std.Random.DefaultPrng.init(0xC04EE);
+
     // Steady-state loop: poll glfw + present. All layout +
     // animation + upload + record work lives in `drawCb` now,
     // keyed off the swapchain's current `extent` so it auto-reflows
@@ -550,6 +568,27 @@ pub fn main() !void {
             update_count += n;
             _ = update_arena.reset(.retain_capacity);
             last_update_ms = now_ms;
+        }
+
+        if (now_ms - last_chart_ms >= CHART_TICK_MS) {
+            chart_phase += 0.06;
+            const base = std.math.sin(chart_phase);
+            const harmonic = 0.40 * std.math.sin(chart_phase * 3.1);
+            const detail = 0.18 * std.math.sin(chart_phase * 7.7);
+            const noise = (chart_rng.random().float(f32) - 0.5) * 0.15;
+            const sample = std.math.clamp(base * 0.6 + harmonic + detail + noise, -1.0, 1.0);
+
+            var buf: [128]u8 = undefined;
+            const directive = std.fmt.bufPrint(&buf,
+                \\:::update {{#telemetry action=append}}
+                \\{d:.4}
+                \\:::
+                \\
+            , .{sample}) catch unreachable;
+            const n = update.applyAll(update_arena.allocator(), &host_state, &registry, directive) catch 0;
+            update_count += n;
+            _ = update_arena.reset(.retain_capacity);
+            last_chart_ms = now_ms;
         }
 
         try rdr.drawFrame();

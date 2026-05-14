@@ -10,9 +10,10 @@ design-decision rationale lives in [`vision.md`](vision.md).
 This roadmap is the staging path from where we are (the full
 live-document substrate: parse → registry → cache → static
 interpolation → reactivity → input → first interactive component →
-`:::update` wire format) to where we're going (composable
-documents, streaming visualisations, remote/headless components).
-Session 5 opened with stage 8a — see headlines below.
+`:::update` wire format → first streaming component) to where
+we're going (composable documents, remote/headless components,
+LLM-driven authoring). Session 5 shipped stages 8a + 8b; the
+composition track is the headline next — see below.
 
 ## Shipped — block extension parser (stage 7a)
 
@@ -190,23 +191,28 @@ box's color is templated (`${state.box_color}`); component-target
 dispatch is covered by unit tests + ready to drive the upcoming
 `:::chart`. 53 unit tests passing.
 
-## Next — `:::chart` + the streaming showcase (stage 8b)
+## Shipped — `:::chart` streaming showcase (stage 8b)
 
-The visceral demo target. A `:::chart` factory whose `handle_update`
-accepts `action=append` with CSV-row bodies, pushing samples onto a
-live trace. Validates the component-target dispatch path under
-streaming workload + closes out the headline "15k fps live LLM
-deltas" pitch from session 3's vision capture.
+The visceral component-target demo. `src/components/chart.zig` —
+ring buffer of f32 samples, axis-aligned column rendering (filled
+sparkline), `handle_update` accepts `action=append` (body=one
+float) and `action=clear`. The chart owns its data opaquely so it
+runs *without* a state Binding — the design pitfall flagged on
+`:::box` (component-target updates fighting templated attrs) doesn't
+apply.
 
-- One file: `src/components/chart.zig`. Reads `type=line`, `x=`/`y=`
-  axis hints from attrs; allocates a ring buffer; emits one quad
-  per segment.
-- Demo wires a synthetic data source (initially a sine + noise
-  driver in main.zig; later a streaming-text adapter).
-- Stress test the registry's parses_unused gc semantics under a
-  high update rate — confirms the cache-during-streaming invariant.
+Demo wires a 60 Hz synthetic data source: layered sines + noise,
+each tick emitting `:::update {#telemetry action=append}\nVALUE\n:::`
+through `update.applyAll`. 4-second smoke: 241 updates dispatched,
+12.0k fps Release with the full re-layout firing on every chart
+append. 9 new unit tests.
 
-## Parallel track — document composition (stages 9–11)
+Attribute grammar mirrors box's: `min`, `max`, `width`, `height`,
+`color`, `bg`, `radius`, plus chart-specific `type=line` and
+`capacity=N` (default 128, set at create only — resize would
+discard history).
+
+## Next — document composition (stages 9–11)
 
 Surfaced end-of-session-4 alongside stage 7f. See
 [`vision.md`](vision.md) "Document composition + the flywheel"
@@ -235,14 +241,18 @@ slider, input field, button. Each is a self-contained component
 module; the contract is fixed by stage 7. Repetitive work, not
 architectural.
 
-## Parallel / orthogonal — retained layout cache
+## Parallel — retained layout cache
 
-The walker currently re-runs on every resize. Caching the laid-out
-glyphs + quads between frames and only re-laying-out when the
-content tree or viewport changed recovers the ~6% perf loss from
-stage 6a. More important when documents grow into the multi-page
-range. Not blocking the vision work above; lands when content
-demand justifies it.
+Bumped to active-watch priority by stage 8b's measurements. The
+chart's 60 Hz feed re-walks the entire markdown document on every
+append because `state.dirty` triggers full re-layout — that's the
+13.3k fps → 12.0k fps gap. Caching laid-out glyphs + quads at the
+Element level + only re-walking elements whose ctx mutated since
+last frame recovers most of the cost. ~12k → ~16k fps is plausible
+on the current demo, more on chart-heavy docs.
+
+Sized right for after the composition track, or as a backfill when
+chart-density demos start landing.
 
 ## Parallel — markdown ↔ ANSI composability (stage 5b)
 

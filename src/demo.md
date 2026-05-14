@@ -56,8 +56,5 @@ Block extensions parse into Specs, get resolved through a host-owned registry in
 animation: "orbital_drift"
 :::
 
-:::chart {#telemetry type=line x=time y=velocity}
-time, velocity, temperature
-00:01, 7400, 24.5
-00:02, 7450, 24.8
+:::chart {#telemetry type=line min=-1 max=1 width=100% height=140}
 :::

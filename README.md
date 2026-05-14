@@ -8,15 +8,16 @@ game UI all flow through. **What we're building** is documented in
 interface to a live, component-driven runtime that an LLM can
 author, mutate, and stream updates into.
 
-End of session 4 the substrate ships: markdown source with full
-chrome, an ANSI fixture, a rainbow SDF "ATTENTION", a live blue
-rounded box driven by frontmatter state + two sliders that drag-set
-its radius and height. Session 5 added the `:::update` micro-stream
-wire format — the host streams synthetic update directives at 1.5s
-intervals to cycle the box colour through the same fast lane an LLM
-would use, all at ~13.3k fps Release. Source for the document is
-[`src/demo.md`](src/demo.md), parsed at startup through vendored
-cmark.
+End of session 5 the substrate is alive on both ends: markdown
+source with full chrome, an ANSI fixture, a rainbow SDF "ATTENTION",
+a live blue rounded box driven by frontmatter state + two sliders
+that drag-set its radius and height, and a streaming `:::chart`
+fed at 60 Hz through the `:::update` wire format — the same path an
+LLM would push deltas through. Box colour cycles every 1.5s via
+state-target updates; chart appends ~240 samples / 4 s via
+component-target updates. All at ~12k fps Release. Source for the
+document is [`src/demo.md`](src/demo.md), parsed at startup through
+vendored cmark.
 
 ```
        ┌───────────────────────────────────────────────────────┐
@@ -69,9 +70,10 @@ cmark.
   reactive state, input handling, sliders driving live geometry.
   Plus the document-composition flywheel.
 - [`docs/journey-session-5.md`](docs/journey-session-5.md) — the
-  fast lane: `:::update` wire format, component-target +
-  state-target dispatch, demo cycles box colour through the
-  streaming path at 13.3k fps.
+  fast lane and the streaming showcase: `:::update` wire format
+  (8a) + `:::chart` component (8b), state-target dispatch driving
+  the box colour and component-target dispatch driving a 60-Hz
+  sparkline trace.
 - [`docs/roadmap.md`](docs/roadmap.md) — staging path from current
   state to live-documents runtime.
 - [`chat.md`](chat.md) — the original brainstorm that started it.
@@ -255,11 +257,19 @@ TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
   arena reset between cycles. Demo cycles box colour every 1.5s
   through five shades via the state-target path; ~13.3k fps Release
   unchanged. 53 unit tests.
+- [x] **Stage 8b** — `:::chart` streaming component. Ring-buffer
+  of f32 samples; filled-column sparkline rendering (axis-aligned
+  quads, no rotated geometry needed). Opts into
+  `handle_update`: `action=append` (body=float) + `action=clear`.
+  No state binding — chart owns data opaquely, so the 8a pitfall
+  with templated attrs doesn't apply. Demo runs a 60 Hz synthetic
+  feed (layered sines + noise) through the component-target path;
+  ~12k fps Release with ~240 updates dispatched per 4s. 62 unit
+  tests total.
 
 ## What's next
 
-[`docs/roadmap.md`](docs/roadmap.md). Headline: **stage 8b** —
-`:::chart` component with `handle_update accepts action=append` for
-streaming CSV-row data, the visceral 15k-fps demo the
-component-target path was designed for. The parallel composition
-track (stages 9–11) is also unblocked.
+[`docs/roadmap.md`](docs/roadmap.md). Headline: **stage 9** —
+`:::embedded-document {src=...}` kicks off the document-composition
+flywheel from `vision.md`. The retained layout cache is also bumped
+to active-watch priority by stage 8b's per-tick re-layout cost.
