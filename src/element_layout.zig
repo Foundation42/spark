@@ -223,11 +223,16 @@ fn layoutList(
     };
 }
 
-/// Preformatted code block. Splits `raw.text` on '\n' and lays each
-/// line out as its own paragraph in the supplied style. No wrap, no
-/// whitespace collapsing — what's in `text` is what renders.
-/// `.sub_block` is the composability hook for the ANSI engine and is
-/// not handled until that engine lands.
+/// Preformatted code block. Each physical line of `raw.text` (split
+/// on '\n') is shaped as a single HB run and emitted directly —
+/// bypassing the inline-flow tokenizer because preformatted means
+/// **leading whitespace is significant and wrap is disabled**. The
+/// inline-flow path's whitespace-collapsing rules (drop leading,
+/// strip trailing) are correct for prose but wrong for code; we'd
+/// lose the indent on every continuation line otherwise.
+/// `.sub_block` is the composability hook for the ANSI engine —
+/// when it lands the engine will hand us an Element tree that
+/// renders through `layoutAndRender` recursively.
 fn layoutCodeBlock(
     content: element.CodeContent,
     origin: [2]f32,
@@ -235,18 +240,35 @@ fn layoutCodeBlock(
     ctx: *element.LayoutCtx,
     out: *element.DrawList,
 ) !element.Box {
+    _ = constraints;
     switch (content) {
         .sub_block => return error.CodeBlockSubBlockNotImplemented,
         .raw => |r| {
+            const m = ctx.fonts.metrics(r.style.font_id);
+            const hb = ctx.fonts.hbFont(r.style.font_id);
             var y = origin[1];
             var it = std.mem.splitScalar(u8, r.text, '\n');
             while (it.next()) |line| {
-                const children = [_]element.Element{
-                    .{ .text = .{ .content = line, .style = r.style } },
-                };
-                const para = element.Element{ .paragraph = &children };
-                const box = try layoutAndRender(para, .{ origin[0], y }, constraints, ctx, out);
-                y += box.h;
+                const baseline_y = y + m.ascender;
+                if (line.len > 0) {
+                    var run = try shape.shapeUtf8(ctx.allocator, hb, line);
+                    defer run.deinit();
+                    _ = try text_layout.appendShapedRun(
+                        &out.glyphs,
+                        ctx.fonts,
+                        ctx.cache,
+                        ctx.mono_atlas,
+                        ctx.color_atlas,
+                        run,
+                        r.style.font_id,
+                        origin[0],
+                        baseline_y,
+                        r.style.color,
+                        r.style.hot_color,
+                        r.style.attention,
+                    );
+                }
+                y += m.line_height;
             }
             return .{
                 .x = origin[0],
@@ -296,15 +318,37 @@ fn layoutStackV(
 }
 
 /// Lay out a flat list of inline elements as one or more lines of
-/// text. `text` runs accumulate into the current line; `line_break`
-/// flushes the current line and starts a new one. Anything else is
-/// out of place — stage 1's inline vocabulary is just text + breaks.
+/// text, wrapping on `constraints.max_w`.
 ///
-/// Per-line work mirrors Makepad's `Turtle.finish_row`: first scan
-/// the line's runs for `max(ascender)` + `max(line_height)`, then
-/// place glyphs against that resolved baseline. This is what makes
-/// mixed-size runs in one line ("body **and 28-px accent** inline")
-/// land cleanly.
+/// Algorithm:
+///   1. Tokenize children into a flat list of `InlineToken`s — each
+///      contiguous non-whitespace UTF-8 run becomes a `word`, each
+///      whitespace run becomes a `gap`, and each `line_break` becomes
+///      a `line_break` token. Whitespace splitting is ASCII space
+///      only for now (CommonMark prose is dominated by space anyway;
+///      tab + NBSP + Unicode whitespace classes land when we hit
+///      content that needs them).
+///   2. Shape each word + gap once via HarfBuzz (arena-allocated for
+///      this call so the shaped runs all free in one shot). Per-atom
+///      width is the sum of `x_advance × fscale` over its glyphs.
+///   3. Greedy line build: accumulate tokens until adding the next
+///      word would exceed `max_w`; if the line already has content,
+///      wrap before that word and start fresh. Strip trailing gaps
+///      from the wrapped line (no rendered trailing whitespace);
+///      drop leading gaps from a new line (no rendered leading
+///      whitespace).
+///   4. Per-line emit reuses Makepad-style baseline resolution —
+///      `max(ascender)` across atoms on the line, then place each
+///      atom's shaped glyphs at the resolved baseline via
+///      `appendShapedRun`.
+///
+/// What's deliberately *not* here yet:
+///   * Tabs / Unicode whitespace classes — split on ASCII space only.
+///   * Character-level break for an oversized single word — currently
+///     it overflows; future stage adds break-anywhere fallback.
+///   * Hyphenation / soft-hyphen / U+00AD handling.
+///   * Bidirectional text — HB does the per-run shaping correctly,
+///     but line composition assumes LTR pen flow.
 fn layoutInlineFlow(
     children: []const element.Element,
     origin: [2]f32,
@@ -312,65 +356,224 @@ fn layoutInlineFlow(
     ctx: *element.LayoutCtx,
     out: *element.DrawList,
 ) !element.Box {
-    _ = constraints; // wrap-policy hook: future Phase B work
-    var y = origin[1];
+    // Arena owns every shaped run we allocate in this call. One free
+    // at the end instead of N free()s — the per-frame layout pass
+    // doesn't keep these around.
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
 
-    // Accumulator for the current line's text runs. Cleared on each
-    // line_break flush.
-    var current_line = std.ArrayList(text_layout.Span).init(ctx.allocator);
-    defer current_line.deinit();
-
-    var last_baseline: f32 = 0;
-
+    // ── 1 & 2: tokenize + shape ────────────────────────────────────
+    var tokens = std.ArrayList(InlineToken).init(arena_alloc);
     for (children) |child| {
         switch (child) {
-            .text => |t| try current_line.append(.{
-                .text = t.content,
-                .style = .{
-                    .font_id = t.style.font_id,
-                    .color = t.style.color,
-                    .hot_color = t.style.hot_color,
-                    .attention = t.style.attention,
-                },
-            }),
-            .line_break => {
-                const flushed = try flushLine(current_line.items, origin[0], y, ctx, out);
-                y += flushed.line_height;
-                last_baseline = flushed.baseline;
-                current_line.clearRetainingCapacity();
-            },
-            // Anything else is out of place inside an inline flow.
-            // Block elements nesting inside a paragraph is a parser
-            // error in markdown ("can't have a list inside a single
-            // paragraph"); strict here lets us catch malformed trees
-            // before they cause subtle layout glitches.
+            .text => |t| try tokenizeText(t.content, t.style, &tokens, arena_alloc, ctx),
+            .line_break => try tokens.append(.line_break),
             else => return error.InlineElementOutsideInlineContext,
         }
     }
 
-    // Flush trailing line (the common case — most paragraphs end
-    // without an explicit hard break).
-    if (current_line.items.len > 0) {
-        const flushed = try flushLine(current_line.items, origin[0], y, ctx, out);
-        y += flushed.line_height;
-        last_baseline = flushed.baseline;
-    } else if (children.len == 0) {
-        // Empty inline flow (a `paragraph { children: &.{} }`) takes
-        // one default line of height. Picks up the first font's
-        // line_height; falls back to 16 if no fonts are loaded yet.
+    // Handle the empty-paragraph case before the wrap loop. Picks up
+    // the first font's line_height; falls back to 16 if no fonts are
+    // loaded yet. This preserves the spacer-as-empty-paragraph
+    // behavior session-1 callers relied on.
+    if (tokens.items.len == 0) {
         const lh: f32 = if (ctx.fonts.entries.items.len > 0)
             ctx.fonts.metrics(0).line_height
         else
             16;
-        y += lh;
+        return .{
+            .x = origin[0],
+            .y = origin[1],
+            .w = 0,
+            .h = lh,
+            .baseline = origin[1] + lh,
+        };
+    }
+
+    // ── 3: greedy wrap-aware line build ────────────────────────────
+    const max_x = origin[0] + constraints.max_w;
+    var y = origin[1];
+
+    // `line_start` is the first token index of the current line;
+    // `pen_x` is the running pixel cursor on it.
+    var line_start: usize = 0;
+    var pen_x: f32 = origin[0];
+    var last_baseline: f32 = 0;
+    var i: usize = 0;
+
+    while (i < tokens.items.len) : (i += 1) {
+        const tok = tokens.items[i];
+
+        // Forced break — flush current line (without including the
+        // break itself), advance past it.
+        if (isLineBreak(tok)) {
+            const lm = try emitLine(tokens.items[line_start..i], origin[0], y, ctx, out);
+            y += lm.line_height;
+            last_baseline = lm.baseline;
+            line_start = i + 1;
+            pen_x = origin[0];
+            continue;
+        }
+
+        const width = tokenWidth(tok);
+
+        // Wrap check: only wrap *before a word*, not before a gap —
+        // gaps are clean break points themselves and shouldn't push
+        // wrap decisions. Don't wrap if the line has no content yet
+        // (otherwise an oversized first word would loop forever).
+        if (isWord(tok) and line_start < i and pen_x + width > max_x) {
+            // Find the line's emit end: strip any trailing gaps so
+            // wrapped lines don't render a hanging space character.
+            var emit_end = i;
+            while (emit_end > line_start and isGap(tokens.items[emit_end - 1])) : (emit_end -= 1) {}
+
+            const lm = try emitLine(tokens.items[line_start..emit_end], origin[0], y, ctx, out);
+            y += lm.line_height;
+            last_baseline = lm.baseline;
+
+            // Skip any gap tokens between `emit_end` and `i` — those
+            // are the whitespace that "lived in" the wrap point and
+            // shouldn't render on either side of the break.
+            line_start = i;
+            pen_x = origin[0];
+        }
+
+        // Drop a leading gap at the start of a fresh line. We do
+        // this by advancing `line_start` past it; the gap atom
+        // simply never enters the rendered slice. No `pen_x`
+        // update because the gap had no width charge.
+        if (isGap(tok) and i == line_start) {
+            line_start = i + 1;
+            continue;
+        }
+
+        pen_x += width;
+    }
+
+    // Flush trailing line (the common case — most paragraphs end
+    // without an explicit hard break).
+    if (line_start < tokens.items.len) {
+        var emit_end = tokens.items.len;
+        while (emit_end > line_start and isGap(tokens.items[emit_end - 1])) : (emit_end -= 1) {}
+        if (emit_end > line_start) {
+            const lm = try emitLine(tokens.items[line_start..emit_end], origin[0], y, ctx, out);
+            y += lm.line_height;
+            last_baseline = lm.baseline;
+        }
     }
 
     return .{
         .x = origin[0],
         .y = origin[1],
-        .w = 0, // we don't measure width yet — wrapping comes later
+        .w = if (std.math.isFinite(constraints.max_w)) constraints.max_w else 0,
         .h = y - origin[1],
         .baseline = last_baseline,
+    };
+}
+
+// ── Inline-flow internals ──────────────────────────────────────────
+
+/// A single atom in the wrap pass — one shaped run plus the cached
+/// metrics the wrap algorithm needs (width, ascender, line_height).
+/// One per word or whitespace gap; LineBreak carries no atom.
+const ShapedAtom = struct {
+    run: shape.ShapedRun,
+    style: element.Style,
+    width: f32,
+    ascender: f32,
+    line_height: f32,
+};
+
+const InlineToken = union(enum) {
+    word: ShapedAtom,
+    gap: ShapedAtom,
+    line_break,
+};
+
+fn isWord(t: InlineToken) bool {
+    return switch (t) {
+        .word => true,
+        else => false,
+    };
+}
+fn isGap(t: InlineToken) bool {
+    return switch (t) {
+        .gap => true,
+        else => false,
+    };
+}
+fn isLineBreak(t: InlineToken) bool {
+    return switch (t) {
+        .line_break => true,
+        else => false,
+    };
+}
+fn tokenWidth(t: InlineToken) f32 {
+    return switch (t) {
+        .word => |w| w.width,
+        .gap => |g| g.width,
+        .line_break => 0,
+    };
+}
+fn tokenAtom(t: InlineToken) ?ShapedAtom {
+    return switch (t) {
+        .word => |w| w,
+        .gap => |g| g,
+        .line_break => null,
+    };
+}
+
+/// Walk one text element's content, splitting on runs of ASCII space
+/// into Word + Gap atoms (each shaped once and pushed to `tokens`).
+/// Empty content emits nothing.
+fn tokenizeText(
+    content: []const u8,
+    style: element.Style,
+    tokens: *std.ArrayList(InlineToken),
+    allocator: std.mem.Allocator,
+    ctx: *element.LayoutCtx,
+) !void {
+    var i: usize = 0;
+    while (i < content.len) {
+        const is_space = content[i] == ' ';
+        const start = i;
+        if (is_space) {
+            while (i < content.len and content[i] == ' ') : (i += 1) {}
+        } else {
+            while (i < content.len and content[i] != ' ') : (i += 1) {}
+        }
+        const atom = try shapeAtom(content[start..i], style, allocator, ctx);
+        if (is_space) {
+            try tokens.append(.{ .gap = atom });
+        } else {
+            try tokens.append(.{ .word = atom });
+        }
+    }
+}
+
+/// Shape one text slice through HB at the style's font, cache its
+/// width + metrics, return a `ShapedAtom` ready for layout. The
+/// returned ShapedRun is owned by `allocator` (typically an arena
+/// for the duration of one layoutInlineFlow call).
+fn shapeAtom(
+    text: []const u8,
+    style: element.Style,
+    allocator: std.mem.Allocator,
+    ctx: *element.LayoutCtx,
+) !ShapedAtom {
+    const hb = ctx.fonts.hbFont(style.font_id);
+    const run = try shape.shapeUtf8(allocator, hb, text);
+    const fscale = ctx.fonts.scale(style.font_id);
+    var width: f32 = 0;
+    for (run.glyphs) |g| width += g.x_advance * fscale;
+    const m = ctx.fonts.metrics(style.font_id);
+    return .{
+        .run = run,
+        .style = style,
+        .width = width,
+        .ascender = m.ascender,
+        .line_height = m.line_height,
     };
 }
 
@@ -379,41 +582,56 @@ const LineMetrics = struct {
     line_height: f32,
 };
 
-/// Place one line's spans at the resolved baseline, return its
-/// height-advance for the caller to bump `y` by.
-fn flushLine(
-    spans: []const text_layout.Span,
+/// Place one line's worth of shaped atoms at the resolved baseline.
+/// First pass: max(ascender) + max(line_height) across the line —
+/// Makepad-style row finish that gives mixed-size content a shared
+/// baseline. Second pass: stream each atom's glyphs through
+/// `appendShapedRun`. Returns the line's metrics so the caller can
+/// advance its `y`.
+fn emitLine(
+    line_tokens: []const InlineToken,
     pen_x: f32,
     y: f32,
     ctx: *element.LayoutCtx,
     out: *element.DrawList,
 ) !LineMetrics {
-    // First pass: deepest ascender + tallest line_height across the
-    // line. This is what tucks the tallest glyph inside the line box
-    // and gives mixed-size runs a shared baseline.
+    if (line_tokens.len == 0) {
+        // Empty line (back-to-back line_breaks). Use a sensible
+        // default so y still advances.
+        const lh: f32 = if (ctx.fonts.entries.items.len > 0)
+            ctx.fonts.metrics(0).line_height
+        else
+            16;
+        return .{ .baseline = y, .line_height = lh };
+    }
+
     var max_asc: f32 = 0;
     var max_lh: f32 = 0;
-    for (spans) |s| {
-        const m = ctx.fonts.metrics(s.style.font_id);
-        if (m.ascender > max_asc) max_asc = m.ascender;
-        if (m.line_height > max_lh) max_lh = m.line_height;
+    for (line_tokens) |tok| {
+        const atom = tokenAtom(tok) orelse continue;
+        if (atom.ascender > max_asc) max_asc = atom.ascender;
+        if (atom.line_height > max_lh) max_lh = atom.line_height;
     }
     const baseline_y = y + max_asc;
 
-    // Second pass: shape + place. Reuses session 1's per-glyph
-    // emission path (`appendShapedRun` inside `appendLineFromSpans`)
-    // unchanged — that's the work the new walker delegates to.
-    _ = try text_layout.appendLineFromSpans(
-        &out.glyphs,
-        ctx.allocator,
-        ctx.fonts,
-        ctx.cache,
-        ctx.mono_atlas,
-        ctx.color_atlas,
-        spans,
-        pen_x,
-        baseline_y,
-    );
+    var x = pen_x;
+    for (line_tokens) |tok| {
+        const atom = tokenAtom(tok) orelse continue;
+        x = try text_layout.appendShapedRun(
+            &out.glyphs,
+            ctx.fonts,
+            ctx.cache,
+            ctx.mono_atlas,
+            ctx.color_atlas,
+            atom.run,
+            atom.style.font_id,
+            x,
+            baseline_y,
+            atom.style.color,
+            atom.style.hot_color,
+            atom.style.attention,
+        );
+    }
 
     return .{ .baseline = baseline_y, .line_height = max_lh };
 }

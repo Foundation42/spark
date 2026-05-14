@@ -90,7 +90,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 2 / stage 2a (block nesting)\n", .{});
+    try stdout.print("text_engine demo — session 2 / stage 2b (block nesting + wrap)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
 
@@ -160,7 +160,7 @@ pub fn main() !void {
 
     // Subtitle.
     const subtitle_children = [_]element.Element{
-        .{ .text = .{ .content = "Stage 2a — block nesting torture test", .style = .{ .font_id = subtitle_id, .color = grey } } },
+        .{ .text = .{ .content = "Stage 2b — block nesting + word wrap", .style = .{ .font_id = subtitle_id, .color = grey } } },
     };
     const subtitle_block = element.Element{ .paragraph = &subtitle_children };
 
@@ -240,8 +240,10 @@ pub fn main() !void {
     } };
 
     // ── Block quote containing a paragraph ─────────────────────────
+    // Long-enough content to force the inline-flow wrap on the
+    // quote's shrunken max_w — the stage-2b proof point.
     const quote_p_children = [_]element.Element{
-        .{ .text = .{ .content = "Quotes indent their content; nesting propagates max_w correctly.", .style = body_style } },
+        .{ .text = .{ .content = "Quotes indent their content, and indent propagates through Constraints so the inline-flow inside this quote wraps on the narrower available width — not on the full viewport width.", .style = body_style } },
     };
     const quote_children = [_]element.Element{
         .{ .paragraph = &quote_p_children },
@@ -306,10 +308,17 @@ pub fn main() !void {
         .color_atlas = &atlas_color,
     };
 
+    // Viewport-anchored content width — 40px left + 40px right gutter
+    // on a 1280px window gives ~1200px for the document. Wrap
+    // decisions inside the tree honour this, with quotes / lists
+    // further shrinking it as their indents accumulate.
+    const content_max_w: f32 = 1280.0 - 80.0;
+    const top_constraints: element.Constraints = .{ .max_w = content_max_w };
+
     const top_box = try element_layout.layoutAndRender(
         top_stack,
         .{ 40, 40 },
-        .{},
+        top_constraints,
         &lc,
         &dl,
     );
@@ -319,7 +328,7 @@ pub fn main() !void {
     _ = try element_layout.layoutAndRender(
         sdf_block,
         .{ 40, sdf_y },
-        .{},
+        top_constraints,
         &lc,
         &dl,
     );
