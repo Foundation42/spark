@@ -27,6 +27,20 @@ pub fn build(b: *std.Build) void {
         \\
     );
 
+    // ── Shaders module (shared) ────────────────────────────────────
+    // ONE module instantiation backing both the library and the demo
+    // exe. Zig 0.14.1 forbids the same source file becoming the root
+    // of two different modules ("file exists in multiple modules"),
+    // which is exactly what happens if both add it via
+    // `addAnonymousImport` independently — they get module IDs but
+    // collide on the underlying generated `shaders.zig`. Sharing a
+    // single created module sidesteps that.
+    const shaders_module = b.createModule(.{
+        .root_source_file = shader_mod,
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ── Public Zig module for host-engine embedding ────────────────
     // `text_engine` exposes the narrow cooperative-embed surface: a
     // host engine (matryoshka, the future terminal, in-game UI) does
@@ -40,9 +54,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    text_engine_mod.addAnonymousImport("shaders", .{
-        .root_source_file = shader_mod,
-    });
+    text_engine_mod.addImport("shaders", shaders_module);
 
     // ── Standalone demo executable ─────────────────────────────────
     // Owns its own glfw window + Vulkan context, exercises the library
@@ -56,9 +68,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    exe.root_module.addAnonymousImport("shaders", .{
-        .root_source_file = shader_mod,
-    });
+    exe.root_module.addImport("shaders", shaders_module);
     exe.root_module.addImport("text_engine", text_engine_mod);
 
     // System libraries the demo links against. The library module

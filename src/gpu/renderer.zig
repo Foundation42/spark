@@ -48,6 +48,13 @@ pub const Renderer = struct {
     frame_index: u32 = 0,
     clear_color: [4]f32 = .{ 0.04, 0.04, 0.07, 1.0 },
 
+    /// Optional hook called inside vkCmdBeginRendering. Use this to
+    /// record draw work for the frame (e.g. text pipeline `recordDraw`
+    /// calls). `ctx` is whatever opaque pointer the host passed in
+    /// alongside the callback.
+    draw_fn: ?*const fn (ctx: ?*anyopaque, cmd: c.VkCommandBuffer, extent: c.VkExtent2D) void = null,
+    draw_ctx: ?*anyopaque = null,
+
     pub fn init(
         allocator: std.mem.Allocator,
         ctx: *vk.Context,
@@ -194,6 +201,7 @@ pub const Renderer = struct {
         ri.pColorAttachments = &color_att;
 
         c.vkCmdBeginRendering(cmd, &ri);
+        if (self.draw_fn) |fnp| fnp(self.draw_ctx, cmd, self.swapchain.extent);
         c.vkCmdEndRendering(cmd);
 
         // COLOR_ATTACHMENT_OPTIMAL → PRESENT_SRC_KHR for the present op.

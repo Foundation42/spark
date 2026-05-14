@@ -54,7 +54,8 @@ Vulkan (loader + headers).
 - [x] **Phase 1b** — clear-color frame loop via dynamic rendering +
   synchronization2 barriers, frames-in-flight, swapchain recreate on
   OUT_OF_DATE / SUBOPTIMAL. ~7600 fps uncapped at 1280×720.
-- [ ] **Phase 2** — FreeType-rasterised first glyph, textured quad.
+- [x] **Phase 2** — FreeType-rasterised first glyph, textured quad
+  via R8_UNORM atlas + linear sampler + straight-alpha blend.
 - [ ] **Phase 3** — HarfBuzz shaping, per-glyph SSBO, instanced draw,
   crisp body text. v1 "rich text on screen" milestone.
 - [ ] **Phase 4** — styled spans, multiple sizes/weights.
