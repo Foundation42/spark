@@ -104,13 +104,26 @@ pub fn layoutAndRender(
 
         .code_block => |cb| return layoutCodeBlock(cb.content, origin, constraints, ctx, out),
 
-        .custom => |cu| return cu.vtable.layout_and_render(
-            cu.ctx,
-            origin,
-            constraints,
-            ctx,
-            out,
-        ),
+        .custom => |cu| {
+            const box = try cu.vtable.layout_and_render(
+                cu.ctx,
+                origin,
+                constraints,
+                ctx,
+                out,
+            );
+            // Register the laid-out box on the hit-test layer iff
+            // the component accepts input — non-interactive customs
+            // (decorative quads etc.) don't appear in hit-tests.
+            if (cu.vtable.on_input != null) {
+                try out.hits.append(.{
+                    .box = box,
+                    .vtable = cu.vtable,
+                    .ctx = cu.ctx,
+                });
+            }
+            return box;
+        },
     }
 }
 

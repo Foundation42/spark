@@ -31,6 +31,7 @@ const markdown = @import("markdown.zig");
 const ansi = @import("ansi.zig");
 const component = @import("component.zig");
 const box_component = @import("components/box.zig");
+const slider_component = @import("components/slider.zig");
 const state_mod = @import("state.zig");
 
 /// Demo document — parsed by the vendored cmark + mapper into an
@@ -108,12 +109,21 @@ const FrameCtx = struct {
 
     // 7e: reactive state. The host owns it across the program
     // lifetime (extracted from demo.md's frontmatter at startup).
-    // drawCb mutates `box_color` on a timer and the registry's
-    // subscriber wiring propagates the change into the cached box
-    // component's state; the `dirty` flag triggers re-layout.
+    // Mutations propagate through the registry's subscribers to
+    // the cached component instances; the `dirty` flag triggers
+    // re-layout.
     state: *state_mod.State,
-    next_state_change_ms: i64,
-    color_idx: u8 = 0,
+
+    // 7f: input. Polled once per frame to detect button / position
+    // transitions. `captured` holds the hit the most recent
+    // mouse_down landed on — subsequent mouse_move + mouse_up go to
+    // the same target regardless of containment (standard
+    // pointer-capture pattern; otherwise drags break the moment the
+    // cursor exits the thumb's box).
+    mouse_x: f32 = 0,
+    mouse_y: f32 = 0,
+    mouse_down: bool = false,
+    captured: ?element.Hit = null,
 
     /// Re-run the layout pass for the current viewport. Clears the
     /// DrawList, lays out all three sub-trees at the new `max_w`,
@@ -154,33 +164,14 @@ const FrameCtx = struct {
     }
 };
 
-/// Demo's reactive proof-of-life: the box's `color` attr resolves
-/// through `${state.box_color}`. Cycling this string fires the
-/// registry's subscriber, which calls factory.update on the cached
-/// instance and flips `state.dirty` so the frame loop re-runs
-/// layout.
-const cycle_colors = [_][]const u8{ "blue", "green", "orange", "purple", "cyan" };
-const STATE_CHANGE_INTERVAL_MS: i64 = 1500;
-
 fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) void {
     const fc: *FrameCtx = @ptrCast(@alignCast(ctx.?));
 
-    // ── Reactive state tick ────────────────────────────────────────
-    // Every STATE_CHANGE_INTERVAL_MS, advance the box color through
-    // the cycle. set() fires the registry's subscriber → factory
-    // update → box component re-reads its color from the new spec
-    // → state.dirty becomes true.
-    const now_ms = std.time.milliTimestamp();
-    if (now_ms >= fc.next_state_change_ms) {
-        fc.color_idx = (fc.color_idx + 1) % @as(u8, @intCast(cycle_colors.len));
-        fc.state.set("box_color", cycle_colors[fc.color_idx]) catch {};
-        fc.next_state_change_ms = now_ms + STATE_CHANGE_INTERVAL_MS;
-    }
-
     // ── Event-driven relayout ──────────────────────────────────────
     // Two triggers: viewport changed (resize), or state mutated
-    // (reactive). First call's last_extent={0,0} guarantees an
-    // initial layout before the first draw.
+    // (input-driven via the slider component, stage 7f). First
+    // call's last_extent={0,0} guarantees an initial layout before
+    // the first draw.
     const extent_changed = extent.width != fc.last_extent.width or extent.height != fc.last_extent.height;
     if (extent_changed or fc.state.dirty) {
         fc.runLayout(extent) catch {
@@ -214,6 +205,83 @@ fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) 
     // ── Record draws — quads first, glyphs on top ──────────────────
     fc.quad_pipeline.recordDraw(cmd, extent, @intCast(fc.dl.quads.items.len));
     fc.text_pipeline.recordDraw(cmd, extent, @intCast(fc.dl.glyphs.items.len));
+}
+
+// ── Input plumbing (stage 7f) ──────────────────────────────────────
+//
+// Poll-based: once per frame, ask glfw for the current cursor
+// position + primary button state, diff against the previous frame,
+// and synthesize InputEvents. Pointer-capture semantics: whichever
+// hit the most recent mouse_down landed on receives every
+// subsequent mouse_move + mouse_up until release, regardless of
+// whether the cursor stays inside its box. Without this drags break
+// at the boundary.
+
+fn processInput(window: *win.Window, fc: *FrameCtx) !void {
+    var x_raw: f64 = 0;
+    var y_raw: f64 = 0;
+    win.c.glfwGetCursorPos(window.handle, &x_raw, &y_raw);
+    const x: f32 = @floatCast(x_raw);
+    const y: f32 = @floatCast(y_raw);
+    const button_now = win.c.glfwGetMouseButton(window.handle, win.c.GLFW_MOUSE_BUTTON_LEFT) == win.c.GLFW_PRESS;
+
+    const prev_down = fc.mouse_down;
+    const moved = x != fc.mouse_x or y != fc.mouse_y;
+    fc.mouse_x = x;
+    fc.mouse_y = y;
+    fc.mouse_down = button_now;
+
+    if (button_now and !prev_down) {
+        // Press transition. Hit-test in reverse so the deepest
+        // (last-emitted) element wins; capture for the duration of
+        // the press.
+        if (findHit(fc.dl.hits.items, x, y)) |hit| {
+            fc.captured = hit;
+            try dispatch(hit, .{ .mouse_down = .{
+                .local = .{ x - hit.box.x, y - hit.box.y },
+                .button = 0,
+                .button_down = true,
+            } }, fc.state);
+        }
+    } else if (button_now and prev_down and moved) {
+        // Held + cursor moved → drag. Route to captured.
+        if (fc.captured) |hit| {
+            try dispatch(hit, .{ .mouse_move = .{
+                .local = .{ x - hit.box.x, y - hit.box.y },
+                .button = 0,
+                .button_down = true,
+            } }, fc.state);
+        }
+    } else if (!button_now and prev_down) {
+        // Release transition.
+        if (fc.captured) |hit| {
+            try dispatch(hit, .{ .mouse_up = .{
+                .local = .{ x - hit.box.x, y - hit.box.y },
+                .button = 0,
+                .button_down = false,
+            } }, fc.state);
+            fc.captured = null;
+        }
+    }
+}
+
+fn findHit(hits: []const element.Hit, x: f32, y: f32) ?element.Hit {
+    var i = hits.len;
+    while (i > 0) {
+        i -= 1;
+        const h = hits[i];
+        if (x >= h.box.x and x < h.box.x + h.box.w and
+            y >= h.box.y and y < h.box.y + h.box.h)
+        {
+            return h;
+        }
+    }
+    return null;
+}
+
+fn dispatch(hit: element.Hit, event: element.InputEvent, state: *state_mod.State) !void {
+    const on_input = hit.vtable.on_input orelse return;
+    try on_input(hit.ctx, event, @ptrCast(state));
 }
 
 /// HSV → RGB conversion using the standard six-sextant formula. `h`
@@ -351,6 +419,7 @@ pub fn main() !void {
     var registry = component.Registry.init(allocator);
     defer registry.deinit();
     try registry.register("box", box_component.factory);
+    try registry.register("slider", slider_component.factory);
 
     // ── Host-owned reactive state (stage 7e) ───────────────────────
     // Frontmatter parses once at startup; the State persists across
@@ -420,7 +489,6 @@ pub fn main() !void {
         .dl = &dl,
         .start_ms = start_ms,
         .state = &host_state,
-        .next_state_change_ms = start_ms + STATE_CHANGE_INTERVAL_MS,
     };
     rdr.draw_fn = drawCb;
     rdr.draw_ctx = @ptrCast(&frame_ctx);
@@ -438,6 +506,7 @@ pub fn main() !void {
     var frame_count: u64 = 0;
     while (!window.shouldClose()) {
         window.pollEvents();
+        processInput(&window, &frame_ctx) catch {};
         try rdr.drawFrame();
         frame_count += 1;
         if (exit_after_ms) |limit| {

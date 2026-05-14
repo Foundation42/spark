@@ -132,11 +132,31 @@ Release through the cycle, 99.6% cache hit rate.
 factory.update on bound component` and `reactive: gc unsubscribes
 the binding`.
 
-## Next — input handling (stage 7f)
+## Shipped — input handling (stage 7f)
 
-Walker grows a parallel `hitTest(point, root) → ?Element` pass.
-Per-component `onInput` vtable callback. The slider → state
-mutation → chart title refresh loop closes here.
+`ElementVTable` grew an optional `on_input` callback. The walker
+appends an entry to `DrawList.hits` for any `custom` element that
+exposes `on_input` — a flat layer of (laid-out Box, vtable, ctx)
+tuples we walk in reverse on each mouse event so the deepest hit
+wins. No bubbling at 7f; lands when a real use-case needs it.
+
+`InputEvent` is a closed union — `mouse_down` / `mouse_up` /
+`mouse_move` with a `MouseEvent` payload carrying `local`
+(relative to the hit's box), `button`, and `button_down` (the
+held-state flag, so mouse_move doubles as the drag channel).
+
+`main.zig` polls `glfwGetCursorPos` + `glfwGetMouseButton` each
+frame, diffs vs the previous frame, and dispatches with pointer
+capture: the hit that received `mouse_down` keeps receiving
+events until release, so drags don't break when the cursor
+leaves the thumb's box.
+
+First interactive component: `src/components/slider.zig`. Track +
+filled track + thumb visuals; drag updates a numeric state path
+declared via the `target` attribute. The demo wires two — radius
+and height for the box. Drag → state.set → registry binding
+fires → factory.update on `:::box` → `state.dirty` triggers
+re-layout → new quad. 43 unit tests.
 
 ## Then — `:::update` micro-stream path (stage 8)
 

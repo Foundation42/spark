@@ -223,13 +223,21 @@ TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
   does substitution at resolve time. `state.dirty` drives
   re-layout. Demo cycles `box_color` every 1.5s through five
   shades; ~13.3k fps Release. 39 unit tests.
+- [x] **Stage 7f** — input handling. `ElementVTable` gains optional
+  `on_input`; walker registers interactive elements in
+  `DrawList.hits` (laid-out box + vtable + ctx). Main loop polls
+  glfw cursor + button state, diffs, dispatches `mouse_down` /
+  `mouse_move` / `mouse_up` with pointer capture (deepest hit on
+  press keeps events until release). First interactive component:
+  `:::slider` — drag-to-set a numeric `target` state path. Demo
+  ships two sliders driving the box's radius and height; the
+  whole loop (drag → state.set → registry binding → factory.update
+  → re-layout) runs at ~13.3k fps. 43 unit tests.
 
 ## What's next
 
-[`docs/roadmap.md`](docs/roadmap.md). Headline for the rest of
-session 4: **input handling** (hit-testing through the laid-out
-Element tree, per-component `onInput` callback, slider → state
-mutation → reactive update closes the loop end-to-end), then the
-**`:::update` micro-stream hot path** that lets an LLM push
-deltas into a live chart at 15k fps without touching document
-layout.
+[`docs/roadmap.md`](docs/roadmap.md). Headline: the **`:::update`
+micro-stream hot path** that lets an LLM push deltas into a live
+component at microsecond latency, bypassing parse + layout
+entirely — the fast lane the reactive substrate from 7e was
+built to enable.

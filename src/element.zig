@@ -226,15 +226,13 @@ pub const Element = union(enum) {
     },
 };
 
-/// vtable for `custom` elements. Two-method contract that mirrors
-/// the shape of the named variants' walker dispatch — measure, then
-/// render. The walker hands both ctx + the resolved origin; the
-/// custom element returns its `Box`.
+/// vtable for `custom` elements. Two slots: a required
+/// layout-and-render and an optional input handler.
 ///
-/// Reserved for stage 3+: `input` for hit-testing / event dispatch.
-/// Layout boxes are already queryable from the returned `Box`, so
-/// input plumbing slots in without changing the layout/render
-/// contract.
+/// The input slot was reserved across earlier stages and lands at
+/// stage 7f. Components without `on_input` (the common case — most
+/// chrome doesn't react to input) leave it null and never enter the
+/// hit-test layer.
 pub const ElementVTable = struct {
     layout_and_render: *const fn (
         ctx: *anyopaque,
@@ -243,6 +241,47 @@ pub const ElementVTable = struct {
         lc: *LayoutCtx,
         out: *DrawList,
     ) anyerror!Box,
+    /// Optional. Called by the host's event dispatcher when a mouse
+    /// event hit-tests inside the component's box. `state` is the
+    /// host-owned reactive state — handlers mutate it via `set` to
+    /// drive other components reactively.
+    on_input: ?*const fn (
+        ctx: *anyopaque,
+        event: InputEvent,
+        state: *anyopaque,
+    ) anyerror!void = null,
+};
+
+/// One input event delivered to a component's `on_input`. Mouse-only
+/// for stage 7f; keyboard / IME land when a text-input component
+/// arrives. `local` is the mouse position **relative to the
+/// component's laid-out top-left** (so a slider doesn't need to
+/// recompute its origin to figure out where the thumb dropped).
+pub const InputEvent = union(enum) {
+    mouse_down: MouseEvent,
+    mouse_up: MouseEvent,
+    mouse_move: MouseEvent,
+};
+
+pub const MouseEvent = struct {
+    local: [2]f32,
+    /// 0 = primary (left), 1 = secondary (right), 2 = middle.
+    button: u8,
+    /// True while the corresponding button is held. Lets `mouse_move`
+    /// double as a "drag" channel without a separate event kind.
+    button_down: bool,
+};
+
+/// One hit-test layer entry — the laid-out box of an interactive
+/// element. Appended to `DrawList.hits` during `layoutAndRender` only
+/// when the element exposes a non-null `on_input`. The dispatcher
+/// walks `hits` in **reverse** so the deepest-laid element wins
+/// (analogous to the layout walker's natural depth-first emit
+/// order).
+pub const Hit = struct {
+    box: Box,
+    vtable: *const ElementVTable,
+    ctx: *anyopaque,
 };
 
 /// Parent-imposed bounds. Stage 1 walker mostly ignores these — text
@@ -428,6 +467,11 @@ pub const LayoutCtx = struct {
 pub const DrawList = struct {
     glyphs: std.ArrayList(tp.GlyphInstance),
     quads: std.ArrayList(qp.QuadInstance),
+    /// Hit-test layer. Populated alongside glyphs / quads during the
+    /// layout walk; only elements with a non-null `vtable.on_input`
+    /// register an entry. Walked in reverse on each mouse event so
+    /// the deepest-laid interactive element wins.
+    hits: std.ArrayList(Hit),
     // future:
     // lines:  std.ArrayList(LineInstance),
     // images: std.ArrayList(ImageInstance),
@@ -436,12 +480,14 @@ pub const DrawList = struct {
         return .{
             .glyphs = std.ArrayList(tp.GlyphInstance).init(allocator),
             .quads = std.ArrayList(qp.QuadInstance).init(allocator),
+            .hits = std.ArrayList(Hit).init(allocator),
         };
     }
 
     pub fn deinit(self: *DrawList) void {
         self.glyphs.deinit();
         self.quads.deinit();
+        self.hits.deinit();
         self.* = undefined;
     }
 
@@ -450,6 +496,7 @@ pub const DrawList = struct {
     pub fn clearRetainingCapacity(self: *DrawList) void {
         self.glyphs.clearRetainingCapacity();
         self.quads.clearRetainingCapacity();
+        self.hits.clearRetainingCapacity();
     }
 };
 

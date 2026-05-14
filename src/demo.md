@@ -3,6 +3,7 @@ state:
   box_color: blue
   box_width: 240
   box_radius: 12
+  box_height: 80
   target_id: "SAT-04"
 ---
 
@@ -42,7 +43,13 @@ fn render(elem: Element) !void {
 
 Block extensions parse, thread through the mapper as a sidecar, and re-materialise as `custom` Elements. The registry doesn't exist yet — every directive renders as a *missing-component* fallback panel. Real components arrive at stage 7c.
 
-:::box {#bx color=${state.box_color} width=${state.box_width} height=80 radius=${state.box_radius}}
+:::box {#bx color=${state.box_color} width=${state.box_width} height=${state.box_height} radius=${state.box_radius}}
+:::
+
+:::slider {#radius_slider target=box_radius min=0 max=40 value=${state.box_radius} width=320}
+:::
+
+:::slider {#height_slider target=box_height min=20 max=120 value=${state.box_height} width=320}
 :::
 
 :::3d-scene {#orbit-view src="models/${state.target_id}.gltf" width=100% height=400px}
