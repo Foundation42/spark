@@ -31,6 +31,20 @@ pub const AtlasKind = enum(u32) {
     sdf = 2,
 };
 
+/// Zero-padding added around an SDF glyph bitmap before distance-
+/// field generation. Without this, FreeType's tight bounding box
+/// puts every "outside-the-letter" pixel within 1–4 px of the
+/// letter outline, so every SDF value across the rect lands in the
+/// 0.3..0.5 range — which overlaps the fragment's glow band and
+/// lights up the entire quad with a warm rectangle behind the
+/// letter. Padding gives the SDF generator room to descend cleanly
+/// to "far outside" (= byte 0) at the rect edges, so glow only
+/// fires in the 1–3 px ring around the letter contour. The
+/// dst-rect grows correspondingly and bearings shift so the letter
+/// still lands at the right pen position. Set ≥ the SDF radius
+/// (8) so the boundary is guaranteed to read as "far outside".
+const SDF_PAD: u32 = 6;
+
 pub const GlyphKey = struct {
     font_id: registry_mod.FontId,
     glyph_id: u32,
@@ -105,15 +119,36 @@ pub const GlyphCache = struct {
         var pixels: []u8 = &.{};
         defer if (pixels.len > 0) self.allocator.free(pixels);
 
-        if (bitmap.width != 0 and bitmap.height != 0) {
+        // SDF gets a padded bitmap so the distance field has room
+        // for "far outside" gradient at its edges. Other lanes use
+        // the tight FT bitmap dimensions as-is.
+        const has_pixels = bitmap.width != 0 and bitmap.height != 0;
+        const out_w: u32 = if (kind == .sdf and has_pixels) bitmap.width + 2 * SDF_PAD else bitmap.width;
+        const out_h: u32 = if (kind == .sdf and has_pixels) bitmap.height + 2 * SDF_PAD else bitmap.height;
+
+        if (has_pixels) {
             pixels = switch (kind) {
                 .mono => try packMonoBitmap(self.allocator, bitmap),
                 .color => try packBgraAsRgba(self.allocator, bitmap),
                 .sdf => blk: {
                     const mono = try packMonoBitmap(self.allocator, bitmap);
                     defer self.allocator.free(mono);
-                    const sdf_buf = try self.allocator.alloc(u8, mono.len);
-                    sdf.generate(bitmap.width, bitmap.height, mono, sdf_buf);
+
+                    // Zero-pad the mono bitmap into a (W+2P, H+2P)
+                    // buffer with the letter content at offset (P, P).
+                    // SDF generation then sees a clean "far outside"
+                    // ring around the letter on all sides.
+                    const padded = try self.allocator.alloc(u8, out_w * out_h);
+                    defer self.allocator.free(padded);
+                    @memset(padded, 0);
+                    var ry: u32 = 0;
+                    while (ry < bitmap.height) : (ry += 1) {
+                        const dst_off = (ry + SDF_PAD) * out_w + SDF_PAD;
+                        @memcpy(padded[dst_off..][0..bitmap.width], mono[ry * bitmap.width ..][0..bitmap.width]);
+                    }
+
+                    const sdf_buf = try self.allocator.alloc(u8, out_w * out_h);
+                    sdf.generate(out_w, out_h, padded, sdf_buf);
                     break :blk sdf_buf;
                 },
             };
@@ -121,11 +156,20 @@ pub const GlyphCache = struct {
 
         // Mono and SDF share the R8 atlas; colour lives in RGBA8.
         const target = if (kind == .color) color_atlas else mono_atlas;
-        const rect = try target.addGlyph(bitmap.width, bitmap.height, pixels);
+        const rect = try target.addGlyph(out_w, out_h, pixels);
+
+        // SDF entry's bearings shift to compensate for the padding.
+        // FT's bearing_x is positive right of pen origin → subtract
+        // padding so the padded top-left lands `SDF_PAD` left of the
+        // unpadded one. FT's bearing_y is positive ABOVE baseline →
+        // add padding because the padded top is `SDF_PAD` higher.
+        const pad_i: i32 = @intCast(SDF_PAD);
+        const entry_bearing_x: i32 = if (kind == .sdf and has_pixels) bitmap.bearing_x - pad_i else bitmap.bearing_x;
+        const entry_bearing_y: i32 = if (kind == .sdf and has_pixels) bitmap.bearing_y + pad_i else bitmap.bearing_y;
         const entry = GlyphEntry{
             .rect = rect,
-            .bearing_x = bitmap.bearing_x,
-            .bearing_y = bitmap.bearing_y,
+            .bearing_x = entry_bearing_x,
+            .bearing_y = entry_bearing_y,
             .kind = kind,
         };
         try self.map.put(key, entry);
