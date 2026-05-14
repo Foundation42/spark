@@ -69,11 +69,12 @@ pub const ContainerLayout = enum {
 };
 
 /// Content of a `code_block`. Either raw preformatted text (renders
-/// in a single monospace style), or the result of running another
-/// layout engine over the inner source (the composability hook —
-/// markdown's ` ```ansi ` fence dispatches to the ANSI engine and
-/// stuffs the resulting tree in here). Defined in stage 1; consumed
-/// in stage B when `code_block` lands in the walker.
+/// in a single monospace style, newlines split into physical lines —
+/// no wrap), or the result of running another layout engine over the
+/// inner source (the composability hook — markdown's ` ```ansi `
+/// fence dispatches to the ANSI engine and stuffs the resulting tree
+/// in here). Stage 2a handles `.raw`; `.sub_block` lands when the
+/// ANSI engine arrives.
 pub const CodeContent = union(enum) {
     raw: struct { text: []const u8, style: Style },
     sub_block: *const Element,
@@ -121,6 +122,47 @@ pub const Element = union(enum) {
         layout: ContainerLayout,
         children: []const Element,
         gap: f32 = 0,
+    },
+
+    /// Explicit vertical space. Cleaner than `paragraph { children:
+    /// &.{} }` for inserting gaps between blocks where per-block
+    /// margins aren't quite right.
+    spacer: struct { height: f32 },
+
+    /// Ordered or unordered list. Items are typically `list_item`
+    /// elements; the walker renders a marker (• for unordered, "N."
+    /// for ordered) at a fixed indent and recurses item content at a
+    /// deeper indent. `start` selects the first number for ordered
+    /// lists (defaults to 1).
+    list: struct {
+        ordered: bool,
+        items: []const Element,
+        marker_style: Style,
+        start: u32 = 1,
+    },
+
+    /// One list entry — a vertical stack of its own block content.
+    /// Multiple paragraphs / nested lists per item are normal in
+    /// CommonMark; the walker treats children as a stack_v.
+    list_item: struct {
+        children: []const Element,
+    },
+
+    /// Block quote. Children are blocks (typically paragraphs); the
+    /// walker indents them. The left bar visual is deferred until the
+    /// quad/line pipeline lands (stage 4+) — for now, indent alone
+    /// distinguishes the quote.
+    quote: struct {
+        children: []const Element,
+    },
+
+    /// Preformatted text block. Single style throughout (no inline
+    /// styling within). Newlines in `content.raw.text` split into
+    /// physical lines — no wrapping, no whitespace collapsing.
+    /// `.sub_block` (cooperative content from another layout engine,
+    /// e.g. ANSI) is reserved but not yet rendered.
+    code_block: struct {
+        content: CodeContent,
     },
 
     // ── open escape hatch ───────────────────────────────────────────

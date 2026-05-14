@@ -38,7 +38,32 @@ pub const Error = error{
     /// elements are valid (e.g. as a direct child of a container).
     /// Inline content belongs inside a `paragraph` or `heading`.
     InlineElementOutsideInlineContext,
+    /// `code_block` with `.sub_block` content was encountered — this
+    /// is the composability hook for the ANSI engine et al., but the
+    /// renderer for it lands when that engine does (post-2a).
+    CodeBlockSubBlockNotImplemented,
 } || std.mem.Allocator.Error || error{ Overflow, SsboOverflow };
+
+// ── Stage-2a layout constants ──────────────────────────────────────
+// Hardcoded indents and gaps used by block kinds that don't carry
+// their own. These move into a `Theme` struct in LayoutCtx during
+// stage 2c — they're walker-baked for now so we can ship nesting
+// without inventing the theme abstraction yet.
+
+/// Horizontal offset from the list's left edge to where the marker
+/// glyph starts.
+const LIST_MARKER_INDENT: f32 = 8;
+/// Horizontal offset from the list's left edge to where item content
+/// starts. The marker sits in the gap between this and
+/// `LIST_MARKER_INDENT`.
+const LIST_CONTENT_INDENT: f32 = 32;
+/// Vertical space between adjacent list items.
+const LIST_ITEM_GAP: f32 = 2;
+/// Horizontal indent applied to block-quote children.
+const QUOTE_INDENT: f32 = 20;
+/// Vertical space between siblings inside a list_item / quote when
+/// they don't already have margins of their own.
+const BLOCK_CHILD_GAP: f32 = 4;
 
 /// Lay out + render `elem` with its top-left at `origin`. Returns the
 /// element's measured `Box` (in display pixels). Constraints are
@@ -74,6 +99,22 @@ pub fn layoutAndRender(
             .stack_v => return layoutStackV(co.children, co.gap, origin, constraints, ctx, out),
         },
 
+        .spacer => |sp| return .{
+            .x = origin[0],
+            .y = origin[1],
+            .w = 0,
+            .h = sp.height,
+            .baseline = 0,
+        },
+
+        .list => |li| return layoutList(li, origin, constraints, ctx, out),
+
+        .list_item => |it| return layoutStackV(it.children, BLOCK_CHILD_GAP, origin, constraints, ctx, out),
+
+        .quote => |q| return layoutQuote(q.children, origin, constraints, ctx, out),
+
+        .code_block => |cb| return layoutCodeBlock(cb.content, origin, constraints, ctx, out),
+
         .custom => |cu| return cu.vtable.layout_and_render(
             cu.ctx,
             origin,
@@ -81,6 +122,140 @@ pub fn layoutAndRender(
             ctx,
             out,
         ),
+    }
+}
+
+/// Shrink `constraints.max_w` by the given indent. Used by quote /
+/// list to propagate "less width is available" to nested content.
+/// Other constraint fields pass through unchanged.
+fn shrinkConstraints(c: element.Constraints, indent: f32) element.Constraints {
+    var out_c = c;
+    if (std.math.isFinite(c.max_w) and c.max_w > indent) {
+        out_c.max_w = c.max_w - indent;
+    }
+    return out_c;
+}
+
+/// Block quote — indent children horizontally, recurse as stack_v.
+/// Left-bar visual is deferred until quad/line primitives land.
+fn layoutQuote(
+    children: []const element.Element,
+    origin: [2]f32,
+    constraints: element.Constraints,
+    ctx: *element.LayoutCtx,
+    out: *element.DrawList,
+) !element.Box {
+    const inner_origin: [2]f32 = .{ origin[0] + QUOTE_INDENT, origin[1] };
+    const inner_constraints = shrinkConstraints(constraints, QUOTE_INDENT);
+    const inner_box = try layoutStackV(children, BLOCK_CHILD_GAP, inner_origin, inner_constraints, ctx, out);
+    return .{
+        .x = origin[0],
+        .y = origin[1],
+        .w = inner_box.w + QUOTE_INDENT,
+        .h = inner_box.h,
+        .baseline = 0,
+    };
+}
+
+/// List — iterate items, render a marker (• for unordered, "N." for
+/// ordered) at `LIST_MARKER_INDENT`, then recurse each item's content
+/// at `LIST_CONTENT_INDENT`. Marker baseline alignment with the first
+/// line of item content is implicit: both lay out from the same y,
+/// and per-line baseline resolution lands them on the same baseline
+/// when they share line metrics.
+fn layoutList(
+    li: anytype,
+    origin: [2]f32,
+    constraints: element.Constraints,
+    ctx: *element.LayoutCtx,
+    out: *element.DrawList,
+) !element.Box {
+    var y = origin[1];
+    var index: u32 = li.start;
+    const inner_constraints = shrinkConstraints(constraints, LIST_CONTENT_INDENT);
+
+    for (li.items, 0..) |item, i| {
+        if (i != 0) y += LIST_ITEM_GAP;
+
+        // ── Marker ─────────────────────────────────────────────────
+        // Compose a tiny inline-flow on the fly: one text run with the
+        // marker glyph(s). Stack buffer for ordered-list digits.
+        var marker_buf: [16]u8 = undefined;
+        const marker_text = if (li.ordered) blk: {
+            break :blk std.fmt.bufPrint(&marker_buf, "{d}.", .{index}) catch "•";
+        } else "•";
+
+        const marker_children = [_]element.Element{
+            .{ .text = .{ .content = marker_text, .style = li.marker_style } },
+        };
+        const marker_paragraph = element.Element{ .paragraph = &marker_children };
+        // Marker's glyphs land in the draw list; its returned Box.h
+        // is discarded because the item's content advances `y` for
+        // us (marker and content share the first line — see comment
+        // above).
+        _ = try layoutAndRender(
+            marker_paragraph,
+            .{ origin[0] + LIST_MARKER_INDENT, y },
+            constraints,
+            ctx,
+            out,
+        );
+
+        // ── Item content ───────────────────────────────────────────
+        const item_box = try layoutAndRender(
+            item,
+            .{ origin[0] + LIST_CONTENT_INDENT, y },
+            inner_constraints,
+            ctx,
+            out,
+        );
+        y += item_box.h;
+
+        index += 1;
+    }
+
+    return .{
+        .x = origin[0],
+        .y = origin[1],
+        .w = 0,
+        .h = y - origin[1],
+        .baseline = 0,
+    };
+}
+
+/// Preformatted code block. Splits `raw.text` on '\n' and lays each
+/// line out as its own paragraph in the supplied style. No wrap, no
+/// whitespace collapsing — what's in `text` is what renders.
+/// `.sub_block` is the composability hook for the ANSI engine and is
+/// not handled until that engine lands.
+fn layoutCodeBlock(
+    content: element.CodeContent,
+    origin: [2]f32,
+    constraints: element.Constraints,
+    ctx: *element.LayoutCtx,
+    out: *element.DrawList,
+) !element.Box {
+    switch (content) {
+        .sub_block => return error.CodeBlockSubBlockNotImplemented,
+        .raw => |r| {
+            var y = origin[1];
+            var it = std.mem.splitScalar(u8, r.text, '\n');
+            while (it.next()) |line| {
+                const children = [_]element.Element{
+                    .{ .text = .{ .content = line, .style = r.style } },
+                };
+                const para = element.Element{ .paragraph = &children };
+                const box = try layoutAndRender(para, .{ origin[0], y }, constraints, ctx, out);
+                y += box.h;
+            }
+            return .{
+                .x = origin[0],
+                .y = origin[1],
+                .w = 0,
+                .h = y - origin[1],
+                .baseline = 0,
+            };
+        },
     }
 }
 

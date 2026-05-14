@@ -90,7 +90,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 2 / stage 1 (element tree)\n", .{});
+    try stdout.print("text_engine demo — session 2 / stage 2a (block nesting)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
 
@@ -114,6 +114,8 @@ pub fn main() !void {
 
     const font_path = std.posix.getenv("TEXT_ENGINE_FONT") orelse
         "/usr/share/fonts/TTF/DejaVuSans.ttf";
+    const mono_path = std.posix.getenv("TEXT_ENGINE_MONO_FONT") orelse
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf";
     const emoji_path = std.posix.getenv("TEXT_ENGINE_EMOJI_FONT") orelse
         "/usr/share/fonts/noto/NotoColorEmoji.ttf";
 
@@ -128,60 +130,150 @@ pub fn main() !void {
     const body_id = try fonts.load(font_path.ptr, 22);
     const accent_id = try fonts.load(font_path.ptr, 28);
     const emoji_id = try fonts.load(emoji_path.ptr, 28);
+    const mono_id = try fonts.load(mono_path.ptr, 18);
     const sdf_id = try fonts.loadSdf(font_path.ptr, 44);
 
     var cache = glyph_cache_mod.GlyphCache.init(allocator);
     defer cache.deinit();
 
     // ── Compose the document as an Element tree ────────────────────
+    // Stage 2a torture test: every block kind nested at least once so
+    // the contract sees the shapes it'll have to handle from a real
+    // markdown parser. Hand-crafted by construction — stage 3's
+    // parser will produce the same tree from a `.md` file.
     const white: [4]f32 = .{ 0.95, 0.95, 0.98, 1.0 };
     const grey: [4]f32 = .{ 0.58, 0.62, 0.72, 1.0 };
     const yellow: [4]f32 = .{ 0.99, 0.84, 0.32, 1.0 };
     const orange: [4]f32 = .{ 0.99, 0.55, 0.30, 1.0 };
+    const code_color: [4]f32 = .{ 0.72, 0.88, 1.0, 1.0 };
+    const marker_color: [4]f32 = .{ 0.65, 0.72, 0.85, 1.0 };
 
-    // Heading: one inline `text` run at heading size.
+    const body_style: element.Style = .{ .font_id = body_id, .color = white };
+    const marker_style: element.Style = .{ .font_id = body_id, .color = marker_color };
+    const code_style: element.Style = .{ .font_id = mono_id, .color = code_color };
+
+    // Heading.
     const heading_children = [_]element.Element{
         .{ .text = .{ .content = "text_engine", .style = .{ .font_id = heading_id, .color = white } } },
     };
     const heading_block = element.Element{ .heading = .{ .level = 1, .content = &heading_children } };
 
-    // Subtitle paragraph.
+    // Subtitle.
     const subtitle_children = [_]element.Element{
-        .{ .text = .{ .content = "Session 2 — element tree contract (stage 1)", .style = .{ .font_id = subtitle_id, .color = grey } } },
+        .{ .text = .{ .content = "Stage 2a — block nesting torture test", .style = .{ .font_id = subtitle_id, .color = grey } } },
     };
     const subtitle_block = element.Element{ .paragraph = &subtitle_children };
 
-    // Spacer: empty paragraph — picks up one default line_height.
-    // Phase B will replace this hack with per-block margins.
-    const spacer_block = element.Element{ .paragraph = &.{} };
-
-    // Mixed-size, mixed-colour inline runs in one paragraph.
+    // Mixed-size, mixed-colour inline (session-1 demo line, preserved
+    // for regression coverage).
     const mixed_children = [_]element.Element{
-        .{ .text = .{ .content = "Mix ", .style = .{ .font_id = body_id, .color = white } } },
+        .{ .text = .{ .content = "Mix ", .style = body_style } },
         .{ .text = .{ .content = "fonts", .style = .{ .font_id = body_id, .color = yellow } } },
-        .{ .text = .{ .content = ", ", .style = .{ .font_id = body_id, .color = white } } },
+        .{ .text = .{ .content = ", ", .style = body_style } },
         .{ .text = .{ .content = "sizes", .style = .{ .font_id = accent_id, .color = orange } } },
-        .{ .text = .{ .content = ", and colours inline.", .style = .{ .font_id = body_id, .color = white } } },
+        .{ .text = .{ .content = ", colours inline; ", .style = body_style } },
+        .{ .text = .{ .content = "🎉🦊🚀", .style = .{ .font_id = emoji_id, .color = white } } },
+        .{ .text = .{ .content = " emoji.", .style = body_style } },
     };
     const mixed_block = element.Element{ .paragraph = &mixed_children };
 
-    // Emoji paragraph — body text wrapped around a colour-emoji run.
-    const emoji_children = [_]element.Element{
-        .{ .text = .{ .content = "Inline emoji: ", .style = .{ .font_id = body_id, .color = white } } },
-        .{ .text = .{ .content = "🎉🦊🚀❤️🎨🌍", .style = .{ .font_id = emoji_id, .color = white } } },
-        .{ .text = .{ .content = "  in body text.", .style = .{ .font_id = body_id, .color = white } } },
+    // ── Unordered list with nested ordered list ────────────────────
+    // Builds bottom-up because each list_item carries a child slice
+    // that needs to live before its parent references it.
+    const item1_p_children = [_]element.Element{
+        .{ .text = .{ .content = "block kinds nest", .style = body_style } },
     };
-    const emoji_block = element.Element{ .paragraph = &emoji_children };
+    const item1_children = [_]element.Element{
+        .{ .paragraph = &item1_p_children },
+    };
 
-    // Top stack: vertical container, no gap (spacer paragraphs handle
-    // gaps for stage 1).
+    const item2_p_children = [_]element.Element{
+        .{ .text = .{ .content = "indent shrinks ", .style = body_style } },
+        .{ .text = .{ .content = "max_w", .style = code_style } },
+        .{ .text = .{ .content = " for nested content", .style = body_style } },
+    };
+    const item2_children = [_]element.Element{
+        .{ .paragraph = &item2_p_children },
+    };
+
+    // Item 3 contains a paragraph AND a nested ordered list — the
+    // "multiple blocks per item" case CommonMark allows.
+    const item3_p_children = [_]element.Element{
+        .{ .text = .{ .content = "and items hold multiple blocks:", .style = body_style } },
+    };
+    const nested_item_a_p = [_]element.Element{
+        .{ .text = .{ .content = "first nested", .style = body_style } },
+    };
+    const nested_item_a_children = [_]element.Element{
+        .{ .paragraph = &nested_item_a_p },
+    };
+    const nested_item_b_p = [_]element.Element{
+        .{ .text = .{ .content = "second nested", .style = body_style } },
+    };
+    const nested_item_b_children = [_]element.Element{
+        .{ .paragraph = &nested_item_b_p },
+    };
+    const nested_items = [_]element.Element{
+        .{ .list_item = .{ .children = &nested_item_a_children } },
+        .{ .list_item = .{ .children = &nested_item_b_children } },
+    };
+    const nested_list = element.Element{ .list = .{
+        .ordered = true,
+        .items = &nested_items,
+        .marker_style = marker_style,
+        .start = 1,
+    } };
+    const item3_children = [_]element.Element{
+        .{ .paragraph = &item3_p_children },
+        nested_list,
+    };
+
+    const unordered_items = [_]element.Element{
+        .{ .list_item = .{ .children = &item1_children } },
+        .{ .list_item = .{ .children = &item2_children } },
+        .{ .list_item = .{ .children = &item3_children } },
+    };
+    const unordered_list = element.Element{ .list = .{
+        .ordered = false,
+        .items = &unordered_items,
+        .marker_style = marker_style,
+    } };
+
+    // ── Block quote containing a paragraph ─────────────────────────
+    const quote_p_children = [_]element.Element{
+        .{ .text = .{ .content = "Quotes indent their content; nesting propagates max_w correctly.", .style = body_style } },
+    };
+    const quote_children = [_]element.Element{
+        .{ .paragraph = &quote_p_children },
+    };
+    const quote_block = element.Element{ .quote = .{ .children = &quote_children } };
+
+    // ── Code block (preformatted monospace) ────────────────────────
+    const code_block_inst = element.Element{ .code_block = .{ .content = .{ .raw = .{
+        .text =
+        \\fn render(elem: Element) !void {
+        \\    // code blocks: monospace, preformatted
+        \\}
+        ,
+        .style = code_style,
+    } } } };
+
+    // ── Top stack assembling everything ────────────────────────────
+    const sp8 = element.Element{ .spacer = .{ .height = 8 } };
+    const sp12 = element.Element{ .spacer = .{ .height = 12 } };
+
     const top_stack_children = [_]element.Element{
         heading_block,
         subtitle_block,
-        spacer_block,
+        sp12,
         mixed_block,
-        emoji_block,
-        spacer_block,
+        sp12,
+        unordered_list,
+        sp12,
+        quote_block,
+        sp12,
+        code_block_inst,
+        sp8,
     };
     const top_stack = element.Element{ .container = .{
         .layout = .stack_v,
