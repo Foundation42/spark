@@ -523,26 +523,152 @@ placeholder which also drew 2 quads), 100.0% cache hit rate. The
 0.8k fps drop from 8b is the embedded doc's extra layout + text
 shaping work. Cheap.
 
+## Stage 11 — remote `:::embedded-document` over HTTP
+
+The "people aren't going to be able to sleep" stage. `src=` on
+`:::embedded-document` accepts URLs as well as filesystem paths;
+the runtime fetches over HTTP, caches in memory, parses, renders.
+The compositional flywheel goes from "local files" to "anything
+addressable on the network" — same factory, different loader.
+
+### The shape
+
+```markdown
+:::embedded-document {#remote_orbit src="http://127.0.0.1:8080/remote_panel.md" primary=${state.box_color}}
+:::
+```
+
+URL detection lives in `embedded_document.zig:loadSource`. Scheme
+prefix matching:
+
+  * `http://` / `https://` → `std.http.Client.fetch` via the new
+    `cachedFetch` path.
+  * `file://` → strip prefix, treat as filesystem path.
+  * otherwise → filesystem path (relative to CWD).
+
+In-memory URL cache keyed by URL string; entries live for the
+program lifetime (`deinitGlobals` frees them at shutdown). The
+cache is shared across all embedded-doc instances — so two
+`:::embedded-document`s pointing at the same URL share bytes.
+
+The demo binds a tiny `std.net.Server` on `127.0.0.1:8080`,
+serving `src/widgets/` as `text/markdown`. Single-threaded accept
+loop in a worker thread spawned at startup, joined at shutdown.
+Demo is self-contained — no python/curl/etc. required.
+
+### Reactive state crosses the network boundary
+
+The demo embeds the remote widget with
+`primary=${state.box_color}`. Stage 9's plumbing already handles
+this: the parent's `:::embedded-document` resolve creates a
+Binding subscribed to `box_color` on parent state. When the
+1.5-second colour cycle fires `state.set("box_color", ...)`, the
+binding refire calls `factory.update` on the embedded-doc, which
+applies the new value onto the **remote child's state**. The
+child binding for `:::box {#a color=${state.primary}}` fires;
+factory.update on the child box; quad recolours.
+
+So the *first* bar of the network-loaded widget follows the
+parent's colour cycle. Live reactive state reaching across an
+HTTP boundary, end-to-end. Two more bars (secondary / tertiary)
+stay at their frontmatter defaults — proof that some props come
+from overlay, others stay local.
+
+### Three bugs found in flight
+
+**1. `accept()` doesn't wake on `close()` (Linux).** Initial
+`Server.stop()` did `listener.deinit()` (which calls `close()`)
+then `thread.join()`. Worker's blocked `accept()` never woke up;
+process hung at shutdown. Demo ran fine for the full 5-second
+EXIT_AFTER window, then froze when the defer fired.
+
+Fix: `posix.shutdown(fd, .both)` *before* `deinit()`. That
+returns an error from the pending `accept()`, worker exits the
+loop, `join()` succeeds, then `deinit()` runs cleanly.
+
+**2. The SSBO ceiling was 2048 glyphs; the new doc is ~2400.**
+Adding the remote widget's prose pushed total glyph count past
+`MAX_GLYPHS = 2048`. `text_pipeline.writeGlyphs` errored;
+`drawCb`'s `catch return` swallowed the error and *just* returned
+— skipping every draw call. Window came up dark, with the demo
+reporting 12k fps but zero visible content.
+
+The metrics output looked perfect (`glyphs: 2437`) — but that's
+also where the bug was visible if you knew to look. Fix:
+`MAX_GLYPHS = 8192` plus stderr surfacing of overflow at both
+`writeGlyphs` and `writeQuads` sites, with a one-shot dedup flag
+so failures can't hide silently again.
+
+The lesson: error swallowing in hot paths needs to be loud-once
+even when it's pragmatically right to drop. `catch return` is
+fine; `catch return` with no log is a future debugging session.
+
+**3. The whole stage 11 architecture is wrong long-term.**
+`std.http.Client.fetch` runs synchronously inside
+`embedded_document.create`, which runs inside `markdown.parse`,
+which runs on the main thread. Localhost is fine; a hung remote
+would freeze the renderer with no fallback. Christian flagged it
+immediately: "we should move the network onto a separate thread,
+with a bidirectional lock-free communication primitive we can
+use for other stuff."
+
+Captured as stage 12 (async I/O channel) on the roadmap and as
+`memory/feedback_async_io.md` — the same channel will carry LLM
+stream input, file-watcher events, MCP subprocess pipes, every
+future async surface. v0 ships with the blocking shape because
+the localhost demo doesn't expose the pathology; v1 lands the
+proper rebuild.
+
+### Limitations v0 ships with
+
+- **Blocking fetch.** Above. Stage 12 fix.
+- **No persistent cache.** In-memory only. Restart re-fetches.
+  Content-addressable persistent cache is a follow-up.
+- **HTTPS works but isn't load-bearing in the demo.** Zig's
+  `std.crypto.tls` handles modern servers in our manual checks
+  but coverage isn't exhaustive — the demo intentionally uses
+  HTTP for reliability.
+- **No base-dir resolution.** Relative paths and URLs are
+  resolved against CWD / the URL itself; no doc-relative
+  resolution (e.g. a child fetching its sibling).
+- **No retry / backoff / circuit breaker.** Failure renders the
+  missing-component placeholder once and never tries again.
+
+### Performance footprint
+
+5-second smoke, Release, 1280×720, with everything stacked:
+- 1.5s box colour cycle (state-target update)
+- 60 Hz chart feed (component-target update)
+- `:::embedded-document` from filesystem (orbit_panel)
+- `:::embedded-document` from HTTP (remote_panel)
+
+98,555 frames / 8.5s = **11.5k fps** (slightly off the 12k of
+stage 8b — extra layout work for two more sub-trees of content).
+2437 glyphs, 148 quads, 100% cache hit rate, 512 updates
+dispatched.
+
 ## What ships at session 5 close
 
-Stages 8a, 8b, *and* 9. The wire format, the streaming component,
-and the composition flywheel — three of the four pieces from
-session 4's vision close. Headless docs (stage 10) and remote
-sources (stage 11) round out the composition track; the retained
-layout cache parallels the perf reclaim.
+Stages 8a, 8b, 9, *and* 11. The wire format, the streaming
+component, recursive document composition, *and* remote document
+composition. Four of the five pieces from session 4's vision
+close.
 
-~10,200 LOC, 70 unit tests passing, ~11.2k fps Release.
+~10,800 LOC, 70 unit tests passing, ~11.5k fps Release. The
+substrate is recursive, streaming, live, and *networked*.
 
-The substrate is recursive, streaming, and live.
+Next entry points:
 
-Next entry points (in order of expected payoff):
-
-1. **Stage 10 — headless documents.** Pure state-machine docs with
-   no viewport. Cleanest split from stage 9: the existing parse
-   pipeline runs minus `layoutAndRender`. State lives, subscribers
-   fire. Other docs subscribe to its paths.
-2. **Stage 11 — remote sources.** URL loaders for `:::embedded-document`.
-   Local-first, content-hash cache, offline fallback.
-3. **Retained layout cache.** Reclaims the 8b + 9 perf cost.
-4. **Plumbing for embedded-doc input handling.** When someone wants
-   a `:::slider` inside an embedded doc.
+1. **Stage 12 — async I/O channel.** Already overdue. Lock-free
+   bidirectional channel + dedicated worker thread for HTTP /
+   LLM streams / file watch / MCP pipes. The right shape for
+   every async surface.
+2. **Scrolling.** Newly escalated. Embedded docs push the demo
+   off-viewport on 720p windows; scroll unblocks the visual
+   payoff.
+3. **Stage 10 — headless documents.** Pure state-machine docs
+   with no viewport. Cleanest split from stage 9.
+4. **Retained layout cache.** Still queued for the per-frame
+   re-layout cost.
+5. **Plumbing for embedded-doc input handling.** When someone
+   wants a `:::slider` inside an embedded doc.

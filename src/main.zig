@@ -36,6 +36,7 @@ const embedded_document_component = @import("components/embedded_document.zig");
 const slider_component = @import("components/slider.zig");
 const state_mod = @import("state.zig");
 const update = @import("update.zig");
+const demo_server_mod = @import("demo_server.zig");
 
 /// Demo document — parsed by the vendored cmark + mapper into an
 /// Element tree at startup. Same render path as the hand-built
@@ -57,7 +58,14 @@ const ansi_demo =
 
 const ATLAS_MONO_SIZE: u32 = 768;
 const ATLAS_COLOR_SIZE: u32 = 1024;
-const MAX_GLYPHS: u32 = 2048;
+// Stage 11 bumped MAX_GLYPHS from 2048 → 8192. The original
+// session-1 ceiling was sized for the SDF + ANSI fixtures; once
+// docs started embedding other docs (and the chart's column-strip
+// chrome started co-existing with multi-paragraph prose) we tripped
+// the cap, writeGlyphs silently failed, and drawCb early-returned
+// every frame — visible as a black window. 8192 is comfortable
+// headroom; bump again if/when doc density justifies.
+const MAX_GLYPHS: u32 = 8192;
 const MAX_QUADS: u32 = 2048;
 
 /// Per-frame context owned by main(), borrowed by `drawCb` through
@@ -128,6 +136,15 @@ const FrameCtx = struct {
     mouse_down: bool = false,
     captured: ?element.Hit = null,
 
+    // Stage 11 lesson: SSBO overflow used to swallow itself via the
+    // `catch return` in drawCb / runLayout, turning a 2048-glyph
+    // ceiling into a silent black-screen. These flags log the first
+    // failure of each kind to stderr so the next overflow can't
+    // hide. A real surface (on-screen banner, telemetry) is the
+    // proper long-term fix — TODO captured at the SSBO-emit sites.
+    glyph_overflow_logged: bool = false,
+    quad_overflow_logged: bool = false,
+
     /// Re-run the layout pass for the current viewport. Clears the
     /// DrawList, lays out all three sub-trees at the new `max_w`,
     /// uploads the quads (static for the lifetime of a layout —
@@ -163,7 +180,20 @@ const FrameCtx = struct {
 
         // Quads stay frozen between layouts (no animation on them);
         // upload once per layout instead of per frame.
-        try self.quad_pipeline.writeQuads(self.dl.quads.items);
+        // TODO: surface SSBO overflow visibly — currently logged
+        // once to stderr (in drawCb's writeGlyphs path) and silently
+        // dropped here. A proper surface (overlay banner, telemetry)
+        // beats hunting "why is the screen black".
+        self.quad_pipeline.writeQuads(self.dl.quads.items) catch |err| {
+            if (!self.quad_overflow_logged) {
+                std.debug.print(
+                    "WARN: quad write failed ({s}) — {d} quads (cap {d}). Bump MAX_QUADS or split passes. Logging suppressed for further frames.\n",
+                    .{ @errorName(err), self.dl.quads.items.len, MAX_QUADS },
+                );
+                self.quad_overflow_logged = true;
+            }
+            return err;
+        };
     }
 };
 
@@ -203,7 +233,20 @@ fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) 
         const rgb = hsvToRgb(hue, 0.85, 1.0);
         fc.dl.glyphs.items[idx].hot_color = .{ rgb[0], rgb[1], rgb[2], 1.0 };
     }
-    fc.text_pipeline.writeGlyphs(fc.dl.glyphs.items) catch return;
+    // TODO: surface SSBO overflow visibly — currently logged once
+    // to stderr and silently dropped. A proper surface (overlay
+    // banner, telemetry) beats hunting "why is the screen black"
+    // again. See stage-11 journey writeup.
+    fc.text_pipeline.writeGlyphs(fc.dl.glyphs.items) catch |err| {
+        if (!fc.glyph_overflow_logged) {
+            std.debug.print(
+                "WARN: glyph write failed ({s}) — {d} glyphs (cap {d}). Bump MAX_GLYPHS. Logging suppressed for further frames.\n",
+                .{ @errorName(err), fc.dl.glyphs.items.len, MAX_GLYPHS },
+            );
+            fc.glyph_overflow_logged = true;
+        }
+        return;
+    };
 
     // ── Record draws — quads first, glyphs on top ──────────────────
     fc.quad_pipeline.recordDraw(cmd, extent, @intCast(fc.dl.quads.items.len));
@@ -326,7 +369,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 5 / stage 9 (:::embedded-document)\n", .{});
+    try stdout.print("text_engine demo — session 5 / stage 11 (remote :::embedded-document)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
     try stdout.print("  demo.md bytes:         {d}\n", .{demo_md.len});
@@ -440,6 +483,14 @@ pub fn main() !void {
     // + registry + parent state all exist. Has to happen before any
     // parse runs.
     try embedded_document_component.install(&registry, &theme, &host_state);
+    defer embedded_document_component.deinitGlobals();
+
+    // Stage 11 — spin up the local demo HTTP server BEFORE the parse
+    // so the remote :::embedded-document fetch succeeds. Listens on
+    // 127.0.0.1:8080 serving src/widgets/. Stopped at scope exit
+    // (which joins the worker thread cleanly via socket close).
+    const demo_server = try demo_server_mod.Server.start(allocator, "src/widgets", 8080);
+    defer demo_server.stop();
 
     // ── Parse demo.md into an Element tree ─────────────────────────
     // All slices + strings the tree references live in `doc_arena`;

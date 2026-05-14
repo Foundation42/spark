@@ -43,6 +43,28 @@
 //! Both are deferred because the smell is isolated to this one
 //! file. Captured in journey-session-5.md.
 //!
+//! ### Remote sources (stage 11)
+//!
+//! `src=` may be:
+//!
+//!   * A filesystem path (`"src/widgets/foo.md"`, or absolute) — read
+//!     via `std.fs.cwd().readFileAlloc`, no caching (filesystem is
+//!     fast enough that re-reads aren't worth tracking).
+//!   * An HTTP(S) URL (`"http://127.0.0.1:8080/foo.md"`,
+//!     `"https://gist.githubusercontent.com/..."`) — fetched via
+//!     `std.http.Client.fetch` and cached in a module-level
+//!     `url_cache` keyed by URL string. Cache lifetime is program
+//!     lifetime; `deinitGlobals()` frees it at host shutdown.
+//!   * A `file://` URL — equivalent to the filesystem path of the
+//!     URL's path component. Convenience for authors who want to
+//!     write all `src=`s in URL form for consistency.
+//!
+//! HTTPS uses Zig's std.crypto.tls — the system trust store is
+//! loaded on first use. Failures (network, 4xx/5xx, TLS handshake)
+//! return `EmbeddedDocumentReadFailed`, which the registry's
+//! resolve path turns into the "missing component" placeholder
+//! visual. Loud but recoverable.
+//!
 //! ### Interactive components inside embedded docs (not supported)
 //!
 //! The walker dispatches input events with the host's State
@@ -80,6 +102,14 @@ pub const Error = error{
 var registry_ref: ?*component_mod.Registry = null;
 var theme_ref: ?*const element.Theme = null;
 var parent_state_ref: ?*state_mod.State = null;
+/// Allocator used for the URL cache; same as the registry's
+/// allocator. Captured at install() time so cache lookups don't
+/// need to thread an allocator everywhere.
+var cache_allocator: ?std.mem.Allocator = null;
+/// URL → fetched bytes cache. Lazily initialised on first remote
+/// fetch. Entries persist for the program lifetime; `deinitGlobals()`
+/// frees them. Keyed by URL string (also duped into the allocator).
+var url_cache: std.StringHashMapUnmanaged([]const u8) = .{};
 
 /// One-time install. Call after registering all the other factories
 /// — keeps the dependency on the rest of the registry explicit.
@@ -91,7 +121,26 @@ pub fn install(
     registry_ref = registry;
     theme_ref = theme;
     parent_state_ref = parent_state;
+    cache_allocator = registry.allocator;
     try registry.register("embedded-document", factory);
+}
+
+/// Free the URL cache. Host calls this at shutdown after
+/// `registry.deinit()`. Idempotent (safe to call when no remote
+/// loads ever happened).
+pub fn deinitGlobals() void {
+    const a = cache_allocator orelse return;
+    var it = url_cache.iterator();
+    while (it.next()) |entry| {
+        a.free(entry.key_ptr.*);
+        a.free(entry.value_ptr.*);
+    }
+    url_cache.deinit(a);
+    url_cache = .{};
+    cache_allocator = null;
+    registry_ref = null;
+    theme_ref = null;
+    parent_state_ref = null;
 }
 
 pub const factory: component_mod.Factory = .{
@@ -121,9 +170,11 @@ fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!c
     const id_raw = spec.id orelse return error.EmbeddedDocumentMissingId;
     const src_path = findAttr(spec.attrs, "src") orelse return error.EmbeddedDocumentMissingSrc;
 
-    // Read the source from disk. 1 MiB cap is plenty for any
-    // reasonable doc + sub-doc; bumped when content demand justifies.
-    const source = std.fs.cwd().readFileAlloc(allocator, src_path, 1024 * 1024) catch
+    // Load the source via scheme dispatch — filesystem path or
+    // HTTP(S) URL. `source` always ends up owned by `allocator` for
+    // the duration of this function; we copy out anything we need
+    // into per-instance storage before returning.
+    const source = loadSource(allocator, src_path) catch
         return error.EmbeddedDocumentReadFailed;
     defer allocator.free(source);
 
@@ -219,6 +270,55 @@ fn applyParentOverlays(child_state: *state_mod.State, spec: *const components.Sp
 fn findAttr(attrs: []const components.Attr, key: []const u8) ?[]const u8 {
     for (attrs) |a| if (std.mem.eql(u8, a.key, key)) return a.value;
     return null;
+}
+
+/// Detect the `src=` scheme and dispatch. Returns bytes owned by
+/// `allocator` — caller's responsibility to free. For URL sources,
+/// the bytes are duped out of the cache so each Component gets its
+/// own copy (lifetime is then bound to the Component's allocator,
+/// matching the filesystem path).
+fn loadSource(allocator: std.mem.Allocator, src: []const u8) ![]const u8 {
+    if (std.mem.startsWith(u8, src, "http://") or std.mem.startsWith(u8, src, "https://")) {
+        const cached = try cachedFetch(src);
+        return try allocator.dupe(u8, cached);
+    }
+    const path: []const u8 = if (std.mem.startsWith(u8, src, "file://"))
+        src["file://".len..]
+    else
+        src;
+    // 1 MiB cap is plenty for any reasonable doc; bumped when
+    // content demand justifies.
+    return try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
+}
+
+/// Fetch + cache. Returns a slice OWNED by the cache (do not free
+/// it directly — caller dupes if it needs an independent copy).
+fn cachedFetch(url: []const u8) ![]const u8 {
+    const a = cache_allocator orelse return error.EmbeddedDocumentNotInstalled;
+
+    if (url_cache.get(url)) |bytes| return bytes;
+
+    var client = std.http.Client{ .allocator = a };
+    defer client.deinit();
+
+    var body = std.ArrayList(u8).init(a);
+    errdefer body.deinit();
+
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .response_storage = .{ .dynamic = &body },
+        .max_append_size = 8 * 1024 * 1024,
+    }) catch return error.EmbeddedDocumentReadFailed;
+
+    if (result.status != .ok) return error.EmbeddedDocumentReadFailed;
+
+    const url_key = try a.dupe(u8, url);
+    errdefer a.free(url_key);
+    const owned = try body.toOwnedSlice();
+    errdefer a.free(owned);
+
+    try url_cache.put(a, url_key, owned);
+    return owned;
 }
 
 const vtable: element.ElementVTable = .{

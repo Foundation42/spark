@@ -280,7 +280,45 @@ flywheel pieces:
   content-addressed caching layer. Same shape as 9, different
   loader.
 
-## Then — real components (stages 12+)
+## Next — async I/O channel (stage 12)
+
+Stage 11 v0 put `std.http.Client.fetch` synchronously inside
+`embedded_document.create`, which runs on the main thread during
+parse. Localhost works fine; a slow / failed / hung remote would
+freeze the renderer with no visible feedback. The same shape is
+wrong for the eventual LLM-stream input path, file-watcher
+hot-reload, MCP-tool subprocess pipes, and anything else that can
+block.
+
+The rebuild is a dedicated I/O worker thread + bidirectional
+lock-free channel:
+
+- **Worker side.** Owns `std.http.Client`, file watchers, future
+  LLM-stream readers. Polls its inbound request queue, blocks on
+  the appropriate primitive (recv / read / select), posts results
+  to the outbound queue.
+- **Channel.** Lock-free SPSC ring buffers (one per direction;
+  bump to MPMC if a worker pool ever lands). Tagged-union payload
+  so one channel carries `FetchRequest` / `FetchResult` /
+  `StreamChunk` / `FileChange` / future variants.
+- **Main side.** Submits requests, never blocks. Each frame polls
+  the inbound queue; transitions component state on results
+  (e.g. `:::embedded-document` flips from "loading" placeholder to
+  ready when the bytes arrive). `state.dirty` triggers the
+  normal re-layout path.
+
+`:::embedded-document` becomes the first migration: factory.create
+posts a `FetchRequest`, returns immediately with a "loading"
+visual; when the channel delivers bytes, the cached instance
+parses + state-transitions; next frame re-layouts.
+
+LLM streaming + file-watcher hot-reload (stage 13+) layer on the
+same channel without touching the contract again.
+
+Saved in `memory/feedback_async_io.md` so the principle survives
+to the rebuild session.
+
+## Then — real components (stages 13+)
 
 3D scene (eventually integrates with matryoshka), live chart,
 slider, input field, button. Each is a self-contained component
@@ -308,13 +346,18 @@ through `ansi.parse`, output stuffed into `CodeContent.sub_block`;
 `layoutCodeBlock` recurses into it. Closes the markdown-↔-ANSI
 loop. Small commit (~50 LOC). Lands when convenient.
 
-## Parallel — scrolling
+## Parallel — scrolling (escalated by stage 11)
 
-The other half of session-3's resize concern. Mouse-wheel /
-keyboard scrolls a viewport offset; renderer applies it before
-NDC mapping (cleanest) or walker subtracts it from glyph y at
-emit (cheaper). Independent of vision work; lands when documents
-get tall enough that resize-reflow alone stops being enough.
+The other half of session-3's resize concern, now load-bearing.
+Stage 11's `:::embedded-document`s push the demo's total height
+well past the typical viewport — the remote-composition section
+sits off-screen on a 720p window. Without scroll, embedded docs
+are visible only on tall windows.
+
+Mouse-wheel / keyboard scrolls a viewport offset; renderer applies
+it before NDC mapping (cleanest) or walker subtracts it from glyph
+y at emit (cheaper). No vision-track dependency; ready to land any
+time.
 
 ## Eventually — LM connection (tier 3)
 

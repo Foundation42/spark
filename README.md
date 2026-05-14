@@ -12,14 +12,17 @@ End of session 5 the substrate is alive on every axis: a top
 markdown doc with chrome, an ANSI fixture, a rainbow SDF
 "ATTENTION", a live rounded box driven by frontmatter state + two
 sliders, a streaming `:::chart` fed at 60 Hz through the
-`:::update` wire format, and now a `:::embedded-document` that
-loads `src/widgets/orbit_panel.md` as a whole second document with
-its own state — parent attrs overlay onto the child's frontmatter,
-child components live in a scoped corner of the registry, and
-mutations bubble dirty up to wake the renderer. Box colour cycles
-every 1.5s; chart appends 60Hz; all at ~11.2k fps Release. Source
-for the parent document is [`src/demo.md`](src/demo.md); the embed
-is [`src/widgets/orbit_panel.md`](src/widgets/orbit_panel.md).
+`:::update` wire format, a `:::embedded-document` loading
+`src/widgets/orbit_panel.md` recursively, **and** a second
+`:::embedded-document` loading `src/widgets/remote_panel.md` over
+HTTP from a localhost server the demo spins up at startup —
+parent reactive state crosses the network boundary so the first
+remote bar follows the colour cycle. ~11.5k fps Release. Source
+for the parent document is [`src/demo.md`](src/demo.md); the
+local embed is
+[`src/widgets/orbit_panel.md`](src/widgets/orbit_panel.md); the
+remote embed is
+[`src/widgets/remote_panel.md`](src/widgets/remote_panel.md).
 
 ```
        ┌───────────────────────────────────────────────────────┐
@@ -280,11 +283,26 @@ TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
   `#bx`. `Registry.deinitScope` tears down child instances when
   the embedded doc itself is GC'd. Demo embeds
   `src/widgets/orbit_panel.md`; ~11.2k fps Release with all of
-  8a + 8b + 9 active. 70 unit tests total.
+  8a + 8b + 9 active.
+- [x] **Stage 11 v0** — remote `:::embedded-document` over HTTP.
+  `src=` accepts `http://` / `https://` / `file://` / paths. URL
+  loader goes through `std.http.Client.fetch` and caches bytes in
+  memory for the program lifetime. Demo binds a tiny local HTTP
+  server on `127.0.0.1:8080` serving `src/widgets/` so the URL
+  embed works dependency-free. Parent reactive state crosses the
+  network boundary: `primary=${state.box_color}` on the URL embed
+  drives the remote widget's first bar through the colour cycle.
+  ~11.5k fps Release with everything (8a + 8b + 9 + 11) live. 70
+  unit tests. **v0 limitations** captured on the roadmap: the
+  fetch is synchronous on the main thread (stage 12 fix), and
+  there's no persistent cache yet.
 
 ## What's next
 
-[`docs/roadmap.md`](docs/roadmap.md). Stages 10 (headless docs)
-and 11 (remote sources) complete the composition flywheel. The
-retained layout cache is also queued — bumped to active-watch
-priority by stage 8b's per-tick re-layout cost.
+[`docs/roadmap.md`](docs/roadmap.md). **Stage 12** is the async
+I/O channel — a dedicated worker thread + lock-free bidirectional
+channel so HTTP fetch, LLM streams, and file-watcher events all
+get off the main loop. Scrolling is also escalated: with embedded
+docs, the demo's content height now overflows typical viewports.
+Headless documents (stage 10) and retained layout cache stay
+queued.

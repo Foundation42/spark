@@ -59,5 +59,12 @@ The block below is a *whole other document* — `src/widgets/orbit_panel.md` —
 :::embedded-document {#orbit src="src/widgets/orbit_panel.md" panel_color=cyan inner_color=magenta}
 :::
 
+## Remote composition (stage 11)
+
+The block below is the *same factory* — but loaded over HTTP from a localhost server the demo spins up at startup. `src=` distinguishes filesystem paths from URLs; the URL path goes through `std.http.Client.fetch` and lives in an in-memory cache for the rest of the session. The first bar's colour follows the parent's `state.box_color` cycle — proof that reactive state crosses the network boundary.
+
+:::embedded-document {#remote_orbit src="http://127.0.0.1:8080/remote_panel.md" primary=${state.box_color}}
+:::
+
 :::chart {#telemetry type=line min=-1 max=1 width=100% height=140}
 :::
