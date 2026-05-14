@@ -88,6 +88,21 @@ pub const FontRegistry = struct {
         // scalable path took setPixelSize, but cheap insurance.
         shape.c.hb_ft_font_changed(hb.handle);
 
+        // ─── HB scale fix for strike-only colour fonts ──────────────
+        // NotoColorEmoji.ttf is CBDT-only; FreeType reports its
+        // `units_per_EM` as 0, and HB derives font scale from
+        // `units_per_EM × ppem`, so the auto-init via
+        // hb_ft_font_create_referenced leaves scale at 0. Net effect:
+        // every glyph's `x_advance` returns 0 and the emoji stack on
+        // top of each other (Phase 5 bring-up bug). Force-set scale +
+        // ppem to the actual rasterisation pixel size in 26.6 fp so
+        // advances come back in real pixel units. Idempotent for
+        // scalable mono fonts where the auto-derived value was
+        // already `actual_px * 64`.
+        const ppem_i: c_int = @intCast(actual_px);
+        shape.c.hb_font_set_scale(hb.handle, ppem_i * 64, ppem_i * 64);
+        shape.c.hb_font_set_ppem(hb.handle, actual_px, actual_px);
+
         const raw_metrics = new_face.metrics();
         const scaled_metrics = face_mod.Metrics{
             .ascender = raw_metrics.ascender * sc,
