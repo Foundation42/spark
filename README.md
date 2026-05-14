@@ -8,12 +8,13 @@ game UI all flow through. **What we're building** is documented in
 interface to a live, component-driven runtime that an LLM can
 author, mutate, and stream updates into.
 
-End of session 3 the demo renders a markdown document with full
-chrome (code-block backgrounds, blockquote bars, thematic rules,
-link underlines), an ANSI fixture (8-color / 256-color / truecolor
-/ bold / italic / multi-line), and a rainbow SDF "ATTENTION" with
-per-glyph attention animation — all reflowing on window resize at
-~13.5k fps Release. Source for the document is
+End of session 4 the substrate ships: markdown source with full
+chrome, an ANSI fixture, a rainbow SDF "ATTENTION", a live blue
+rounded box driven by frontmatter state + two sliders that drag-set
+its radius and height. Session 5 added the `:::update` micro-stream
+wire format — the host streams synthetic update directives at 1.5s
+intervals to cycle the box colour through the same fast lane an LLM
+would use, all at ~13.3k fps Release. Source for the document is
 [`src/demo.md`](src/demo.md), parsed at startup through vendored
 cmark.
 
@@ -67,6 +68,10 @@ cmark.
   substrate ships: block extension parser, component registry,
   reactive state, input handling, sliders driving live geometry.
   Plus the document-composition flywheel.
+- [`docs/journey-session-5.md`](docs/journey-session-5.md) — the
+  fast lane: `:::update` wire format, component-target +
+  state-target dispatch, demo cycles box colour through the
+  streaming path at 13.3k fps.
 - [`docs/roadmap.md`](docs/roadmap.md) — staging path from current
   state to live-documents runtime.
 - [`chat.md`](chat.md) — the original brainstorm that started it.
@@ -238,10 +243,23 @@ TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
   whole loop (drag → state.set → registry binding → factory.update
   → re-layout) runs at ~13.3k fps. 43 unit tests.
 
+### Session 5 — live-document plumbing continued
+
+- [x] **Stage 8a** — `:::update` micro-stream wire format. Two
+  dispatch backends: component-target (`{#id action=NAME}\nBODY\n:::`
+  → `Factory.handle_update`) and state-target
+  (`{target=state.path}\nVALUE\n:::` → `state.set`). New optional
+  `Factory.handle_update` vtable slot; box opts in with
+  `set-color`/`-radius`/`-width`/`-height`. `update.applyAll(arena,
+  state, registry, source)` parses + dispatches a whole burst,
+  arena reset between cycles. Demo cycles box colour every 1.5s
+  through five shades via the state-target path; ~13.3k fps Release
+  unchanged. 53 unit tests.
+
 ## What's next
 
-[`docs/roadmap.md`](docs/roadmap.md). Headline: the **`:::update`
-micro-stream hot path** that lets an LLM push deltas into a live
-component at microsecond latency, bypassing parse + layout
-entirely — the fast lane the reactive substrate from 7e was
-built to enable.
+[`docs/roadmap.md`](docs/roadmap.md). Headline: **stage 8b** —
+`:::chart` component with `handle_update accepts action=append` for
+streaming CSV-row data, the visceral 15k-fps demo the
+component-target path was designed for. The parallel composition
+track (stages 9–11) is also unblocked.

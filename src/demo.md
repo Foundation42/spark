@@ -39,9 +39,9 @@ fn render(elem: Element) !void {
 }
 ```
 
-## Live components (stage 7a)
+## Live components
 
-Block extensions parse, thread through the mapper as a sidecar, and re-materialise as `custom` Elements. The registry doesn't exist yet — every directive renders as a *missing-component* fallback panel. Real components arrive at stage 7c.
+Block extensions parse into Specs, get resolved through a host-owned registry into cached instances, and survive across re-parses. Templated `${state.x}` attrs subscribe to state mutations through the reactive layer. The host's frame loop streams `:::update {target=state.box_color}` directives at 1.5s intervals — watch the box recolour through the same fast lane an LLM would use.
 
 :::box {#bx color=${state.box_color} width=${state.box_width} height=${state.box_height} radius=${state.box_radius}}
 :::

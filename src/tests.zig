@@ -12,4 +12,5 @@ test {
     _ = @import("components/box.zig");
     _ = @import("components/slider.zig");
     _ = @import("state.zig");
+    _ = @import("update.zig");
 }

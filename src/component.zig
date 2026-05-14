@@ -66,12 +66,22 @@ const state_mod = @import("state.zig");
 
 pub const Error = error{
     DuplicateFactory,
+    UnknownComponentId,
+    NoUpdateHandler,
 } || std.mem.Allocator.Error;
 
 /// Component factory — host-supplied per directive name. `create` is
 /// called on cache miss; `update` (if non-null) is called on cache
 /// hit so the instance can react to attr changes between parses;
 /// `deinit` (if non-null) runs when the registry GCs the instance.
+///
+/// `handle_update` (stage 8a) is the micro-stream hot path: the host
+/// receives a `:::update {#id action=NAME}\nBODY\n:::` directive
+/// from outside (LLM stream, network, keyboard), looks up the cached
+/// instance by `#id`, and calls this handler — bypassing cmark, the
+/// Element walker, and any re-parse. Components opt in; the
+/// dispatcher errors with `NoUpdateHandler` when called on a
+/// component that didn't supply one.
 ///
 /// `create`'s allocator is the registry's allocator (NOT the parse
 /// arena) — instance state lives across many parses, so it must
@@ -90,6 +100,11 @@ pub const Factory = struct {
         ctx: *anyopaque,
         allocator: std.mem.Allocator,
     ) void = null,
+    handle_update: ?*const fn (
+        ctx: *anyopaque,
+        action: []const u8,
+        body: []const u8,
+    ) anyerror!void = null,
 };
 
 /// What a factory produces — the (vtable, ctx) pair the Element
@@ -403,6 +418,45 @@ pub const Registry = struct {
         return entry;
     }
 
+    /// Look up a cached instance by explicit id. Returns null when no
+    /// `:::name {#id ...}` block with that id has been resolved yet
+    /// (or when its instance has been GC'd). Auto-generated `auto:N`
+    /// ids are reachable too, but the intended caller is
+    /// `:::update {#id ...}` dispatch which always uses author-stable
+    /// ids.
+    pub fn lookup(self: *Registry, id: []const u8) ?Resolved {
+        const entry = self.instances.get(id) orelse return null;
+        return .{ .vtable = entry.instance.vtable, .ctx = entry.instance.ctx };
+    }
+
+    /// Dispatch one `:::update {#id action=NAME}` directive to the
+    /// cached instance's `handle_update` handler. The `body` slice is
+    /// passed through verbatim (caller has already trimmed surrounding
+    /// whitespace via `parseUpdate`'s body-trim rule). Errors:
+    ///
+    ///   * `UnknownComponentId` — no live instance under `id`. The
+    ///     host's previous parse may have GC'd it; caller drops.
+    ///   * `NoUpdateHandler` — the factory didn't opt into updates.
+    ///     Caller logs and drops at its policy.
+    ///
+    /// Doesn't touch `parses_unused`: update lifecycle is
+    /// intentionally orthogonal to parse lifecycle. If the doc stops
+    /// referencing the instance, the next gc() will sweep it and
+    /// subsequent updates fall through with UnknownComponentId, which
+    /// is the right behaviour — the document no longer wants this
+    /// component.
+    pub fn handleUpdate(
+        self: *Registry,
+        id: []const u8,
+        action: []const u8,
+        body: []const u8,
+    ) anyerror!void {
+        const entry = self.instances.get(id) orelse return error.UnknownComponentId;
+        const factory = self.factories.get(entry.factory_name) orelse return error.UnknownComponentId;
+        const handler = factory.handle_update orelse return error.NoUpdateHandler;
+        try handler(entry.instance.ctx, action, body);
+    }
+
     /// Destroy every cached instance whose `parses_unused` exceeds
     /// `sweep_threshold`. Host calls this after swapping the new
     /// Element tree into place — at which point no live Element
@@ -471,6 +525,11 @@ const testing = std.testing;
 var t_creates: u32 = 0;
 var t_updates: u32 = 0;
 var t_deinits: u32 = 0;
+var t_handle_updates: u32 = 0;
+var t_last_action_buf: [64]u8 = undefined;
+var t_last_action_len: usize = 0;
+var t_last_body_buf: [256]u8 = undefined;
+var t_last_body_len: usize = 0;
 
 const TestState = struct {
     allocator: std.mem.Allocator,
@@ -515,16 +574,33 @@ fn testDeinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     allocator.free(state.last_color);
     allocator.destroy(state);
 }
+fn testHandleUpdate(ctx: *anyopaque, action: []const u8, body: []const u8) anyerror!void {
+    t_handle_updates += 1;
+    t_last_action_len = @min(action.len, t_last_action_buf.len);
+    @memcpy(t_last_action_buf[0..t_last_action_len], action[0..t_last_action_len]);
+    t_last_body_len = @min(body.len, t_last_body_buf.len);
+    @memcpy(t_last_body_buf[0..t_last_body_len], body[0..t_last_body_len]);
+    // Mirror into the component's state so tests can assert end-to-end.
+    if (std.mem.eql(u8, action, "set-color")) {
+        const state: *TestState = @ptrCast(@alignCast(ctx));
+        state.allocator.free(state.last_color);
+        state.last_color = try state.allocator.dupe(u8, body);
+    }
+}
 const test_factory: Factory = .{
     .create = testCreate,
     .update = testUpdate,
     .deinit = testDeinit,
+    .handle_update = testHandleUpdate,
 };
 
 fn resetCounters() void {
     t_creates = 0;
     t_updates = 0;
     t_deinits = 0;
+    t_handle_updates = 0;
+    t_last_action_len = 0;
+    t_last_body_len = 0;
 }
 
 test "register + resolve creates instance once" {
@@ -679,6 +755,66 @@ test "reactive: state.set fires factory.update on bound component" {
     // An unrelated path mutation doesn't fire.
     try st.set("unrelated", "x");
     try testing.expectEqual(@as(u32, 1), t_updates);
+}
+
+test "lookup returns null for unknown id" {
+    resetCounters();
+    var registry = Registry.init(testing.allocator);
+    defer registry.deinit();
+    try testing.expect(registry.lookup("nope") == null);
+}
+
+test "lookup returns the resolved instance once it exists" {
+    resetCounters();
+    var registry = Registry.init(testing.allocator);
+    defer registry.deinit();
+    try registry.register("box", test_factory);
+
+    const spec: components.Spec = .{ .name = "box", .id = "bx" };
+    const r = try registry.resolve(&spec, 0, null);
+    const looked = registry.lookup("bx").?;
+    try testing.expectEqual(r.?.ctx, looked.ctx);
+}
+
+test "handleUpdate dispatches to factory handle_update" {
+    resetCounters();
+    var registry = Registry.init(testing.allocator);
+    defer registry.deinit();
+    try registry.register("box", test_factory);
+
+    const spec: components.Spec = .{ .name = "box", .id = "bx" };
+    _ = try registry.resolve(&spec, 0, null);
+    try testing.expectEqual(@as(u32, 1), t_creates);
+
+    try registry.handleUpdate("bx", "set-color", "orange");
+    try testing.expectEqual(@as(u32, 1), t_handle_updates);
+    try testing.expectEqualStrings("set-color", t_last_action_buf[0..t_last_action_len]);
+    try testing.expectEqualStrings("orange", t_last_body_buf[0..t_last_body_len]);
+}
+
+test "handleUpdate: unknown id errors" {
+    resetCounters();
+    var registry = Registry.init(testing.allocator);
+    defer registry.deinit();
+    try registry.register("box", test_factory);
+    try testing.expectError(error.UnknownComponentId, registry.handleUpdate("missing", "set-color", "red"));
+}
+
+test "handleUpdate: factory without handler errors" {
+    resetCounters();
+    var registry = Registry.init(testing.allocator);
+    defer registry.deinit();
+    const no_handler: Factory = .{
+        .create = testCreate,
+        .update = testUpdate,
+        .deinit = testDeinit,
+        // handle_update intentionally null
+    };
+    try registry.register("box", no_handler);
+
+    const spec: components.Spec = .{ .name = "box", .id = "bx" };
+    _ = try registry.resolve(&spec, 0, null);
+    try testing.expectError(error.NoUpdateHandler, registry.handleUpdate("bx", "set-color", "red"));
 }
 
 test "reactive: gc unsubscribes the binding" {

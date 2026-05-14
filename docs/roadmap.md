@@ -9,10 +9,10 @@ design-decision rationale lives in [`vision.md`](vision.md).
 
 This roadmap is the staging path from where we are (the full
 live-document substrate: parse → registry → cache → static
-interpolation → reactivity → input → first interactive component)
-to where we're going (composable documents, micro-streamed updates,
-remote/headless components). Session 5 picks up stage 8 or the
-document-composition track — see headlines below.
+interpolation → reactivity → input → first interactive component →
+`:::update` wire format) to where we're going (composable
+documents, streaming visualisations, remote/headless components).
+Session 5 opened with stage 8a — see headlines below.
 
 ## Shipped — block extension parser (stage 7a)
 
@@ -161,20 +161,50 @@ and height for the box. Drag → state.set → registry binding
 fires → factory.update on `:::box` → `state.dirty` triggers
 re-layout → new quad. 43 unit tests.
 
-## Next — `:::update` micro-stream path (stage 8)
+## Shipped — `:::update` micro-stream wire format (stage 8a)
 
-The LLM-streamed-delta-into-live-component hot path. Markdown
-recognises `:::update {#id action=...}` and routes the body to
-the target component's handler directly — bypasses cmark, bypasses
-text layout, microsecond hot path.
+The LLM-streamed-delta path — bypasses cmark, bypasses the Element
+walker, bypasses text layout. Two dispatch backends:
 
-- Reuses the registry's instance cache from 7b — `#id` lookup is
-  the entire dispatch.
-- New `Factory.handle_update: ?fn(ctx, action, body) anyerror!void`
-  vtable slot. Components opt-in; missing handlers log + drop.
-- Demo target: a `:::chart` component (next concrete component
-  after `:::box` + `:::slider`) that accepts `action=append` with
-  a CSV row body and pushes it onto a live trace at 15k fps.
+- **Component-target.** `:::update {#id action=NAME}\nBODY\n:::`
+  → `Registry.handleUpdate(id, action, body)` → cached instance's
+  `Factory.handle_update`. New optional vtable slot; components
+  opt-in. Errors with `UnknownComponentId` or `NoUpdateHandler` for
+  missing surfaces — caller drops + logs at its policy.
+- **State-target.** `:::update {target=state.path}\nVALUE\n:::`
+  → `state.set(path, body)` → 7e reactive substrate propagates
+  through `Binding.refire` to bound component instances. The
+  canonical path for declarative-state mutations from an outside
+  agent.
+
+`update.applyAll(arena, state, registry, source)` parses + dispatches
+every `:::update` block found in `source` and returns the count
+applied. Per-update overhead is one attr-list slice + one body dupe
+in caller-supplied arena. Demo loop emits one state-target directive
+every 1.5s and reuses the arena via `reset(.retain_capacity)` — 0
+allocations in steady state, holds the existing ~13.3k fps Release.
+
+Box gained `handle_update` accepting `set-color`/`-radius`/`-width`/
+`-height`. The visible demo uses the state-target path because the
+box's color is templated (`${state.box_color}`); component-target
+dispatch is covered by unit tests + ready to drive the upcoming
+`:::chart`. 53 unit tests passing.
+
+## Next — `:::chart` + the streaming showcase (stage 8b)
+
+The visceral demo target. A `:::chart` factory whose `handle_update`
+accepts `action=append` with CSV-row bodies, pushing samples onto a
+live trace. Validates the component-target dispatch path under
+streaming workload + closes out the headline "15k fps live LLM
+deltas" pitch from session 3's vision capture.
+
+- One file: `src/components/chart.zig`. Reads `type=line`, `x=`/`y=`
+  axis hints from attrs; allocates a ring buffer; emits one quad
+  per segment.
+- Demo wires a synthetic data source (initially a sine + noise
+  driver in main.zig; later a streaming-text adapter).
+- Stress test the registry's parses_unused gc semantics under a
+  high update rate — confirms the cache-during-streaming invariant.
 
 ## Parallel track — document composition (stages 9–11)
 

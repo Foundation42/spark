@@ -85,6 +85,7 @@ pub const factory: component_mod.Factory = .{
     .create = create,
     .update = update,
     .deinit = deinit_,
+    .handle_update = handleUpdate,
 };
 
 fn create(
@@ -104,6 +105,37 @@ fn update(ctx: *anyopaque, spec: *const components.Spec) anyerror!void {
 fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     const c: *Component = @ptrCast(@alignCast(ctx));
     allocator.destroy(c);
+}
+
+/// Component-target update path. Each action targets one field; body
+/// is the new value as a string. Unknown actions are silent no-ops at
+/// this stage — production telemetry / logging is the next refinement.
+///
+/// Conflict with `${state.x}`-templated attrs: the host's slider /
+/// state.set path goes through `factory.update`, which calls
+/// `fromSpec` and re-reads every templated attr. A subsequent
+/// `state.set` of any templated path will therefore stomp these
+/// direct-set values. That's by design — the binding is the source
+/// of truth for templated components. `handle_update` is the cheap
+/// path for *non-templated* attrs or for components that own their
+/// state opaquely (charts, scrolling logs, …).
+fn handleUpdate(ctx: *anyopaque, action: []const u8, body: []const u8) anyerror!void {
+    const c: *Component = @ptrCast(@alignCast(ctx));
+    const value = std.mem.trim(u8, body, " \t\r\n");
+    if (std.mem.eql(u8, action, "set-color")) {
+        if (parseColor(value)) |col| c.color = col;
+    } else if (std.mem.eql(u8, action, "set-width")) {
+        if (parseLength(value)) |l| c.width = l;
+    } else if (std.mem.eql(u8, action, "set-height")) {
+        if (parseLength(value)) |l| c.height = l;
+    } else if (std.mem.eql(u8, action, "set-radius")) {
+        if (parseLength(value)) |l| {
+            c.radius = switch (l) {
+                .pixels => |p| p,
+                else => 0,
+            };
+        }
+    }
 }
 
 const vtable: element.ElementVTable = .{
@@ -326,4 +358,50 @@ test "Component.fromSpec: full attrs" {
     try testing.expectEqual(@as(f32, 300), c.width.pixels);
     try testing.expectEqual(@as(f32, 120), c.height.pixels);
     try testing.expectEqual(@as(f32, 12), c.radius);
+}
+
+test "handleUpdate: set-color mutates instance color" {
+    var c: Component = .{
+        .color = MAGENTA,
+        .width = .{ .pixels = 100 },
+        .height = .{ .pixels = 50 },
+        .radius = 0,
+    };
+    try handleUpdate(@ptrCast(&c), "set-color", "orange");
+    try testing.expect(c.color[0] > 0.5); // orange has dominant red+green
+    try testing.expect(c.color[1] > 0.4);
+
+    // Trailing whitespace trimmed from body.
+    try handleUpdate(@ptrCast(&c), "set-color", "  green  \n");
+    try testing.expect(c.color[1] > 0.5);
+    try testing.expect(c.color[0] < 0.5);
+}
+
+test "handleUpdate: set-radius / set-width / set-height" {
+    var c: Component = .{
+        .color = MAGENTA,
+        .width = .{ .pixels = 100 },
+        .height = .{ .pixels = 50 },
+        .radius = 0,
+    };
+    try handleUpdate(@ptrCast(&c), "set-radius", "20");
+    try testing.expectEqual(@as(f32, 20), c.radius);
+
+    try handleUpdate(@ptrCast(&c), "set-width", "250px");
+    try testing.expectEqual(@as(f32, 250), c.width.pixels);
+
+    try handleUpdate(@ptrCast(&c), "set-height", "75%");
+    try testing.expect(c.height == .percent);
+    try testing.expectEqual(@as(f32, 0.75), c.height.percent);
+}
+
+test "handleUpdate: unknown action is silent no-op" {
+    var c: Component = .{
+        .color = MAGENTA,
+        .width = .{ .pixels = 100 },
+        .height = .{ .pixels = 50 },
+        .radius = 0,
+    };
+    try handleUpdate(@ptrCast(&c), "explode", "boom");
+    try testing.expectEqual(MAGENTA, c.color);
 }

@@ -33,6 +33,7 @@ const component = @import("component.zig");
 const box_component = @import("components/box.zig");
 const slider_component = @import("components/slider.zig");
 const state_mod = @import("state.zig");
+const update = @import("update.zig");
 
 /// Demo document — parsed by the vendored cmark + mapper into an
 /// Element tree at startup. Same render path as the hand-built
@@ -323,7 +324,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 3 / stage 6a (resize-aware layout)\n", .{});
+    try stdout.print("text_engine demo — session 5 / stage 8a (:::update micro-stream)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
     try stdout.print("  demo.md bytes:         {d}\n", .{demo_md.len});
@@ -499,14 +500,58 @@ pub fn main() !void {
         break :blk @intFromFloat(secs * 1000.0);
     } else |_| null;
 
+    // ── Stage 8a — update micro-stream demo ────────────────────────
+    // Every UPDATE_CYCLE_MS, build a synthetic `:::update {...}` byte
+    // stream and pipe it through `update.applyAll`. The directive
+    // targets the box's `state.box_color` (state-target path), which
+    // walks the existing reactive plumbing from 7e: state.set fires
+    // the registry's Binding subscriber, which re-substitutes the
+    // cached :::box instance's templated `${state.box_color}` attr
+    // and calls factory.update with a fresh color.
+    //
+    // Reusing a single arena across cycles + resetting `retain_capacity`
+    // means steady-state allocation is zero after the first cycle —
+    // the parse + dispatch path stays inside the cached pages.
+    //
+    // (Component-target dispatch is covered by unit tests; visible
+    // demo uses state-target because the box's color attr is
+    // templated, so a component-target `set-color` would get stomped
+    // by the next Binding.refire. Non-templated components are the
+    // natural home for direct component-target updates — and the
+    // upcoming `:::chart` will be the showcase.)
+    var update_arena = std.heap.ArenaAllocator.init(allocator);
+    defer update_arena.deinit();
+    const UPDATE_CYCLE_MS: i64 = 1500;
+    const cycle_colors = [_][]const u8{ "blue", "purple", "cyan", "green", "orange" };
+    var color_idx: usize = 0;
+    var last_update_ms = std.time.milliTimestamp();
+
     // Steady-state loop: poll glfw + present. All layout +
     // animation + upload + record work lives in `drawCb` now,
     // keyed off the swapchain's current `extent` so it auto-reflows
     // when the user resizes the window.
     var frame_count: u64 = 0;
+    var update_count: u64 = 0;
     while (!window.shouldClose()) {
         window.pollEvents();
         processInput(&window, &frame_ctx) catch {};
+
+        const now_ms = std.time.milliTimestamp();
+        if (now_ms - last_update_ms >= UPDATE_CYCLE_MS) {
+            color_idx = (color_idx + 1) % cycle_colors.len;
+            var buf: [256]u8 = undefined;
+            const directive = std.fmt.bufPrint(&buf,
+                \\:::update {{target=state.box_color}}
+                \\{s}
+                \\:::
+                \\
+            , .{cycle_colors[color_idx]}) catch unreachable;
+            const n = update.applyAll(update_arena.allocator(), &host_state, &registry, directive) catch 0;
+            update_count += n;
+            _ = update_arena.reset(.retain_capacity);
+            last_update_ms = now_ms;
+        }
+
         try rdr.drawFrame();
         frame_count += 1;
         if (exit_after_ms) |limit| {
@@ -530,4 +575,5 @@ pub fn main() !void {
         elapsed_ms,
         if (elapsed_ms > 0) @as(f64, @floatFromInt(frame_count)) * 1000.0 / @as(f64, @floatFromInt(elapsed_ms)) else 0,
     });
+    try stdout.print("  updates applied:       {d} via :::update wire format\n", .{update_count});
 }
