@@ -64,6 +64,10 @@ Vulkan (loader + headers).
   Paragraph types, layoutParagraph with row-level baseline
   resolution lifted from Makepad's turtle. Mixed-size spans land
   on a shared baseline; repeat glyphs serve straight from atlas.
-- [ ] **Phase 5** — emoji (COLRv1 + sbix fallback).
+- [x] **Phase 5** — colour emoji via dual atlas (R8 mono + RGBA8
+  color), per-glyph `tex_select` routing, premultiplied-alpha blend,
+  strike-aware FontRegistry scale factor so CBDT bitmaps inline with
+  body text. Bitmap path (CBDT/sbix). COLRv1 vector path is a
+  later option if we need bigger emoji.
 - [ ] **Phase 6** — MSDF lane + per-glyph attention attribute hooked
   to the fragment threshold.

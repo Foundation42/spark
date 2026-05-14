@@ -25,19 +25,27 @@ const c = vk.c;
 /// Per-glyph SSBO entry. Layout must match the GLSL `GlyphInstance`
 /// struct in `shaders/text.vert` under std430:
 ///   * each `vec2` is 8-byte aligned (8 bytes wide → no padding)
-///   * the trailing `vec4` is 16-byte aligned; the four preceding
-///     vec2s have already landed it at offset 32 so it's natural.
-/// Total stride: 48 bytes.
+///   * the `vec4` is 16-byte aligned; four preceding vec2s have
+///     already landed it at offset 32 so it's natural.
+///   * `tex_select` (uint, 4 bytes) at offset 48.
+///   * Struct stride aligns to the struct's max-member alignment
+///     (16, from the vec4) — so std430 pads to 64 bytes total. We
+///     declare the padding explicitly to keep Zig's `extern struct`
+///     size matching the GLSL stride.
 pub const GlyphInstance = extern struct {
     dst_pos: [2]f32,
     dst_size: [2]f32,
     uv_min: [2]f32,
     uv_max: [2]f32,
     color: [4]f32,
+    /// 0 = mono atlas (R8 coverage), 1 = color atlas (RGBA8). See
+    /// `glyph_cache.AtlasKind` — the int values are kept in sync.
+    tex_select: u32,
+    _pad: [3]u32,
 };
 
 comptime {
-    std.debug.assert(@sizeOf(GlyphInstance) == 48);
+    std.debug.assert(@sizeOf(GlyphInstance) == 64);
 }
 
 pub const TextPushConsts = extern struct {
@@ -61,7 +69,8 @@ pub const TextPipeline = struct {
     pub fn init(
         ctx: *const vk.Context,
         color_format: c.VkFormat,
-        atlas: *const atlas_mod.Atlas,
+        mono_atlas: *const atlas_mod.Atlas,
+        color_atlas: *const atlas_mod.Atlas,
         max_glyphs: u32,
     ) !TextPipeline {
         const dev = ctx.device;
@@ -108,11 +117,15 @@ pub const TextPipeline = struct {
         try vk.check(c.vkMapMemory(dev, self.glyph_memory, 0, bytes, 0, &raw));
         self.glyph_mapped = @ptrCast(@alignCast(raw.?));
 
-        // ── Descriptor set layout: image+sampler (frag) + SSBO (vert)
-        // Two bindings, one set. Hand-coded array because Zig structs
-        // mapped to Vulkan can't sit in `&[_]X{...}` while being
-        // pre-zeroed via std.mem.zeroes — easier to fill fields. ─
+        // ── Descriptor set layout ───────────────────────────────────
+        // binding 0: mono atlas (R8) — fragment
+        // binding 1: glyph SSBO            — vertex
+        // binding 2: color atlas (RGBA8)   — fragment
+        // Phase 5 reuses the same set across the mono + color lanes
+        // so a single bind covers both samplers; the per-glyph
+        // `tex_select` in the SSBO picks which one the shader reads.
         var bindings = [_]c.VkDescriptorSetLayoutBinding{
+            std.mem.zeroes(c.VkDescriptorSetLayoutBinding),
             std.mem.zeroes(c.VkDescriptorSetLayoutBinding),
             std.mem.zeroes(c.VkDescriptorSetLayoutBinding),
         };
@@ -124,6 +137,10 @@ pub const TextPipeline = struct {
         bindings[1].descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[1].descriptorCount = 1;
         bindings[1].stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT;
+        bindings[2].binding = 2;
+        bindings[2].descriptorType = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[2].descriptorCount = 1;
+        bindings[2].stageFlags = c.VK_SHADER_STAGE_FRAGMENT_BIT;
 
         var dsl_ci = std.mem.zeroes(c.VkDescriptorSetLayoutCreateInfo);
         dsl_ci.sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -131,9 +148,9 @@ pub const TextPipeline = struct {
         dsl_ci.pBindings = &bindings;
         try vk.check(c.vkCreateDescriptorSetLayout(dev, &dsl_ci, null, &self.descriptor_set_layout));
 
-        // ── Descriptor pool: one set with two bindings ──────────────
+        // ── Descriptor pool: one set with three bindings ────────────
         var pool_sizes = [_]c.VkDescriptorPoolSize{
-            .{ .type = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1 },
+            .{ .type = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 2 },
             .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1 },
         };
         var dp_ci = std.mem.zeroes(c.VkDescriptorPoolCreateInfo);
@@ -150,9 +167,14 @@ pub const TextPipeline = struct {
         ds_ai.pSetLayouts = &self.descriptor_set_layout;
         try vk.check(c.vkAllocateDescriptorSets(dev, &ds_ai, &self.descriptor_set));
 
-        var img_info = c.VkDescriptorImageInfo{
-            .sampler = atlas.sampler,
-            .imageView = atlas.view,
+        var mono_info = c.VkDescriptorImageInfo{
+            .sampler = mono_atlas.sampler,
+            .imageView = mono_atlas.view,
+            .imageLayout = c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        var color_info = c.VkDescriptorImageInfo{
+            .sampler = color_atlas.sampler,
+            .imageView = color_atlas.view,
             .imageLayout = c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         };
         var buf_info = c.VkDescriptorBufferInfo{
@@ -163,19 +185,26 @@ pub const TextPipeline = struct {
         var writes = [_]c.VkWriteDescriptorSet{
             std.mem.zeroes(c.VkWriteDescriptorSet),
             std.mem.zeroes(c.VkWriteDescriptorSet),
+            std.mem.zeroes(c.VkWriteDescriptorSet),
         };
         writes[0].sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet = self.descriptor_set;
         writes[0].dstBinding = 0;
         writes[0].descriptorCount = 1;
         writes[0].descriptorType = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[0].pImageInfo = &img_info;
+        writes[0].pImageInfo = &mono_info;
         writes[1].sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[1].dstSet = self.descriptor_set;
         writes[1].dstBinding = 1;
         writes[1].descriptorCount = 1;
         writes[1].descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[1].pBufferInfo = &buf_info;
+        writes[2].sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[2].dstSet = self.descriptor_set;
+        writes[2].dstBinding = 2;
+        writes[2].descriptorCount = 1;
+        writes[2].descriptorType = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[2].pImageInfo = &color_info;
         c.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
 
         // ── Pipeline layout: descriptor set + viewport push consts ──
@@ -226,10 +255,16 @@ pub const TextPipeline = struct {
         ms.sType = c.VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
         ms.rasterizationSamples = c.VK_SAMPLE_COUNT_1_BIT;
 
-        // Straight-alpha blend (see Phase 2 commit for rationale).
+        // Premultiplied-alpha blend. Both lanes feed the same blend
+        // hardware: mono fragments output `(color.rgb * coverage *
+        // color.a, color.a * coverage)` (premultiplied at output);
+        // color fragments sample CBDT bitmaps which FT delivers
+        // already premultiplied. Using `srcFactor = ONE` (not
+        // SRC_ALPHA) avoids the well-known "double-multiplied alpha"
+        // smearing on coloured glyphs.
         var cba = std.mem.zeroes(c.VkPipelineColorBlendAttachmentState);
         cba.blendEnable = c.VK_TRUE;
-        cba.srcColorBlendFactor = c.VK_BLEND_FACTOR_SRC_ALPHA;
+        cba.srcColorBlendFactor = c.VK_BLEND_FACTOR_ONE;
         cba.dstColorBlendFactor = c.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
         cba.colorBlendOp = c.VK_BLEND_OP_ADD;
         cba.srcAlphaBlendFactor = c.VK_BLEND_FACTOR_ONE;

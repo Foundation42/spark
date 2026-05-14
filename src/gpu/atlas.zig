@@ -1,13 +1,14 @@
-//! Glyph atlas: a single R8_UNORM image backed by device-local memory,
-//! sampled with linear filtering. The text pipeline binds this as a
-//! combined-image-sampler at descriptor set 0, binding 0.
+//! Glyph atlas: a single device-local image, sampled with linear
+//! filtering, parameterised by `AtlasFormat`. `mono_r8` is the
+//! hinted-grayscale lane (8-bit coverage); `color_rgba8` is the
+//! emoji / bitmap-color lane (premultiplied RGBA).
 //!
 //! Phase 2 ships the simplest possible variant — fixed-size image,
 //! manual `uploadRegion` to plant a glyph bitmap into a known XY,
 //! one-shot command buffer per upload. Phase 3 layers a rectangle
-//! packer + a key→{u, v, w, h} map on top so the renderer can fetch
-//! "where is glyph G of font F at size S in this atlas" without
-//! callers tracking layout themselves.
+//! packer on top. Phase 5 makes the format selectable so emoji
+//! atlases share the packer + upload plumbing but live in their own
+//! image with their own pixel layout.
 //!
 //! Layout transitions:
 //!   * After `init`: the image lives in SHADER_READ_ONLY_OPTIMAL,
@@ -23,6 +24,31 @@ const vk = @import("vk.zig");
 const c = vk.c;
 
 pub const Rect = struct { x: u32, y: u32, w: u32, h: u32 };
+
+pub const AtlasFormat = enum(u32) {
+    mono_r8 = 0,
+    color_rgba8 = 1,
+
+    pub fn vkFormat(self: AtlasFormat) c.VkFormat {
+        return switch (self) {
+            .mono_r8 => c.VK_FORMAT_R8_UNORM,
+            // Picking R8G8B8A8_UNORM means the cache must swizzle FT's
+            // BGRA bitmaps to RGBA on upload. The alternative —
+            // B8G8R8A8_UNORM with a sampler swizzle on the view —
+            // works too, but the per-glyph CPU swizzle is trivial
+            // (one-time, atlas-side) and keeps the fragment shader
+            // reading plain `.rgba` regardless of source format.
+            .color_rgba8 => c.VK_FORMAT_R8G8B8A8_UNORM,
+        };
+    }
+
+    pub fn bytesPerPixel(self: AtlasFormat) u32 {
+        return switch (self) {
+            .mono_r8 => 1,
+            .color_rgba8 => 4,
+        };
+    }
+};
 
 /// Shelf-packer state. Glyphs flow left-to-right on a "shelf"; when
 /// a glyph doesn't fit the current shelf's remaining width, a new
@@ -46,6 +72,7 @@ pub const Atlas = struct {
     view: c.VkImageView,
     sampler: c.VkSampler,
     extent: c.VkExtent2D,
+    format: AtlasFormat,
 
     // Borrowed Vulkan handles — Atlas does not own these.
     device: c.VkDevice,
@@ -59,6 +86,7 @@ pub const Atlas = struct {
         ctx: *const vk.Context,
         width: u32,
         height: u32,
+        format: AtlasFormat,
     ) !Atlas {
         const dev = ctx.device;
         const pd = ctx.physical_device;
@@ -69,6 +97,7 @@ pub const Atlas = struct {
             .view = null,
             .sampler = null,
             .extent = .{ .width = width, .height = height },
+            .format = format,
             .device = dev,
             .physical_device = pd,
             .queue = ctx.queue,
@@ -80,7 +109,7 @@ pub const Atlas = struct {
         var ici = std.mem.zeroes(c.VkImageCreateInfo);
         ici.sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         ici.imageType = c.VK_IMAGE_TYPE_2D;
-        ici.format = c.VK_FORMAT_R8_UNORM;
+        ici.format = format.vkFormat();
         ici.extent = .{ .width = width, .height = height, .depth = 1 };
         ici.mipLevels = 1;
         ici.arrayLayers = 1;
@@ -107,7 +136,7 @@ pub const Atlas = struct {
         ivci.sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         ivci.image = self.image;
         ivci.viewType = c.VK_IMAGE_VIEW_TYPE_2D;
-        ivci.format = c.VK_FORMAT_R8_UNORM;
+        ivci.format = format.vkFormat();
         ivci.subresourceRange = .{
             .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
             .baseMipLevel = 0,
@@ -153,16 +182,18 @@ pub const Atlas = struct {
         self.* = undefined;
     }
 
-    /// Reserve and upload an `w*h` grayscale bitmap into the next
-    /// free spot in the atlas. Returns the placed rectangle, or
-    /// `error.AtlasFull` if there's no room. For zero-size glyphs
-    /// (e.g. U+0020 space) returns a degenerate rect at the current
-    /// shelf cursor without packing or uploading — callers can still
-    /// use the rect as a valid UV (zero width/height = zero coverage).
+    /// Reserve and upload a `w*h` bitmap into the next free spot in
+    /// the atlas. `pixels` must be exactly `w * h * bytesPerPixel`
+    /// bytes. Returns the placed rectangle, or `error.AtlasFull` if
+    /// there's no room. For zero-size glyphs (e.g. U+0020 space)
+    /// returns a degenerate rect at the current shelf cursor without
+    /// packing or uploading — callers can still use the rect as a
+    /// valid UV (zero width/height = zero coverage).
     pub fn addGlyph(self: *Atlas, w: u32, h: u32, pixels: []const u8) !Rect {
         if (w == 0 or h == 0) {
             return .{ .x = self.shelf.cursor_x, .y = self.shelf.top_y, .w = 0, .h = 0 };
         }
+        std.debug.assert(pixels.len == w * h * self.format.bytesPerPixel());
         const rect = self.pack(w, h) orelse return error.AtlasFull;
         try self.uploadRegion(rect.x, rect.y, w, h, pixels);
         return rect;
@@ -186,10 +217,9 @@ pub const Atlas = struct {
         return .{ .x = 0, .y = new_top, .w = w, .h = h };
     }
 
-    /// Upload an 8-bit grayscale `pixels` buffer of size `w*h` (row
-    /// pitch == w) into the atlas at `(dst_x, dst_y)`. Synchronous —
-    /// returns after the copy is done and the image is back in
-    /// SHADER_READ_ONLY_OPTIMAL.
+    /// Upload a `pixels` buffer of size `w*h*bytesPerPixel` into the
+    /// atlas at `(dst_x, dst_y)`. Synchronous — returns after the
+    /// copy is done and the image is back in SHADER_READ_ONLY_OPTIMAL.
     pub fn uploadRegion(
         self: *Atlas,
         dst_x: u32,
@@ -198,11 +228,12 @@ pub const Atlas = struct {
         h: u32,
         pixels: []const u8,
     ) !void {
-        std.debug.assert(pixels.len == w * h);
+        const bpp = self.format.bytesPerPixel();
+        std.debug.assert(pixels.len == w * h * bpp);
         if (w == 0 or h == 0) return;
 
         // ── Staging buffer (host-visible, host-coherent) ────────────
-        var staging = try Staging.init(self.physical_device, self.device, w * h);
+        var staging = try Staging.init(self.physical_device, self.device, w * h * bpp);
         defer staging.deinit(self.device);
         @memcpy(staging.mapped[0..pixels.len], pixels);
 

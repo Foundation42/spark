@@ -1,20 +1,21 @@
-//! Font registry: indexes loaded `(face, hb_font, px_size, metrics)`
-//! quadruples by an opaque `FontId` (u32). Each `load(path, px)` call
-//! adds a new entry — same file at two pixel sizes becomes two
-//! entries, because FreeType's `FT_Set_Pixel_Sizes` mutates the face
+//! Font registry: indexes loaded `(face, hb_font, ...)` entries by
+//! an opaque `FontId` (u32). Each `load(path, px)` call adds a new
+//! entry — same file at two pixel sizes becomes two entries,
+//! because FreeType's `FT_Set_Pixel_Sizes` mutates the face
 //! globally and we don't want to interleave rasterisations at
 //! different sizes through one face.
 //!
-//! Each entry owns its FT face and HB font; deinit destroys all of
-//! them in registration order. Holds the FT `Library` borrowed —
-//! caller is responsible for keeping that alive for the registry's
-//! lifetime.
+//! Each entry tracks both the *requested* display size (what the
+//! user asked for) and the *actual* rasterisation size (what FT
+//! settled on — usually equal, but for strike-only colour bitmap
+//! fonts like Noto Color Emoji's CBDT it's the nearest baked-in
+//! strike size). The ratio is exposed as `scale(font_id)` so the
+//! layout pass can shrink emoji bitmaps down to inline with body
+//! text. For scalable mono fonts the scale is always 1.
 //!
-//! IDs are *stable* — registering N fonts gives ids 0..N-1, and we
-//! never compact. Phase 4 doesn't need unload (we register at
-//! startup and live with it); when fonts become user-controllable
-//! (Phase 7+), we'll either intern by path+size or generation-tag
-//! the ids.
+//! `metrics(font_id)` returns metrics in display units (already
+//! scaled), so the layout pass doesn't have to multiply at every
+//! callsite.
 
 const std = @import("std");
 const face_mod = @import("face.zig");
@@ -25,7 +26,17 @@ pub const FontId = u32;
 const Entry = struct {
     face: face_mod.Face,
     hb: shape.Font,
-    px_size: u32,
+    /// What FT actually uses internally — may be a strike size for
+    /// CBDT/sbix fonts where the requested size wasn't available.
+    actual_px: u32,
+    /// What the caller asked for. Equal to `actual_px` for scalable
+    /// fonts; smaller for strike fonts being shrunk to inline.
+    display_px: u32,
+    /// `display_px / actual_px`. The layout pass multiplies every
+    /// FT-pixel quantity (bearings, HB advances, atlas-rect sizes)
+    /// by this to land in display coordinates.
+    scale: f32,
+    /// Pre-scaled to display units.
     metrics: face_mod.Metrics,
 };
 
@@ -51,26 +62,46 @@ pub const FontRegistry = struct {
         self.* = undefined;
     }
 
-    /// Load a TTF/OTF font file at `px_size` pixels, returning its
-    /// FontId. The same (path, px_size) loaded twice gives two
-    /// independent entries — we don't intern.
+    /// Load a TTF/OTF font file targeting `display_px` pixels of
+    /// rendered height. For scalable fonts FT rasterises at exactly
+    /// that size; for CBDT/sbix strike fonts FT picks the nearest
+    /// strike and the entry records a scale factor < 1 so the
+    /// layout pass can shrink the bitmaps inline.
     pub fn load(
         self: *FontRegistry,
         path: [*:0]const u8,
-        px_size: u32,
+        display_px: u32,
     ) !FontId {
         var new_face = try face_mod.Face.init(self.ft, path, 0);
         errdefer new_face.deinit();
-        try new_face.setPixelSize(px_size);
+        try new_face.setPixelSize(display_px);
 
         var hb = try shape.Font.fromFreetypeFace(new_face);
         errdefer hb.deinit();
 
+        const actual_px = new_face.pixel_size;
+        const sc: f32 = @as(f32, @floatFromInt(display_px)) / @as(f32, @floatFromInt(actual_px));
+
+        // FT_Select_Size (strike fallback inside setPixelSize) changes
+        // the face's metric scaling — let HB know so its cached
+        // metric callbacks pick up the new size. No-op when the
+        // scalable path took setPixelSize, but cheap insurance.
+        shape.c.hb_ft_font_changed(hb.handle);
+
+        const raw_metrics = new_face.metrics();
+        const scaled_metrics = face_mod.Metrics{
+            .ascender = raw_metrics.ascender * sc,
+            .descender = raw_metrics.descender * sc,
+            .line_height = raw_metrics.line_height * sc,
+        };
+
         try self.entries.append(.{
             .face = new_face,
             .hb = hb,
-            .px_size = px_size,
-            .metrics = new_face.metrics(),
+            .actual_px = actual_px,
+            .display_px = display_px,
+            .scale = sc,
+            .metrics = scaled_metrics,
         });
         return @intCast(self.entries.items.len - 1);
     }
@@ -87,7 +118,14 @@ pub const FontRegistry = struct {
         return self.entries.items[id].metrics;
     }
 
-    pub fn pxSize(self: *const FontRegistry, id: FontId) u32 {
-        return self.entries.items[id].px_size;
+    /// Scale factor from actual FT pixel units to display units —
+    /// 1.0 for scalable mono fonts, < 1.0 for strike-only colour
+    /// emoji fonts being shrunk inline.
+    pub fn scale(self: *const FontRegistry, id: FontId) f32 {
+        return self.entries.items[id].scale;
+    }
+
+    pub fn displayPx(self: *const FontRegistry, id: FontId) u32 {
+        return self.entries.items[id].display_px;
     }
 };

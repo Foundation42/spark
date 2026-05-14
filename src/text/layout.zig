@@ -5,8 +5,8 @@
 //! Three layers, lowest to highest:
 //!
 //!   1. `appendShapedRun` — given an already-shaped HarfBuzz run +
-//!      a font id + a baseline, place each glyph against the atlas
-//!      cache. Knows nothing about spans.
+//!      a font id + a baseline, place each glyph against the
+//!      appropriate atlas. Knows nothing about spans.
 //!   2. `appendLineFromSpans` — given a slice of `Span`s and a
 //!      baseline, shape each span in turn and append. Spans flow
 //!      left-to-right on one line; the pen carries between them so
@@ -15,18 +15,22 @@
 //!      resolve each line's baseline from `max(ascender)` over the
 //!      fonts used on it before placing glyphs, then advance
 //!      vertically by `max(line_height)`. Row-level baseline
-//!      resolution is the trick lifted from Makepad's turtle (see
+//!      resolution is lifted from Makepad's turtle (see
 //!      [[reference-makepad-layout]]) — it's what makes inline
 //!      mixed-size content like "Mix **sizes** inline" land cleanly.
 //!
-//! Output goes into a caller-owned `ArrayList(GlyphInstance)` so the
-//! aggregating caller controls one allocation across many layout
-//! passes — no intermediate slice churn.
+//! Phase 5 splits the atlas in two: `mono_atlas` (R8, hinted
+//! grayscale) and `color_atlas` (RGBA8, premultiplied colour
+//! bitmaps from CBDT/sbix/COLRv1 fonts). The cache routes glyphs
+//! to whichever based on FT's pixel mode; the layout pass picks
+//! UVs from the matching atlas and tags each `GlyphInstance` with
+//! a `tex_select` so the fragment shader knows which sampler to
+//! read from.
 //!
-//! Coordinates: framebuffer-style (origin top-left, Y down). FT
-//! `bearing_y` is positive ABOVE the baseline, so a glyph's top
-//! lives at `baseline_y - bearing_y`. `dst_pos` rounds to integer
-//! pixels so the hinted-grayscale coverage stays sharp.
+//! Per-font `scale` from `FontRegistry` is applied at layout time
+//! to every FT-pixel quantity (bearings, HB advances, atlas rect
+//! sizes). For scalable mono fonts the scale is 1; for strike-only
+//! colour emoji it's `< 1` so emoji shrink to inline with body.
 
 const std = @import("std");
 const shape = @import("../font/shape.zig");
@@ -60,7 +64,8 @@ pub fn appendShapedRun(
     out: *std.ArrayList(tp.GlyphInstance),
     fonts: *registry_mod.FontRegistry,
     cache: *glyph_cache_mod.GlyphCache,
-    atlas: *atlas_mod.Atlas,
+    mono_atlas: *atlas_mod.Atlas,
+    color_atlas: *atlas_mod.Atlas,
     run: shape.ShapedRun,
     font_id: registry_mod.FontId,
     pen_x: f32,
@@ -68,17 +73,32 @@ pub fn appendShapedRun(
     color: [4]f32,
 ) !f32 {
     var x = pen_x;
-    const aw: f32 = @floatFromInt(atlas.extent.width);
-    const ah: f32 = @floatFromInt(atlas.extent.height);
+    const fscale = fonts.scale(font_id);
+    const mono_w: f32 = @floatFromInt(mono_atlas.extent.width);
+    const mono_h: f32 = @floatFromInt(mono_atlas.extent.height);
+    const color_w: f32 = @floatFromInt(color_atlas.extent.width);
+    const color_h: f32 = @floatFromInt(color_atlas.extent.height);
 
     for (run.glyphs) |g| {
-        const entry = try cache.getOrRasterize(fonts, atlas, font_id, g.glyph_id);
+        const entry = try cache.getOrRasterize(fonts, mono_atlas, color_atlas, font_id, g.glyph_id);
         if (entry.rect.w != 0 and entry.rect.h != 0) {
-            const dx = @round(x + @as(f32, @floatFromInt(entry.bearing_x)) + g.x_offset);
-            const dy = @round(baseline_y - @as(f32, @floatFromInt(entry.bearing_y)) + g.y_offset);
+            const bx: f32 = @floatFromInt(entry.bearing_x);
+            const by: f32 = @floatFromInt(entry.bearing_y);
+            const rw: f32 = @floatFromInt(entry.rect.w);
+            const rh: f32 = @floatFromInt(entry.rect.h);
+
+            // All FT-pixel quantities scale by `fscale` to land in
+            // display units; `pen_x` and `baseline_y` are already
+            // display units coming in from the caller.
+            const dx = @round(x + (bx + g.x_offset) * fscale);
+            const dy = @round(baseline_y - (by - g.y_offset) * fscale);
+
+            const aw: f32 = if (entry.kind == .color) color_w else mono_w;
+            const ah: f32 = if (entry.kind == .color) color_h else mono_h;
+
             try out.append(.{
                 .dst_pos = .{ dx, dy },
-                .dst_size = .{ @floatFromInt(entry.rect.w), @floatFromInt(entry.rect.h) },
+                .dst_size = .{ rw * fscale, rh * fscale },
                 .uv_min = .{
                     @as(f32, @floatFromInt(entry.rect.x)) / aw,
                     @as(f32, @floatFromInt(entry.rect.y)) / ah,
@@ -88,9 +108,11 @@ pub fn appendShapedRun(
                     @as(f32, @floatFromInt(entry.rect.y + entry.rect.h)) / ah,
                 },
                 .color = color,
+                .tex_select = @intFromEnum(entry.kind),
+                ._pad = .{ 0, 0, 0 },
             });
         }
-        x += g.x_advance;
+        x += g.x_advance * fscale;
     }
     return x;
 }
@@ -103,7 +125,8 @@ pub fn appendLineFromSpans(
     allocator: std.mem.Allocator,
     fonts: *registry_mod.FontRegistry,
     cache: *glyph_cache_mod.GlyphCache,
-    atlas: *atlas_mod.Atlas,
+    mono_atlas: *atlas_mod.Atlas,
+    color_atlas: *atlas_mod.Atlas,
     spans: []const Span,
     pen_x: f32,
     baseline_y: f32,
@@ -117,7 +140,8 @@ pub fn appendLineFromSpans(
             out,
             fonts,
             cache,
-            atlas,
+            mono_atlas,
+            color_atlas,
             run,
             span.style.font_id,
             x,
@@ -134,15 +158,13 @@ pub fn appendLineFromSpans(
 /// line box), then a second pass that shapes + places glyphs against
 /// that baseline. Advances `y` by the line's `max(line_height)`
 /// between lines.
-///
-/// Returns the final `y` so callers can chain paragraphs vertically
-/// or compute total paragraph height for hit-test bounds.
 pub fn layoutParagraph(
     out: *std.ArrayList(tp.GlyphInstance),
     allocator: std.mem.Allocator,
     fonts: *registry_mod.FontRegistry,
     cache: *glyph_cache_mod.GlyphCache,
-    atlas: *atlas_mod.Atlas,
+    mono_atlas: *atlas_mod.Atlas,
+    color_atlas: *atlas_mod.Atlas,
     paragraph: Paragraph,
     pen_x: f32,
     start_y: f32,
@@ -150,20 +172,10 @@ pub fn layoutParagraph(
     var y = start_y;
     for (paragraph.lines) |line| {
         if (line.spans.len == 0) {
-            // Caller wants vertical whitespace — advance by a single
-            // body-ish line height. We don't have a "this is body"
-            // signal so just pick the first registered font's
-            // line_height as a stand-in. Empty-line behaviour will
-            // get a proper API when we have a real text-document
-            // model.
             y += if (fonts.entries.items.len > 0) fonts.metrics(0).line_height else 16;
             continue;
         }
 
-        // First pass: gather metrics from every font used on the
-        // line. The line's baseline drops by `max(ascender)` so the
-        // tallest glyph fits above it; vertical advance for the
-        // next line is `max(line_height)`.
         var max_asc: f32 = 0;
         var max_lh: f32 = 0;
         for (line.spans) |s| {
@@ -173,7 +185,17 @@ pub fn layoutParagraph(
         }
 
         const baseline_y = y + max_asc;
-        _ = try appendLineFromSpans(out, allocator, fonts, cache, atlas, line.spans, pen_x, baseline_y);
+        _ = try appendLineFromSpans(
+            out,
+            allocator,
+            fonts,
+            cache,
+            mono_atlas,
+            color_atlas,
+            line.spans,
+            pen_x,
+            baseline_y,
+        );
         y += max_lh;
     }
     return y;

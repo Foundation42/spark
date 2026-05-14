@@ -42,11 +42,24 @@ pub const Library = struct {
 pub const Face = struct {
     handle: c.FT_Face,
     pixel_size: u32 = 0,
+    /// True when the face has CBDT / sbix / COLRv1 colour glyph
+    /// tables. Caller queries via `hasColor()`; rasterise paths use
+    /// `FT_LOAD_COLOR` when set so the bitmap comes back as
+    /// `FT_PIXEL_MODE_BGRA` premultiplied.
+    has_color: bool = false,
 
     pub fn init(lib: Library, path: [*:0]const u8, face_index: i32) !Face {
         var f: c.FT_Face = null;
         try checkFt(c.FT_New_Face(lib.handle, path, face_index, &f));
-        return .{ .handle = f };
+        // FT_HAS_COLOR is a macro testing the `face_flags` field;
+        // re-implement it explicitly here so we can store the
+        // result without re-querying every glyph.
+        const has_color = (f.*.face_flags & c.FT_FACE_FLAG_COLOR) != 0;
+        return .{ .handle = f, .has_color = has_color };
+    }
+
+    pub fn hasColor(self: *const Face) bool {
+        return self.has_color;
     }
 
     pub fn deinit(self: *Face) void {
@@ -57,9 +70,41 @@ pub const Face = struct {
     /// Configure the face for px-tall glyphs. The 0 width arg lets
     /// FreeType derive width from the face's design aspect ratio,
     /// which is what we want for proportional fonts.
+    ///
+    /// For colour bitmap fonts (CBDT/sbix) the available "strikes"
+    /// are fixed sizes baked into the font (Noto Color Emoji ships
+    /// a single 136px strike). `FT_Set_Pixel_Sizes` will fail with
+    /// `Invalid_Pixel_Size` if asked for an arbitrary size on a
+    /// strike-only font, so we fall back to `FT_Select_Size` on the
+    /// nearest strike — emoji come out at the strike pixel height
+    /// rather than the requested one, and the layout step scales
+    /// the destination rect to compensate.
     pub fn setPixelSize(self: *Face, px: u32) !void {
-        try checkFt(c.FT_Set_Pixel_Sizes(self.handle, 0, px));
-        self.pixel_size = px;
+        const err = c.FT_Set_Pixel_Sizes(self.handle, 0, px);
+        if (err == 0) {
+            self.pixel_size = px;
+            return;
+        }
+        // Fall back to fixed-strike selection for colour bitmap fonts.
+        const num_sizes = self.handle.*.num_fixed_sizes;
+        if (num_sizes > 0) {
+            const sizes = self.handle.*.available_sizes[0..@intCast(num_sizes)];
+            var best_idx: u32 = 0;
+            var best_diff: u64 = std.math.maxInt(u64);
+            for (sizes, 0..) |s, i| {
+                const a = @as(i64, @intCast(s.height));
+                const b = @as(i64, @intCast(px));
+                const diff: u64 = @abs(a - b);
+                if (diff < best_diff) {
+                    best_diff = diff;
+                    best_idx = @intCast(i);
+                }
+            }
+            try checkFt(c.FT_Select_Size(self.handle, @intCast(best_idx)));
+            self.pixel_size = @intCast(sizes[best_idx].height);
+            return;
+        }
+        return checkFt(err); // bubble the original error if nothing fits
     }
 
     /// Load + render a single glyph by Unicode codepoint. The
@@ -68,7 +113,7 @@ pub const Face = struct {
     /// drawing this glyph. Returns a borrowed view of the face's
     /// internal glyph slot — valid until the next load on this face.
     pub fn rasterizeChar(self: *Face, codepoint: u32) !GlyphBitmap {
-        try checkFt(c.FT_Load_Char(self.handle, codepoint, c.FT_LOAD_RENDER));
+        try checkFt(c.FT_Load_Char(self.handle, codepoint, self.loadFlags()));
         return self.slotBitmap();
     }
 
@@ -77,8 +122,21 @@ pub const Face = struct {
     /// rather than Load_Char (which does its own cmap lookup that
     /// would double-count what the shaper already did).
     pub fn rasterizeGlyph(self: *Face, glyph_id: u32) !GlyphBitmap {
-        try checkFt(c.FT_Load_Glyph(self.handle, glyph_id, c.FT_LOAD_RENDER));
+        try checkFt(c.FT_Load_Glyph(self.handle, glyph_id, self.loadFlags()));
         return self.slotBitmap();
+    }
+
+    fn loadFlags(self: *const Face) c_int {
+        // FT_LOAD_COLOR routes through the colour-bitmap (CBDT/sbix)
+        // or COLRv1 paths and produces an FT_PIXEL_MODE_BGRA bitmap;
+        // without it, an emoji face would return its monochrome
+        // .notdef placeholder. Mono faces ignore the flag.
+        // FT's flag macros land at slightly different widths after
+        // @cImport (FT_LOAD_RENDER is c_int, FT_LOAD_COLOR is c_long
+        // on this platform) — explicit cast both sides keeps Zig happy.
+        const base: c_long = @as(c_long, c.FT_LOAD_RENDER);
+        const color: c_long = if (self.has_color) @as(c_long, c.FT_LOAD_COLOR) else 0;
+        return @intCast(base | color);
     }
 
     fn slotBitmap(self: *Face) !GlyphBitmap {
@@ -87,17 +145,22 @@ pub const Face = struct {
         // Allow zero-size glyphs (e.g. U+0020 space) — they have a
         // valid advance but no pixels, and HarfBuzz still emits them
         // in the output run so the caller can advance the pen.
-        if (bm.width != 0 and bm.rows != 0 and bm.pixel_mode != c.FT_PIXEL_MODE_GRAY) {
+        if (bm.width != 0 and bm.rows != 0 and
+            bm.pixel_mode != c.FT_PIXEL_MODE_GRAY and
+            bm.pixel_mode != c.FT_PIXEL_MODE_BGRA)
+        {
             return error.UnsupportedPixelMode;
         }
-        // FreeType stores grayscale as 1 byte/pixel; pitch may be
-        // negative (bottom-up) or larger than width (row padding).
-        // We expose the raw buffer + pitch so the uploader can copy
-        // row-by-row.
+        // FT stores GRAY as 1 byte/pixel and BGRA as 4 bytes/pixel
+        // (premultiplied). Pitch may be negative (bottom-up) or
+        // larger than width*bpp (row padding). We expose the raw
+        // buffer + pitch + pixel_mode so the cache uploader can
+        // route mono → R8 atlas vs colour → RGBA8 atlas.
         return .{
             .width = bm.width,
             .height = bm.rows,
             .pitch = bm.pitch,
+            .pixel_mode = bm.pixel_mode,
             .buffer = bm.buffer,
             .bearing_x = slot.*.bitmap_left,
             .bearing_y = slot.*.bitmap_top,
@@ -133,6 +196,11 @@ pub const GlyphBitmap = struct {
     /// rows are stored bottom-up — uncommon for FT_LOAD_RENDER but
     /// honour it just in case.
     pitch: c_int,
+    /// `FT_PIXEL_MODE_GRAY` (1 byte/px) or `FT_PIXEL_MODE_BGRA`
+    /// (4 bytes/px premultiplied). The cache uploader routes by
+    /// this field — mono goes to the R8 atlas, BGRA to the RGBA8
+    /// atlas (swizzled on the way in).
+    pixel_mode: u8,
     /// Borrowed pointer into the face's glyph slot. Caller must copy
     /// before the next rasterizeChar() on the same face.
     buffer: [*c]const u8,

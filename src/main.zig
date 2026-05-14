@@ -1,8 +1,8 @@
-//! text_engine_demo — Phase 4: multi-font glyph cache + styled
-//! spans. Demonstrates per-line baseline resolution over mixed
-//! font sizes (Makepad-style row finish), and proves the
-//! `(font_id, glyph_id)` cache pulls repeat glyphs straight from
-//! the atlas instead of going back to FreeType.
+//! text_engine_demo — Phase 5: colour emoji via dual-atlas
+//! (R8 grayscale + RGBA8 premultiplied) routed by per-glyph
+//! `tex_select`. Noto Color Emoji is a strike-only CBDT font, so
+//! the registry tracks an actual-vs-display scale factor and the
+//! layout pass shrinks the 136-px native bitmaps inline.
 
 const std = @import("std");
 const text_engine = @import("text_engine");
@@ -17,7 +17,8 @@ const registry_mod = @import("font/registry.zig");
 const glyph_cache_mod = @import("text/glyph_cache.zig");
 const layout = @import("text/layout.zig");
 
-const ATLAS_SIZE: u32 = 512;
+const ATLAS_MONO_SIZE: u32 = 512;
+const ATLAS_COLOR_SIZE: u32 = 1024; // emoji bitmaps are 136 px native, give them room
 const MAX_GLYPHS: u32 = 2048;
 
 const FrameCtx = struct {
@@ -36,7 +37,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — phase 4\n", .{});
+    try stdout.print("text_engine demo — phase 5\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
 
@@ -50,18 +51,18 @@ pub fn main() !void {
     var swapchain = try swap.Swapchain.init(allocator, &ctx, &window);
     defer swapchain.deinit();
 
-    var atlas = try atlas_mod.Atlas.init(&ctx, ATLAS_SIZE, ATLAS_SIZE);
-    defer atlas.deinit();
+    var atlas_mono = try atlas_mod.Atlas.init(&ctx, ATLAS_MONO_SIZE, ATLAS_MONO_SIZE, .mono_r8);
+    defer atlas_mono.deinit();
+    var atlas_color = try atlas_mod.Atlas.init(&ctx, ATLAS_COLOR_SIZE, ATLAS_COLOR_SIZE, .color_rgba8);
+    defer atlas_color.deinit();
 
-    var pipeline = try tp.TextPipeline.init(&ctx, swapchain.format, &atlas, MAX_GLYPHS);
+    var pipeline = try tp.TextPipeline.init(&ctx, swapchain.format, &atlas_mono, &atlas_color, MAX_GLYPHS);
     defer pipeline.deinit();
 
-    // ── Font registry: one entry per (file, px) ─────────────────────
-    // Loading the same file at four sizes is the common path while
-    // we don't yet have weight/italic variants — Phase ≥5 will pull
-    // those in via fontconfig.
     const font_path = std.posix.getenv("TEXT_ENGINE_FONT") orelse
         "/usr/share/fonts/TTF/DejaVuSans.ttf";
+    const emoji_path = std.posix.getenv("TEXT_ENGINE_EMOJI_FONT") orelse
+        "/usr/share/fonts/noto/NotoColorEmoji.ttf";
 
     var ft = try face_mod.Library.init();
     defer ft.deinit();
@@ -73,6 +74,15 @@ pub fn main() !void {
     const subtitle_id = try fonts.load(font_path.ptr, 18);
     const body_id = try fonts.load(font_path.ptr, 22);
     const accent_id = try fonts.load(font_path.ptr, 28);
+    // Asking for 28-px emoji from a 136-px-strike CBDT font: the
+    // registry stores actual=136, display=28, scale≈0.206. Layout
+    // shrinks the bitmaps inline with the surrounding 22-px body.
+    const emoji_id = try fonts.load(emoji_path.ptr, 28);
+    try stdout.print("  emoji font:            actual {d}px, display {d}px, scale {d:.3}\n", .{
+        fonts.entries.items[emoji_id].actual_px,
+        fonts.entries.items[emoji_id].display_px,
+        fonts.scale(emoji_id),
+    });
 
     var cache = glyph_cache_mod.GlyphCache.init(allocator);
     defer cache.deinit();
@@ -88,26 +98,25 @@ pub fn main() !void {
         .{ .text = "text_engine", .style = .{ .font_id = heading_id, .color = white } },
     } };
     const subtitle_line = layout.Line{ .spans = &.{
-        .{ .text = "Phase 4 — styled spans + glyph cache", .style = .{ .font_id = subtitle_id, .color = grey } },
+        .{ .text = "Phase 5 — colour emoji via dual atlas", .style = .{ .font_id = subtitle_id, .color = grey } },
     } };
     const blank_line = layout.Line{ .spans = &.{} };
-    // Mixed-size line — accent span lifts the baseline so the
-    // surrounding 22 px body still sits cleanly underneath.
     const mixed_line = layout.Line{ .spans = &.{
         .{ .text = "Mix ", .style = .{ .font_id = body_id, .color = white } },
         .{ .text = "fonts", .style = .{ .font_id = body_id, .color = yellow } },
         .{ .text = ", ", .style = .{ .font_id = body_id, .color = white } },
         .{ .text = "sizes", .style = .{ .font_id = accent_id, .color = orange } },
-        .{ .text = " and colours inline.", .style = .{ .font_id = body_id, .color = white } },
+        .{ .text = ", and colours inline.", .style = .{ .font_id = body_id, .color = white } },
     } };
-    const repeat_line = layout.Line{ .spans = &.{
-        .{ .text = "Same glyph, same atlas slot — cache turns ", .style = .{ .font_id = body_id, .color = white } },
-        .{ .text = "warm", .style = .{ .font_id = body_id, .color = green } },
-        .{ .text = " after the first sighting.", .style = .{ .font_id = body_id, .color = white } },
+    const emoji_line = layout.Line{ .spans = &.{
+        .{ .text = "Inline emoji: ", .style = .{ .font_id = body_id, .color = white } },
+        .{ .text = "🎉🦊🚀❤️🎨🌍", .style = .{ .font_id = emoji_id, .color = white } },
+        .{ .text = "  in body text.", .style = .{ .font_id = body_id, .color = white } },
     } };
     const ligature_line = layout.Line{ .spans = &.{
-        .{ .text = "Ligatures: fi fl ff ffi  •  Pangram: ", .style = .{ .font_id = body_id, .color = white } },
-        .{ .text = "Sphinx of black quartz, judge my vow.", .style = .{ .font_id = body_id, .color = grey } },
+        .{ .text = "Ligatures still: fi fl ff ffi  •  Cache hits keep ", .style = .{ .font_id = body_id, .color = white } },
+        .{ .text = "warm", .style = .{ .font_id = body_id, .color = green } },
+        .{ .text = " across the paragraph.", .style = .{ .font_id = body_id, .color = white } },
     } };
 
     const paragraph = layout.Paragraph{ .lines = &.{
@@ -115,14 +124,10 @@ pub fn main() !void {
         subtitle_line,
         blank_line,
         mixed_line,
-        repeat_line,
+        emoji_line,
         ligature_line,
     } };
 
-    // ── Lay out into a caller-owned ArrayList ──────────────────────
-    // One allocation grows to hold every glyph in the paragraph;
-    // appendLineFromSpans / appendShapedRun never allocate a glyph
-    // slice of their own.
     var glyphs = std.ArrayList(tp.GlyphInstance).init(allocator);
     defer glyphs.deinit();
 
@@ -131,7 +136,8 @@ pub fn main() !void {
         allocator,
         &fonts,
         &cache,
-        &atlas,
+        &atlas_mono,
+        &atlas_color,
         paragraph,
         40,
         40,
@@ -145,7 +151,6 @@ pub fn main() !void {
         cache.hitRate() * 100.0,
     });
 
-    // ── Frame loop ─────────────────────────────────────────────────
     var rdr = try renderer.Renderer.init(allocator, &ctx, &swapchain, &window);
     defer rdr.deinit();
 
