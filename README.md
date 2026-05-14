@@ -59,7 +59,11 @@ Vulkan (loader + headers).
 - [x] **Phase 3** — HarfBuzz shaping, per-glyph SSBO, instanced draw,
   shelf-packed atlas, baseline-relative layout. v1 "rich text on
   screen" milestone — one `vkCmdDraw(6, n_glyphs, 0, 0)` per frame.
-- [ ] **Phase 4** — styled spans, multiple sizes/weights.
+- [x] **Phase 4** — font registry (multi (file, px) entries), glyph
+  cache keyed by `(font_id, glyph_id)`, Style + Span + Line +
+  Paragraph types, layoutParagraph with row-level baseline
+  resolution lifted from Makepad's turtle. Mixed-size spans land
+  on a shared baseline; repeat glyphs serve straight from atlas.
 - [ ] **Phase 5** — emoji (COLRv1 + sbix fallback).
 - [ ] **Phase 6** — MSDF lane + per-glyph attention attribute hooked
   to the fragment threshold.
