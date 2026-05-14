@@ -25,40 +25,43 @@ const c = vk.c;
 /// Per-glyph SSBO entry. Layout must match the GLSL `GlyphInstance`
 /// struct in `shaders/text.vert` under std430:
 ///   * each `vec2` is 8-byte aligned (8 bytes wide → no padding)
-///   * the `vec4` is 16-byte aligned; four preceding vec2s have
-///     already landed it at offset 32 so it's natural.
-///   * `tex_select` (uint, 4 bytes) at offset 48.
-///   * `attention` (float, 4 bytes) at offset 52.
-///   * `fx_kind` (uint, 4 bytes) at offset 56 — reserved for Phase
-///     7+ effect-type dispatch (glow / pulse / shimmer / drop-shadow).
-///   * Struct stride aligns to the struct's max-member alignment
-///     (16, from the vec4) — so std430 pads to 64 bytes total. We
-///     declare the trailing pad explicitly to keep Zig's `extern
-///     struct` size matching the GLSL stride.
+///   * `color` (vec4) at offset 32, naturally 16-byte aligned.
+///   * `hot_color` (vec4) at offset 48 — `color → hot_color` lerp
+///     target for the attention modulation.
+///   * `tex_select` (uint) at offset 64.
+///   * `attention` (float) at offset 68.
+///   * `fx_kind` (uint) at offset 72 — reserved for Phase 7+
+///     effect-type dispatch (underline / size-pulse / per-glyph PBR).
+///   * Struct alignment is 16 (from the vec4s); std430 pads to a
+///     multiple of 16. Total: 80 bytes with a trailing 4-byte pad
+///     declared explicitly to keep Zig's `extern struct` size in
+///     lockstep with the GLSL stride.
 pub const GlyphInstance = extern struct {
     dst_pos: [2]f32,
     dst_size: [2]f32,
     uv_min: [2]f32,
     uv_max: [2]f32,
     color: [4]f32,
+    hot_color: [4]f32,
     /// 0 = mono atlas (R8 coverage), 1 = colour atlas (RGBA8), 2 =
     /// SDF (R8 atlas, distance-field sampling). See
     /// `glyph_cache.AtlasKind` — the int values are kept in sync.
     tex_select: u32,
-    /// LM-driven attribute the shader can read. Phase 6 wires it to
-    /// the SDF threshold so high-attention glyphs render bolder /
-    /// glow brighter. Range nominally [0, 1] but unclamped — the
-    /// shader handles saturation.
+    /// LM-driven attribute the shader reads. Phase 6 wires it to
+    /// the SDF threshold (weight pulse) and to a `color → hot_color`
+    /// lerp (hue shift) in both mono and SDF branches. Colour-atlas
+    /// glyphs (emoji) deliberately ignore it — their artwork is not
+    /// tinted. Range nominally [0, 1]; shader clamps.
     attention: f32,
     /// Reserved for future per-glyph effect dispatch — Phase 7+.
     /// 0 = no effect (pass-through). Other values will route to
-    /// glow / shimmer / drop-shadow / colour-warp branches.
+    /// underline / size-pulse / shimmer / colour-warp branches.
     fx_kind: u32,
     _pad: u32,
 };
 
 comptime {
-    std.debug.assert(@sizeOf(GlyphInstance) == 64);
+    std.debug.assert(@sizeOf(GlyphInstance) == 80);
 }
 
 pub const TextPushConsts = extern struct {

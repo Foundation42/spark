@@ -42,10 +42,21 @@ const glyph_cache_mod = @import("glyph_cache.zig");
 pub const Style = struct {
     font_id: registry_mod.FontId,
     color: [4]f32,
-    /// Phase 6: LM-driven attention attribute. Per-span default;
-    /// the demo can mutate per-glyph in the SSBO at frame time for
-    /// animation. Range nominally 0..1, shader doesn't clamp.
-    attention: f32 = 0.5,
+    /// Target colour at `attention == 1.0`. The shader lerps
+    /// `color → hot_color` by attention in the mono + SDF branches,
+    /// giving an LM-driven hue shift on top of the SDF weight
+    /// pulse. Default warm yellow reads as the conventional
+    /// "this is hot / important" cue from attention-as-heat
+    /// visualisations; override per-span for different signal
+    /// semantics (warning red for errors, calm green for success,
+    /// etc.). The colour atlas (emoji) ignores this — emoji
+    /// artwork is never tinted.
+    hot_color: [4]f32 = .{ 1.0, 0.85, 0.40, 1.0 },
+    /// Per-glyph attention, nominally 0..1 (shader clamps). Default
+    /// 0 means no visible effect even with `hot_color` set — opt in
+    /// by setting non-zero, or by animating per-frame on the SSBO
+    /// for live LM signals.
+    attention: f32 = 0.0,
 };
 
 pub const Span = struct {
@@ -75,6 +86,7 @@ pub fn appendShapedRun(
     pen_x: f32,
     baseline_y: f32,
     color: [4]f32,
+    hot_color: [4]f32,
     attention: f32,
 ) !f32 {
     var x = pen_x;
@@ -123,6 +135,7 @@ pub fn appendShapedRun(
                     (@as(f32, @floatFromInt(entry.rect.y + entry.rect.h)) - inset) / ah,
                 },
                 .color = color,
+                .hot_color = hot_color,
                 .tex_select = @intFromEnum(entry.kind),
                 .attention = attention,
                 .fx_kind = 0,
@@ -164,6 +177,7 @@ pub fn appendLineFromSpans(
             x,
             baseline_y,
             span.style.color,
+            span.style.hot_color,
             span.style.attention,
         );
     }
