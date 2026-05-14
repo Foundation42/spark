@@ -702,9 +702,38 @@ fn emitLine(
     }
     const baseline_y = y + max_asc;
 
+    // Underline-run tracker. Each link in the source produces atoms
+    // with `style.link == true`; we track contiguous runs on this
+    // line and emit one underline quad per run after we know its
+    // x-extent. A link wrapping across a line break naturally gets
+    // one quad per line because emit_line runs once per line.
+    //
+    // `run_max_px` is the dominant displayPx in the current run, so
+    // the underline thickness/offset scale to the largest font in
+    // the link span (mixed-size links are rare but possible — heading
+    // links, link-around-a-strong, etc).
     var x = pen_x;
+    var run_start_x: ?f32 = null;
+    var run_max_px: u32 = 0;
+    var run_color: [4]f32 = .{ 0, 0, 0, 0 };
+
     for (line_tokens) |tok| {
         const atom = tokenAtom(tok) orelse continue;
+
+        if (atom.style.link) {
+            if (run_start_x == null) {
+                run_start_x = x;
+                run_max_px = ctx.fonts.displayPx(atom.style.font_id);
+                run_color = atom.style.color;
+            } else {
+                const px = ctx.fonts.displayPx(atom.style.font_id);
+                if (px > run_max_px) run_max_px = px;
+            }
+        } else if (run_start_x) |start_x| {
+            try emitUnderline(out, ctx.theme, start_x, x, baseline_y, run_max_px, run_color);
+            run_start_x = null;
+        }
+
         x = try text_layout.appendShapedRun(
             &out.glyphs,
             ctx.fonts,
@@ -721,5 +750,36 @@ fn emitLine(
         );
     }
 
+    // Trailing run — a link that reaches the end of the line.
+    if (run_start_x) |start_x| {
+        try emitUnderline(out, ctx.theme, start_x, x, baseline_y, run_max_px, run_color);
+    }
+
     return .{ .baseline = baseline_y, .line_height = max_lh };
+}
+
+/// Emit one underline quad spanning `[x0, x1]` at the given baseline.
+/// Thickness + offset derive from the run's dominant `displayPx`
+/// scaled by `theme.link_underline_*_em` so the underline auto-sizes
+/// with the run's font. Thickness clamped to >= 1px so it never
+/// disappears even at tiny sizes.
+fn emitUnderline(
+    out: *element.DrawList,
+    theme: *const element.Theme,
+    x0: f32,
+    x1: f32,
+    baseline_y: f32,
+    run_px: u32,
+    color: [4]f32,
+) !void {
+    if (x1 <= x0) return;
+    const px_f: f32 = @floatFromInt(run_px);
+    const thickness = @max(1.0, px_f * theme.link_underline_thickness_em);
+    const offset = px_f * theme.link_underline_offset_em;
+    try out.quads.append(.{
+        .dst_pos = .{ x0, baseline_y + offset },
+        .dst_size = .{ x1 - x0, thickness },
+        .color = color,
+        .radius = 0,
+    });
 }

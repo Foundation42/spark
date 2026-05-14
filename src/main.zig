@@ -37,7 +37,7 @@ const demo_md = @embedFile("demo.md");
 const ATLAS_MONO_SIZE: u32 = 768;
 const ATLAS_COLOR_SIZE: u32 = 1024;
 const MAX_GLYPHS: u32 = 2048;
-const MAX_QUADS: u32 = 256;
+const MAX_QUADS: u32 = 2048;
 
 const FrameCtx = struct {
     text_pipeline: *tp.TextPipeline,
@@ -104,7 +104,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 3 / stage 4a (quad chrome)\n", .{});
+    try stdout.print("text_engine demo — session 3 / stage 4b (link underlines)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
     try stdout.print("  demo.md bytes:         {d}\n", .{demo_md.len});

@@ -333,6 +333,17 @@ pub const Theme = struct {
     thematic_break_height: f32 = 12,
     thematic_break_thickness: f32 = 2,
 
+    /// Link underline thickness as a fraction of em size. The walker
+    /// multiplies by the run's dominant `displayPx` so underlines
+    /// auto-scale with font size — a heading-link gets a chunkier
+    /// underline than a body link, in proportion. Defaults to 6% of
+    /// em, the OpenType convention's middle of the road.
+    link_underline_thickness_em: f32 = 0.06,
+    /// Underline offset below baseline, also as a fraction of em.
+    /// 10% sits comfortably in the descender zone without colliding
+    /// with descenders on most Latin fonts.
+    link_underline_offset_em: f32 = 0.10,
+
     // ── Layout constants the walker reads ───────────────────────────
     list_marker_indent: f32 = 8,
     list_content_indent: f32 = 32,

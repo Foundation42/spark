@@ -8,6 +8,8 @@ Same renderer as before — only the construction path changed. This document is
 
 This paragraph uses *italic* and **bold** and ***bold-italic*** and `inline code` and a [link](https://example.com).
 
+Underlines honour wrap — [this is a longer link with enough text inside its anchor that it spans more than one line, producing one underline quad per visible line of the link](https://example.com).
+
 ## Nesting
 
 - block kinds nest
