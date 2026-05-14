@@ -30,6 +30,7 @@ const element_layout = @import("element_layout.zig");
 const markdown = @import("markdown.zig");
 const ansi = @import("ansi.zig");
 const component = @import("component.zig");
+const box_component = @import("components/box.zig");
 
 /// Demo document — parsed by the vendored cmark + mapper into an
 /// Element tree at startup. Same render path as the hand-built
@@ -318,6 +319,7 @@ pub fn main() !void {
     // the first real factory; visible change lands then.
     var registry = component.Registry.init(allocator);
     defer registry.deinit();
+    try registry.register("box", box_component.factory);
 
     // ── Parse demo.md into an Element tree ─────────────────────────
     // All slices + strings the tree references live in `doc_arena`;

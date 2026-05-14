@@ -34,7 +34,7 @@ fn render(elem: Element) !void {
 
 Block extensions parse, thread through the mapper as a sidecar, and re-materialise as `custom` Elements. The registry doesn't exist yet — every directive renders as a *missing-component* fallback panel. Real components arrive at stage 7c.
 
-:::box {#bx color=red width=200 height=80}
+:::box {#bx color=blue width=200 height=80 radius=8}
 :::
 
 :::3d-scene {#orbit-view width=100% height=400px}

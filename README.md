@@ -198,12 +198,20 @@ TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
   takes an optional registry; null preserves 7a placeholder
   behaviour. `zig build test` step added. Demo unchanged — no
   factories registered yet, dormant infrastructure ready for 7c.
+- [x] **Stage 7c** — first concrete component: `:::box`. Lives in
+  `src/components/box.zig`. Parses `color` (named + hex), `width` /
+  `height` (px + %), `radius` from `Spec.attrs` and emits one
+  rounded quad. `update` wired so attr edits hit the cached
+  instance in place (the "cheap edit" path `:::update` will use
+  later). Demo's `:::box` block renders as a 200×80 blue rounded
+  rectangle alongside the two red placeholders for the still-
+  unregistered `:::3d-scene` / `:::chart`. 21 unit tests.
 
 ## What's next
 
 [`docs/roadmap.md`](docs/roadmap.md). Headline for the rest of
-session 4: **first concrete component** (`:::box` with color + size
-attrs), then **reactive frontmatter state + bindings**, then **input
-handling**, then the **`:::update` micro-stream hot path** that
-lets an LLM push deltas into a live chart at 15k fps without
+session 4: **reactive frontmatter state + bindings** (`${state.x}`
+substitution + observable store + per-binding subscribers), then
+**input handling**, then the **`:::update` micro-stream hot path**
+that lets an LLM push deltas into a live chart at 15k fps without
 touching the document layout.

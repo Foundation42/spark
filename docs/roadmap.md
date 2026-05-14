@@ -60,16 +60,26 @@ factory-produced instance pointer.
 Demo unchanged: no factories registered yet, every `:::` still
 hits the placeholder. Infrastructure is dormant, ready for 7c.
 
-## Next — first concrete component (stage 7c)
+## Shipped — first concrete component (stage 7c)
 
-`:::box {color, width, height}` as the minimal loop validator.
-Renders a coloured quad. Proves: parse → registry → cached
-instance → layout returns Box → quad emit, end-to-end.
+`:::box` lives in `src/components/box.zig`. Reads `color` (named or
+`#RGB` / `#RRGGBB` / `#RRGGBBAA` hex), `width`, `height` (pixels or
+`%`), and `radius` (pixels) from `Spec.attrs`. Emits one rounded
+quad through the existing quad pipeline. `update` is wired so attr
+changes between parses mutate the cached instance in place — the
+"cheap edit" path the `:::update` micro-stream will eventually
+exploit. Missing-or-unparseable color → opaque magenta indicator.
 
-Or jump straight to `:::chart` if visual impact wins over minimal
-scope — same loop, more LOC. Lean toward `:::box` first.
+Visible payoff: the `:::box` block in `demo.md` now renders as a
+200×80 blue rounded rectangle. `:::3d-scene` and `:::chart` stay
+as red missing-component placeholders (factories not registered).
 
-## Then — frontmatter state + bindings (stage 7d → 7e)
+`zig build test` now runs through a single entry point
+(`src/tests.zig`) so subdirectory test files can reach siblings via
+`../`-style relative imports without hitting Zig's module-root
+guard. 21 tests total: parser + registry + box parsing helpers.
+
+## Next — frontmatter state + bindings (stage 7d → 7e)
 
 YAML frontmatter (a small hand-rolled subset — `key: value` pairs
 under a `state:` block — until we need lists / nested maps).
