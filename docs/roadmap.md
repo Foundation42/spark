@@ -8,24 +8,32 @@ micro-updates. Full pitch + architectural mapping +
 design-decision rationale lives in [`vision.md`](vision.md).
 
 This roadmap is the staging path from where we are (markdown
-rendering + chrome + ANSI + resize) to where we're going (live
-documents). Session 4 starts on stage 7a.
+rendering + chrome + ANSI + resize + `:::` parser) to where we're
+going (live documents). Session 4 starts on stage 7b.
 
-## Next — block extension parser (stage 7a)
+## Shipped — block extension parser (stage 7a)
 
 `markdown.zig` recognises `:::name {attrs}\nbody\n:::` syntax and
-emits a `custom` Element with vtable + ctx pointer.
+emits a `custom` Element backed by a placeholder vtable. Approach:
+pre-scan source for `:::` blocks before cmark sees it; lift each
+block into a sidecar `Spec` slice; replace the byte range with a
+`<!--te:N-->` HTML comment sentinel bracketed by blank lines so
+cmark treats it as a standalone `CMARK_NODE_HTML_BLOCK`; mapper
+intercepts the sentinel pattern and emits the `custom` Element.
+Keeps vendored cmark completely untouched.
 
-- cmark doesn't support `:::` blocks natively. Three approaches
-  considered (vision doc has the full list); leaning toward
-  walking cmark's paragraph output to detect leading `:::` lines.
-  Keeps the vendored cmark untouched.
-- Attribute parser handles `{#id key=val key="quoted val"}`.
-- Components without a registered factory render a fallback
-  "missing component: name" box — clear failure mode for authors
-  / LLMs that pick the wrong directive name.
+- `src/markdown_components.zig` — `Spec`/`Attr` types, `preprocess`,
+  `parseDirectiveLine`, `extractSentinelIndex`, `placeholder_vtable`
+  rendering the red-bordered "missing component: NAME" panel.
+- Attribute grammar: `{#id key=val key="quoted val"}`. Directive
+  names allow digit-leading (`3d-scene`); keys / ids letter-leading.
+- Fenced code blocks tracked during pre-scan so embedded `:::`
+  doesn't get hijacked.
+- Tests in source: `parseDirectiveLine`, `preprocess` happy path +
+  fenced-code passthrough + unterminated-block error,
+  `extractSentinelIndex`. All passing.
 
-## Then — component registry + cache (stage 7b)
+## Next — component registry + cache (stage 7b)
 
 Host registers `name → ComponentFactory`. Cache keyed by `#id`
 (or auto-generated stable position-based ID) persists instances

@@ -29,3 +29,21 @@ fn render(elem: Element) !void {
     // code blocks: monospace, preformatted
 }
 ```
+
+## Live components (stage 7a)
+
+Block extensions parse, thread through the mapper as a sidecar, and re-materialise as `custom` Elements. The registry doesn't exist yet — every directive renders as a *missing-component* fallback panel. Real components arrive at stage 7c.
+
+:::box {#bx color=red width=200 height=80}
+:::
+
+:::3d-scene {#orbit-view width=100% height=400px}
+src: "assets/sat.gltf"
+animation: "orbital_drift"
+:::
+
+:::chart {#telemetry type=line x=time y=velocity}
+time, velocity, temperature
+00:01, 7400, 24.5
+00:02, 7450, 24.8
+:::

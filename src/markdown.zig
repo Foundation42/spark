@@ -41,6 +41,7 @@
 
 const std = @import("std");
 const element = @import("element.zig");
+const components = @import("markdown_components.zig");
 
 pub const cmark = @cImport({
     @cInclude("cmark.h");
@@ -49,26 +50,52 @@ pub const cmark = @cImport({
 pub const Error = error{
     CmarkParseFailed,
     UnsupportedNodeKind,
-} || std.mem.Allocator.Error;
+} || std.mem.Allocator.Error || components.Error;
+
+/// Threaded through the block-mapping recursion. Replaces the old
+/// `arena + theme` pair (one struct ptr is cheaper to pass than two
+/// scalars, and we needed somewhere to hang `specs` anyway). Inline
+/// mapping doesn't see `specs` because inline content is never a
+/// component — keeps the inline recursion signature unchanged.
+const MapCtx = struct {
+    arena: std.mem.Allocator,
+    theme: *const element.Theme,
+    /// Specs for `:::` component blocks, indexed by sentinel N.
+    /// Populated by `components.preprocess` ahead of the cmark parse.
+    specs: []const components.Spec,
+};
 
 /// Parse `source` (UTF-8 CommonMark) into an Element tree owned by
 /// `arena`. The returned root is a `container.stack_v` containing
 /// every top-level block — the same shape as `cmark`'s
 /// `CMARK_NODE_DOCUMENT`. Free the entire tree by deinit'ing the
 /// arena the caller passed in.
+///
+/// `:::name {attrs}\nbody\n:::` block extensions are extracted before
+/// cmark sees the source (see `markdown_components.preprocess`); the
+/// extracted specs ride along through the mapper as a sidecar slice
+/// and get re-materialised as `custom` Elements when the mapper hits
+/// the matching sentinel HTML comment.
 pub fn parse(
     arena: std.mem.Allocator,
     source: []const u8,
     theme: *const element.Theme,
 ) Error!element.Element {
+    const pre = try components.preprocess(arena, source);
+
     const root = cmark.cmark_parse_document(
-        source.ptr,
-        source.len,
+        pre.source.ptr,
+        pre.source.len,
         cmark.CMARK_OPT_DEFAULT,
     ) orelse return error.CmarkParseFailed;
     defer cmark.cmark_node_free(root);
 
-    return try mapBlock(arena, root, theme.body, theme);
+    const mc: MapCtx = .{
+        .arena = arena,
+        .theme = theme,
+        .specs = pre.specs,
+    };
+    return try mapBlock(&mc, root, theme.body);
 }
 
 // ── Block mapping ──────────────────────────────────────────────────
@@ -77,16 +104,15 @@ pub fn parse(
 /// resolved style — relevant only for the inline content nested
 /// inside this block; block kinds themselves don't carry a style.
 fn mapBlock(
-    arena: std.mem.Allocator,
+    mc: *const MapCtx,
     node: *cmark.cmark_node,
     cascade: element.Style,
-    theme: *const element.Theme,
 ) Error!element.Element {
     const t = cmark.cmark_node_get_type(node);
 
     switch (t) {
         cmark.CMARK_NODE_DOCUMENT => {
-            const children = try mapBlockChildren(arena, node, cascade, theme);
+            const children = try mapBlockChildren(mc, node, cascade);
             return .{ .container = .{
                 .layout = .stack_v,
                 .children = children,
@@ -95,7 +121,7 @@ fn mapBlock(
         },
 
         cmark.CMARK_NODE_PARAGRAPH => {
-            const inline_content = try mapInlineChildren(arena, node, cascade, theme);
+            const inline_content = try mapInlineChildren(mc.arena, node, cascade, mc.theme);
             return .{ .paragraph = inline_content };
         },
 
@@ -107,13 +133,13 @@ fn mapBlock(
             // h2 base, NOT off body. (Limited by the body-relative
             // cascade caveat in element.Theme — fix when nested
             // emphasis inside headings becomes a visual concern.)
-            const heading_base = theme.heading[level - 1];
-            const inline_content = try mapInlineChildren(arena, node, heading_base, theme);
+            const heading_base = mc.theme.heading[level - 1];
+            const inline_content = try mapInlineChildren(mc.arena, node, heading_base, mc.theme);
             return .{ .heading = .{ .level = level, .content = inline_content } };
         },
 
         cmark.CMARK_NODE_BLOCK_QUOTE => {
-            const children = try mapBlockChildren(arena, node, cascade, theme);
+            const children = try mapBlockChildren(mc, node, cascade);
             return .{ .quote = .{ .children = children } };
         },
 
@@ -121,31 +147,51 @@ fn mapBlock(
             const ordered = cmark.cmark_node_get_list_type(node) == cmark.CMARK_ORDERED_LIST;
             const raw_start = cmark.cmark_node_get_list_start(node);
             const start: u32 = if (ordered) @intCast(@max(@as(c_int, 1), raw_start)) else 1;
-            const items = try mapBlockChildren(arena, node, cascade, theme);
+            const items = try mapBlockChildren(mc, node, cascade);
             return .{ .list = .{ .ordered = ordered, .items = items, .start = start } };
         },
 
         cmark.CMARK_NODE_ITEM => {
-            const children = try mapBlockChildren(arena, node, cascade, theme);
+            const children = try mapBlockChildren(mc, node, cascade);
             return .{ .list_item = .{ .children = children } };
         },
 
-        cmark.CMARK_NODE_CODE_BLOCK, cmark.CMARK_NODE_HTML_BLOCK => {
-            // Both render as preformatted code for now. CMARK provides
-            // the fenced language via `cmark_node_get_fence_info` —
-            // when the ANSI engine lands we'll dispatch on that to
+        cmark.CMARK_NODE_CODE_BLOCK => {
+            // CMARK provides the fenced language via
+            // `cmark_node_get_fence_info` — when the ANSI engine
+            // lands (stage 5b) we'll dispatch on that to
             // `CodeContent.sub_block`.
+            return try makePreformattedBlock(mc, node);
+        },
+
+        cmark.CMARK_NODE_HTML_BLOCK => {
+            // `:::` blocks survive the preprocess as HTML comment
+            // sentinels — `<!--te:N-->` — which cmark emits as
+            // `CMARK_NODE_HTML_BLOCK` literals. Match and materialise
+            // a `custom` element backed by the spec; otherwise fall
+            // back to rendering the raw HTML block as preformatted
+            // text (better than dropping silently).
             const literal_ptr = cmark.cmark_node_get_literal(node);
-            const raw: []const u8 = if (literal_ptr != null)
+            const literal: []const u8 = if (literal_ptr != null)
                 std.mem.span(literal_ptr)
             else
                 "";
-            const trimmed = std.mem.trimRight(u8, raw, "\n");
-            const owned = try arena.dupe(u8, trimmed);
-            return .{ .code_block = .{ .content = .{ .raw = .{
-                .text = owned,
-                .style = theme.code_block,
-            } } } };
+            if (components.extractSentinelIndex(literal)) |idx| {
+                if (idx < mc.specs.len) {
+                    // Specs live in arena-backed storage owned by the
+                    // same arena as the Element tree, so taking the
+                    // address of one is stable for the tree's
+                    // lifetime. `*anyopaque` discards const because
+                    // the vtable signature is non-const for symmetry
+                    // with mutable widgets that'll arrive at stage 7c.
+                    const spec_ptr = &mc.specs[idx];
+                    return .{ .custom = .{
+                        .vtable = &components.placeholder_vtable,
+                        .ctx = @ptrCast(@constCast(spec_ptr)),
+                    } };
+                }
+            }
+            return try makePreformattedBlock(mc, node);
         },
 
         cmark.CMARK_NODE_THEMATIC_BREAK => {
@@ -156,19 +202,39 @@ fn mapBlock(
     }
 }
 
+/// Wrap a CODE_BLOCK or HTML_BLOCK literal in a preformatted
+/// code_block Element. Shared between the cmark CODE_BLOCK arm and
+/// the HTML_BLOCK fallback path (when the literal isn't one of our
+/// `:::` sentinels).
+fn makePreformattedBlock(
+    mc: *const MapCtx,
+    node: *cmark.cmark_node,
+) Error!element.Element {
+    const literal_ptr = cmark.cmark_node_get_literal(node);
+    const raw: []const u8 = if (literal_ptr != null)
+        std.mem.span(literal_ptr)
+    else
+        "";
+    const trimmed = std.mem.trimRight(u8, raw, "\n");
+    const owned = try mc.arena.dupe(u8, trimmed);
+    return .{ .code_block = .{ .content = .{ .raw = .{
+        .text = owned,
+        .style = mc.theme.code_block,
+    } } } };
+}
+
 /// Iterate `parent`'s direct children, mapping each as a block. The
 /// returned slice is arena-owned. Used by DOCUMENT, BLOCK_QUOTE,
 /// LIST, ITEM — every container kind whose children are blocks.
 fn mapBlockChildren(
-    arena: std.mem.Allocator,
+    mc: *const MapCtx,
     parent: *cmark.cmark_node,
     cascade: element.Style,
-    theme: *const element.Theme,
 ) Error![]const element.Element {
-    var list = std.ArrayList(element.Element).init(arena);
+    var list = std.ArrayList(element.Element).init(mc.arena);
     var child: ?*cmark.cmark_node = cmark.cmark_node_first_child(parent);
     while (child) |c| : (child = cmark.cmark_node_next(c)) {
-        try list.append(try mapBlock(arena, c, cascade, theme));
+        try list.append(try mapBlock(mc, c, cascade));
     }
     return try list.toOwnedSlice();
 }

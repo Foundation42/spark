@@ -180,13 +180,24 @@ TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
   [`docs/vision.md`](docs/vision.md) captures the live-documents
   runtime direction.
 
+### Session 4 — live-document plumbing
+
+- [x] **Stage 7a** — block extension parser. `:::name {attrs}\nbody\n:::`
+  pre-scanned into a sidecar `Spec` slice; the byte range becomes a
+  `<!--te:N-->` HTML comment cmark passes through as
+  `CMARK_NODE_HTML_BLOCK`; mapper intercepts the sentinel and emits a
+  `custom` Element. No registry yet — every directive renders as a
+  red-bordered "missing component: NAME" placeholder panel. cmark
+  itself stays untouched.
+
 ## What's next
 
-[`docs/roadmap.md`](docs/roadmap.md). Headline for session 4:
-**block extension parser** (`:::name {attrs}` directives → `custom`
-Elements with host-registered vtables), then **component registry
-+ cache**, then a **first concrete component**, then **reactive
-frontmatter state + bindings**, then **input handling**, then
-the **`:::update` micro-stream hot path** that lets an LLM push
-deltas into a live chart at 15k fps without touching the document
-layout.
+[`docs/roadmap.md`](docs/roadmap.md). Headline for the rest of
+session 4: **component registry + cache** (host registers
+`name → factory`, cache keyed by `#id` or auto-generated stable
+position ID, persists instances across re-layouts), then a
+**first concrete component** to validate the end-to-end loop, then
+**reactive frontmatter state + bindings**, then **input handling**,
+then the **`:::update` micro-stream hot path** that lets an LLM
+push deltas into a live chart at 15k fps without touching the
+document layout.
