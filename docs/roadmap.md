@@ -100,24 +100,39 @@ and `${state.path}` both work — `state.` prefix is optional.
 - Demo's `:::box` block now sources color / width / radius from
   frontmatter; `:::3d-scene`'s `src` interpolates `target_id`.
 
-## Next — reactive state (stage 7e)
+## Shipped — reactive state (stage 7e)
 
-State becomes observable. `state.set(path, value)` fires
-subscribers. The registry auto-subscribes a callback per `${}`
-reference during `resolve`: when the path mutates, the registry
-re-resolves the cached instance's templated attrs and calls
-`factory.update` with the fresh Spec.
+State is now observable. `state.set(path, value)` fires
+subscribers. The registry auto-subscribes a `Binding` callback per
+`${}` reference during `resolve`: when the path mutates, the
+binding re-substitutes the cached instance's templated attrs and
+calls `factory.update` with a fresh Spec.
 
-- Templated attrs duped into registry's allocator at instance
-  create time so they survive parse-arena resets.
-- Demo: drawCb cycles `box_color` on a timer; the box re-renders
-  without re-parsing.
-- Subscriber model now (not "mark dirty, host re-parses") because
-  the subscriber substrate is exactly what stage 8's
-  `:::update` micro-stream consumes — shipping it twice would be
-  wasted work.
+Key shape decisions baked in:
 
-## Then — input handling (stage 7f)
+- Preprocess keeps **templated** attrs (with `${}` literal); the
+  registry substitutes internally when invoking factory.create /
+  factory.update. That way the templates are always available
+  for re-substitution on mutations.
+- `Binding` is heap-allocated separately from the Entry so
+  Subscriber callbacks hold a stable `*Binding` ctx even if the
+  registry's instances map reallocates.
+- Subscriptions are soft-deleted on `unsubscribe` so peer
+  pointers stay valid mid-fire. Compaction can land later.
+- `state.dirty` flag drives re-layout — drawCb checks it
+  alongside the extent-change trigger; cleared after runLayout.
+
+Demo cycles `box_color` through five colours every 1.5s. The
+registry's subscriber fires factory.update on the cached box
+instance, which updates its color field; dirty flag triggers
+re-layout; the quad pipeline picks up the new colour. ~13.3k fps
+Release through the cycle, 99.6% cache hit rate.
+
+39 unit tests passing, including `reactive: state.set fires
+factory.update on bound component` and `reactive: gc unsubscribes
+the binding`.
+
+## Next — input handling (stage 7f)
 
 Walker grows a parallel `hitTest(point, root) → ?Element` pass.
 Per-component `onInput` vtable callback. The slider → state

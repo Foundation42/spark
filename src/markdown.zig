@@ -69,6 +69,10 @@ const MapCtx = struct {
     theme: *const element.Theme,
     /// Specs for `:::` component blocks, indexed by sentinel N.
     /// Populated by `components.preprocess` ahead of the cmark parse.
+    /// Attribute values are kept in their **templated** form (with
+    /// `${path}` literals); the registry substitutes against `state`
+    /// at resolve time so the templated form is available for
+    /// reactive re-substitution on state mutations (stage 7e).
     specs: []const components.Spec,
     /// Host-supplied component registry. When null, every `:::` block
     /// renders as the missing-component placeholder (stage-7a
@@ -76,6 +80,10 @@ const MapCtx = struct {
     /// first and falls back to the placeholder only for unregistered
     /// directive names.
     registry: ?*component_mod.Registry,
+    /// Reactive state for `${path}` substitution. Hands directly to
+    /// `registry.resolve`. The placeholder path doesn't need it
+    /// (only reads `spec.name`).
+    state: ?*state_mod.State,
 };
 
 /// Parse `source` (UTF-8 CommonMark) into an Element tree owned by
@@ -125,7 +133,7 @@ pub fn parseWithState(
     source: []const u8,
     theme: *const element.Theme,
     registry: ?*component_mod.Registry,
-    state: ?*const state_mod.State,
+    state: ?*state_mod.State,
 ) anyerror!element.Element {
     var body: []const u8 = source;
     var local_state: ?state_mod.State = null;
@@ -137,11 +145,16 @@ pub fn parseWithState(
             local_state = try state_mod.parseFrontmatter(arena, fm.body);
         }
     }
-    const effective_state: ?*const state_mod.State = if (state) |s|
+    const effective_state: ?*state_mod.State = if (state) |s|
         s
     else if (local_state) |*s| s else null;
 
-    const pre = try components.preprocess(arena, body, effective_state);
+    // Preprocess intentionally does NOT substitute — Spec.attrs stay
+    // templated so the component registry can stash the templates
+    // and re-substitute on state mutations (stage 7e). The placeholder
+    // path doesn't read attrs, so leaving them templated has no
+    // visible consequence for unregistered directives.
+    const pre = try components.preprocess(arena, body, null);
 
     const root = cmark.cmark_parse_document(
         pre.source.ptr,
@@ -157,6 +170,7 @@ pub fn parseWithState(
         .theme = theme,
         .specs = pre.specs,
         .registry = registry,
+        .state = effective_state,
     };
     return try mapBlock(&mc, root, theme.body);
 }
@@ -249,7 +263,7 @@ fn mapBlock(
                     // instance state lives in the registry's
                     // allocator, stable across many parses.
                     if (mc.registry) |reg| {
-                        if (try reg.resolve(spec_ptr, idx)) |inst| {
+                        if (try reg.resolve(spec_ptr, idx, mc.state)) |inst| {
                             return .{ .custom = .{
                                 .vtable = inst.vtable,
                                 .ctx = inst.ctx,

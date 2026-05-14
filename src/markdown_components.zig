@@ -67,6 +67,48 @@ pub const Preprocessed = struct {
     specs: []const Spec,
 };
 
+/// Walk `attrs` collecting every distinct `${path}` reference's
+/// resolved key (with the optional `state.` prefix stripped, same
+/// rules as `substituteState`). Used by the component registry to
+/// know which paths to subscribe to. Owns no memory — keys are
+/// slices into the caller-supplied attr value strings.
+pub fn collectReferencedPaths(
+    allocator: std.mem.Allocator,
+    attrs: []const Attr,
+) Error![][]const u8 {
+    var paths = std.ArrayList([]const u8).init(allocator);
+    for (attrs) |attr| {
+        var i: usize = 0;
+        while (i < attr.value.len) {
+            if (attr.value[i] == '$' and i + 1 < attr.value.len and attr.value[i + 1] == '{') {
+                const close = std.mem.indexOfScalarPos(u8, attr.value, i + 2, '}') orelse {
+                    break;
+                };
+                const raw_path = std.mem.trim(u8, attr.value[i + 2 .. close], " \t");
+                const key: []const u8 = if (std.mem.startsWith(u8, raw_path, "state."))
+                    raw_path["state.".len..]
+                else
+                    raw_path;
+                // Skip duplicates inside the same attrs sweep — same
+                // path used in two attr values still only needs one
+                // subscription per Binding.
+                var already = false;
+                for (paths.items) |existing| {
+                    if (std.mem.eql(u8, existing, key)) {
+                        already = true;
+                        break;
+                    }
+                }
+                if (!already) try paths.append(key);
+                i = close + 1;
+                continue;
+            }
+            i += 1;
+        }
+    }
+    return paths.toOwnedSlice();
+}
+
 /// Pre-scan `source` for `:::name {attrs}\nbody\n:::` blocks. Returns
 /// the rewritten source + the extracted specs, both owned by `arena`.
 ///
@@ -270,7 +312,10 @@ pub fn parseDirectiveLine(arena: std.mem.Allocator, content: []const u8, state: 
 /// Always returns an arena-allocated string so the caller's
 /// lifetime contract is uniform regardless of whether substitution
 /// happened.
-fn substituteState(arena: std.mem.Allocator, raw: []const u8, state: ?*const state_mod.State) Error![]const u8 {
+///
+/// Public so the component registry can re-run substitution against
+/// a current state when a path mutates (stage 7e reactivity).
+pub fn substituteState(arena: std.mem.Allocator, raw: []const u8, state: ?*const state_mod.State) Error![]const u8 {
     // Fast path: no `$` → straight dupe, skip the rebuild.
     if (std.mem.indexOfScalar(u8, raw, '$') == null) {
         return try arena.dupe(u8, raw);

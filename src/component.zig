@@ -62,6 +62,7 @@
 const std = @import("std");
 const element = @import("element.zig");
 const components = @import("markdown_components.zig");
+const state_mod = @import("state.zig");
 
 pub const Error = error{
     DuplicateFactory,
@@ -112,10 +113,77 @@ pub const Resolved = struct {
 /// factory produced. `parses_unused` is bumped at the start of each
 /// parse by `beginParse`; `resolve` resets it to 0 on a cache hit.
 /// `factory_name` lets `gc` find the right factory to call `deinit`.
+/// `binding` is non-null only when the directive's attrs reference
+/// at least one `${path}` — it holds the templated form + the State
+/// subscriber pointers we'll unsubscribe at gc time.
 const Entry = struct {
     instance: Instance,
     parses_unused: u32,
     factory_name: []const u8,
+    binding: ?*Binding = null,
+};
+
+/// Reactive-state plumbing for one cached component instance.
+/// Allocated separately from the Entry so the Subscriber callback
+/// can hold a stable `*Binding` ctx even if the registry's instance
+/// map reallocates. Lifetime: created on the first resolve where
+/// the templated attrs contain `${}`; destroyed when the parent
+/// Entry is GC'd.
+const Binding = struct {
+    allocator: std.mem.Allocator,
+    state: *state_mod.State,
+    factory: Factory,
+    instance_ctx: *anyopaque,
+    /// Templated attrs (with `${...}` literals), arena-duped into
+    /// `allocator`. The Subscriber callback re-substitutes against
+    /// the current state on every mutation.
+    templated_attrs: []components.Attr,
+    /// Subscription handles, one per distinct path referenced by
+    /// `templated_attrs`. Owned by the State; we hold the pointers
+    /// so we can `unsubscribe` at gc.
+    subscriptions: []*state_mod.Subscriber,
+
+    fn refire(self: *Binding) anyerror!void {
+        // Build a fresh substituted Spec in a scratch arena that
+        // dies when this fire returns. The factory only needs the
+        // values during its `update` callback — anything it wants
+        // to retain it copies into its own state.
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const fresh_attrs = try a.alloc(components.Attr, self.templated_attrs.len);
+        for (self.templated_attrs, 0..) |t, i| {
+            fresh_attrs[i] = .{
+                .key = t.key,
+                .value = try components.substituteState(a, t.value, self.state),
+            };
+        }
+        const fresh_spec = components.Spec{
+            .name = "",
+            .id = null,
+            .attrs = fresh_attrs,
+            .body = "",
+        };
+        if (self.factory.update) |u| try u(self.instance_ctx, &fresh_spec);
+    }
+
+    fn callback(ctx: *anyopaque) anyerror!void {
+        const b: *Binding = @ptrCast(@alignCast(ctx));
+        return b.refire();
+    }
+
+    fn destroy(self: *Binding) void {
+        for (self.subscriptions) |sub| self.state.unsubscribe(sub);
+        self.allocator.free(self.subscriptions);
+        for (self.templated_attrs) |attr| {
+            self.allocator.free(attr.key);
+            self.allocator.free(attr.value);
+        }
+        self.allocator.free(self.templated_attrs);
+        const alloc = self.allocator;
+        alloc.destroy(self);
+    }
 };
 
 pub const Registry = struct {
@@ -138,6 +206,7 @@ pub const Registry = struct {
         var it = self.instances.iterator();
         while (it.next()) |entry| {
             const e = entry.value_ptr.*;
+            if (e.binding) |b| b.destroy();
             if (self.factories.get(e.factory_name)) |f| {
                 if (f.deinit) |d| d(e.instance.ctx, self.allocator);
             }
@@ -177,10 +246,18 @@ pub const Registry = struct {
     /// placeholder visual). `sentinel_idx` is the per-document
     /// position of the block — used to fabricate an `auto:N` cache
     /// key when the author didn't supply `#id`.
+    ///
+    /// `spec` is expected to carry **templated** attribute values
+    /// (with `${path}` still literal). The registry substitutes
+    /// them against `state` before invoking factory.create /
+    /// factory.update, and — when `${}` references exist — sets up
+    /// a Binding so subsequent state mutations refire update
+    /// automatically.
     pub fn resolve(
         self: *Registry,
         spec: *const components.Spec,
         sentinel_idx: usize,
+        state: ?*state_mod.State,
     ) !?Resolved {
         const factory = self.factories.get(spec.name) orelse return null;
 
@@ -192,24 +269,22 @@ pub const Registry = struct {
 
         const gop = try self.instances.getOrPut(self.allocator, id);
         if (gop.found_existing) {
-            // Cache hit. If the instance was cached under a different
-            // factory name (auto-IDs can collide if `:::name {...}`
-            // gets edited to `:::other {...}` at the same position),
-            // destroy + recreate. Conservative; rare in practice.
+            // Cache hit. Factory-name change → destroy + recreate.
             if (!std.mem.eql(u8, gop.value_ptr.factory_name, spec.name)) {
                 if (self.factories.get(gop.value_ptr.factory_name)) |old_factory| {
                     if (old_factory.deinit) |d|
                         d(gop.value_ptr.instance.ctx, self.allocator);
                 }
-                const fresh = try factory.create(self.allocator, spec);
-                gop.value_ptr.* = .{
-                    .instance = fresh,
-                    .parses_unused = 0,
-                    .factory_name = self.factories.getKey(spec.name).?,
+                if (gop.value_ptr.binding) |b| b.destroy();
+                gop.value_ptr.* = try self.buildEntry(factory, spec, state);
+                return .{
+                    .vtable = gop.value_ptr.instance.vtable,
+                    .ctx = gop.value_ptr.instance.ctx,
                 };
-                return .{ .vtable = fresh.vtable, .ctx = fresh.ctx };
             }
-            if (factory.update) |u| try u(gop.value_ptr.instance.ctx, spec);
+            // Same factory — update path. Build a fresh substituted
+            // spec, hand to factory.update.
+            try self.invokeUpdate(factory, gop.value_ptr.instance.ctx, spec, state);
             gop.value_ptr.parses_unused = 0;
             return .{
                 .vtable = gop.value_ptr.instance.vtable,
@@ -217,29 +292,115 @@ pub const Registry = struct {
             };
         }
 
-        // Cache miss. Allocate a stable copy of the id; instantiate.
+        // Cache miss. Stable id, then full create + (maybe) binding.
         const stable_id = self.allocator.dupe(u8, id) catch |err| {
-            // Undo the getOrPut on failure.
             _ = self.instances.remove(id);
             return err;
         };
         gop.key_ptr.* = stable_id;
-        const fresh = factory.create(self.allocator, spec) catch |err| {
+        gop.value_ptr.* = self.buildEntry(factory, spec, state) catch |err| {
             self.allocator.free(stable_id);
             _ = self.instances.remove(stable_id);
             return err;
         };
-        // factory_name is a borrow from the factories map — its
-        // backing string outlives every Entry because the factory
-        // (and its name) must be registered before any instance can
-        // exist, and entries get destroyed at gc / deinit before the
-        // factory is.
-        gop.value_ptr.* = .{
-            .instance = fresh,
+        return .{
+            .vtable = gop.value_ptr.instance.vtable,
+            .ctx = gop.value_ptr.instance.ctx,
+        };
+    }
+
+    /// Substitute `spec.attrs` against `state` into a scratch arena
+    /// and call `factory.update`. Used on the cache-hit path so the
+    /// cached instance learns about templated attr changes between
+    /// parses without being destroyed.
+    fn invokeUpdate(
+        self: *Registry,
+        factory: Factory,
+        ctx: *anyopaque,
+        spec: *const components.Spec,
+        state: ?*state_mod.State,
+    ) !void {
+        const u = factory.update orelse return;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const fresh = try buildSubstitutedSpec(a, spec, state);
+        try u(ctx, &fresh);
+    }
+
+    /// Build a fresh Entry from scratch: substitute spec.attrs,
+    /// call factory.create, and (when the templated attrs reference
+    /// any `${path}`) construct a Binding that subscribes the
+    /// callback to each path. Caller stores the returned Entry in
+    /// the instances map.
+    fn buildEntry(
+        self: *Registry,
+        factory: Factory,
+        spec: *const components.Spec,
+        state: ?*state_mod.State,
+    ) !Entry {
+        // First create the instance with substituted attrs in a
+        // scratch arena — same shape as invokeUpdate.
+        var create_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer create_arena.deinit();
+        const ca = create_arena.allocator();
+        const fresh = try buildSubstitutedSpec(ca, spec, state);
+        const inst = try factory.create(self.allocator, &fresh);
+
+        var entry: Entry = .{
+            .instance = inst,
             .parses_unused = 0,
             .factory_name = self.factories.getKey(spec.name).?,
+            .binding = null,
         };
-        return .{ .vtable = fresh.vtable, .ctx = fresh.ctx };
+
+        // If the spec has no `${}` references — or no state to
+        // resolve against — we're done. Static directives skip the
+        // entire reactive plumbing.
+        if (state == null) return entry;
+
+        // Inspect templated attrs for `${path}` references; only
+        // build a Binding if there's at least one.
+        var path_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer path_arena.deinit();
+        const paths = try components.collectReferencedPaths(path_arena.allocator(), spec.attrs);
+        if (paths.len == 0) return entry;
+
+        // Dupe templated attrs into long-lived registry storage so
+        // the subscriber callback can re-substitute on any future
+        // mutation.
+        const templated = try self.allocator.alloc(components.Attr, spec.attrs.len);
+        errdefer self.allocator.free(templated);
+        for (spec.attrs, 0..) |src, i| {
+            templated[i] = .{
+                .key = try self.allocator.dupe(u8, src.key),
+                .value = try self.allocator.dupe(u8, src.value),
+            };
+        }
+
+        const binding = try self.allocator.create(Binding);
+        binding.* = .{
+            .allocator = self.allocator,
+            .state = state.?,
+            .factory = factory,
+            .instance_ctx = inst.ctx,
+            .templated_attrs = templated,
+            .subscriptions = &.{},
+        };
+
+        var subs = try self.allocator.alloc(*state_mod.Subscriber, paths.len);
+        var i: usize = 0;
+        errdefer {
+            for (subs[0..i]) |s| state.?.unsubscribe(s);
+            self.allocator.free(subs);
+        }
+        while (i < paths.len) : (i += 1) {
+            subs[i] = try state.?.subscribe(paths[i], Binding.callback, @ptrCast(binding));
+        }
+        binding.subscriptions = subs;
+
+        entry.binding = binding;
+        return entry;
     }
 
     /// Destroy every cached instance whose `parses_unused` exceeds
@@ -260,6 +421,7 @@ pub const Registry = struct {
         }
         for (dead.items) |key| {
             const entry = self.instances.fetchRemove(key) orelse continue;
+            if (entry.value.binding) |b| b.destroy();
             if (self.factories.get(entry.value.factory_name)) |f| {
                 if (f.deinit) |d| d(entry.value.instance.ctx, self.allocator);
             }
@@ -267,6 +429,35 @@ pub const Registry = struct {
         }
     }
 };
+
+/// Allocate a fresh `Spec` whose attrs are `templated.attrs` with
+/// every `${path}` resolved against `state`. The returned Spec
+/// borrows the allocator; caller-supplied arenas are the natural
+/// choice because the substituted attrs are consumed inside
+/// factory.create / factory.update and don't outlive that call.
+fn buildSubstitutedSpec(
+    allocator: std.mem.Allocator,
+    templated: *const components.Spec,
+    state: ?*state_mod.State,
+) !components.Spec {
+    const fresh_attrs = try allocator.alloc(components.Attr, templated.attrs.len);
+    for (templated.attrs, 0..) |src, i| {
+        fresh_attrs[i] = .{
+            .key = src.key,
+            .value = try components.substituteState(
+                allocator,
+                src.value,
+                if (state) |s| @as(*const state_mod.State, s) else null,
+            ),
+        };
+    }
+    return .{
+        .name = templated.name,
+        .id = templated.id,
+        .attrs = fresh_attrs,
+        .body = templated.body,
+    };
+}
 
 // ── Tests ──────────────────────────────────────────────────────────
 //
@@ -282,7 +473,8 @@ var t_updates: u32 = 0;
 var t_deinits: u32 = 0;
 
 const TestState = struct {
-    last_color: []const u8,
+    allocator: std.mem.Allocator,
+    last_color: []u8,
 };
 
 fn testLayout(_: *anyopaque, _: [2]f32, _: element.Constraints, _: *element.LayoutCtx, _: *element.DrawList) anyerror!element.Box {
@@ -300,17 +492,27 @@ fn pickColor(spec: *const components.Spec) ?[]const u8 {
 fn testCreate(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!Instance {
     t_creates += 1;
     const state = try allocator.create(TestState);
-    state.* = .{ .last_color = pickColor(spec) orelse "" };
+    // Real components own their state — copy the value into our own
+    // allocator-owned memory. The Spec's strings live in scratch
+    // memory the registry frees after `create` returns.
+    state.* = .{
+        .allocator = allocator,
+        .last_color = try allocator.dupe(u8, pickColor(spec) orelse ""),
+    };
     return .{ .vtable = &test_vtable, .ctx = @ptrCast(state) };
 }
 fn testUpdate(ctx: *anyopaque, spec: *const components.Spec) anyerror!void {
     t_updates += 1;
     const state: *TestState = @ptrCast(@alignCast(ctx));
-    state.last_color = pickColor(spec) orelse state.last_color;
+    if (pickColor(spec)) |c| {
+        state.allocator.free(state.last_color);
+        state.last_color = try state.allocator.dupe(u8, c);
+    }
 }
 fn testDeinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     t_deinits += 1;
     const state: *TestState = @ptrCast(@alignCast(ctx));
+    allocator.free(state.last_color);
     allocator.destroy(state);
 }
 const test_factory: Factory = .{
@@ -332,13 +534,13 @@ test "register + resolve creates instance once" {
     try registry.register("box", test_factory);
 
     const spec: components.Spec = .{ .name = "box", .id = "bx" };
-    const r1 = try registry.resolve(&spec, 0);
+    const r1 = try registry.resolve(&spec, 0, null);
     try testing.expect(r1 != null);
     try testing.expectEqual(@as(u32, 1), t_creates);
     try testing.expectEqual(@as(u32, 0), t_updates);
 
     registry.beginParse();
-    const r2 = try registry.resolve(&spec, 0);
+    const r2 = try registry.resolve(&spec, 0, null);
     try testing.expect(r2 != null);
     try testing.expectEqual(r1.?.ctx, r2.?.ctx);
     try testing.expectEqual(@as(u32, 1), t_creates);
@@ -350,7 +552,7 @@ test "resolve returns null for unregistered name" {
     var registry = Registry.init(testing.allocator);
     defer registry.deinit();
     const spec: components.Spec = .{ .name = "nothing", .id = "x" };
-    const r = try registry.resolve(&spec, 0);
+    const r = try registry.resolve(&spec, 0, null);
     try testing.expect(r == null);
 }
 
@@ -361,13 +563,13 @@ test "auto-id is order-based" {
     try registry.register("box", test_factory);
 
     const a: components.Spec = .{ .name = "box" }; // no id → auto:5
-    const r1 = try registry.resolve(&a, 5);
+    const r1 = try registry.resolve(&a, 5, null);
     registry.beginParse();
-    const r2 = try registry.resolve(&a, 5);
+    const r2 = try registry.resolve(&a, 5, null);
     try testing.expectEqual(r1.?.ctx, r2.?.ctx);
 
     // Different sentinel idx with same name → different cache slot.
-    const r3 = try registry.resolve(&a, 6);
+    const r3 = try registry.resolve(&a, 6, null);
     try testing.expect(r1.?.ctx != r3.?.ctx);
     try testing.expectEqual(@as(u32, 2), t_creates);
 }
@@ -380,7 +582,7 @@ test "gc destroys after sweep_threshold consecutive unused parses" {
     try registry.register("box", test_factory);
 
     const spec: components.Spec = .{ .name = "box", .id = "bx" };
-    _ = try registry.resolve(&spec, 0);
+    _ = try registry.resolve(&spec, 0, null);
     try testing.expectEqual(@as(u32, 1), t_creates);
 
     // Threshold=2 → instance dies on the third unused parse.
@@ -394,7 +596,7 @@ test "gc destroys after sweep_threshold consecutive unused parses" {
     registry.gc();
     try testing.expectEqual(@as(u32, 1), t_deinits);
 
-    _ = try registry.resolve(&spec, 0);
+    _ = try registry.resolve(&spec, 0, null);
     try testing.expectEqual(@as(u32, 2), t_creates);
 }
 
@@ -408,13 +610,13 @@ test "factory name change destroys old + recreates" {
     // Auto-id collision when the spec at sentinel 0 changes name
     // across parses — e.g. an edit turning `:::box` into `:::chart`.
     const as_box: components.Spec = .{ .name = "box" };
-    _ = try registry.resolve(&as_box, 0);
+    _ = try registry.resolve(&as_box, 0, null);
     try testing.expectEqual(@as(u32, 1), t_creates);
     try testing.expectEqual(@as(u32, 0), t_deinits);
 
     registry.beginParse();
     const as_chart: components.Spec = .{ .name = "chart" };
-    _ = try registry.resolve(&as_chart, 0);
+    _ = try registry.resolve(&as_chart, 0, null);
     try testing.expectEqual(@as(u32, 2), t_creates);
     try testing.expectEqual(@as(u32, 1), t_deinits);
 }
@@ -427,7 +629,7 @@ test "update sees latest spec attrs" {
 
     const attrs_red = [_]components.Attr{.{ .key = "color", .value = "red" }};
     const spec_red: components.Spec = .{ .name = "box", .id = "bx", .attrs = &attrs_red };
-    const r1 = try registry.resolve(&spec_red, 0);
+    const r1 = try registry.resolve(&spec_red, 0, null);
     {
         const state: *TestState = @ptrCast(@alignCast(r1.?.ctx));
         try testing.expectEqualStrings("red", state.last_color);
@@ -436,9 +638,73 @@ test "update sees latest spec attrs" {
     registry.beginParse();
     const attrs_blue = [_]components.Attr{.{ .key = "color", .value = "blue" }};
     const spec_blue: components.Spec = .{ .name = "box", .id = "bx", .attrs = &attrs_blue };
-    _ = try registry.resolve(&spec_blue, 0);
+    _ = try registry.resolve(&spec_blue, 0, null);
     {
         const state: *TestState = @ptrCast(@alignCast(r1.?.ctx));
         try testing.expectEqualStrings("blue", state.last_color);
     }
+}
+
+test "reactive: state.set fires factory.update on bound component" {
+    resetCounters();
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    try st.set("box_color", "red");
+
+    var registry = Registry.init(testing.allocator);
+    defer registry.deinit();
+    try registry.register("box", test_factory);
+
+    const attrs = [_]components.Attr{.{ .key = "color", .value = "${state.box_color}" }};
+    const spec: components.Spec = .{ .name = "box", .id = "bx", .attrs = &attrs };
+
+    // Initial resolve substitutes — factory.create sees "red".
+    const r1 = try registry.resolve(&spec, 0, &st);
+    {
+        const tst: *TestState = @ptrCast(@alignCast(r1.?.ctx));
+        try testing.expectEqualStrings("red", tst.last_color);
+    }
+    try testing.expectEqual(@as(u32, 1), t_creates);
+    try testing.expectEqual(@as(u32, 0), t_updates);
+
+    // State mutation fires the binding's subscriber → factory.update.
+    try st.set("box_color", "green");
+    try testing.expectEqual(@as(u32, 1), t_creates);
+    try testing.expectEqual(@as(u32, 1), t_updates);
+    {
+        const tst: *TestState = @ptrCast(@alignCast(r1.?.ctx));
+        try testing.expectEqualStrings("green", tst.last_color);
+    }
+
+    // An unrelated path mutation doesn't fire.
+    try st.set("unrelated", "x");
+    try testing.expectEqual(@as(u32, 1), t_updates);
+}
+
+test "reactive: gc unsubscribes the binding" {
+    resetCounters();
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    try st.set("c", "red");
+
+    var registry = Registry.init(testing.allocator);
+    defer registry.deinit();
+    registry.sweep_threshold = 0; // die after one unused parse
+    try registry.register("box", test_factory);
+
+    const attrs = [_]components.Attr{.{ .key = "color", .value = "${c}" }};
+    const spec: components.Spec = .{ .name = "box", .id = "bx", .attrs = &attrs };
+    _ = try registry.resolve(&spec, 0, &st);
+    try testing.expectEqual(@as(u32, 1), t_creates);
+
+    // Parse without re-resolving → entry hits sweep, gc destroys it
+    // including the binding (and its subscription).
+    registry.beginParse();
+    registry.gc();
+    try testing.expectEqual(@as(u32, 1), t_deinits);
+
+    // State mutation no longer fires anything (subscription was
+    // soft-deleted at gc).
+    try st.set("c", "blue");
+    try testing.expectEqual(@as(u32, 0), t_updates);
 }

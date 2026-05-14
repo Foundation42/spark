@@ -1,17 +1,27 @@
-//! Reactive state container — stage 7d (static interpolation half).
+//! Reactive state container.
 //!
-//! Stage 7d ships:
+//! Two-phase build-up across stages 7d + 7e:
+//!
+//! **Stage 7d (static interpolation):**
 //!   * `State` — a flat string→string store, the live-document
 //!     analogue of YAML frontmatter's `state:` block.
 //!   * `parseFrontmatter` — hand-rolled YAML subset that recognises
-//!     `state: { key: value }` pairs at one indent level. Quoted
-//!     strings get unquoted; bare values captured verbatim.
+//!     `state: { key: value }` pairs at one indent level.
 //!
-//! Stage 7e adds subscribers + mutation propagation (the "reactive"
-//! half). For 7d the state is read once during parse, attribute
-//! values are substituted from it, and that's the whole story —
-//! enough to demo "edit frontmatter → re-parse → component attrs
-//! reflect the new state."
+//! **Stage 7e (reactivity):**
+//!   * `subscribe(path, cb)` — register a callback that fires when
+//!     the given path mutates.
+//!   * `set(path, value)` — mutate + notify. Walks subscribers for
+//!     that exact path and invokes each.
+//!   * `dirty` flag — bumped on any mutation so the host's frame
+//!     loop knows to re-run layout.
+//!
+//! Subscribers are heap-allocated for pointer stability across
+//! ArrayList growth. `unsubscribe` soft-deletes (sets `active=false`)
+//! rather than compacting the list — keeps pointers stable for any
+//! callbacks still in flight when an unrelated subscription is
+//! revoked. Compaction can land later if subscriber churn becomes a
+//! memory concern; for stage 7e it doesn't.
 //!
 //! ### YAML scope
 //!
@@ -46,17 +56,34 @@ pub const Error = error{
     InvalidFrontmatter,
 } || std.mem.Allocator.Error;
 
+/// One reactive callback. Heap-allocated by `subscribe` for pointer
+/// stability — the returned pointer is the unsubscribe handle.
+pub const Subscriber = struct {
+    callback: *const fn (ctx: *anyopaque) anyerror!void,
+    ctx: *anyopaque,
+    /// Soft-delete flag. `set` skips inactive subscribers; the
+    /// memory stays in the per-path list until the State is
+    /// deinit'd. Cheap to check, no pointer invalidation when
+    /// unrelated subscribers come and go.
+    active: bool = true,
+};
+
 pub const State = struct {
     allocator: std.mem.Allocator,
     map: std.StringHashMapUnmanaged([]const u8) = .{},
+    subscribers: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(*Subscriber)) = .{},
+    /// Bumped by every `set`. Hosts read it from their frame loop
+    /// and call layout on a true→false transition.
+    dirty: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) State {
         return .{ .allocator = allocator };
     }
 
-    /// Free both the map storage and every key/value the parser
-    /// arena-duped during construction. Hosts that don't want to
-    /// keep the state across re-parses call this and rebuild.
+    /// Free the map storage, every key/value the parser duped, and
+    /// every Subscriber struct. Subscriber callbacks themselves
+    /// reference Registry-owned memory — that lifetime is the host's
+    /// responsibility, not the State's.
     pub fn deinit(self: *State) void {
         var it = self.map.iterator();
         while (it.next()) |entry| {
@@ -64,9 +91,21 @@ pub const State = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.map.deinit(self.allocator);
+
+        var sit = self.subscribers.iterator();
+        while (sit.next()) |entry| {
+            for (entry.value_ptr.items) |sub| self.allocator.destroy(sub);
+            entry.value_ptr.deinit(self.allocator);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.subscribers.deinit(self.allocator);
+
         self.* = undefined;
     }
 
+    /// Set a path's value. Fires any subscribers registered for that
+    /// exact path. Sets `dirty=true` regardless of whether the value
+    /// actually changed — callers debounce if they care.
     pub fn set(self: *State, key: []const u8, value: []const u8) Error!void {
         const gop = try self.map.getOrPut(self.allocator, key);
         if (gop.found_existing) {
@@ -75,6 +114,24 @@ pub const State = struct {
             gop.key_ptr.* = try self.allocator.dupe(u8, key);
         }
         gop.value_ptr.* = try self.allocator.dupe(u8, value);
+        self.dirty = true;
+
+        if (self.subscribers.getPtr(key)) |list| {
+            // Snapshot the items pointer in case a callback adds /
+            // removes subscriptions during the walk. New
+            // subscriptions go onto the same slice (ArrayList grows
+            // at the end); we'll see them next time. Removals are
+            // soft, so existing pointers stay valid.
+            for (list.items) |sub| {
+                if (sub.active) {
+                    // Subscriber errors are non-fatal: swallow so a
+                    // failing callback doesn't abort other
+                    // subscribers' notifications. Future stage can
+                    // route through a structured logger.
+                    sub.callback(sub.ctx) catch {};
+                }
+            }
+        }
     }
 
     /// Returns null when `path` isn't set. Callers can choose to
@@ -84,7 +141,52 @@ pub const State = struct {
     pub fn get(self: *const State, path: []const u8) ?[]const u8 {
         return self.map.get(path);
     }
+
+    /// Register a callback for mutations to `path`. The returned
+    /// pointer is the unsubscribe handle. Multiple subscribers per
+    /// path are supported and fire in registration order.
+    pub fn subscribe(
+        self: *State,
+        path: []const u8,
+        callback: *const fn (ctx: *anyopaque) anyerror!void,
+        ctx: *anyopaque,
+    ) Error!*Subscriber {
+        const sub = try self.allocator.create(Subscriber);
+        sub.* = .{ .callback = callback, .ctx = ctx };
+
+        const gop = try self.subscribers.getOrPut(self.allocator, path);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.allocator.dupe(u8, path);
+            gop.value_ptr.* = .{};
+        }
+        try gop.value_ptr.append(self.allocator, sub);
+        return sub;
+    }
+
+    /// Soft-revoke a subscription. The Subscriber struct stays
+    /// allocated until State.deinit (no list compaction). Pointers
+    /// to other subscribers stay valid even across an unsubscribe,
+    /// which matters because a subscriber's callback might unwind
+    /// some peer subscription mid-fire.
+    pub fn unsubscribe(_: *State, sub: *Subscriber) void {
+        sub.active = false;
+    }
+
+    /// Clear the dirty flag. Host calls after running the layout
+    /// pass triggered by the mutation.
+    pub fn clearDirty(self: *State) void {
+        self.dirty = false;
+    }
 };
+
+/// Convenience: extract frontmatter from `source` (if present) and
+/// parse it into a host-owned State. Returns null when there's no
+/// `--- ... ---` block at the head of `source`. Caller owns the
+/// returned State and is responsible for `deinit`'ing it.
+pub fn fromSource(allocator: std.mem.Allocator, source: []const u8) Error!?State {
+    const fm = extractFrontmatter(source) orelse return null;
+    return try parseFrontmatter(allocator, fm.body);
+}
 
 /// Parse the inside of a `--- ... ---` YAML frontmatter block (the
 /// delimiters themselves stripped by the caller). Returns a `State`
@@ -280,4 +382,86 @@ test "extractFrontmatter: absent" {
     try testing.expect(extractFrontmatter("") == null);
     // `---` not at start-of-file → not a frontmatter delimiter.
     try testing.expect(extractFrontmatter("\n---\nx: 1\n---\n") == null);
+}
+
+// ── Reactive layer tests ───────────────────────────────────────────
+
+const TestCb = struct {
+    counter: u32 = 0,
+
+    fn cb(ctx: *anyopaque) anyerror!void {
+        const self: *TestCb = @ptrCast(@alignCast(ctx));
+        self.counter += 1;
+    }
+};
+
+test "subscribe + set fires callback" {
+    var s = State.init(testing.allocator);
+    defer s.deinit();
+
+    var probe = TestCb{};
+    _ = try s.subscribe("x", TestCb.cb, @ptrCast(&probe));
+    try testing.expectEqual(@as(u32, 0), probe.counter);
+    try s.set("x", "1");
+    try testing.expectEqual(@as(u32, 1), probe.counter);
+    try s.set("x", "2");
+    try testing.expectEqual(@as(u32, 2), probe.counter);
+    // Different path doesn't fire this subscriber.
+    try s.set("y", "anything");
+    try testing.expectEqual(@as(u32, 2), probe.counter);
+}
+
+test "unsubscribe stops the callback" {
+    var s = State.init(testing.allocator);
+    defer s.deinit();
+
+    var probe = TestCb{};
+    const sub = try s.subscribe("x", TestCb.cb, @ptrCast(&probe));
+    try s.set("x", "1");
+    try testing.expectEqual(@as(u32, 1), probe.counter);
+    s.unsubscribe(sub);
+    try s.set("x", "2");
+    try testing.expectEqual(@as(u32, 1), probe.counter);
+}
+
+test "multiple subscribers on same path" {
+    var s = State.init(testing.allocator);
+    defer s.deinit();
+
+    var a = TestCb{};
+    var b = TestCb{};
+    _ = try s.subscribe("x", TestCb.cb, @ptrCast(&a));
+    _ = try s.subscribe("x", TestCb.cb, @ptrCast(&b));
+    try s.set("x", "go");
+    try testing.expectEqual(@as(u32, 1), a.counter);
+    try testing.expectEqual(@as(u32, 1), b.counter);
+}
+
+test "dirty flag is set by set() and cleared by clearDirty()" {
+    var s = State.init(testing.allocator);
+    defer s.deinit();
+    try testing.expect(!s.dirty);
+    try s.set("x", "1");
+    try testing.expect(s.dirty);
+    s.clearDirty();
+    try testing.expect(!s.dirty);
+}
+
+test "fromSource extracts + parses frontmatter" {
+    const opt = try fromSource(testing.allocator,
+        \\---
+        \\state:
+        \\  x: 1
+        \\---
+        \\# body
+    );
+    try testing.expect(opt != null);
+    var s = opt.?;
+    defer s.deinit();
+    try testing.expectEqualStrings("1", s.get("x").?);
+}
+
+test "fromSource returns null when no frontmatter" {
+    const opt = try fromSource(testing.allocator, "# just body\n");
+    try testing.expect(opt == null);
 }

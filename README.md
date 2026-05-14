@@ -215,12 +215,21 @@ TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
   paths stay literal so authors notice typos. Demo's `:::box`
   attrs now flow from frontmatter; edit YAML → rebuild → box
   reflects the new state. 31 unit tests.
+- [x] **Stage 7e** — reactive state. `state.set(path, value)` fires
+  subscribers. The registry auto-subscribes a `Binding` per `${}`
+  reference during `resolve`; mutations re-substitute the cached
+  instance's templated attrs and call `factory.update` with a
+  fresh Spec. Preprocess now keeps attrs templated; the registry
+  does substitution at resolve time. `state.dirty` drives
+  re-layout. Demo cycles `box_color` every 1.5s through five
+  shades; ~13.3k fps Release. 39 unit tests.
 
 ## What's next
 
 [`docs/roadmap.md`](docs/roadmap.md). Headline for the rest of
-session 4: **reactive state** (subscribers auto-register per `${}`
-reference, mutations fire targeted factory.update calls), then
-**input handling**, then the **`:::update` micro-stream hot path**
-that lets an LLM push deltas into a live chart at 15k fps without
-touching the document layout.
+session 4: **input handling** (hit-testing through the laid-out
+Element tree, per-component `onInput` callback, slider → state
+mutation → reactive update closes the loop end-to-end), then the
+**`:::update` micro-stream hot path** that lets an LLM push
+deltas into a live chart at 15k fps without touching document
+layout.

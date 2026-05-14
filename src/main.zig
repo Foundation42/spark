@@ -31,6 +31,7 @@ const markdown = @import("markdown.zig");
 const ansi = @import("ansi.zig");
 const component = @import("component.zig");
 const box_component = @import("components/box.zig");
+const state_mod = @import("state.zig");
 
 /// Demo document — parsed by the vendored cmark + mapper into an
 /// Element tree at startup. Same render path as the hand-built
@@ -105,6 +106,15 @@ const FrameCtx = struct {
     pulse_count: u32 = 0,
     start_ms: i64,
 
+    // 7e: reactive state. The host owns it across the program
+    // lifetime (extracted from demo.md's frontmatter at startup).
+    // drawCb mutates `box_color` on a timer and the registry's
+    // subscriber wiring propagates the change into the cached box
+    // component's state; the `dirty` flag triggers re-layout.
+    state: *state_mod.State,
+    next_state_change_ms: i64,
+    color_idx: u8 = 0,
+
     /// Re-run the layout pass for the current viewport. Clears the
     /// DrawList, lays out all three sub-trees at the new `max_w`,
     /// uploads the quads (static for the lifetime of a layout —
@@ -144,14 +154,35 @@ const FrameCtx = struct {
     }
 };
 
+/// Demo's reactive proof-of-life: the box's `color` attr resolves
+/// through `${state.box_color}`. Cycling this string fires the
+/// registry's subscriber, which calls factory.update on the cached
+/// instance and flips `state.dirty` so the frame loop re-runs
+/// layout.
+const cycle_colors = [_][]const u8{ "blue", "green", "orange", "purple", "cyan" };
+const STATE_CHANGE_INTERVAL_MS: i64 = 1500;
+
 fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) void {
     const fc: *FrameCtx = @ptrCast(@alignCast(ctx.?));
 
+    // ── Reactive state tick ────────────────────────────────────────
+    // Every STATE_CHANGE_INTERVAL_MS, advance the box color through
+    // the cycle. set() fires the registry's subscriber → factory
+    // update → box component re-reads its color from the new spec
+    // → state.dirty becomes true.
+    const now_ms = std.time.milliTimestamp();
+    if (now_ms >= fc.next_state_change_ms) {
+        fc.color_idx = (fc.color_idx + 1) % @as(u8, @intCast(cycle_colors.len));
+        fc.state.set("box_color", cycle_colors[fc.color_idx]) catch {};
+        fc.next_state_change_ms = now_ms + STATE_CHANGE_INTERVAL_MS;
+    }
+
     // ── Event-driven relayout ──────────────────────────────────────
-    // Compare against cached extent; relayout only when the viewport
-    // actually changed. First call's last_extent={0,0} guarantees
-    // an initial layout before the first draw.
-    if (extent.width != fc.last_extent.width or extent.height != fc.last_extent.height) {
+    // Two triggers: viewport changed (resize), or state mutated
+    // (reactive). First call's last_extent={0,0} guarantees an
+    // initial layout before the first draw.
+    const extent_changed = extent.width != fc.last_extent.width or extent.height != fc.last_extent.height;
+    if (extent_changed or fc.state.dirty) {
         fc.runLayout(extent) catch {
             // SsboOverflow / AtlasFull etc. — drop this frame quietly.
             // A production path would surface this; for the demo we
@@ -159,6 +190,7 @@ fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) 
             return;
         };
         fc.last_extent = extent;
+        fc.state.clearDirty();
     }
 
     // ── Per-frame SDF wave animation ───────────────────────────────
@@ -313,13 +345,20 @@ pub fn main() !void {
 
     // ── Component registry (stage 7b) ──────────────────────────────
     // Owned by the host across the entire program lifetime so cached
-    // component instances persist over re-parses. No factories
-    // registered yet — every `:::` block falls through to the 7a
-    // missing-component placeholder. Stage 7c registers `:::box` as
-    // the first real factory; visible change lands then.
+    // component instances persist over re-parses. Box factory
+    // registered at 7c; 3d-scene and chart factories still missing
+    // (their `:::` blocks render as red placeholders).
     var registry = component.Registry.init(allocator);
     defer registry.deinit();
     try registry.register("box", box_component.factory);
+
+    // ── Host-owned reactive state (stage 7e) ───────────────────────
+    // Frontmatter parses once at startup; the State persists across
+    // the program's lifetime. drawCb mutates it on a timer and the
+    // registry's subscriber wiring propagates changes into the
+    // cached component instances.
+    var host_state = (try state_mod.fromSource(allocator, demo_md)) orelse state_mod.State.init(allocator);
+    defer host_state.deinit();
 
     // ── Parse demo.md into an Element tree ─────────────────────────
     // All slices + strings the tree references live in `doc_arena`;
@@ -328,7 +367,7 @@ pub fn main() !void {
     // memory survives the call.
     var doc_arena = std.heap.ArenaAllocator.init(allocator);
     defer doc_arena.deinit();
-    const top_stack = try markdown.parse(doc_arena.allocator(), demo_md, &theme, &registry);
+    const top_stack = try markdown.parseWithState(doc_arena.allocator(), demo_md, &theme, &registry, &host_state);
 
     // SDF "ATTENTION" paragraph — separate from the top stack so we
     // can capture the glyph index range for per-frame animation.
@@ -364,6 +403,7 @@ pub fn main() !void {
     var rdr = try renderer.Renderer.init(allocator, &ctx, &swapchain, &window);
     defer rdr.deinit();
 
+    const start_ms = std.time.milliTimestamp();
     var frame_ctx = FrameCtx{
         .text_pipeline = &pipeline,
         .quad_pipeline = &quad_pipeline,
@@ -378,7 +418,9 @@ pub fn main() !void {
         .ansi_tree = ansi_tree,
         .sdf_block = sdf_block,
         .dl = &dl,
-        .start_ms = std.time.milliTimestamp(),
+        .start_ms = start_ms,
+        .state = &host_state,
+        .next_state_change_ms = start_ms + STATE_CHANGE_INTERVAL_MS,
     };
     rdr.draw_fn = drawCb;
     rdr.draw_ctx = @ptrCast(&frame_ctx);
