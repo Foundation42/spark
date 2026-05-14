@@ -42,6 +42,39 @@ fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) 
     fc.pipeline.recordDraw(cmd, extent, fc.n_glyphs);
 }
 
+/// HSV → RGB conversion using the standard six-sextant formula. `h`
+/// is degrees [0, 360); `s` and `v` are [0, 1]. Used by the demo to
+/// paint each animated SDF glyph with its own rainbow hue.
+fn hsvToRgb(h_deg: f32, s: f32, v: f32) [3]f32 {
+    const c = v * s;
+    const h_prime = @mod(h_deg / 60.0, 6.0);
+    const x = c * (1.0 - @abs(@mod(h_prime, 2.0) - 1.0));
+    const m = v - c;
+    var r: f32 = 0;
+    var g: f32 = 0;
+    var b: f32 = 0;
+    if (h_prime < 1.0) {
+        r = c;
+        g = x;
+    } else if (h_prime < 2.0) {
+        r = x;
+        g = c;
+    } else if (h_prime < 3.0) {
+        g = c;
+        b = x;
+    } else if (h_prime < 4.0) {
+        g = x;
+        b = c;
+    } else if (h_prime < 5.0) {
+        r = x;
+        b = c;
+    } else {
+        r = c;
+        b = x;
+    }
+    return .{ r + m, g + m, b + m };
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -216,6 +249,16 @@ pub fn main() !void {
             const phase = t_sec * 3.0 - @as(f32, @floatFromInt(i)) * 0.6;
             const w = (std.math.sin(phase) + 1.0) * 0.5;
             frame_ctx.glyphs[idx].attention = w;
+
+            // Rainbow per-glyph: each letter sits at its own hue
+            // around the wheel (9 letters → 40° apart → full
+            // ROYGBIV span), with the whole spectrum drifting
+            // slowly over time. Combined with the attention lerp
+            // in the fragment, each letter fades from white toward
+            // its own hue as its attention ramps up the sine.
+            const hue = @mod(@as(f32, @floatFromInt(i)) * 40.0 + t_sec * 30.0, 360.0);
+            const rgb = hsvToRgb(hue, 0.85, 1.0);
+            frame_ctx.glyphs[idx].hot_color = .{ rgb[0], rgb[1], rgb[2], 1.0 };
         }
         try pipeline.writeGlyphs(frame_ctx.glyphs);
 
