@@ -38,26 +38,14 @@ const registry_mod = @import("../font/registry.zig");
 const atlas_mod = @import("../gpu/atlas.zig");
 const tp = @import("../gpu/text_pipeline.zig");
 const glyph_cache_mod = @import("glyph_cache.zig");
+const element = @import("../element.zig");
 
-pub const Style = struct {
-    font_id: registry_mod.FontId,
-    color: [4]f32,
-    /// Target colour at `attention == 1.0`. The shader lerps
-    /// `color → hot_color` by attention in the mono + SDF branches,
-    /// giving an LM-driven hue shift on top of the SDF weight
-    /// pulse. Default warm yellow reads as the conventional
-    /// "this is hot / important" cue from attention-as-heat
-    /// visualisations; override per-span for different signal
-    /// semantics (warning red for errors, calm green for success,
-    /// etc.). The colour atlas (emoji) ignores this — emoji
-    /// artwork is never tinted.
-    hot_color: [4]f32 = .{ 1.0, 0.85, 0.40, 1.0 },
-    /// Per-glyph attention, nominally 0..1 (shader clamps). Default
-    /// 0 means no visible effect even with `hot_color` set — opt in
-    /// by setting non-zero, or by animating per-frame on the SSBO
-    /// for live LM signals.
-    attention: f32 = 0.0,
-};
+/// Canonical `Style` lives in `element.zig` as part of the public
+/// element vocabulary; re-exported here so existing callers using
+/// `layout.Style` (or the `.style = .{ ... }` duck-typed shape on
+/// `Span`) keep compiling. New code should reach for `element.Style`
+/// directly.
+pub const Style = element.Style;
 
 pub const Span = struct {
     text: []const u8,

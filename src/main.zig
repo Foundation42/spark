@@ -1,11 +1,17 @@
-//! text_engine_demo — Phase 6: SDF lane + per-glyph attention.
+//! text_engine_demo — Stage 1 of session 2:
 //!
-//! Adds a new bottom paragraph "ATTENTION" rendered through the SDF
-//! lane, with each glyph's `attention` SSBO field animated per frame
-//! as a sine wave. The fragment shader thickens the SDF threshold +
-//! grows a warm halo for high-attention glyphs, so we see a visible
-//! "wave of heat" rolling left-to-right through the word — first
-//! piece of the chat.md vision wired up end-to-end.
+//! Same visual output as session 1 (heading + subtitle + mixed paragraph
+//! + emoji line + rainbow SDF "ATTENTION"), but composed as an
+//! `Element` tree and rendered through the new `element_layout` walker.
+//! Sole point of the migration this stage: prove the contract holds
+//! against session 1's content before adding markdown / ANSI engines on
+//! top of it.
+//!
+//! The pulse-span trick from session 1 survives unchanged: layout the
+//! top stack first, capture `glyphs.items.len`, then layout the SDF
+//! paragraph — the new glyphs are the ones to animate. Phase B will
+//! probably replace this with named ranges on the `DrawList`, but
+//! it's not load-bearing for stage 1.
 
 const std = @import("std");
 const text_engine = @import("text_engine");
@@ -18,7 +24,8 @@ const tp = @import("gpu/text_pipeline.zig");
 const face_mod = @import("font/face.zig");
 const registry_mod = @import("font/registry.zig");
 const glyph_cache_mod = @import("text/glyph_cache.zig");
-const layout = @import("text/layout.zig");
+const element = @import("element.zig");
+const element_layout = @import("element_layout.zig");
 
 const ATLAS_MONO_SIZE: u32 = 768;
 const ATLAS_COLOR_SIZE: u32 = 1024;
@@ -27,7 +34,9 @@ const MAX_GLYPHS: u32 = 2048;
 const FrameCtx = struct {
     pipeline: *tp.TextPipeline,
     n_glyphs: u32,
-    /// All glyph instances, mutated per frame for the attention wave.
+    /// Borrowed slice into the DrawList's glyph buffer — mutated per
+    /// frame for the attention wave. Stable for the lifetime of the
+    /// frame loop because we don't append after the layout pass.
     glyphs: []tp.GlyphInstance,
     /// Index range covering the animated SDF span — the wave
     /// rewrites only these entries each frame.
@@ -81,7 +90,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — phase 6\n", .{});
+    try stdout.print("text_engine demo — session 2 / stage 1 (element tree)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
 
@@ -119,90 +128,114 @@ pub fn main() !void {
     const body_id = try fonts.load(font_path.ptr, 22);
     const accent_id = try fonts.load(font_path.ptr, 28);
     const emoji_id = try fonts.load(emoji_path.ptr, 28);
-    // SDF lane at 44 px display — large enough that the attention
-    // glow + threshold modulation is visible; small enough to share
-    // a line with body text without overwhelming it. Source-px is
-    // fixed at 64 inside `loadSdf` regardless.
     const sdf_id = try fonts.loadSdf(font_path.ptr, 44);
 
     var cache = glyph_cache_mod.GlyphCache.init(allocator);
     defer cache.deinit();
 
-    // ── Compose the paragraph ──────────────────────────────────────
+    // ── Compose the document as an Element tree ────────────────────
     const white: [4]f32 = .{ 0.95, 0.95, 0.98, 1.0 };
     const grey: [4]f32 = .{ 0.58, 0.62, 0.72, 1.0 };
     const yellow: [4]f32 = .{ 0.99, 0.84, 0.32, 1.0 };
     const orange: [4]f32 = .{ 0.99, 0.55, 0.30, 1.0 };
 
-    const heading_line = layout.Line{ .spans = &.{
-        .{ .text = "text_engine", .style = .{ .font_id = heading_id, .color = white } },
-    } };
-    const subtitle_line = layout.Line{ .spans = &.{
-        .{ .text = "Phase 6 — SDF lane + per-glyph attention", .style = .{ .font_id = subtitle_id, .color = grey } },
-    } };
-    const blank_line = layout.Line{ .spans = &.{} };
-    const mixed_line = layout.Line{ .spans = &.{
-        .{ .text = "Mix ", .style = .{ .font_id = body_id, .color = white } },
-        .{ .text = "fonts", .style = .{ .font_id = body_id, .color = yellow } },
-        .{ .text = ", ", .style = .{ .font_id = body_id, .color = white } },
-        .{ .text = "sizes", .style = .{ .font_id = accent_id, .color = orange } },
-        .{ .text = ", and colours inline.", .style = .{ .font_id = body_id, .color = white } },
-    } };
-    const emoji_line = layout.Line{ .spans = &.{
-        .{ .text = "Inline emoji: ", .style = .{ .font_id = body_id, .color = white } },
-        .{ .text = "🎉🦊🚀❤️🎨🌍", .style = .{ .font_id = emoji_id, .color = white } },
-        .{ .text = "  in body text.", .style = .{ .font_id = body_id, .color = white } },
-    } };
-    // The SDF span. Default per-span attention is 0.5; the per-frame
-    // update below overwrites the .attention field of every glyph in
-    // this span individually so each letter rides a different phase.
-    const sdf_line = layout.Line{ .spans = &.{
-        .{ .text = "ATTENTION", .style = .{ .font_id = sdf_id, .color = white, .attention = 0.5 } },
+    // Heading: one inline `text` run at heading size.
+    const heading_children = [_]element.Element{
+        .{ .text = .{ .content = "text_engine", .style = .{ .font_id = heading_id, .color = white } } },
+    };
+    const heading_block = element.Element{ .heading = .{ .level = 1, .content = &heading_children } };
+
+    // Subtitle paragraph.
+    const subtitle_children = [_]element.Element{
+        .{ .text = .{ .content = "Session 2 — element tree contract (stage 1)", .style = .{ .font_id = subtitle_id, .color = grey } } },
+    };
+    const subtitle_block = element.Element{ .paragraph = &subtitle_children };
+
+    // Spacer: empty paragraph — picks up one default line_height.
+    // Phase B will replace this hack with per-block margins.
+    const spacer_block = element.Element{ .paragraph = &.{} };
+
+    // Mixed-size, mixed-colour inline runs in one paragraph.
+    const mixed_children = [_]element.Element{
+        .{ .text = .{ .content = "Mix ", .style = .{ .font_id = body_id, .color = white } } },
+        .{ .text = .{ .content = "fonts", .style = .{ .font_id = body_id, .color = yellow } } },
+        .{ .text = .{ .content = ", ", .style = .{ .font_id = body_id, .color = white } } },
+        .{ .text = .{ .content = "sizes", .style = .{ .font_id = accent_id, .color = orange } } },
+        .{ .text = .{ .content = ", and colours inline.", .style = .{ .font_id = body_id, .color = white } } },
+    };
+    const mixed_block = element.Element{ .paragraph = &mixed_children };
+
+    // Emoji paragraph — body text wrapped around a colour-emoji run.
+    const emoji_children = [_]element.Element{
+        .{ .text = .{ .content = "Inline emoji: ", .style = .{ .font_id = body_id, .color = white } } },
+        .{ .text = .{ .content = "🎉🦊🚀❤️🎨🌍", .style = .{ .font_id = emoji_id, .color = white } } },
+        .{ .text = .{ .content = "  in body text.", .style = .{ .font_id = body_id, .color = white } } },
+    };
+    const emoji_block = element.Element{ .paragraph = &emoji_children };
+
+    // Top stack: vertical container, no gap (spacer paragraphs handle
+    // gaps for stage 1).
+    const top_stack_children = [_]element.Element{
+        heading_block,
+        subtitle_block,
+        spacer_block,
+        mixed_block,
+        emoji_block,
+        spacer_block,
+    };
+    const top_stack = element.Element{ .container = .{
+        .layout = .stack_v,
+        .children = &top_stack_children,
+        .gap = 0,
     } };
 
-    var glyphs = std.ArrayList(tp.GlyphInstance).init(allocator);
-    defer glyphs.deinit();
+    // SDF "ATTENTION" paragraph — separate from the top stack so we
+    // can capture the glyph index range for per-frame animation.
+    // Default per-span `attention = 0.5`; the frame loop overwrites
+    // each glyph's `.attention` individually for the wave.
+    const sdf_children = [_]element.Element{
+        .{ .text = .{ .content = "ATTENTION", .style = .{
+            .font_id = sdf_id,
+            .color = white,
+            .attention = 0.5,
+        } } },
+    };
+    const sdf_block = element.Element{ .paragraph = &sdf_children };
 
-    // Layout the top part of the paragraph, then capture the index
-    // range for the SDF line, then layout the SDF line, then we know
-    // exactly which entries to animate per frame.
-    const top_paragraph = layout.Paragraph{ .lines = &.{
-        heading_line,
-        subtitle_line,
-        blank_line,
-        mixed_line,
-        emoji_line,
-        blank_line,
-    } };
-    const sdf_y = try layout.layoutParagraph(
-        &glyphs,
-        allocator,
-        &fonts,
-        &cache,
-        &atlas_mono,
-        &atlas_color,
-        top_paragraph,
-        40,
-        40,
+    // ── Lay out + render ───────────────────────────────────────────
+    var dl = element.DrawList.init(allocator);
+    defer dl.deinit();
+
+    var lc = element.LayoutCtx{
+        .allocator = allocator,
+        .fonts = &fonts,
+        .cache = &cache,
+        .mono_atlas = &atlas_mono,
+        .color_atlas = &atlas_color,
+    };
+
+    const top_box = try element_layout.layoutAndRender(
+        top_stack,
+        .{ 40, 40 },
+        .{},
+        &lc,
+        &dl,
     );
+    const sdf_y = top_box.y + top_box.h;
 
-    const pulse_start: u32 = @intCast(glyphs.items.len);
-    _ = try layout.layoutParagraph(
-        &glyphs,
-        allocator,
-        &fonts,
-        &cache,
-        &atlas_mono,
-        &atlas_color,
-        .{ .lines = &.{sdf_line} },
-        40,
-        sdf_y,
+    const pulse_start: u32 = @intCast(dl.glyphs.items.len);
+    _ = try element_layout.layoutAndRender(
+        sdf_block,
+        .{ 40, sdf_y },
+        .{},
+        &lc,
+        &dl,
     );
-    const pulse_count: u32 = @intCast(glyphs.items.len - pulse_start);
+    const pulse_count: u32 = @intCast(dl.glyphs.items.len - pulse_start);
 
-    try pipeline.writeGlyphs(glyphs.items);
+    try pipeline.writeGlyphs(dl.glyphs.items);
     try stdout.print("  glyphs:                {d} (pulse span: {d} glyphs)\n", .{
-        glyphs.items.len,
+        dl.glyphs.items.len,
         pulse_count,
     });
     try stdout.print("  cache:                 {d} miss / {d} hit ({d:.1}% hit rate)\n", .{
@@ -216,8 +249,8 @@ pub fn main() !void {
 
     var frame_ctx = FrameCtx{
         .pipeline = &pipeline,
-        .n_glyphs = @intCast(glyphs.items.len),
-        .glyphs = glyphs.items,
+        .n_glyphs = @intCast(dl.glyphs.items.len),
+        .glyphs = dl.glyphs.items,
         .pulse_start = pulse_start,
         .pulse_count = pulse_count,
         .start_ms = std.time.milliTimestamp(),
@@ -236,11 +269,6 @@ pub fn main() !void {
         window.pollEvents();
 
         // ── Per-frame attention wave ────────────────────────────────
-        // Each glyph in the pulse span gets a sine-driven attention
-        // value, phase-offset by index — a single wave rolls
-        // left-to-right through the word. The SSBO is host-coherent,
-        // so the memcpy in writeGlyphs becomes visible to the GPU
-        // before the next submit without any explicit flush.
         const elapsed: f32 = @floatFromInt(std.time.milliTimestamp() - frame_ctx.start_ms);
         const t_sec: f32 = elapsed * 0.001;
         var i: u32 = 0;
@@ -250,12 +278,6 @@ pub fn main() !void {
             const w = (std.math.sin(phase) + 1.0) * 0.5;
             frame_ctx.glyphs[idx].attention = w;
 
-            // Rainbow per-glyph: each letter sits at its own hue
-            // around the wheel (9 letters → 40° apart → full
-            // ROYGBIV span), with the whole spectrum drifting
-            // slowly over time. Combined with the attention lerp
-            // in the fragment, each letter fades from white toward
-            // its own hue as its attention ramps up the sine.
             const hue = @mod(@as(f32, @floatFromInt(i)) * 40.0 + t_sec * 30.0, 360.0);
             const rgb = hsvToRgb(hue, 0.85, 1.0);
             frame_ctx.glyphs[idx].hot_color = .{ rgb[0], rgb[1], rgb[2], 1.0 };
