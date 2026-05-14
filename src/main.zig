@@ -28,11 +28,25 @@ const glyph_cache_mod = @import("text/glyph_cache.zig");
 const element = @import("element.zig");
 const element_layout = @import("element_layout.zig");
 const markdown = @import("markdown.zig");
+const ansi = @import("ansi.zig");
 
 /// Demo document — parsed by the vendored cmark + mapper into an
 /// Element tree at startup. Same render path as the hand-built
 /// torture trees of earlier stages; only the construction changed.
 const demo_md = @embedFile("demo.md");
+
+/// Small ANSI fixture rendered by `src/ansi.zig` after the markdown.
+/// The `\x1b` escapes resolve at compile time to real ESC bytes
+/// (0x1B), so the parser sees authentic terminal output. Exercises
+/// 8-colour, 256-colour, truecolor, bold + italic, multi-line.
+const ansi_demo =
+    "\x1b[1;31m\xE2\x97\x8F\x1b[0m bold red    " ++
+    "\x1b[1;32m\xE2\x97\x8F\x1b[0m bold green    " ++
+    "\x1b[1;33m\xE2\x97\x8F\x1b[0m bold yellow\n" ++
+    "\x1b[34mblue\x1b[0m  " ++
+    "\x1b[38;5;202m256: orange\x1b[0m  " ++
+    "\x1b[38;2;255;127;80mtrue: coral\x1b[0m  " ++
+    "\x1b[3mitalic\x1b[0m\n";
 
 const ATLAS_MONO_SIZE: u32 = 768;
 const ATLAS_COLOR_SIZE: u32 = 1024;
@@ -104,7 +118,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 3 / stage 4b (link underlines)\n", .{});
+    try stdout.print("text_engine demo — session 3 / stage 5a (ansi engine)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
     try stdout.print("  demo.md bytes:         {d}\n", .{demo_md.len});
@@ -241,7 +255,27 @@ pub fn main() !void {
         &lc,
         &dl,
     );
-    const sdf_y = top_box.y + top_box.h;
+
+    // ── ANSI fixture between markdown and the SDF "ATTENTION" ──────
+    // Derives a theme with body pointed at the mono font so spacing
+    // is terminal-like; bold + italic fall back to proportional
+    // variants for now (mono bold/italic loads belong to a refinement
+    // later — see the project memory's "ansi font mismatch" note).
+    var ansi_theme = theme;
+    ansi_theme.body = .{ .font_id = code_inline_id, .color = .{ 0.92, 0.94, 0.98, 1.0 } };
+    var ansi_lc = lc;
+    ansi_lc.theme = &ansi_theme;
+
+    const ansi_tree = try ansi.parse(doc_arena.allocator(), ansi_demo, &ansi_theme);
+    const ansi_box = try element_layout.layoutAndRender(
+        ansi_tree,
+        .{ 40, top_box.y + top_box.h + 8 },
+        top_constraints,
+        &ansi_lc,
+        &dl,
+    );
+
+    const sdf_y = ansi_box.y + ansi_box.h;
 
     const pulse_start: u32 = @intCast(dl.glyphs.items.len);
     _ = try element_layout.layoutAndRender(
