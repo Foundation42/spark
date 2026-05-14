@@ -268,19 +268,32 @@ pub const Registry = struct {
     /// factory.update, and — when `${}` references exist — sets up
     /// a Binding so subsequent state mutations refire update
     /// automatically.
+    ///
+    /// `scope` (stage 9) namespaces the cache key so an embedded
+    /// document can hold `:::box {#bx}` without colliding with the
+    /// parent doc's `:::box {#bx}`. When non-null the effective key
+    /// becomes `"{scope}/{id_or_auto:N}"`. Null preserves the
+    /// single-global-namespace behaviour for the top-level doc.
     pub fn resolve(
         self: *Registry,
         spec: *const components.Spec,
         sentinel_idx: usize,
         state: ?*state_mod.State,
+        scope: ?[]const u8,
     ) !?Resolved {
         const factory = self.factories.get(spec.name) orelse return null;
 
-        var id_buf: [64]u8 = undefined;
-        const id: []const u8 = if (spec.id) |id|
-            id
-        else
-            std.fmt.bufPrint(&id_buf, "auto:{d}", .{sentinel_idx}) catch unreachable;
+        var key_buf: [192]u8 = undefined;
+        const id: []const u8 = blk: {
+            if (scope) |s| {
+                if (spec.id) |sid|
+                    break :blk std.fmt.bufPrint(&key_buf, "{s}/{s}", .{ s, sid }) catch unreachable
+                else
+                    break :blk std.fmt.bufPrint(&key_buf, "{s}/auto:{d}", .{ s, sentinel_idx }) catch unreachable;
+            }
+            if (spec.id) |sid| break :blk sid;
+            break :blk std.fmt.bufPrint(&key_buf, "auto:{d}", .{sentinel_idx}) catch unreachable;
+        };
 
         const gop = try self.instances.getOrPut(self.allocator, id);
         if (gop.found_existing) {
@@ -457,6 +470,41 @@ pub const Registry = struct {
         try handler(entry.instance.ctx, action, body);
     }
 
+    /// Destroy every cached instance whose key starts with
+    /// `"{prefix}/"`. Used by embedded-document factories (stage 9)
+    /// to tear down all of their child components when the embedded
+    /// doc itself is destroyed. Without this, child instances would
+    /// only get swept on the next gc pass — risky because the
+    /// embedded-doc factory.deinit is about to free the child State
+    /// the bindings reference.
+    ///
+    /// Bindings are unsubscribed (via Binding.destroy) before the
+    /// instance is destroyed, so a child instance whose binding
+    /// references the about-to-be-freed child State doesn't get
+    /// fired during the embedded-doc's teardown.
+    pub fn deinitScope(self: *Registry, prefix: []const u8) void {
+        var dead = std.ArrayList([]const u8).init(self.allocator);
+        defer dead.deinit();
+
+        var sep_buf: [192]u8 = undefined;
+        const search_prefix = std.fmt.bufPrint(&sep_buf, "{s}/", .{prefix}) catch return;
+
+        var it = self.instances.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.startsWith(u8, entry.key_ptr.*, search_prefix)) {
+                dead.append(entry.key_ptr.*) catch continue;
+            }
+        }
+        for (dead.items) |key| {
+            const entry = self.instances.fetchRemove(key) orelse continue;
+            if (entry.value.binding) |b| b.destroy();
+            if (self.factories.get(entry.value.factory_name)) |f| {
+                if (f.deinit) |d| d(entry.value.instance.ctx, self.allocator);
+            }
+            self.allocator.free(entry.key);
+        }
+    }
+
     /// Destroy every cached instance whose `parses_unused` exceeds
     /// `sweep_threshold`. Host calls this after swapping the new
     /// Element tree into place — at which point no live Element
@@ -610,13 +658,13 @@ test "register + resolve creates instance once" {
     try registry.register("box", test_factory);
 
     const spec: components.Spec = .{ .name = "box", .id = "bx" };
-    const r1 = try registry.resolve(&spec, 0, null);
+    const r1 = try registry.resolve(&spec, 0, null, null);
     try testing.expect(r1 != null);
     try testing.expectEqual(@as(u32, 1), t_creates);
     try testing.expectEqual(@as(u32, 0), t_updates);
 
     registry.beginParse();
-    const r2 = try registry.resolve(&spec, 0, null);
+    const r2 = try registry.resolve(&spec, 0, null, null);
     try testing.expect(r2 != null);
     try testing.expectEqual(r1.?.ctx, r2.?.ctx);
     try testing.expectEqual(@as(u32, 1), t_creates);
@@ -628,7 +676,7 @@ test "resolve returns null for unregistered name" {
     var registry = Registry.init(testing.allocator);
     defer registry.deinit();
     const spec: components.Spec = .{ .name = "nothing", .id = "x" };
-    const r = try registry.resolve(&spec, 0, null);
+    const r = try registry.resolve(&spec, 0, null, null);
     try testing.expect(r == null);
 }
 
@@ -639,13 +687,13 @@ test "auto-id is order-based" {
     try registry.register("box", test_factory);
 
     const a: components.Spec = .{ .name = "box" }; // no id → auto:5
-    const r1 = try registry.resolve(&a, 5, null);
+    const r1 = try registry.resolve(&a, 5, null, null);
     registry.beginParse();
-    const r2 = try registry.resolve(&a, 5, null);
+    const r2 = try registry.resolve(&a, 5, null, null);
     try testing.expectEqual(r1.?.ctx, r2.?.ctx);
 
     // Different sentinel idx with same name → different cache slot.
-    const r3 = try registry.resolve(&a, 6, null);
+    const r3 = try registry.resolve(&a, 6, null, null);
     try testing.expect(r1.?.ctx != r3.?.ctx);
     try testing.expectEqual(@as(u32, 2), t_creates);
 }
@@ -658,7 +706,7 @@ test "gc destroys after sweep_threshold consecutive unused parses" {
     try registry.register("box", test_factory);
 
     const spec: components.Spec = .{ .name = "box", .id = "bx" };
-    _ = try registry.resolve(&spec, 0, null);
+    _ = try registry.resolve(&spec, 0, null, null);
     try testing.expectEqual(@as(u32, 1), t_creates);
 
     // Threshold=2 → instance dies on the third unused parse.
@@ -672,7 +720,7 @@ test "gc destroys after sweep_threshold consecutive unused parses" {
     registry.gc();
     try testing.expectEqual(@as(u32, 1), t_deinits);
 
-    _ = try registry.resolve(&spec, 0, null);
+    _ = try registry.resolve(&spec, 0, null, null);
     try testing.expectEqual(@as(u32, 2), t_creates);
 }
 
@@ -686,13 +734,13 @@ test "factory name change destroys old + recreates" {
     // Auto-id collision when the spec at sentinel 0 changes name
     // across parses — e.g. an edit turning `:::box` into `:::chart`.
     const as_box: components.Spec = .{ .name = "box" };
-    _ = try registry.resolve(&as_box, 0, null);
+    _ = try registry.resolve(&as_box, 0, null, null);
     try testing.expectEqual(@as(u32, 1), t_creates);
     try testing.expectEqual(@as(u32, 0), t_deinits);
 
     registry.beginParse();
     const as_chart: components.Spec = .{ .name = "chart" };
-    _ = try registry.resolve(&as_chart, 0, null);
+    _ = try registry.resolve(&as_chart, 0, null, null);
     try testing.expectEqual(@as(u32, 2), t_creates);
     try testing.expectEqual(@as(u32, 1), t_deinits);
 }
@@ -705,7 +753,7 @@ test "update sees latest spec attrs" {
 
     const attrs_red = [_]components.Attr{.{ .key = "color", .value = "red" }};
     const spec_red: components.Spec = .{ .name = "box", .id = "bx", .attrs = &attrs_red };
-    const r1 = try registry.resolve(&spec_red, 0, null);
+    const r1 = try registry.resolve(&spec_red, 0, null, null);
     {
         const state: *TestState = @ptrCast(@alignCast(r1.?.ctx));
         try testing.expectEqualStrings("red", state.last_color);
@@ -714,7 +762,7 @@ test "update sees latest spec attrs" {
     registry.beginParse();
     const attrs_blue = [_]components.Attr{.{ .key = "color", .value = "blue" }};
     const spec_blue: components.Spec = .{ .name = "box", .id = "bx", .attrs = &attrs_blue };
-    _ = try registry.resolve(&spec_blue, 0, null);
+    _ = try registry.resolve(&spec_blue, 0, null, null);
     {
         const state: *TestState = @ptrCast(@alignCast(r1.?.ctx));
         try testing.expectEqualStrings("blue", state.last_color);
@@ -735,7 +783,7 @@ test "reactive: state.set fires factory.update on bound component" {
     const spec: components.Spec = .{ .name = "box", .id = "bx", .attrs = &attrs };
 
     // Initial resolve substitutes — factory.create sees "red".
-    const r1 = try registry.resolve(&spec, 0, &st);
+    const r1 = try registry.resolve(&spec, 0, &st, null);
     {
         const tst: *TestState = @ptrCast(@alignCast(r1.?.ctx));
         try testing.expectEqualStrings("red", tst.last_color);
@@ -757,6 +805,64 @@ test "reactive: state.set fires factory.update on bound component" {
     try testing.expectEqual(@as(u32, 1), t_updates);
 }
 
+test "scoped resolve namespaces cache keys" {
+    resetCounters();
+    var registry = Registry.init(testing.allocator);
+    defer registry.deinit();
+    try registry.register("box", test_factory);
+
+    const spec: components.Spec = .{ .name = "box", .id = "bx" };
+
+    // Same #id under different scopes -> two distinct instances.
+    const r_top = try registry.resolve(&spec, 0, null, null);
+    const r_a = try registry.resolve(&spec, 0, null, "embed:a");
+    const r_b = try registry.resolve(&spec, 0, null, "embed:b");
+    try testing.expectEqual(@as(u32, 3), t_creates);
+    try testing.expect(r_top.?.ctx != r_a.?.ctx);
+    try testing.expect(r_a.?.ctx != r_b.?.ctx);
+
+    // Cache hit within the same scope reuses.
+    registry.beginParse();
+    const r_a_again = try registry.resolve(&spec, 0, null, "embed:a");
+    try testing.expectEqual(@as(u32, 3), t_creates);
+    try testing.expectEqual(r_a.?.ctx, r_a_again.?.ctx);
+}
+
+test "scoped resolve: auto:N + scope" {
+    resetCounters();
+    var registry = Registry.init(testing.allocator);
+    defer registry.deinit();
+    try registry.register("box", test_factory);
+
+    const spec: components.Spec = .{ .name = "box" }; // no id -> auto:N
+    _ = try registry.resolve(&spec, 0, null, "child");
+    _ = try registry.resolve(&spec, 0, null, null);
+    try testing.expectEqual(@as(u32, 2), t_creates); // scoped vs unscoped are distinct
+}
+
+test "deinitScope destroys only matching instances" {
+    resetCounters();
+    var registry = Registry.init(testing.allocator);
+    defer registry.deinit();
+    try registry.register("box", test_factory);
+
+    const spec_top: components.Spec = .{ .name = "box", .id = "top" };
+    const spec_inner: components.Spec = .{ .name = "box", .id = "inner" };
+    _ = try registry.resolve(&spec_top, 0, null, null);
+    _ = try registry.resolve(&spec_inner, 0, null, "child");
+    _ = try registry.resolve(&spec_inner, 1, null, "other");
+    try testing.expectEqual(@as(u32, 3), t_creates);
+    try testing.expectEqual(@as(u32, 0), t_deinits);
+
+    registry.deinitScope("child");
+    try testing.expectEqual(@as(u32, 1), t_deinits);
+
+    // Top-level + "other"'s instance survive.
+    try testing.expect(registry.lookup("top") != null);
+    try testing.expect(registry.lookup("other/inner") != null);
+    try testing.expect(registry.lookup("child/inner") == null);
+}
+
 test "lookup returns null for unknown id" {
     resetCounters();
     var registry = Registry.init(testing.allocator);
@@ -771,7 +877,7 @@ test "lookup returns the resolved instance once it exists" {
     try registry.register("box", test_factory);
 
     const spec: components.Spec = .{ .name = "box", .id = "bx" };
-    const r = try registry.resolve(&spec, 0, null);
+    const r = try registry.resolve(&spec, 0, null, null);
     const looked = registry.lookup("bx").?;
     try testing.expectEqual(r.?.ctx, looked.ctx);
 }
@@ -783,7 +889,7 @@ test "handleUpdate dispatches to factory handle_update" {
     try registry.register("box", test_factory);
 
     const spec: components.Spec = .{ .name = "box", .id = "bx" };
-    _ = try registry.resolve(&spec, 0, null);
+    _ = try registry.resolve(&spec, 0, null, null);
     try testing.expectEqual(@as(u32, 1), t_creates);
 
     try registry.handleUpdate("bx", "set-color", "orange");
@@ -813,7 +919,7 @@ test "handleUpdate: factory without handler errors" {
     try registry.register("box", no_handler);
 
     const spec: components.Spec = .{ .name = "box", .id = "bx" };
-    _ = try registry.resolve(&spec, 0, null);
+    _ = try registry.resolve(&spec, 0, null, null);
     try testing.expectError(error.NoUpdateHandler, registry.handleUpdate("bx", "set-color", "red"));
 }
 
@@ -830,7 +936,7 @@ test "reactive: gc unsubscribes the binding" {
 
     const attrs = [_]components.Attr{.{ .key = "color", .value = "${c}" }};
     const spec: components.Spec = .{ .name = "box", .id = "bx", .attrs = &attrs };
-    _ = try registry.resolve(&spec, 0, &st);
+    _ = try registry.resolve(&spec, 0, &st, null);
     try testing.expectEqual(@as(u32, 1), t_creates);
 
     // Parse without re-resolving → entry hits sweep, gc destroys it

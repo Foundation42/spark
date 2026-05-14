@@ -52,8 +52,11 @@ Block extensions parse into Specs, get resolved through a host-owned registry in
 :::slider {#height_slider target=box_height min=20 max=120 value=${state.box_height} width=320}
 :::
 
-:::3d-scene {#orbit-view src="models/${state.target_id}.gltf" width=100% height=400px}
-animation: "orbital_drift"
+## Composition (stage 9)
+
+The block below is a *whole other document* — `src/widgets/orbit_panel.md` — embedded recursively. Parent attrs (`panel_color=cyan`, `inner_color=magenta`) overlay the child's frontmatter; child components live in the same registry under the scope `orbit/...` so their ids can't collide with the parent's.
+
+:::embedded-document {#orbit src="src/widgets/orbit_panel.md" panel_color=cyan inner_color=magenta}
 :::
 
 :::chart {#telemetry type=line min=-1 max=1 width=100% height=140}

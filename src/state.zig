@@ -75,6 +75,15 @@ pub const State = struct {
     /// Bumped by every `set`. Hosts read it from their frame loop
     /// and call layout on a true→false transition.
     dirty: bool = false,
+    /// Optional pointer up the document-composition chain (stage 9).
+    /// When an embedded document is created, its child State's
+    /// `parent` is set to the embedding document's State. `set`
+    /// flips `dirty` all the way up the chain so the host's frame
+    /// loop (which only watches the root State.dirty) sees mutations
+    /// in any nested document. Subscriber firing stays local — each
+    /// State manages its own subscribers — so the bubble is *only*
+    /// about waking the renderer.
+    parent: ?*State = null,
 
     pub fn init(allocator: std.mem.Allocator) State {
         return .{ .allocator = allocator };
@@ -105,7 +114,9 @@ pub const State = struct {
 
     /// Set a path's value. Fires any subscribers registered for that
     /// exact path. Sets `dirty=true` regardless of whether the value
-    /// actually changed — callers debounce if they care.
+    /// actually changed — callers debounce if they care. Dirty
+    /// bubbles up through `parent` so a root-watching renderer wakes
+    /// even when the mutation happened inside an embedded document.
     pub fn set(self: *State, key: []const u8, value: []const u8) Error!void {
         const gop = try self.map.getOrPut(self.allocator, key);
         if (gop.found_existing) {
@@ -115,6 +126,8 @@ pub const State = struct {
         }
         gop.value_ptr.* = try self.allocator.dupe(u8, value);
         self.dirty = true;
+        var p = self.parent;
+        while (p) |s| : (p = s.parent) s.dirty = true;
 
         if (self.subscribers.getPtr(key)) |list| {
             // Snapshot the items pointer in case a callback adds /
@@ -464,4 +477,49 @@ test "fromSource extracts + parses frontmatter" {
 test "fromSource returns null when no frontmatter" {
     const opt = try fromSource(testing.allocator, "# just body\n");
     try testing.expect(opt == null);
+}
+
+test "dirty bubbles up through parent chain" {
+    var root = State.init(testing.allocator);
+    defer root.deinit();
+    var child = State.init(testing.allocator);
+    defer child.deinit();
+    var grandchild = State.init(testing.allocator);
+    defer grandchild.deinit();
+
+    child.parent = &root;
+    grandchild.parent = &child;
+
+    try testing.expect(!root.dirty);
+    try testing.expect(!child.dirty);
+    try testing.expect(!grandchild.dirty);
+
+    try grandchild.set("x", "1");
+    try testing.expect(grandchild.dirty);
+    try testing.expect(child.dirty);
+    try testing.expect(root.dirty);
+
+    // Clearing one level doesn't affect the others — that's the
+    // host's job; clearDirty is local.
+    grandchild.clearDirty();
+    try testing.expect(!grandchild.dirty);
+    try testing.expect(child.dirty);
+    try testing.expect(root.dirty);
+}
+
+test "subscribers fire only on the state where set was called" {
+    var root = State.init(testing.allocator);
+    defer root.deinit();
+    var child = State.init(testing.allocator);
+    defer child.deinit();
+    child.parent = &root;
+
+    var root_probe = TestCb{};
+    var child_probe = TestCb{};
+    _ = try root.subscribe("x", TestCb.cb, @ptrCast(&root_probe));
+    _ = try child.subscribe("x", TestCb.cb, @ptrCast(&child_probe));
+
+    try child.set("x", "v");
+    try testing.expectEqual(@as(u32, 0), root_probe.counter); // root not fired
+    try testing.expectEqual(@as(u32, 1), child_probe.counter);
 }

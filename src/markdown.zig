@@ -84,6 +84,12 @@ const MapCtx = struct {
     /// `registry.resolve`. The placeholder path doesn't need it
     /// (only reads `spec.name`).
     state: ?*state_mod.State,
+    /// Cache-key scope for components resolved during this parse
+    /// (stage 9). Null at the top-level doc; embedded-document
+    /// factories propagate their `#id` here when calling
+    /// parseWithState so child components don't collide with parent
+    /// components in the registry's instance map.
+    scope: ?[]const u8 = null,
 };
 
 /// Parse `source` (UTF-8 CommonMark) into an Element tree owned by
@@ -115,6 +121,21 @@ pub fn parse(
     return parseWithState(arena, source, theme, registry, null);
 }
 
+/// Same as `parseWithState` but also takes a `scope` prefix for the
+/// registry's instance cache (stage 9). Embedded-document factories
+/// call this with their own `#id` as the scope so child components
+/// don't collide with the parent's in the same Registry.
+pub fn parseWithStateAndScope(
+    arena: std.mem.Allocator,
+    source: []const u8,
+    theme: *const element.Theme,
+    registry: ?*component_mod.Registry,
+    state: ?*state_mod.State,
+    scope: ?[]const u8,
+) anyerror!element.Element {
+    return parseInternal(arena, source, theme, registry, state, scope);
+}
+
 /// Same as `parse` but with an explicit `?*const State` to use for
 /// `${path}` interpolation in component attribute values. When
 /// `state` is null and the source begins with a `---` YAML
@@ -134,6 +155,17 @@ pub fn parseWithState(
     theme: *const element.Theme,
     registry: ?*component_mod.Registry,
     state: ?*state_mod.State,
+) anyerror!element.Element {
+    return parseInternal(arena, source, theme, registry, state, null);
+}
+
+fn parseInternal(
+    arena: std.mem.Allocator,
+    source: []const u8,
+    theme: *const element.Theme,
+    registry: ?*component_mod.Registry,
+    state: ?*state_mod.State,
+    scope: ?[]const u8,
 ) anyerror!element.Element {
     var body: []const u8 = source;
     var local_state: ?state_mod.State = null;
@@ -163,7 +195,15 @@ pub fn parseWithState(
     ) orelse return error.CmarkParseFailed;
     defer cmark.cmark_node_free(root);
 
-    if (registry) |r| r.beginParse();
+    // Only the top-level doc calls beginParse — embedded docs share
+    // the registry but don't reset its parses_unused counters, since
+    // they're a nested parse INSIDE one. Each parent re-parse will
+    // re-invoke the embedded-doc factory which re-enters here; the
+    // embedded children get touched via scoped resolve and stay
+    // alive through the outer beginParse cycle naturally.
+    if (scope == null) {
+        if (registry) |r| r.beginParse();
+    }
 
     const mc: MapCtx = .{
         .arena = arena,
@@ -171,6 +211,7 @@ pub fn parseWithState(
         .specs = pre.specs,
         .registry = registry,
         .state = effective_state,
+        .scope = scope,
     };
     return try mapBlock(&mc, root, theme.body);
 }
@@ -263,7 +304,7 @@ fn mapBlock(
                     // instance state lives in the registry's
                     // allocator, stable across many parses.
                     if (mc.registry) |reg| {
-                        if (try reg.resolve(spec_ptr, idx, mc.state)) |inst| {
+                        if (try reg.resolve(spec_ptr, idx, mc.state, mc.scope)) |inst| {
                             return .{ .custom = .{
                                 .vtable = inst.vtable,
                                 .ctx = inst.ctx,

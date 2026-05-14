@@ -32,6 +32,7 @@ const ansi = @import("ansi.zig");
 const component = @import("component.zig");
 const box_component = @import("components/box.zig");
 const chart_component = @import("components/chart.zig");
+const embedded_document_component = @import("components/embedded_document.zig");
 const slider_component = @import("components/slider.zig");
 const state_mod = @import("state.zig");
 const update = @import("update.zig");
@@ -325,7 +326,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 5 / stage 8b (:::chart streaming)\n", .{});
+    try stdout.print("text_engine demo — session 5 / stage 9 (:::embedded-document)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
     try stdout.print("  demo.md bytes:         {d}\n", .{demo_md.len});
@@ -423,6 +424,9 @@ pub fn main() !void {
     try registry.register("box", box_component.factory);
     try registry.register("chart", chart_component.factory);
     try registry.register("slider", slider_component.factory);
+    // Embedded-document factory needs theme + registry + parent
+    // state captured at install time — see embedded_document.zig's
+    // "module-globals smell" note for why.
 
     // ── Host-owned reactive state (stage 7e) ───────────────────────
     // Frontmatter parses once at startup; the State persists across
@@ -431,6 +435,11 @@ pub fn main() !void {
     // cached component instances.
     var host_state = (try state_mod.fromSource(allocator, demo_md)) orelse state_mod.State.init(allocator);
     defer host_state.deinit();
+
+    // Stage 9 — install the embedded-document factory now that theme
+    // + registry + parent state all exist. Has to happen before any
+    // parse runs.
+    try embedded_document_component.install(&registry, &theme, &host_state);
 
     // ── Parse demo.md into an Element tree ─────────────────────────
     // All slices + strings the tree references live in `doc_arena`;

@@ -8,16 +8,18 @@ game UI all flow through. **What we're building** is documented in
 interface to a live, component-driven runtime that an LLM can
 author, mutate, and stream updates into.
 
-End of session 5 the substrate is alive on both ends: markdown
-source with full chrome, an ANSI fixture, a rainbow SDF "ATTENTION",
-a live blue rounded box driven by frontmatter state + two sliders
-that drag-set its radius and height, and a streaming `:::chart`
-fed at 60 Hz through the `:::update` wire format — the same path an
-LLM would push deltas through. Box colour cycles every 1.5s via
-state-target updates; chart appends ~240 samples / 4 s via
-component-target updates. All at ~12k fps Release. Source for the
-document is [`src/demo.md`](src/demo.md), parsed at startup through
-vendored cmark.
+End of session 5 the substrate is alive on every axis: a top
+markdown doc with chrome, an ANSI fixture, a rainbow SDF
+"ATTENTION", a live rounded box driven by frontmatter state + two
+sliders, a streaming `:::chart` fed at 60 Hz through the
+`:::update` wire format, and now a `:::embedded-document` that
+loads `src/widgets/orbit_panel.md` as a whole second document with
+its own state — parent attrs overlay onto the child's frontmatter,
+child components live in a scoped corner of the registry, and
+mutations bubble dirty up to wake the renderer. Box colour cycles
+every 1.5s; chart appends 60Hz; all at ~11.2k fps Release. Source
+for the parent document is [`src/demo.md`](src/demo.md); the embed
+is [`src/widgets/orbit_panel.md`](src/widgets/orbit_panel.md).
 
 ```
        ┌───────────────────────────────────────────────────────┐
@@ -266,10 +268,23 @@ TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
   feed (layered sines + noise) through the component-target path;
   ~12k fps Release with ~240 updates dispatched per 4s. 62 unit
   tests total.
+- [x] **Stage 9** — `:::embedded-document {#id src=... attr=val}`.
+  Recursive document composition. Built-in factory reads the child
+  file, parses through `markdown.parseWithStateAndScope` with a
+  fresh child `State` (`parent` pointer set for dirty bubble),
+  applies non-`src` parent attrs as overrides on child state,
+  grafts the parsed Element subtree into the host layout. Cache
+  keys for child components are scope-prefixed
+  (`Registry.resolve` grew `scope: ?[]const u8`) so a
+  `:::box {#bx}` in the embed never collides with a parent-level
+  `#bx`. `Registry.deinitScope` tears down child instances when
+  the embedded doc itself is GC'd. Demo embeds
+  `src/widgets/orbit_panel.md`; ~11.2k fps Release with all of
+  8a + 8b + 9 active. 70 unit tests total.
 
 ## What's next
 
-[`docs/roadmap.md`](docs/roadmap.md). Headline: **stage 9** —
-`:::embedded-document {src=...}` kicks off the document-composition
-flywheel from `vision.md`. The retained layout cache is also bumped
-to active-watch priority by stage 8b's per-tick re-layout cost.
+[`docs/roadmap.md`](docs/roadmap.md). Stages 10 (headless docs)
+and 11 (remote sources) complete the composition flywheel. The
+retained layout cache is also queued — bumped to active-watch
+priority by stage 8b's per-tick re-layout cost.

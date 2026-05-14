@@ -354,18 +354,195 @@ one fast:
    a one-stage delta. Each commit is reversible. Builds confidence
    the contract holds.
 
+## Stage 9 — `:::embedded-document`
+
+The composition flywheel. Documents that contain whole other
+documents. Christian's pitch from end of session 4 ("documents are
+components, recursively, with headless variants and a network-effect
+substrate") becomes real here.
+
+### The shape
+
+```markdown
+:::embedded-document {#orbit src="src/widgets/orbit_panel.md" panel_color=cyan inner_color=magenta}
+:::
+```
+
+A built-in factory. The host reads the file, parses it through a
+new `markdown.parseWithStateAndScope` that takes a fresh child
+`State` and a *scope* prefix, grafts the resulting Element subtree
+into the parent's layout, and tracks the child instances under the
+shared registry — namespaced so they can't collide with anything
+parent-level.
+
+### The three pieces of plumbing
+
+**1. Scope-prefixed cache keys (component.zig).**
+`Registry.resolve` grew an optional fifth parameter
+`scope: ?[]const u8`. When non-null, the cached instance's key is
+`"{scope}/{id_or_auto:N}"` instead of the bare `id`. So a child's
+`:::box {#bx}` resolves to `"orbit/bx"` while the parent's
+`:::box {#bx}` is just `"bx"`. No collision. Same registry, two
+distinct slots.
+
+The auto:N path scopes too: `:::box` (no id) inside the embedded
+doc becomes `"orbit/auto:0"`, the parent's anonymous box stays at
+`"auto:0"`. So even author-anonymous components in nested docs
+survive co-existence.
+
+**2. The parent-state dirty bubble (state.zig).**
+`State` grew a `parent: ?*State = null` field. `set` walks up the
+parent chain flipping `dirty` so when a child-state mutation fires
+inside an embedded doc — via a slider, a `:::update`, or a
+Binding.refire — the host's renderer (which only watches the
+*root* state) still wakes up.
+
+Subscriber firing stays local to each State. The bubble is *only*
+about waking the renderer. No spurious refires across documents.
+
+**3. `Registry.deinitScope(prefix)`.**
+When the embedded doc itself gets gc'd, its child components need
+to die *before* their bindings' subscribed-to state does. The new
+`deinitScope` walks the registry, picks every instance key
+matching `"{prefix}/..."`, destroys each one (calling
+`Binding.destroy` for any reactive plumbing along the way), and
+unsubscribes them from child state. Then the factory.deinit can
+free child state safely.
+
+The ordering matters: child instances first, child state second,
+child arena (Element tree) third, Component struct last. Bindings
+hold pointers into child state; reversing the order is a use-
+after-free in waiting.
+
+### `markdown.parseWithStateAndScope`
+
+The new public entry point. `parseWithState` calls it with
+`scope = null` (the top-level path); embedded-doc factory.create
+calls it with `scope = spec.id`. They share an internal helper
+`parseInternal` to keep behaviour consistent.
+
+The only extra subtlety: `beginParse` only runs at the top-level
+parse, not on nested embedded parses. Nested parses are happening
+*inside* the parent's parse cycle — they shouldn't reset the
+parent's `parses_unused` counters. Conditional on `scope == null`.
+
+### The module-globals smell
+
+`Factory.create` takes `(allocator, spec)`. It doesn't see theme,
+registry, or parent state — but the embedded-doc factory needs
+all three to call `parseWithStateAndScope`. v0 workaround:
+module-level globals in `embedded_document.zig`, captured by an
+`install(registry, theme, parent_state)` helper the host calls in
+place of `registry.register("embedded-document", ...)`.
+
+The long-term fix is either a per-factory config pointer baked
+into the `Factory` struct, or a `*Host` context threaded through
+`Factory.create`'s signature. Both are deferred because:
+
+- the smell is isolated to one file,
+- contract-changing every Factory for one feature is a steeper
+  price than this localised global,
+- the right shape is unclear until a second factory ever needs
+  similar context.
+
+Noted in this writeup, the source file, and the project memory so
+we don't forget to revisit.
+
+### The widget file
+
+`src/widgets/orbit_panel.md` — a self-contained mini-document:
+
+```markdown
+---
+state:
+  panel_color: orange
+  panel_height: 60
+  inner_color: yellow
+  inner_radius: 6
+---
+
+A nested document. Frontmatter values become the child state...
+
+:::box {#outer color=${state.panel_color} width=100% height=${state.panel_height} radius=10}
+:::
+
+:::box {#inner color=${state.inner_color} width=60% height=28 radius=${state.inner_radius}}
+:::
+```
+
+Two boxes pulling their colours and dimensions from child state.
+Parent overlays in `demo.md` say `panel_color=cyan inner_color=magenta`
+so the rendered output is **cyan-on-magenta** — not the orange-on-
+yellow the widget's own frontmatter defaults to. Visible proof that
+parent attrs win over child frontmatter.
+
+### What the demo renders
+
+The parent doc gets a new "Composition (stage 9)" section that
+embeds the widget. Visually below the chart, above the ANSI fixture:
+
+- Parent prose ("The block below is a *whole other document*...")
+- The widget's prose ("A nested document. Frontmatter values...")
+- A cyan rounded box (the outer panel, full width)
+- A magenta rounded box (the inner panel, 60% width)
+- More widget prose ("These two `:::box` components...")
+- Continues into the chart + ANSI
+
+The widget's components share the parent's quad pipeline, glyph
+atlas, font registry. There's no second renderer, no second
+GPU pipeline. Just one substrate, recursive.
+
+### Limitations v0 ships with
+
+Captured on the roadmap, repeated here so they're visible from one
+place when you pick this up next time:
+
+- **Interactive components inside embedded docs route input to
+  parent state.** The walker stamps the root state pointer onto
+  every Hit; embedded sliders would mutate the wrong state. Fix
+  needs `LayoutCtx` and `Hit` to carry an optional state pointer.
+- **External `:::update` directives can't target scoped components.**
+  `:::update {#bx ...}` from outside always hits the parent-scope
+  `bx`. Future: `id="scope/leaf"` syntax or `scope=` attr.
+- **`src=` is a CWD-relative path.** No base-dir resolution, no
+  URLs (stage 11), no content-hash cache.
+- **`src` changes on a live embed are ignored by `update`.** Author
+  changes the `#id` to force destroy + recreate.
+
+### Performance footprint
+
+11.2k fps Release with everything from 8a + 8b + 9 all active:
+- 1.5s box colour cycle (state-target update)
+- 60 Hz chart feed (component-target update)
+- Embedded doc with two reactive boxes
+- Plus all the original markdown + ANSI + SDF content
+
+1691 glyphs (up from 1155 in 8b — the widget's prose adds ~536),
+144 quads (unchanged — the new boxes replaced the 3d-scene
+placeholder which also drew 2 quads), 100.0% cache hit rate. The
+0.8k fps drop from 8b is the embedded doc's extra layout + text
+shaping work. Cheap.
+
 ## What ships at session 5 close
 
-Stages 8a + 8b. Both dispatch paths of the `:::update` wire
-format live and demonstrated. ~9,500 LOC, 62 unit tests passing,
-~12k fps Release with a colour cycle + 60 Hz chart feed both
-active.
+Stages 8a, 8b, *and* 9. The wire format, the streaming component,
+and the composition flywheel — three of the four pieces from
+session 4's vision close. Headless docs (stage 10) and remote
+sources (stage 11) round out the composition track; the retained
+layout cache parallels the perf reclaim.
+
+~10,200 LOC, 70 unit tests passing, ~11.2k fps Release.
+
+The substrate is recursive, streaming, and live.
 
 Next entry points (in order of expected payoff):
 
-1. **Stage 9 — `:::embedded-document`.** Composition track kickoff.
-   Pure factory implementation; no contract change.
-2. **Retained layout cache.** Bumped to active-watch by 8b's perf
-   measurements. Will unblock higher-rate streaming.
-3. **Stage 10 — headless documents.** Slots in after 9.
-4. **Stage 11 — remote sources.** Slots in after 9.
+1. **Stage 10 — headless documents.** Pure state-machine docs with
+   no viewport. Cleanest split from stage 9: the existing parse
+   pipeline runs minus `layoutAndRender`. State lives, subscribers
+   fire. Other docs subscribe to its paths.
+2. **Stage 11 — remote sources.** URL loaders for `:::embedded-document`.
+   Local-first, content-hash cache, offline fallback.
+3. **Retained layout cache.** Reclaims the 8b + 9 perf cost.
+4. **Plumbing for embedded-doc input handling.** When someone wants
+   a `:::slider` inside an embedded doc.

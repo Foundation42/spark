@@ -11,6 +11,7 @@ test {
     _ = @import("component.zig");
     _ = @import("components/box.zig");
     _ = @import("components/chart.zig");
+    _ = @import("components/embedded_document.zig");
     _ = @import("components/slider.zig");
     _ = @import("state.zig");
     _ = @import("update.zig");

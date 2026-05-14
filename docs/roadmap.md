@@ -10,10 +10,10 @@ design-decision rationale lives in [`vision.md`](vision.md).
 This roadmap is the staging path from where we are (the full
 live-document substrate: parse → registry → cache → static
 interpolation → reactivity → input → first interactive component →
-`:::update` wire format → first streaming component) to where
-we're going (composable documents, remote/headless components,
-LLM-driven authoring). Session 5 shipped stages 8a + 8b; the
-composition track is the headline next — see below.
+`:::update` wire format → first streaming component → recursive
+document composition) to where we're going (headless docs, remote
+sources, LLM-driven authoring). Session 5 shipped stages 8a, 8b,
+and 9 — the substrate is recursive, streaming, *and* live.
 
 ## Shipped — block extension parser (stage 7a)
 
@@ -212,27 +212,73 @@ Attribute grammar mirrors box's: `min`, `max`, `width`, `height`,
 `capacity=N` (default 128, set at create only — resize would
 discard history).
 
-## Next — document composition (stages 9–11)
+## Shipped — `:::embedded-document` (stage 9)
 
-Surfaced end-of-session-4 alongside stage 7f. See
-[`vision.md`](vision.md) "Document composition + the flywheel"
-for the full pitch.
+The composition flywheel kickoff. Built-in factory reads `src=` from
+disk, parses through `markdown.parseWithStateAndScope` with a fresh
+child `State` (`parent` pointer set so dirty bubbles up), and grafts
+the resulting Element subtree into the host doc's layout. Non-`src`
+attrs overlay onto child state — parent always wins over child
+frontmatter.
 
-- **Stage 9 — `:::embedded-document {src=...}`.** Built-in
-  component factory that loads another markdown file, parses
-  through `markdown.parseWithState` with parent attrs
-  overlaying child frontmatter, and grafts the resulting Element
-  subtree into the host document. Caching keyed by `src` + `#id`.
+Scoped cache keys: `Registry.resolve` grew an optional `scope`
+param; when non-null the effective key becomes `"{scope}/{id_or_auto:N}"`.
+Child components in the embedded doc share the parent's Registry
+but their cached instances live under prefixed keys, so a child's
+`:::box {#bx}` never collides with a parent-level `#bx`.
+
+New `Registry.deinitScope(prefix)` sweeps every instance under a
+given scope — called by the embedded-doc factory.deinit before
+freeing child state so child bindings unsubscribe cleanly while
+their subscribed-to state is still alive.
+
+State grew a `parent: ?*State = null` field. `set()` walks up the
+chain flipping `dirty` so a host that only watches the root state
+still sees mutations inside any nested document.
+
+Demo `src/widgets/orbit_panel.md` shows two stacked `:::box`
+elements taking colour + dimensions from child state, plus parent
+overlay (`panel_color=cyan inner_color=magenta`) that wins over
+the widget's frontmatter (orange / yellow). ~11.2k fps Release with
+all of 8a + 8b + 9 active.
+
+**v0 limitations** (deferred to follow-up stages):
+
+- **Interactive components inside embedded docs** route input to the
+  parent state, not child state. The walker stamps the root state
+  pointer onto every Hit; fixing it means plumbing state through
+  `LayoutCtx` and `Hit`. v0 demo uses non-interactive child
+  components.
+- **External `:::update`** wire-format directives can't target
+  scoped components; `:::update {#bx ...}` always looks up the
+  parent-scope `bx`. Future: `id="scope/leaf"` or `scope=` attr.
+- **`src=` is a CWD-relative path.** No base-dir resolution, no
+  URLs, no content-hash cache. Stage 11 layers that on.
+- **`update` of a live embedded-doc doesn't honour `src` changes** —
+  author changes the `#id` to force destroy + recreate.
+- **Module-globals in `embedded_document.zig`** (registry + theme +
+  parent state captured at install time). The `Factory.create`
+  signature doesn't expose host context; a future contract change
+  (per-factory config pointer, or a `*Host` ctx through create) is
+  the right fix.
+
+## Next — document composition continued (stages 10–11)
+
+See [`vision.md`](vision.md) "Document composition + the flywheel"
+for the full pitch. Stage 9 shipped above; the remaining two
+flywheel pieces:
+
 - **Stage 10 — headless documents.** A document parsed without
   a viewport: factories instantiate, state lives, subscribers
   fire, but no `layoutAndRender` runs. Other documents subscribe
   to its state paths or read its AST via `markdown.parse`'s
-  return value.
+  return value. The runtime equivalent of a "data layer" doc — a
+  shared state machine that visible docs project from.
 - **Stage 11 — remote component sources.** The `src=` of a
-  `:::embedded-document` (or even a `:::name {...}` directive
-  that resolves to a remote factory) can be a URL. Loader is a
-  factory that fetches + parses + caches. Local-first; offline
-  fallbacks; content-addressed caching layer.
+  `:::embedded-document` can be a URL. Loader is a factory that
+  fetches + parses + caches. Local-first; offline fallbacks;
+  content-addressed caching layer. Same shape as 9, different
+  loader.
 
 ## Then — real components (stages 12+)
 
