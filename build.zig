@@ -1,0 +1,106 @@
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    // ── Compile GLSL → SPIR-V ──────────────────────────────────────
+    // Each shader gets `-I shaders/` so it can `#include` common helpers,
+    // and `-MD -MF <name>.d` emits a make-style depfile that Zig's build
+    // system parses so edits to included `.glsl` files invalidate the
+    // cached SPIR-V — without this, only edits to the top-level file
+    // would trigger a recompile.
+    const text_vert_spv = compileShaderStage(b, "text", "vert");
+    const text_frag_spv = compileShaderStage(b, "text", "frag");
+
+    // ── Bundle SPIR-V into a generated Zig module ──────────────────
+    // The compiled blobs need `align(4)` because Vulkan's `pCode` field
+    // takes a `const uint32_t*`. Dereferencing the @embedFile and tagging
+    // align(4) materialises the bytes in static data at a u32-aligned
+    // address. Pattern lifted from tripvulkan/build.zig.
+    const wf = b.addWriteFiles();
+    _ = wf.addCopyFile(text_vert_spv, "text.vert.spv");
+    _ = wf.addCopyFile(text_frag_spv, "text.frag.spv");
+    const shader_mod = wf.add("shaders.zig",
+        \\pub const text_vert align(4) = @embedFile("text.vert.spv").*;
+        \\pub const text_frag align(4) = @embedFile("text.frag.spv").*;
+        \\
+    );
+
+    // ── Public Zig module for host-engine embedding ────────────────
+    // `text_engine` exposes the narrow cooperative-embed surface: a
+    // host engine (matryoshka, the future terminal, in-game UI) does
+    // `@import("text_engine")` and reaches the styled-text pipeline +
+    // SPIR-V blobs. Vulkan / FreeType / HarfBuzz / glfw are the
+    // host's link responsibility — same policy as `valkyr_gpu` in
+    // tripvulkan/build.zig. Keeps link config singular when one host
+    // embeds several cooperative libraries.
+    const text_engine_mod = b.addModule("text_engine", .{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    text_engine_mod.addAnonymousImport("shaders", .{
+        .root_source_file = shader_mod,
+    });
+
+    // ── Standalone demo executable ─────────────────────────────────
+    // Owns its own glfw window + Vulkan context, exercises the library
+    // via the same module a host engine would. Build-system stress test
+    // and the dogfood surface during library development. Production
+    // hosts (matryoshka HUD, terminal app) come later and use the
+    // cooperative attach surface, not this exe.
+    const exe = b.addExecutable(.{
+        .name = "text_engine_demo",
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    exe.root_module.addAnonymousImport("shaders", .{
+        .root_source_file = shader_mod,
+    });
+    exe.root_module.addImport("text_engine", text_engine_mod);
+
+    // System libraries the demo links against. The library module
+    // itself does *not* link these — host's responsibility.
+    if (target.result.os.tag == .windows) {
+        if (std.process.getEnvVarOwned(b.allocator, "VULKAN_SDK")) |sdk| {
+            exe.addIncludePath(.{ .cwd_relative = b.fmt("{s}/Include", .{sdk}) });
+            exe.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/Lib", .{sdk}) });
+        } else |_| {}
+        exe.linkSystemLibrary("vulkan-1");
+    } else {
+        exe.linkSystemLibrary("vulkan");
+    }
+    exe.linkSystemLibrary("glfw");
+    exe.linkSystemLibrary("freetype2");
+    exe.linkSystemLibrary("harfbuzz");
+    exe.linkLibC();
+
+    b.installArtifact(exe);
+
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_cmd.addArgs(args);
+    const run_step = b.step("run", "Run text_engine_demo");
+    run_step.dependOn(&run_cmd.step);
+}
+
+// Compile one shader stage (`name.<stage>` → `name.<stage>.spv`) via
+// glslc. `stage` is "vert" / "frag" / "comp"; the source file is
+// `shaders/<name>.<stage>`. Emits a depfile so #include'd helpers
+// trigger rebuilds. Returns the LazyPath of the resulting .spv blob.
+fn compileShaderStage(b: *std.Build, name: []const u8, stage: []const u8) std.Build.LazyPath {
+    const src = b.fmt("shaders/{s}.{s}", .{ name, stage });
+    const spv = b.fmt("{s}.{s}.spv", .{ name, stage });
+    const dep = b.fmt("{s}.{s}.d", .{ name, stage });
+    const cmd = b.addSystemCommand(&.{ "glslc", "--target-env=vulkan1.3" });
+    cmd.addArg("-I");
+    cmd.addDirectoryArg(b.path("shaders"));
+    cmd.addArg("-MD");
+    cmd.addArg("-MF");
+    _ = cmd.addDepFileOutputArg(dep);
+    cmd.addFileArg(b.path(src));
+    cmd.addArg("-o");
+    return cmd.addOutputFileArg(spv);
+}

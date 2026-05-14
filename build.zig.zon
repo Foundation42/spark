@@ -1,0 +1,13 @@
+.{
+    .name = .text_engine,
+    .version = "0.1.0",
+    .fingerprint = 0xfd24837e0f3a7e77, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.14.1",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "shaders",
+    },
+    .dependencies = .{},
+}
