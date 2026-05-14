@@ -1,160 +1,160 @@
 # text_engine — roadmap
 
-Where this goes next. Session 2 closed with the element contract +
-markdown rendering live; agreed direction is **session 3 = quad/line
-primitives → ANSI engine → retained mode**.
+The destination crystallised end-of-session-3 into a **live-
+document runtime**: markdown source as the declarative interface,
+native Vulkan components instantiated via `:::name {attrs}` block
+extensions, reactive frontmatter state, targeted LLM-streamed
+micro-updates. Full pitch + architectural mapping +
+design-decision rationale lives in [`vision.md`](vision.md).
 
-## Next session — quad/line draw primitives
+This roadmap is the staging path from where we are (markdown
+rendering + chrome + ANSI + resize) to where we're going (live
+documents). Session 4 starts on stage 7a.
 
-The contract grew `DrawList` to be extensible from day one (see
-[`architecture.md`](architecture.md)). Time to fill it. The visible
-improvements waiting on this:
+## Next — block extension parser (stage 7a)
 
-- **Code-block backgrounds** — markdown's ` ```zig ``` ` fences want
-  a subtle background panel. Quad primitive with a rounded corner
-  radius parameter.
-- **Blockquote left bars** — the conventional "vertical accent bar
-  at the indent" that distinguishes quotes from "just an indented
-  paragraph." Thin tall quad.
-- **Thematic break** — currently a 12px spacer; should render as a
-  horizontal rule across the available width. Thin wide quad.
-- **Link underlines** — markdown links pick up the `link_color` and
-  the `link` semantic flag rides along on Style. Add a line
-  primitive driven by `fx_kind = 1` so the renderer can decide
-  per-glyph whether to emit an underline.
-- **Selection / highlight rectangles** — eventually, but the same
-  quad primitive covers it.
+`markdown.zig` recognises `:::name {attrs}\nbody\n:::` syntax and
+emits a `custom` Element with vtable + ctx pointer.
 
-Engineering shape:
+- cmark doesn't support `:::` blocks natively. Three approaches
+  considered (vision doc has the full list); leaning toward
+  walking cmark's paragraph output to detect leading `:::` lines.
+  Keeps the vendored cmark untouched.
+- Attribute parser handles `{#id key=val key="quoted val"}`.
+- Components without a registered factory render a fallback
+  "missing component: name" box — clear failure mode for authors
+  / LLMs that pick the wrong directive name.
 
-- New pipeline (`quad_pipeline.zig`) with its own SPIR-V pair
-  (`quad.vert` + `quad.frag`). Instanced rect with optional rounded
-  corners + colour.
-- `gpu/atlas.zig` mostly untouched — quads don't atlas. (Eventually
-  they might for textured panels / images, but not now.)
-- `DrawList.quads` field becomes live. Walker handlers for
-  `quote` and `code_block` grow background/bar emit lines. `link`
-  cascade flag drives a line-primitive emit during inline emit.
-- New ssbo binding for quad instances; or push-constant if the
-  count is small. Probably ssbo for symmetry with glyphs.
+## Then — component registry + cache (stage 7b)
 
-Open question: one pipeline per primitive kind (glyph, quad, line)
-or one mega-pipeline that branches on a `prim_kind` field? Lean
-toward separate pipelines — each is simple, and the cmd buffer
-records them in known order anyway.
+Host registers `name → ComponentFactory`. Cache keyed by `#id`
+(or auto-generated stable position-based ID) persists instances
+across re-layouts. `custom.ctx` carries the cached instance.
 
-## Then — ANSI layout engine
+- Components without `#id` get an auto-generated stable ID from
+  position in the tree (parent's ID + sibling index). Stable
+  across trivial edits; not stable across structural reorders —
+  right trade-off for stage 7b.
+- Lifecycle: instantiated on first appearance, destroyed after N
+  consecutive layouts without appearing. Avoids thrashing on edits.
 
-Christian's tier-2 target from session 1. Now that markdown is the
-proven first consumer of the contract, ANSI is the next producer.
+## Then — first concrete component (stage 7c)
 
-What it does: consume a stream of UTF-8 + ANSI escape codes (SGR for
-colour/style, cursor movement, scrollback), produce Element trees.
+`:::box {color, width, height}` as the minimal loop validator.
+Renders a coloured quad. Proves: parse → registry → cached
+instance → layout returns Box → quad emit, end-to-end.
 
-Two API shapes possible:
+Or jump straight to `:::chart` if visual impact wins over minimal
+scope — same loop, more LOC. Lean toward `:::box` first.
 
-1. **Batch parser**: takes a string of terminal output, produces a
-   `code_block { content: sub_block: *Element }` tree that markdown's
-   ` ```ansi ``` ` fence can host directly. This is the composability
-   bit — markdown fences with `ansi` language route through the ANSI
-   engine and stash the result in `CodeContent.sub_block`.
-2. **Streaming terminal**: maintains a cell-grid model, applies
-   escape codes incrementally, exposes the grid as Elements for
-   rendering. This is the terminal-app shape.
+## Then — frontmatter state + bindings (stage 7d → 7e)
 
-Both are worth building. (1) is the simpler starting point and
-directly closes the markdown↔ANSI composition loop. (2) is what the
-eventual terminal app needs.
+YAML frontmatter (a small hand-rolled subset — `key: value` pairs
+under a `state:` block — until we need lists / nested maps).
+`${state.x}` interpolation in attribute values, resolved at
+component construction (7d), then reactive: state mutations
+notify subscribers, bindings re-evaluate, component setters fire
+(7e).
 
-Existing prior art: `~/dev/ac/src/terminal.zig` has the ANSI parser
-state machine (1,900 LOC); the layout engine is fresh.
+## Then — input handling (stage 7f)
 
-## Then — Retained mode + document model
+Walker grows a parallel `hitTest(point, root) → ?Element` pass.
+Per-component `onInput` vtable callback. The slider → state
+mutation → chart title refresh loop closes here.
 
-Currently every frame re-walks the entire Element tree. Fine for a
-small demo, wasteful for a terminal scrollback or a long markdown
-document. Need:
+## Then — `:::update` micro-stream path (stage 8)
 
-- **`Document` type** owning a retained Element tree, with
-  invalidation regions when content changes.
-- **Per-line cached glyph emission** — the wrap pass shapes atoms
-  every frame; for content that hasn't changed, the shaped + placed
-  glyphs should be cached.
-- **Viewport-aware emit** — only re-shape lines visible in the
-  scroll viewport. Critical for ANSI scrollback (millions of lines
-  potentially).
-- **Scroll offset** as a separate property, not a re-layout trigger.
+The LLM-streamed-delta-into-live-component hot path. Markdown
+recognises `:::update {#id action=...}` and routes the body to
+the target component's handler directly — bypasses cmark, bypasses
+text layout, microsecond hot path.
 
-This is the foundation for the actual terminal app and a markdown
-reader app. Out of scope for the library itself until consumers
-demand it.
+## Then — real components (stages 9+)
 
-## Eventually — richer LM effects
+3D scene (eventually integrates with matryoshka), live chart,
+slider, input field, button. Each is a self-contained component
+module; the contract is fixed by stage 7. Repetitive work, not
+architectural.
 
-`fx_kind` is reserved in `GlyphInstance` for per-glyph effect
-dispatch. The inline cascade flags on `Style` (emphasis, strong,
-code_inline, link) are semantic markers waiting for visual fx hooks.
-Natural additions:
+## Parallel / orthogonal — retained layout cache
 
-- `fx_kind = 1` **underline** driven by attention OR by `link` flag.
-- `fx_kind = 2` **size pulse** — attention scales `dst_size`,
-  layout re-runs per frame. The "alive" version of the current
-  SDF weight wave.
-- `fx_kind = 3+` **per-character PBR materials** — long-term — each
-  glyph as a 3D-ish quad with material properties. Slots in
-  naturally when text_engine ports into matryoshka's renderer.
+The walker currently re-runs on every resize. Caching the laid-out
+glyphs + quads between frames and only re-laying-out when the
+content tree or viewport changed recovers the ~6% perf loss from
+stage 6a. More important when documents grow into the multi-page
+range. Not blocking the vision work above; lands when content
+demand justifies it.
+
+## Parallel — markdown ↔ ANSI composability (stage 5b)
+
+Originally planned as stage-5-followup but bumped by the vision
+work. ` ```ansi ``` ` fenced code blocks in markdown route
+through `ansi.parse`, output stuffed into `CodeContent.sub_block`;
+`layoutCodeBlock` recurses into it. Closes the markdown-↔-ANSI
+loop. Small commit (~50 LOC). Lands when convenient.
+
+## Parallel — scrolling
+
+The other half of session-3's resize concern. Mouse-wheel /
+keyboard scrolls a viewport offset; renderer applies it before
+NDC mapping (cleanest) or walker subtracts it from glyph y at
+emit (cheaper). Independent of vision work; lands when documents
+get tall enough that resize-reflow alone stops being enough.
 
 ## Eventually — LM connection (tier 3)
 
 Once the rendering channels (`attention`, `hot_color`, `fx_kind`)
-are stable, plug in real LM signals:
+and the live-document runtime are both stable, plug in real LM
+signals as the producer of state mutations + `:::update` streams.
+This is the closing of the loop from `chat.md`'s original vision:
+the LM doesn't just produce text — it produces a *live document*
+that updates in place as the model's understanding evolves.
 
-- valkyr or another model produces per-token importance / sentiment
-  / entity type
-- A semantic plugin maps that to per-glyph `attention` + `hot_color`
-  + `fx_kind`
-- Text "lives" — important tokens visibly weighted, anomalies
-  flagged, semantic regions colour-coded
-
-This is the closing of the loop from `chat.md`'s original vision.
-By the time we get here the rendering is a solved problem; the work
-is in the semantic mapping.
-
-## Library / demo boundary
-
-Today the split is **conceptual** — `lib.zig` documents the surface
-but nothing reaches through it. Real separation happens when
-matryoshka starts consuming `text_engine` via the cooperative-attach
-API. That session forces real decisions about what crosses the
-module boundary.
-
-## Parked rendering issues
+## Parked — rendering issues
 
 Captured in [`memory/project_known_issues.md`](../../../.claude/projects/-home-chrisbe-dev-terminal/memory/project_known_issues.md). Surface when relevant:
 
-- **Resize bug** — glyphs don't reposition when the window resizes.
-- **Atlas overflow** — `error.AtlasFull` after enough unique glyphs.
+- **Atlas overflow** — `error.AtlasFull` after enough unique
+  glyphs. LRU eviction or grow + recreate descriptor.
 - **Gamma correction** — fine at 20 px, matters at 14 px.
-- **Font fallback** — `"Hello 🎉"` in one text run loses the emoji
-  because DejaVu's glyph for U+1F389 is `.notdef`. Stage 3b
-  workaround: emoji absent from `demo.md`.
-- **Single-channel SDF** — corners slightly soft under extreme zoom.
+- **Font fallback** — `"Hello 🎉"` in one text run loses the
+  emoji because DejaVu's glyph for U+1F389 is `.notdef`.
+- **Single-channel SDF** — corners slightly soft under extreme
+  zoom.
 
-## Parked layout issues
+## Parked — layout issues
 
-- **Break-anywhere wrap** — a single word wider than `max_w` overflows
-  rather than breaking mid-word. Character-level break fallback when
-  no whitespace is available.
-- **Tab + Unicode whitespace** — tokenizer splits on ASCII space only.
-- **Bidirectional text** — HB shapes each run correctly, but line
-  composition assumes LTR. Bidi reordering across runs deferred.
-- **Body-relative cascade** — emphasis inside a heading swaps to body
-  italic font. Per-block font families fix it.
+- **Break-anywhere wrap** — a single word wider than `max_w`
+  overflows. Character-level break fallback when no whitespace
+  is available.
+- **Tab + Unicode whitespace** — tokenizer splits on ASCII space
+  only.
+- **Bidirectional text** — HB shapes each run correctly, but
+  line composition assumes LTR.
+- **Body-relative cascade** — emphasis inside a heading swaps
+  to body italic font. Per-block font families fix it.
 
-## Parked test polish
+## Parked — visuals waiting for primitives we now have
 
-cmark ships ~600 CommonMark spec test cases. Worth hooking into our
-mapper to catch edge cases we don't think about (link reference
-definitions, list tightness, hard vs soft break boundaries, etc.).
-Not urgent — the torture demo + parsed `demo.md` catch the obvious
-bugs, and the spec compliance level is what cmark gives us anyway.
+Now that stage 4 shipped quad / line primitives, these get
+unblocked:
+
+- **ANSI underline + strikethrough + reverse** — SGR parses them,
+  Style flags exist; needs the quad/line emit path that link
+  underlines pioneered.
+- **ANSI background colours** — per-character quad emission
+  during inline-flow emit. Possible now but moderate
+  engineering.
+
+## Parked — naming
+
+`text_engine` is visibly the wrong name for what's becoming a
+live-document runtime. Rename when stage 7c ships (first concrete
+component) — at that point the runtime layer above the contract
+is real enough to anchor the name.
+
+Candidates that came up:
+- `glow` (live + glowing)
+- `forge` (runtime/factory feel)
+- `litho` (printed page + dynamic)
+- something tied to matryoshka (sibling brand)

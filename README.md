@@ -1,39 +1,57 @@
 # text_engine
 
-Rich-text rendering for Zig + Vulkan host engines. One Element
-contract that markdown, ANSI terminals, and (long-term) Dear ImGui-
-shaped game UI all flow through.
+A live-document runtime for Zig + Vulkan host engines. One Element
+contract that markdown, ANSI terminals, future native components
+(charts, 3D scenes, sliders), and (long-term) Dear ImGui-shaped
+game UI all flow through. **What we're building** is documented in
+[`docs/vision.md`](docs/vision.md): markdown as the declarative
+interface to a live, component-driven runtime that an LLM can
+author, mutate, and stream updates into.
 
-End of session 2 the demo renders a markdown document — heading
-levels, mixed-style paragraph with bold-italic-link-code cascade,
-nested lists, wrapping blockquote, fenced code block — plus a
-rainbow SDF "ATTENTION" with per-glyph attention animation, all in
-one instanced draw call per frame at ~14k fps Release. Source for
-the document is [`src/demo.md`](src/demo.md), parsed at startup
-through the vendored cmark.
+End of session 3 the demo renders a markdown document with full
+chrome (code-block backgrounds, blockquote bars, thematic rules,
+link underlines), an ANSI fixture (8-color / 256-color / truecolor
+/ bold / italic / multi-line), and a rainbow SDF "ATTENTION" with
+per-glyph attention animation — all reflowing on window resize at
+~13.5k fps Release. Source for the document is
+[`src/demo.md`](src/demo.md), parsed at startup through vendored
+cmark.
 
 ```
-                ┌────────────────────────────────────────────┐
-                │   markdown source (src/demo.md)            │
-                │             │                              │
-                │             ▼                              │
-                │    cmark AST  ──►  markdown.parse()        │
-                │                            │               │
-                │                            ▼               │
-                │                     Element tree           │
-                │                            │               │
-                │                            ▼               │
-                │              element_layout.walker         │
-                │                            │               │
-                │                            ▼               │
-                │           shape → cache → atlas → SSBO     │
-                │           3 lanes: mono / colour / sdf     │
-                │           per-glyph attention + hot_color  │
-                └────────────────────────────────────────────┘
+       ┌───────────────────────────────────────────────────────┐
+       │   producers                                           │
+       │     markdown.parse  (src/demo.md → cmark AST → tree)  │
+       │     ansi.parse      (escape stream → tree)            │
+       │     hand-built      (e.g. SDF ATTENTION rainbow)      │
+       │     future: live components via :::name {attrs}       │
+       │                          │                            │
+       │                          ▼                            │
+       │                  Element tree                         │
+       │                  (text, line_break, emph, strong,     │
+       │                   code, link, paragraph, heading,     │
+       │                   container, spacer, list, list_item, │
+       │                   quote, code_block, thematic_break,  │
+       │                   custom { vtable, ctx })             │
+       │                          │                            │
+       │                          ▼                            │
+       │             element_layout.walker (event-driven)      │
+       │                          │                            │
+       │                          ▼                            │
+       │                  DrawList { glyphs, quads }           │
+       │                          │                            │
+       │      quads first (chrome), glyphs on top (text)       │
+       │                          │                            │
+       │                          ▼                            │
+       │              one vkCmdBeginRendering pass             │
+       └───────────────────────────────────────────────────────┘
 ```
 
 ## Docs
 
+- [`docs/vision.md`](docs/vision.md) — where this is going.
+  Markdown as the declarative interface to a live, component-driven
+  runtime. Block extensions, reactive frontmatter state, targeted
+  LLM micro-updates. The destination.
 - [`docs/architecture.md`](docs/architecture.md) — Element contract,
   Theme, source layout, data flow, atlas lanes, GlyphInstance,
   design decisions, known limitations.
@@ -42,8 +60,11 @@ through the vendored cmark.
   attention.
 - [`docs/journey-session-2.md`](docs/journey-session-2.md) — the
   contract: Element / Theme / cascade / wrap / markdown parser.
-- [`docs/roadmap.md`](docs/roadmap.md) — what's next. Quad/line
-  primitives, ANSI engine, retained mode, LM effects.
+- [`docs/journey-session-3.md`](docs/journey-session-3.md) — the
+  chrome and the vision: quad pipeline, link underlines, ANSI
+  engine, resize reflow, live-documents pitch.
+- [`docs/roadmap.md`](docs/roadmap.md) — staging path from current
+  state to live-documents runtime.
 - [`chat.md`](chat.md) — the original brainstorm that started it.
 
 ## Three-tier plan
@@ -138,11 +159,34 @@ TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
   now the demo content; ~200 lines of hand-built tree literals
   deleted.
 
+### Session 3 — chrome + second producer + resize, then the vision
+
+- [x] **Stage 4a** — quad pipeline: code-block backgrounds, quote
+  bars, thematic rules. New SPIR-V pair + descriptor set; DrawList
+  grew `quads` field; walker handlers emit chrome.
+- [x] **Stage 4b** — link underlines via per-line emit tracking.
+  Underline geometry deferred to the line-emit pass so wrapping
+  links naturally produce one underline per visible line.
+  Font-metric-driven (thickness + offset are em fractions).
+- [x] **Stage 5a** — ANSI engine. Second tier-2 producer. State
+  machine + 256-colour palette + SGR cascade from `~/dev/ac/src/
+  terminal_parser.zig`, adapted to emit Element trees instead of
+  cell-grid writes.
+- [x] **Stage 6a** — resize-aware relayout. drawCb runs the layout
+  pass when the swapchain's extent changes; poll-based detection
+  in the renderer handles compositors (Wayland) that don't signal
+  OUT_OF_DATE_KHR on resize.
+- 🌟 **Vision crystallised** end of session 3 —
+  [`docs/vision.md`](docs/vision.md) captures the live-documents
+  runtime direction.
+
 ## What's next
 
-[`docs/roadmap.md`](docs/roadmap.md). Headline for session 3:
-**quad/line draw primitives** (unlocks code-block backgrounds,
-quote bars, thematic breaks, link underlines), then the **ANSI
-layout engine** as the second contract consumer (closing the
-markdown↔ANSI composition loop), then retained mode + document
-model for the eventual terminal app.
+[`docs/roadmap.md`](docs/roadmap.md). Headline for session 4:
+**block extension parser** (`:::name {attrs}` directives → `custom`
+Elements with host-registered vtables), then **component registry
++ cache**, then a **first concrete component**, then **reactive
+frontmatter state + bindings**, then **input handling**, then
+the **`:::update` micro-stream hot path** that lets an LLM push
+deltas into a live chart at 15k fps without touching the document
+layout.
