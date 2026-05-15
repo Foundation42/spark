@@ -400,15 +400,63 @@ TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
   `drainHandler` dispatches polymorphically and new consumers no
   longer touch `main.zig`.
 
+### Session 8 — caching, parallelism, raster image gen
+
+- [x] **Stage 14a — retained per-block layout cache.**
+  `src/layout_cache.zig`. Key is `(elem_id, max_w, theme)`;
+  content version held *outside* the key as an Entry field so a
+  bump replaces the slot in place (a 1000-chunk LLM stream
+  doesn't leak 1000 entries). Leaf-ish kinds (paragraph /
+  heading / code_block / thematic_break) cache automatically;
+  custom components opt in via `vtable.content_version` and out
+  via `vtable.disable_cache`. LLM-stream nulls `cache_blocks`
+  before recursing into its child tree (per-chunk re-parse
+  changes inner pointer identity). **97.9% cache hit rate at
+  idle, 56 entries, ~7600 fps with chart at 60 Hz.**
+
+- [x] **glslc -O for release builds.** Mapped Zig's `optimize`
+  to glslc flags in `compileShaderStage`. Debug → `-O0` (default),
+  ReleaseSafe / ReleaseFast → `-O`, ReleaseSmall → `-Os`. Text
+  fragment SPIR-V shrank **34%** (3040 → 2008 bytes).
+
+- [⚠] **Stage 14b — parallel cache-miss layouts (built, then
+  parked).** One mutex around `GlyphCache.getOrRasterize` (the
+  only shared-write surface); classify-then-dispatch worker
+  pattern in `layoutStackVParallel` (workers walk into private
+  DrawLists at origin (0,0); main merges in order + snapshots).
+  Worked at idle. **Hangs the main thread** when multiple
+  `:::*-stream` HTTP fetches are in flight because
+  `httpStreamJob` occupies a `JobSystem` worker for 5-15 s of
+  upstream wait — the compute pool starves while tessellation +
+  layout dispatch compete for the few remaining workers.
+  `PARALLEL_MIN_WALKS` raised to `maxInt(usize)` so dispatch
+  never fires; the rest of the plumbing stays live. Session 9
+  splits the worker pool (blocking I/O ≠ compute) and drops the
+  threshold back to 2.
+
+- [x] **Stage 14c — raster `:::image-stream` (Gemini image
+  preview).** Mirror of `:::svg-stream` for image-class models.
+  Same OpenAI-shaped wire format; data URL contains a PNG/JPG
+  instead of an SVG. Vendored `stb_image` (matryoshka pattern,
+  `vendor/stb/`). New `src/gpu/image_texture.zig` (per-image
+  `VkImage` + view + sampler + staged upload, reuses Atlas's
+  pub-promoted `Staging` / `findMemoryType` / `cmdImageBarrier`
+  helpers). New `src/gpu/image_pipeline.zig` + `shaders/image.*`
+  (textured-quad pipeline, per-image descriptor sets from a
+  pool, push constants for viewport + dst rect). `DrawList.images`
+  is the new draw layer. Render order: tris → images → quads →
+  glyphs. Texture reused across re-fires when dimensions match;
+  reallocated + descriptor rewritten in place otherwise.
+
 ## What's next
 
-[`docs/roadmap.md`](docs/roadmap.md). Open queue: **retained
-layout cache** (now load-bearing — per-chunk re-parse re-walks
-the whole doc, fine for one stream but stresses three+),
-**stage 10** (headless documents — composition-track
-completion), **SVG cache** (content-addressable disk cache
-keyed on model+prompt; Recraft is $0.08 per image), **raster
-`:::image`** (PNG/JPG via OpenRouter image-class models —
-plumbing mirrors svg-stream), **crisp zoom** (multi-size atlas
-+ re-layout-on-zoom), **persistent URL cache** (disk-backed
-remote widgets across restarts).
+[`docs/roadmap.md`](docs/roadmap.md). Open queue: **worker pool
+split** (unblocks 14b's parallel walker — blocking I/O on a
+dedicated pool, compute keeps the JobSystem), **persistent URL +
+asset cache** (Recraft + Gemini image preview are both ~$0.08
+per image; content-addressable disk cache keyed on
+model+prompt+params), **stage 10** (headless documents —
+composition-track completion), **more image-class probes**
+(Stability SD-Vector, Bytedance Doubao-Vector, OpenAI gpt-image-1),
+**selection + clipboard for `:::input`**, **crisp zoom**
+(multi-size atlas + re-layout-on-zoom).

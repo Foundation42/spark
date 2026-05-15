@@ -497,26 +497,79 @@ PendingX struct) replaces the old result-kind switch in
 
 ## Then — more components (stage 13d.4+)
 
-Raster `:::image` (PNG/JPG via base64 data URL, mirrors the
-SVG-stream shape with a texture pipeline instead of triangles).
 More SVG generators (Stability SD-Vector, Bytedance Doubao-Vector
-on OpenRouter). 3D scene (eventually integrates with
-matryoshka), live chart beyond sparkline, form, table. Each is
-a self-contained component module; the contract is fixed by
-stage 7. Repetitive work, not architectural.
+on OpenRouter). 3D scene (eventually integrates with matryoshka),
+live chart beyond sparkline, form, table. Each is a self-contained
+component module; the contract is fixed by stage 7. Repetitive
+work, not architectural.
 
-## Parallel — retained layout cache
+## Shipped — retained layout cache (stage 14a)
 
-Bumped to active-watch priority by stage 8b's measurements. The
-chart's 60 Hz feed re-walks the entire markdown document on every
-append because `state.dirty` triggers full re-layout — that's the
-13.3k fps → 12.0k fps gap. Caching laid-out glyphs + quads at the
-Element level + only re-walking elements whose ctx mutated since
-last frame recovers most of the cost. ~12k → ~16k fps is plausible
-on the current demo, more on chart-heavy docs.
+`src/layout_cache.zig` — per-block cache keyed on
+`(elem_id, max_w, theme)`. Content version held outside the key as
+an Entry field so a bump replaces the slot in place (no leak on
+1000-chunk streams). Leaf-ish kinds (paragraph / heading /
+code_block / thematic_break) cache automatically; custom
+components opt in via `vtable.content_version` and out via
+`vtable.disable_cache`. LLM-stream nulls `cache_blocks` before
+recursing into its child tree (per-chunk re-parse changes inner
+pointer identity).
 
-Sized right for after the composition track, or as a backfill when
-chart-density demos start landing.
+Idle: 97.9% cache hit rate, 56 entries, ~7600 fps with chart at
+60 Hz + box color cycle. Chart's per-tick `state.dirty` no longer
+re-walks the whole document.
+
+## Shipped — glslc -O for release builds
+
+Mapped Zig's `optimize` → glslc flags in `compileShaderStage`.
+Debug → `-O0` (default), ReleaseSafe / ReleaseFast → `-O`,
+ReleaseSmall → `-Os`. Text fragment SPIR-V shrank 34% (3040 →
+2008 bytes).
+
+## Parked — parallel cache-miss layouts (stage 14b)
+
+Built end-to-end then disabled. The infrastructure (mutex around
+GlyphCache, classification, blitPrivate / snapshotFromPrivate)
+stays live; the dispatch threshold is currently
+`maxInt(usize)` so it never fires.
+
+Reason: `httpStreamJob` is a `JobSystem` job that occupies a
+worker for the entire duration of an upstream wait (5-15s for
+Recraft / Gemini image preview). With three LLM streams +
+svg-stream + image-stream all in flight, ~5 worker slots are
+blocked on the wire. When `:::svg-stream` finalises and calls
+`tess.tessellateParallel` from the drain handler, main + the one
+free worker can't drain the 125-job tessellation queue fast
+enough — and the layout pass dispatching parallel walks on top
+of that hangs the main thread in Counter.wait spin loops.
+
+Two fixes queued for session 9:
+1. **Split the worker pool** — separate blocking I/O from
+   compute. HTTP jobs go to a dedicated pool sized for
+   concurrency (4-8 workers, all blocking is fine); compute
+   stays on a pool sized for parallelism (cpu_count - 2).
+2. **Cost-aware classification** — only walks whose layout is
+   actually expensive justify dispatch. Chart re-render +
+   svg-stream re-emit are O(N) memcpy; not worth the
+   dispatch overhead even when their version bumps.
+
+## Shipped — raster `:::image-stream` (stage 14c)
+
+Mirror of `:::svg-stream` for image-class models (target:
+google/gemini-3.1-flash-image-preview). Same OpenAI-shaped wire
+format; data URL contains a PNG/JPG instead of an SVG, decoded
+via vendored `stb_image` into per-component `VkImage` + sampler.
+
+New pieces: `vendor/stb/`, `src/gpu/image_texture.zig`,
+`src/gpu/image_pipeline.zig`, `shaders/image.{vert,frag}`,
+`DrawList.images`, `src/components/image_stream.zig`. Render order
+extended to tris → images → quads → glyphs.
+
+Each component owns one descriptor set from the pipeline's pool
+(MAX_IMAGES = 32). Texture reused across re-fires when
+dimensions match; reallocated otherwise. Descriptor rewritten in
+place via `vkUpdateDescriptorSets` so cached layout entries stay
+valid.
 
 ## Parallel — markdown ↔ ANSI composability (stage 5b)
 
