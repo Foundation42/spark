@@ -10,12 +10,12 @@ pub fn build(b: *std.Build) void {
     // system parses so edits to included `.glsl` files invalidate the
     // cached SPIR-V — without this, only edits to the top-level file
     // would trigger a recompile.
-    const text_vert_spv = compileShaderStage(b, "text", "vert");
-    const text_frag_spv = compileShaderStage(b, "text", "frag");
-    const quad_vert_spv = compileShaderStage(b, "quad", "vert");
-    const quad_frag_spv = compileShaderStage(b, "quad", "frag");
-    const tri_vert_spv = compileShaderStage(b, "tri", "vert");
-    const tri_frag_spv = compileShaderStage(b, "tri", "frag");
+    const text_vert_spv = compileShaderStage(b, "text", "vert", optimize);
+    const text_frag_spv = compileShaderStage(b, "text", "frag", optimize);
+    const quad_vert_spv = compileShaderStage(b, "quad", "vert", optimize);
+    const quad_frag_spv = compileShaderStage(b, "quad", "frag", optimize);
+    const tri_vert_spv = compileShaderStage(b, "tri", "vert", optimize);
+    const tri_frag_spv = compileShaderStage(b, "tri", "frag", optimize);
 
     // ── Bundle SPIR-V into a generated Zig module ──────────────────
     // The compiled blobs need `align(4)` because Vulkan's `pCode` field
@@ -194,7 +194,13 @@ pub fn build(b: *std.Build) void {
 // glslc. `stage` is "vert" / "frag" / "comp"; the source file is
 // `shaders/<name>.<stage>`. Emits a depfile so #include'd helpers
 // trigger rebuilds. Returns the LazyPath of the resulting .spv blob.
-fn compileShaderStage(b: *std.Build, name: []const u8, stage: []const u8) std.Build.LazyPath {
+//
+// Optimization map:
+//   * `Debug`         → `-O0` (default — readable SPIR-V, validation friendly)
+//   * `ReleaseSafe`   → `-O`  (perf optimisation, debug info preserved)
+//   * `ReleaseFast`   → `-O`  (perf optimisation)
+//   * `ReleaseSmall`  → `-Os` (size optimisation)
+fn compileShaderStage(b: *std.Build, name: []const u8, stage: []const u8, optimize: std.builtin.OptimizeMode) std.Build.LazyPath {
     const src = b.fmt("shaders/{s}.{s}", .{ name, stage });
     const spv = b.fmt("{s}.{s}.spv", .{ name, stage });
     const dep = b.fmt("{s}.{s}.d", .{ name, stage });
@@ -204,6 +210,11 @@ fn compileShaderStage(b: *std.Build, name: []const u8, stage: []const u8) std.Bu
     cmd.addArg("-MD");
     cmd.addArg("-MF");
     _ = cmd.addDepFileOutputArg(dep);
+    switch (optimize) {
+        .Debug => {}, // -O0 is glslc's default
+        .ReleaseSafe, .ReleaseFast => cmd.addArg("-O"),
+        .ReleaseSmall => cmd.addArg("-Os"),
+    }
     cmd.addFileArg(b.path(src));
     cmd.addArg("-o");
     return cmd.addOutputFileArg(spv);
