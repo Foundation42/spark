@@ -134,6 +134,13 @@ const FrameCtx = struct {
     // the result back into the cache.
     block_cache: *layout_cache_mod.BlockCache,
 
+    // Stage 14b — parallel cache-miss layout dispatch. JobSystem
+    // fan-out plus a single mutex around the glyph cache + atlas
+    // staging. Workers walk independent cache-miss blocks at origin
+    // (0,0) into private DrawLists; main thread merges in order.
+    job_system: *jobs_mod.JobSystem,
+    glyph_cache_lock: *std.Thread.Mutex,
+
     // Cached viewport for resize detection. Starts at {0,0} so the
     // first `drawCb` call sees a mismatch and triggers the initial
     // layout, unifying init and resize paths.
@@ -225,6 +232,8 @@ const FrameCtx = struct {
             // restores around its child subtree.
             .state = @ptrCast(self.state),
             .cache_blocks = self.block_cache,
+            .job_system = self.job_system,
+            .glyph_cache_lock = self.glyph_cache_lock,
         };
         var ansi_lc = lc;
         ansi_lc.theme = self.ansi_theme;
@@ -712,7 +721,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 8 / stage 14a (retained layout cache)\n", .{});
+    try stdout.print("text_engine demo — session 8 / stage 14b (parallel cache-miss layouts)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
     try stdout.print("  demo.md bytes:         {d}\n", .{demo_md.len});
@@ -927,6 +936,14 @@ pub fn main() !void {
     var block_cache = layout_cache_mod.BlockCache.init(allocator);
     defer block_cache.deinit();
 
+    // Stage 14b — mutex around the (FreeType glyph slot + GlyphCache
+    // hashmap + Atlas packing) write surface. Worker threads doing
+    // parallel cache-miss layouts acquire it inside
+    // `text_layout.appendShapedRun` around each `getOrRasterize` call.
+    // Lives next to block_cache so its lifetime matches the layout
+    // pipeline; uncontested cost is a single atomic compare-exchange.
+    var glyph_cache_lock = std.Thread.Mutex{};
+
     // ANSI uses a mono-bodied derivation of the theme so spacing is
     // terminal-like. Bold + italic still fall back to the proportional
     // variants of the main theme — mono bold / italic font loads are
@@ -961,6 +978,8 @@ pub fn main() !void {
         .sdf_block = sdf_block,
         .dl = &dl,
         .block_cache = &block_cache,
+        .job_system = job_system,
+        .glyph_cache_lock = &glyph_cache_lock,
         .start_ms = start_ms,
         .state = &host_state,
     };

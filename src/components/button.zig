@@ -244,6 +244,7 @@ fn layoutAndRender(
         lc.cache,
         lc.mono_atlas,
         lc.color_atlas,
+        lc.glyph_cache_lock,
         run,
         style.font_id,
         text_x,

@@ -322,6 +322,7 @@ fn renderError(
         lc.cache,
         lc.mono_atlas,
         lc.color_atlas,
+        lc.glyph_cache_lock,
         run,
         style.font_id,
         origin[0] + ERR_PAD_X,

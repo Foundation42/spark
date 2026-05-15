@@ -529,6 +529,18 @@ pub const LayoutCtx = struct {
     /// origin offset; misses walk fresh + snapshot back into the
     /// cache. `null` falls through to the unconditional walk path.
     cache_blocks: ?*layout_cache_mod.BlockCache = null,
+    /// Optional JobSystem for parallel cache-miss layouts (stage 14b).
+    /// When non-null AND `glyph_cache_lock` is also non-null, the
+    /// stack_v walker fans out walks for cache-miss children onto
+    /// worker threads. Workers walk at origin (0,0) into private
+    /// DrawLists; main thread merges in order, blits + snapshots.
+    job_system: ?*jobs_mod.JobSystem = null,
+    /// Mutex guarding the (FreeType glyph slot + Atlas packing +
+    /// GlyphCache hashmap) write surface. Held during
+    /// `GlyphCache.getOrRasterize` calls from worker threads.
+    /// `null` = serial mode (no locking). Must be non-null whenever
+    /// `job_system` is non-null and the walker may dispatch jobs.
+    glyph_cache_lock: ?*std.Thread.Mutex = null,
 };
 
 /// GPU draw work accumulated during the walk. Quads land first
@@ -592,3 +604,4 @@ const atlas_mod = @import("gpu/atlas.zig");
 const qp = @import("gpu/quad_pipeline.zig");
 const tri_pipeline = @import("gpu/tri_pipeline.zig");
 const layout_cache_mod = @import("layout_cache.zig");
+const jobs_mod = @import("jobs.zig");

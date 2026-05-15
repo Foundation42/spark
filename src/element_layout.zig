@@ -34,6 +34,13 @@ const text_layout = @import("text/layout.zig");
 const shape = @import("font/shape.zig");
 const qp = @import("gpu/quad_pipeline.zig");
 const layout_cache = @import("layout_cache.zig");
+const jobs_mod = @import("jobs.zig");
+
+/// Stage 14b — parallel stack_v walk thresholds. The dispatcher falls
+/// back to serial when these aren't met; dispatch overhead dominates
+/// for short stacks. Override via env var for benchmarking.
+const PARALLEL_MIN_CHILDREN: usize = 4;
+const PARALLEL_MIN_WALKS: usize = 2;
 
 pub const Error = error{
     /// `text` or `line_break` appeared at a position where only block
@@ -403,6 +410,7 @@ fn layoutCodeBlock(
                         ctx.cache,
                         ctx.mono_atlas,
                         ctx.color_atlas,
+                        ctx.glyph_cache_lock,
                         run,
                         r.style.font_id,
                         text_x,
@@ -448,6 +456,15 @@ fn layoutStackV(
     ctx: *element.LayoutCtx,
     out: *element.DrawList,
 ) !element.Box {
+    // Stage 14b — try parallel fan-out for cache misses across a wide
+    // enough stack. The dispatcher checks classification + threshold
+    // and falls back to the serial loop below when it doesn't pay.
+    if (ctx.job_system != null and ctx.cache_blocks != null and ctx.glyph_cache_lock != null and children.len >= PARALLEL_MIN_CHILDREN) {
+        if (try layoutStackVParallel(children, gap, origin, constraints, ctx, out)) |box| return box;
+        // null return → not enough cache-miss work to amortise dispatch;
+        // fall through to serial.
+    }
+
     var y = origin[1];
     var max_w: f32 = 0;
     for (children, 0..) |child, i| {
@@ -469,6 +486,330 @@ fn layoutStackV(
         .h = y - origin[1],
         .baseline = 0,
     };
+}
+
+// ── Stage 14b parallel stack_v walk ──────────────────────────────────
+
+/// Per-child decision produced by phase-1 classification. `walk`
+/// variants are populated with their `private_dl` only in phase 2 —
+/// no allocation if we bail out before dispatching.
+const ChildClass = union(enum) {
+    cache_hit: layout_cache.Entry,
+    walk_with_snapshot: WalkSpec,
+    walk_no_cache: WalkSpec,
+};
+
+const WalkSpec = struct {
+    /// Filled in by the worker (or by the merge-phase fallback walk).
+    box: element.Box = .{ .x = 0, .y = 0, .w = 0, .h = 0, .baseline = 0 },
+    /// Private per-job DrawList owned by main; the worker writes into
+    /// it at origin (0,0). Allocated lazily in phase 2 once we're
+    /// committed to dispatching. c_allocator-backed for thread-safety.
+    private_dl: ?*element.DrawList = null,
+    /// `null` for the `walk_no_cache` variant; set when this child
+    /// will be snapshotted back into the cache after walking.
+    cache_key: ?layout_cache.Key = null,
+    /// Snapshot version when `cache_key != null`. Captured pre-walk
+    /// so a concurrent bump doesn't desynchronise the entry's stored
+    /// version from the content it actually holds.
+    version: u64 = 0,
+    /// Set if the worker errored. Merge phase falls back to a fresh
+    /// serial walk for this child.
+    err: ?anyerror = null,
+};
+
+const ParallelWalkCtx = struct {
+    children: []const element.Element,
+    classifications: []ChildClass,
+    constraints: element.Constraints,
+    base_ctx: *element.LayoutCtx,
+};
+
+/// Dispatch parallel walks. Returns null when classification finds
+/// fewer than `PARALLEL_MIN_WALKS` walk-able children — caller falls
+/// back to serial in that case.
+fn layoutStackVParallel(
+    children: []const element.Element,
+    gap: f32,
+    origin: [2]f32,
+    constraints: element.Constraints,
+    ctx: *element.LayoutCtx,
+    out: *element.DrawList,
+) anyerror!?element.Box {
+    const cache = ctx.cache_blocks.?;
+    const js = ctx.job_system.?;
+    const a = ctx.allocator;
+
+    // Phase 1 — classify every child. No private-DrawList allocations
+    // yet — we may bail out below if there aren't enough walks.
+    const classifications = try a.alloc(ChildClass, children.len);
+    defer a.free(classifications);
+
+    // Count *snapshot-eligible* walks toward the dispatch threshold.
+    // Walks of `disable_cache = true` children (sliders / inputs /
+    // embedded-doc) happen every layout regardless of state change —
+    // counting them would dispatch every frame even when nothing
+    // content-relevant changed, and the worker would lose inner
+    // cache hits (workers run with `cache_blocks = null` to keep the
+    // block cache single-threaded). Only "real" cache misses justify
+    // the dispatch.
+    var snapshot_walks: usize = 0;
+    for (children, 0..) |child, i| {
+        classifications[i] = classifyChild(child, constraints, ctx, cache);
+        if (classifications[i] == .walk_with_snapshot) snapshot_walks += 1;
+    }
+
+    if (snapshot_walks < PARALLEL_MIN_WALKS) return null;
+
+    // Phase 2 — allocate private DrawLists for every walk slot. These
+    // are released after the merge, regardless of success/failure.
+    for (classifications) |*cls| {
+        switch (cls.*) {
+            .cache_hit => {},
+            .walk_with_snapshot => |*s| {
+                s.private_dl = try a.create(element.DrawList);
+                s.private_dl.?.* = element.DrawList.init(std.heap.c_allocator);
+            },
+            .walk_no_cache => |*s| {
+                s.private_dl = try a.create(element.DrawList);
+                s.private_dl.?.* = element.DrawList.init(std.heap.c_allocator);
+            },
+        }
+    }
+    defer {
+        for (classifications) |cls| {
+            const pdl_opt: ?*element.DrawList = switch (cls) {
+                .cache_hit => null,
+                .walk_with_snapshot => |s| s.private_dl,
+                .walk_no_cache => |s| s.private_dl,
+            };
+            if (pdl_opt) |pdl| {
+                pdl.deinit();
+                a.destroy(pdl);
+            }
+        }
+    }
+
+    // Phase 3 — dispatch one job per child index. Cache hits return
+    // immediately inside the job; only walks do real work. We dispatch
+    // *all* indices (not just walks) so the worker loop doesn't need
+    // to map sparse indices — uncontested hits cost a few ns each.
+    var walk_ctx = ParallelWalkCtx{
+        .children = children,
+        .classifications = classifications,
+        .constraints = constraints,
+        .base_ctx = ctx,
+    };
+    var counter = jobs_mod.Counter.init(0);
+    js.parallelFor(
+        @intCast(children.len),
+        1,
+        walkOneJob,
+        @ptrCast(&walk_ctx),
+        &counter,
+    );
+    js.waitFor(&counter);
+
+    // Phase 4 — merge in order. Hits blit cached entries; walks blit
+    // private DrawLists and snapshot back into the cache when
+    // applicable. Worker errors fall back to a serial walk in the
+    // master so a flaky path doesn't leave a hole.
+    var y = origin[1];
+    var max_w: f32 = 0;
+    for (children, 0..) |child, i| {
+        if (i != 0) y += gap;
+        const child_origin: [2]f32 = .{ origin[0], y };
+        switch (classifications[i]) {
+            .cache_hit => |entry| {
+                const box = try layout_cache.blitEntry(out, entry, child_origin);
+                if (box.w > max_w) max_w = box.w;
+                y += entry.box.h;
+            },
+            .walk_with_snapshot => |spec| {
+                if (spec.err != null or spec.private_dl == null) {
+                    const box = try layoutAndRenderCached(child, child_origin, constraints, ctx, out);
+                    if (box.w > max_w) max_w = box.w;
+                    y += box.h;
+                    continue;
+                }
+                try blitPrivate(out, spec.private_dl.?, child_origin);
+                if (spec.cache_key) |key| {
+                    try snapshotFromPrivate(cache, key, spec.version, spec.private_dl.?, spec.box);
+                }
+                if (spec.box.w > max_w) max_w = spec.box.w;
+                y += spec.box.h;
+            },
+            .walk_no_cache => |spec| {
+                if (spec.err != null or spec.private_dl == null) {
+                    const box = try layoutAndRenderCached(child, child_origin, constraints, ctx, out);
+                    if (box.w > max_w) max_w = box.w;
+                    y += box.h;
+                    continue;
+                }
+                try blitPrivate(out, spec.private_dl.?, child_origin);
+                if (spec.box.w > max_w) max_w = spec.box.w;
+                y += spec.box.h;
+            },
+        }
+    }
+
+    return element.Box{
+        .x = origin[0],
+        .y = origin[1],
+        .w = max_w,
+        .h = y - origin[1],
+        .baseline = 0,
+    };
+}
+
+/// Classify one child. Cache eligibility mirrors `layoutAndRenderCached`:
+/// must be `cacheableLeaf`, must have a non-zero `elementIdentity`,
+/// must hit the cache at the current version. Anything else falls
+/// through to a walk; cacheable-but-stale walks get a `cache_key` so
+/// the merge step snapshots back into the cache.
+///
+/// Note: does NOT allocate `private_dl` — that happens in phase 2.
+fn classifyChild(
+    elem: element.Element,
+    constraints: element.Constraints,
+    ctx: *element.LayoutCtx,
+    cache: *layout_cache.BlockCache,
+) ChildClass {
+    if (layout_cache.cacheableLeaf(elem)) {
+        const id = layout_cache.elementIdentity(elem);
+        if (id != 0) {
+            const key = layout_cache.keyFor(elem, constraints, ctx.theme);
+            const version = layout_cache.versionFor(elem);
+            if (cache.lookup(key, version)) |entry| {
+                return .{ .cache_hit = entry };
+            }
+            return .{ .walk_with_snapshot = .{
+                .cache_key = key,
+                .version = version,
+            } };
+        }
+    }
+    cache.skipped += 1;
+    return .{ .walk_no_cache = .{} };
+}
+
+/// Worker entry. Walks each child in its batch range into the
+/// already-allocated private DrawList at origin (0,0). On error the
+/// worker stamps `spec.err` and the merge phase falls back to serial.
+fn walkOneJob(job: *jobs_mod.Job) void {
+    const range = job.getData(jobs_mod.BatchRange);
+    const wc: *ParallelWalkCtx = @constCast(@ptrCast(@alignCast(range.context)));
+
+    // Worker-local LayoutCtx: shadow the cache + job_system fields
+    // so workers walk recursively without touching the block cache
+    // and without recursive dispatch. Allocator swaps to c_allocator
+    // (thread-safe; the inline-flow arena builds on top). Lock stays
+    // in place so the inner shaping path serialises around the glyph
+    // cache + atlas.
+    var worker_ctx = wc.base_ctx.*;
+    worker_ctx.allocator = std.heap.c_allocator;
+    worker_ctx.cache_blocks = null;
+    worker_ctx.job_system = null;
+
+    var i = range.start;
+    while (i < range.end) : (i += 1) {
+        const cls_ptr = &wc.classifications[i];
+        const spec_ptr: *WalkSpec = switch (cls_ptr.*) {
+            .cache_hit => continue,
+            .walk_with_snapshot => |*s| s,
+            .walk_no_cache => |*s| s,
+        };
+        const pdl = spec_ptr.private_dl orelse continue;
+        const box = layoutAndRender(
+            wc.children[i],
+            .{ 0, 0 },
+            wc.constraints,
+            &worker_ctx,
+            pdl,
+        ) catch |e| {
+            spec_ptr.err = e;
+            continue;
+        };
+        spec_ptr.box = box;
+    }
+}
+
+/// Append a private DrawList's contents into `out`, translating
+/// positions by `origin` and rebasing triangle indices. Symmetric to
+/// `layout_cache.blitEntry`, but reads from a live DrawList rather
+/// than a cached snapshot.
+fn blitPrivate(out: *element.DrawList, src: *const element.DrawList, origin: [2]f32) !void {
+    const ox = origin[0];
+    const oy = origin[1];
+
+    const g_start = out.glyphs.items.len;
+    try out.glyphs.appendSlice(src.glyphs.items);
+    for (out.glyphs.items[g_start..]) |*g| {
+        g.dst_pos[0] += ox;
+        g.dst_pos[1] += oy;
+    }
+
+    const q_start = out.quads.items.len;
+    try out.quads.appendSlice(src.quads.items);
+    for (out.quads.items[q_start..]) |*q| {
+        q.dst_pos[0] += ox;
+        q.dst_pos[1] += oy;
+    }
+
+    const tri_vertex_base: u32 = @intCast(out.tris.items.len);
+    try out.tris.appendSlice(src.tris.items);
+    for (out.tris.items[tri_vertex_base..]) |*v| {
+        v.pos[0] += ox;
+        v.pos[1] += oy;
+    }
+    const ti_start = out.tri_indices.items.len;
+    try out.tri_indices.appendSlice(src.tri_indices.items);
+    for (out.tri_indices.items[ti_start..]) |*idx| idx.* += tri_vertex_base;
+
+    for (src.hits.items) |h| {
+        var h2 = h;
+        h2.box.x += ox;
+        h2.box.y += oy;
+        try out.hits.append(h2);
+    }
+}
+
+/// Copy a private DrawList's contents into a new cache Entry (block-
+/// local coords — no translation needed because the worker already
+/// walked at origin (0,0)).
+fn snapshotFromPrivate(
+    cache: *layout_cache.BlockCache,
+    key: layout_cache.Key,
+    version: u64,
+    src: *const element.DrawList,
+    box: element.Box,
+) !void {
+    const glyphs = try cache.allocator.dupe(@TypeOf(src.glyphs.items[0]), src.glyphs.items);
+    errdefer cache.allocator.free(glyphs);
+    const quads = try cache.allocator.dupe(@TypeOf(src.quads.items[0]), src.quads.items);
+    errdefer cache.allocator.free(quads);
+    const tris = try cache.allocator.dupe(@TypeOf(src.tris.items[0]), src.tris.items);
+    errdefer cache.allocator.free(tris);
+    const tri_indices = try cache.allocator.dupe(u32, src.tri_indices.items);
+    errdefer cache.allocator.free(tri_indices);
+    const hits = try cache.allocator.dupe(element.Hit, src.hits.items);
+    errdefer cache.allocator.free(hits);
+
+    try cache.insert(key, .{
+        .version = version,
+        .glyphs = glyphs,
+        .quads = quads,
+        .tris = tris,
+        .tri_indices = tri_indices,
+        .hits = hits,
+        .box = .{
+            .x = 0,
+            .y = 0,
+            .w = box.w,
+            .h = box.h,
+            .baseline = box.baseline, // already block-local: worker walked at (0,0)
+        },
+    });
 }
 
 /// Lay out a flat list of inline elements as one or more lines of
@@ -830,6 +1171,7 @@ fn emitLine(
             ctx.cache,
             ctx.mono_atlas,
             ctx.color_atlas,
+            ctx.glyph_cache_lock,
             atom.run,
             atom.style.font_id,
             x,

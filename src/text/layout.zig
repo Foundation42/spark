@@ -63,12 +63,21 @@ pub const Paragraph = struct {
 /// Append glyphs for an already-shaped run, looking each glyph up
 /// in the cache (rasterising + packing on miss). Returns the pen X
 /// after the run for callers that want to chain runs on one line.
+///
+/// `glyph_cache_lock` (optional): when non-null, every
+/// `cache.getOrRasterize` call is wrapped in the lock. The mutex
+/// protects (a) the FT shared glyph slot used during glyph rendering,
+/// (b) the GlyphCache hashmap, and (c) the Atlas packing/staging
+/// buffer. Pass `null` for the serial path — no locking overhead.
+/// Stage 14b's parallel stack_v walker hands the same mutex to every
+/// worker thread.
 pub fn appendShapedRun(
     out: *std.ArrayList(tp.GlyphInstance),
     fonts: *registry_mod.FontRegistry,
     cache: *glyph_cache_mod.GlyphCache,
     mono_atlas: *atlas_mod.Atlas,
     color_atlas: *atlas_mod.Atlas,
+    glyph_cache_lock: ?*std.Thread.Mutex,
     run: shape.ShapedRun,
     font_id: registry_mod.FontId,
     pen_x: f32,
@@ -85,7 +94,14 @@ pub fn appendShapedRun(
     const color_h: f32 = @floatFromInt(color_atlas.extent.height);
 
     for (run.glyphs) |g| {
-        const entry = try cache.getOrRasterize(fonts, mono_atlas, color_atlas, font_id, g.glyph_id);
+        const entry = blk: {
+            if (glyph_cache_lock) |m| {
+                m.lock();
+                defer m.unlock();
+                break :blk try cache.getOrRasterize(fonts, mono_atlas, color_atlas, font_id, g.glyph_id);
+            }
+            break :blk try cache.getOrRasterize(fonts, mono_atlas, color_atlas, font_id, g.glyph_id);
+        };
         if (entry.rect.w != 0 and entry.rect.h != 0) {
             const bx: f32 = @floatFromInt(entry.bearing_x);
             const by: f32 = @floatFromInt(entry.bearing_y);
@@ -145,6 +161,7 @@ pub fn appendLineFromSpans(
     cache: *glyph_cache_mod.GlyphCache,
     mono_atlas: *atlas_mod.Atlas,
     color_atlas: *atlas_mod.Atlas,
+    glyph_cache_lock: ?*std.Thread.Mutex,
     spans: []const Span,
     pen_x: f32,
     baseline_y: f32,
@@ -160,6 +177,7 @@ pub fn appendLineFromSpans(
             cache,
             mono_atlas,
             color_atlas,
+            glyph_cache_lock,
             run,
             span.style.font_id,
             x,
@@ -185,6 +203,7 @@ pub fn layoutParagraph(
     cache: *glyph_cache_mod.GlyphCache,
     mono_atlas: *atlas_mod.Atlas,
     color_atlas: *atlas_mod.Atlas,
+    glyph_cache_lock: ?*std.Thread.Mutex,
     paragraph: Paragraph,
     pen_x: f32,
     start_y: f32,
@@ -212,6 +231,7 @@ pub fn layoutParagraph(
             cache,
             mono_atlas,
             color_atlas,
+            glyph_cache_lock,
             line.spans,
             pen_x,
             baseline_y,
