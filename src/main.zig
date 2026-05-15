@@ -31,6 +31,7 @@ const markdown = @import("markdown.zig");
 const ansi = @import("ansi.zig");
 const component = @import("component.zig");
 const box_component = @import("components/box.zig");
+const button_component = @import("components/button.zig");
 const chart_component = @import("components/chart.zig");
 const embedded_document_component = @import("components/embedded_document.zig");
 const llm_stream_component = @import("components/llm_stream.zig");
@@ -562,7 +563,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 6 / stage 13a.5 (multi-provider LLM streaming)\n", .{});
+    try stdout.print("text_engine demo — session 6 / stage 13b (button → LLM trigger)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
     try stdout.print("  demo.md bytes:         {d}\n", .{demo_md.len});
@@ -660,6 +661,8 @@ pub fn main() !void {
     try registry.register("box", box_component.factory);
     try registry.register("chart", chart_component.factory);
     try registry.register("slider", slider_component.factory);
+    try button_component.install(&registry);
+    defer button_component.deinitGlobals();
     // Embedded-document factory needs theme + registry + parent
     // state captured at install time — see embedded_document.zig's
     // "module-globals smell" note for why.

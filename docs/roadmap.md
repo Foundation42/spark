@@ -396,14 +396,42 @@ Demo now stacks three providers side-by-side: local Ollama,
 remote DeepSeek, and `google/gemini-2.5-flash` via OpenRouter.
 All three streaming concurrently runs at ~7.6k fps Release.
 
-## Then — more components (stage 13b+)
+## Shipped — button + LLM trigger (stage 13b)
 
-3D scene (eventually integrates with matryoshka), live chart,
-input field, button. Each is a self-contained component module;
-the contract is fixed by stage 7. **Input field + button** is
-the natural pair for stage 13b — closes the user→LLM authoring
-loop (type into a field, click submit, watch the
-`:::llm-stream` answer flow in below).
+`:::button` is the first non-slider interactive component.
+Attrs: `label=`, `target=#id`, `action=name`, optional `body=`.
+The on_input arm fires `registry.handleUpdate(target, action,
+body)` on primary mouse_up. Simpler than going through the
+`:::update` byte stream — buttons are a click→dispatch shortcut.
+Currently component-target only; pair with the existing
+`:::update` emitter when a button needs to mutate state directly.
+
+`:::llm-stream` grew `auto_start=false` + `Phase.idle` + a
+`handle_update(action=start)` arm. The kickStream pathway is now
+reusable for both first-mount-fire and click-driven re-fire. On
+re-fire it nulls the in-flight Pending's back-pointer (so the
+worker's chunks are quietly discarded), clears the content +
+line buffer, resets the arena, and submits fresh.
+
+Demo: three `Run …` buttons sit next to three idle
+`:::llm-stream` blocks (Ollama / DeepSeek / OpenRouter-Gemini).
+Click to trigger; click again to watch a fresh stream paint in.
+
+## Then — input field (stage 13c)
+
+Closes the user→LLM authoring loop properly. A `:::input` text
+field with cursor + selection + IME, paired with `:::button` to
+fire the prompt as the user's message. Demo: a single chat
+session where the user can type, click send, watch the streamed
+response, type again. That's the v1 of the live-document
+substrate's headline use case.
+
+## Then — more components (stage 13d+)
+
+3D scene (eventually integrates with matryoshka), live chart
+beyond sparkline, form, table. Each is a self-contained
+component module; the contract is fixed by stage 7. Repetitive
+work, not architectural.
 
 ## Parallel — retained layout cache
 

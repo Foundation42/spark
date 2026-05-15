@@ -344,10 +344,22 @@ TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
   the auth header. Tiny `src/dotenv.zig` reads `~/.env`'s
   `KEY=VALUE` pairs at startup; `api_key_env=` attribute names
   which entry the factory should read for the Bearer token. Demo
-  now stacks three providers side-by-side — local Ollama, remote
+  stacks three providers side-by-side — local Ollama, remote
   DeepSeek, and Gemini-2.5-Flash via OpenRouter — all streaming
-  into the same Vulkan-rendered document concurrently. ~7.6k fps
-  steady-state with three providers live.
+  into the same Vulkan-rendered document concurrently.
+- [x] **Stage 13b — button → LLM trigger.** New `:::button`
+  component (`src/components/button.zig`) — clickable rect with
+  `label=`, `target=#id`, `action=name`, optional `body=`. On
+  primary mouse_up inside it, calls
+  `registry.handleUpdate(target, action, body)`. `:::llm-stream`
+  grew `auto_start=false` + `Phase.idle` (subtle grey "ready"
+  placeholder) + a `handle_update` arm that re-fires
+  the stream on `action=start` — cancels any in-flight (nulls
+  the back-pointer, the worker keeps running but the completion
+  handler discards), clears content + line buffer, resets the
+  arena, kicks off a fresh fetch. Demo now has three `Run …`
+  buttons next to three idle `:::llm-stream` blocks; click to
+  trigger, click again to re-run. ~7.5k fps idle.
 
 ## What's next
 

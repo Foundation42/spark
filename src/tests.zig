@@ -10,6 +10,7 @@ test {
     _ = @import("markdown_components.zig");
     _ = @import("component.zig");
     _ = @import("components/box.zig");
+    _ = @import("components/button.zig");
     _ = @import("components/chart.zig");
     _ = @import("components/embedded_document.zig");
     _ = @import("components/llm_stream.zig");

@@ -119,6 +119,11 @@ pub const Provider = enum {
 };
 
 const Phase = enum {
+    /// `auto_start=false` and the stream hasn't been triggered yet.
+    /// Renders a subtle "ready" placeholder; waits for a
+    /// `handle_update(action=start)` (typically fired by a sibling
+    /// `:::button`).
+    idle,
     loading,
     streaming,
     done,
@@ -156,6 +161,15 @@ const Component = struct {
     model_label: []u8, // owned dupe — used for the loading placeholder
     provider: Provider = .ollama,
 
+    // Request params held for re-firing on `handle_update(start)`.
+    // All owned dupes; freed in deinit_.
+    model: []u8 = &.{},
+    prompt: []u8 = &.{},
+    endpoint: []u8 = &.{},
+    system: ?[]u8 = null,
+    api_key_env: ?[]u8 = null,
+    max_tokens: u32 = DEFAULT_MAX_TOKENS,
+
     /// Set when `.failed`. Owned by the Component.
     err_name: ?[]u8 = null,
 };
@@ -164,6 +178,7 @@ pub const factory: component_mod.Factory = .{
     .create = create,
     .update = update,
     .deinit = deinit_,
+    .handle_update = handleUpdate,
 };
 
 fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
@@ -174,6 +189,13 @@ fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!c
     const model = findAttr(spec.attrs, "model") orelse return Error.LlmStreamMissingModel;
     const prompt = findAttr(spec.attrs, "prompt") orelse return Error.LlmStreamMissingPrompt;
     const system = findAttr(spec.attrs, "system");
+    const api_key_env = findAttr(spec.attrs, "api_key_env");
+    const auto_start: bool = blk: {
+        if (findAttr(spec.attrs, "auto_start")) |s| {
+            break :blk !std.mem.eql(u8, s, "false");
+        }
+        break :blk true; // default preserves stage-13a behavior
+    };
     const max_tokens: u32 = blk: {
         if (findAttr(spec.attrs, "max_tokens")) |s| {
             break :blk std.fmt.parseInt(u32, s, 10) catch DEFAULT_MAX_TOKENS;
@@ -213,6 +235,17 @@ fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!c
     const model_label = try allocator.dupe(u8, model);
     errdefer allocator.free(model_label);
 
+    const model_dup = try allocator.dupe(u8, model);
+    errdefer allocator.free(model_dup);
+    const prompt_dup = try allocator.dupe(u8, prompt);
+    errdefer allocator.free(prompt_dup);
+    const endpoint_dup = try allocator.dupe(u8, endpoint);
+    errdefer allocator.free(endpoint_dup);
+    const system_dup: ?[]u8 = if (system) |s| try allocator.dupe(u8, s) else null;
+    errdefer if (system_dup) |s| allocator.free(s);
+    const api_key_env_dup: ?[]u8 = if (api_key_env) |k| try allocator.dupe(u8, k) else null;
+    errdefer if (api_key_env_dup) |k| allocator.free(k);
+
     c.* = .{
         .allocator = allocator,
         .arena = arena,
@@ -221,36 +254,75 @@ fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!c
         .scope = scope,
         .model_label = model_label,
         .provider = provider,
+        .model = model_dup,
+        .prompt = prompt_dup,
+        .endpoint = endpoint_dup,
+        .system = system_dup,
+        .api_key_env = api_key_env_dup,
+        .max_tokens = max_tokens,
+        .phase = if (auto_start) .loading else .idle,
     };
 
-    // Build the JSON request body + any auth headers in a scratch
-    // arena. submitHttpStream dupes everything it needs, so we can
-    // tear the arena down right after.
-    var scratch = std.heap.ArenaAllocator.init(allocator);
+    if (auto_start) {
+        try kickStream(c);
+    }
+
+    return .{ .vtable = &vtable, .ctx = @ptrCast(c) };
+}
+
+/// Submit (or re-submit) a fresh stream. Cancels any in-flight
+/// fetch from this component first (chunks already queued in the
+/// channel will land but be discarded — `PendingStream.component`
+/// is null'd before the new submission). Clears the content buffer
+/// so the re-render is from scratch.
+fn kickStream(c: *Component) !void {
+    const ch = io_channel_ref orelse return Error.LlmStreamNotInstalled;
+
+    // Cancel any in-flight stream from this component.
+    if (c.pending) |p| {
+        p.component = null;
+        c.pending = null;
+    }
+
+    // Reset content + line buffer so the new run paints fresh.
+    c.content.clearRetainingCapacity();
+    c.line_buf.clearRetainingCapacity();
+    if (c.err_name) |e| {
+        c.allocator.free(e);
+        c.err_name = null;
+    }
+    // Drop the cached parsed tree by resetting the arena.
+    _ = c.arena.reset(.retain_capacity);
+    c.root = element.Element{ .paragraph = &[_]element.Element{} };
+    c.phase = .loading;
+
+    // Build body + headers in a scratch arena; submitHttpStream
+    // dupes them, so the arena can drop right after.
+    var scratch = std.heap.ArenaAllocator.init(c.allocator);
     defer scratch.deinit();
     const sa = scratch.allocator();
 
     var body_buf = std.ArrayList(u8).init(sa);
-    switch (provider) {
-        .ollama => try buildOllamaBody(body_buf.writer(), model, prompt, system, max_tokens),
-        .openai => try buildOpenAiBody(body_buf.writer(), model, prompt, system, max_tokens),
+    switch (c.provider) {
+        .ollama => try buildOllamaBody(body_buf.writer(), c.model, c.prompt, c.system, c.max_tokens),
+        .openai => try buildOpenAiBody(body_buf.writer(), c.model, c.prompt, c.system, c.max_tokens),
     }
 
     var headers_buf: std.ArrayListUnmanaged(io.Header) = .{};
-    if (provider == .openai) {
-        const key_env = findAttr(spec.attrs, "api_key_env") orelse return Error.LlmStreamMissingApiKeyEnv;
+    if (c.provider == .openai) {
+        const key_env = c.api_key_env orelse return Error.LlmStreamMissingApiKeyEnv;
         const env = env_ref orelse return Error.LlmStreamApiKeyNotFound;
         const key = env.get(key_env) orelse return Error.LlmStreamApiKeyNotFound;
         const auth_value = try std.fmt.allocPrint(sa, "Bearer {s}", .{key});
         try headers_buf.append(sa, .{ .name = "Authorization", .value = auth_value });
     }
 
-    const pending = try allocator.create(PendingStream);
-    errdefer allocator.destroy(pending);
-    pending.* = .{ .allocator = allocator, .component = c };
+    const pending = try c.allocator.create(PendingStream);
+    errdefer c.allocator.destroy(pending);
+    pending.* = .{ .allocator = c.allocator, .component = c };
 
-    const handle = try io_channel_ref.?.submitHttpStream(.{
-        .url = endpoint,
+    const handle = try ch.submitHttpStream(.{
+        .url = c.endpoint,
         .method = .POST,
         .body = body_buf.items,
         .content_type = "application/json",
@@ -258,8 +330,24 @@ fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!c
     }, @intFromPtr(pending));
     c.handle = handle;
     c.pending = pending;
+}
 
-    return .{ .vtable = &vtable, .ctx = @ptrCast(c) };
+/// Component-target dispatch. Today's only action is `start` —
+/// trigger (or re-trigger) the stream. `body` is unused for now;
+/// reserved for future "alter prompt and run" or "set system
+/// message on the fly" cases.
+fn handleUpdate(ctx: *anyopaque, action: []const u8, _: []const u8) anyerror!void {
+    const c: *Component = @ptrCast(@alignCast(ctx));
+    if (std.mem.eql(u8, action, "start")) {
+        kickStream(c) catch |e| {
+            std.log.err("llm-stream: kickStream failed: {s}", .{@errorName(e)});
+            c.phase = .failed;
+            const a = c.allocator;
+            if (c.err_name) |old| a.free(old);
+            c.err_name = a.dupe(u8, @errorName(e)) catch null;
+        };
+        if (parent_state_ref) |ps| ps.dirty = true;
+    }
 }
 
 fn update(ctx: *anyopaque, _: *const components.Spec) anyerror!void {
@@ -287,6 +375,11 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     allocator.destroy(c.arena);
     allocator.free(c.scope);
     allocator.free(c.model_label);
+    allocator.free(c.model);
+    allocator.free(c.prompt);
+    allocator.free(c.endpoint);
+    if (c.system) |s| allocator.free(s);
+    if (c.api_key_env) |k| allocator.free(k);
     if (c.err_name) |e| allocator.free(e);
     allocator.destroy(c);
 }
@@ -550,6 +643,11 @@ fn layoutAndRender(
     const c: *const Component = @ptrCast(@alignCast(ctx));
 
     switch (c.phase) {
+        .idle => {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "{s} — ready", .{c.model_label}) catch "ready";
+            return try renderPlaceholder(msg, .idle, origin, constraints, lc, out);
+        },
         .loading => {
             var buf: [256]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "{s} thinking…", .{c.model_label}) catch "thinking…";
@@ -572,7 +670,7 @@ fn layoutAndRender(
 
 // ── Placeholders ────────────────────────────────────────────────────
 
-const PlaceholderScheme = enum { loading, failed };
+const PlaceholderScheme = enum { idle, loading, failed };
 
 const PLACEHOLDER_RADIUS: f32 = 6;
 const PLACEHOLDER_BORDER_PX: f32 = 2;
@@ -580,6 +678,8 @@ const PLACEHOLDER_PAD_X: f32 = 12;
 const PLACEHOLDER_PAD_Y: f32 = 8;
 const PLACEHOLDER_MIN_W: f32 = 240;
 
+const IDLE_BORDER: [4]f32 = .{ 0.40, 0.46, 0.54, 0.75 };
+const IDLE_BG: [4]f32 = .{ 0.10, 0.12, 0.16, 0.55 };
 const LOADING_BORDER: [4]f32 = .{ 0.45, 0.65, 0.55, 0.85 };
 const LOADING_BG: [4]f32 = .{ 0.08, 0.16, 0.12, 0.55 };
 const FAILED_BORDER: [4]f32 = .{ 0.85, 0.30, 0.30, 0.95 };
@@ -594,10 +694,12 @@ fn renderPlaceholder(
     out: *element.DrawList,
 ) !element.Box {
     const border_rgba = switch (scheme) {
+        .idle => IDLE_BORDER,
         .loading => LOADING_BORDER,
         .failed => FAILED_BORDER,
     };
     const bg_rgba = switch (scheme) {
+        .idle => IDLE_BG,
         .loading => LOADING_BG,
         .failed => FAILED_BG,
     };
