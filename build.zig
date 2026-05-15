@@ -16,6 +16,8 @@ pub fn build(b: *std.Build) void {
     const quad_frag_spv = compileShaderStage(b, "quad", "frag", optimize);
     const tri_vert_spv = compileShaderStage(b, "tri", "vert", optimize);
     const tri_frag_spv = compileShaderStage(b, "tri", "frag", optimize);
+    const image_vert_spv = compileShaderStage(b, "image", "vert", optimize);
+    const image_frag_spv = compileShaderStage(b, "image", "frag", optimize);
 
     // ── Bundle SPIR-V into a generated Zig module ──────────────────
     // The compiled blobs need `align(4)` because Vulkan's `pCode` field
@@ -29,6 +31,8 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(quad_frag_spv, "quad.frag.spv");
     _ = wf.addCopyFile(tri_vert_spv, "tri.vert.spv");
     _ = wf.addCopyFile(tri_frag_spv, "tri.frag.spv");
+    _ = wf.addCopyFile(image_vert_spv, "image.vert.spv");
+    _ = wf.addCopyFile(image_frag_spv, "image.frag.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const text_vert align(4) = @embedFile("text.vert.spv").*;
         \\pub const text_frag align(4) = @embedFile("text.frag.spv").*;
@@ -36,6 +40,8 @@ pub fn build(b: *std.Build) void {
         \\pub const quad_frag align(4) = @embedFile("quad.frag.spv").*;
         \\pub const tri_vert align(4) = @embedFile("tri.vert.spv").*;
         \\pub const tri_frag align(4) = @embedFile("tri.frag.spv").*;
+        \\pub const image_vert align(4) = @embedFile("image.vert.spv").*;
+        \\pub const image_frag align(4) = @embedFile("image.frag.spv").*;
         \\
     );
 
@@ -149,6 +155,15 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("harfbuzz");
     exe.linkLibrary(cmark_lib);
     exe.addIncludePath(b.path("vendor/cmark"));
+    // stb_image — single-translation-unit C library for PNG/JPG/etc.
+    // decoding. Pattern matches matryoshka's `libs/stb_image.{c,h}`:
+    // a .c stub defines `STB_IMAGE_IMPLEMENTATION` and includes the
+    // header so the static functions get emitted exactly once.
+    exe.addCSourceFile(.{
+        .file = b.path("vendor/stb/stb_image.c"),
+        .flags = &.{"-std=c99"},
+    });
+    exe.addIncludePath(b.path("vendor/stb"));
     exe.linkLibC();
 
     b.installArtifact(exe);
@@ -185,6 +200,11 @@ pub fn build(b: *std.Build) void {
     t.linkSystemLibrary("harfbuzz");
     t.linkLibrary(cmark_lib);
     t.addIncludePath(b.path("vendor/cmark"));
+    t.addCSourceFile(.{
+        .file = b.path("vendor/stb/stb_image.c"),
+        .flags = &.{"-std=c99"},
+    });
+    t.addIncludePath(b.path("vendor/stb"));
     t.linkLibC();
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(t).step);

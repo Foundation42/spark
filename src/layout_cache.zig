@@ -104,6 +104,11 @@ pub const Entry = struct {
     tris: []tri_pipeline.Vertex,
     /// Indices relative to the start of `tris` (already rebased to 0).
     tri_indices: []u32,
+    /// Block-local image draws (descriptor pointer + relative rect).
+    /// Descriptors are owned by the source `:::image-stream` component
+    /// and stay valid across cache hits (a re-fire bumps version and
+    /// re-snapshots, but the descriptor handle is rewritten in place).
+    images: []element.ImageDraw,
     /// Block-local hits: `box.x`/`box.y` are relative to (0, 0).
     hits: []element.Hit,
     /// Measured layout box at origin (0, 0). `baseline` is also
@@ -141,6 +146,7 @@ pub const BlockCache = struct {
         self.allocator.free(e.quads);
         self.allocator.free(e.tris);
         self.allocator.free(e.tri_indices);
+        self.allocator.free(e.images);
         self.allocator.free(e.hits);
     }
 
@@ -292,6 +298,15 @@ pub fn blitEntry(
     try out.tri_indices.appendSlice(entry.tri_indices);
     for (out.tri_indices.items[ti_start..]) |*i| i.* += tri_vertex_base;
 
+    // Images — translate dst_pos. Descriptor handle is stable across
+    // hits (owned by the source component).
+    for (entry.images) |im| {
+        var im2 = im;
+        im2.dst_pos[0] += ox;
+        im2.dst_pos[1] += oy;
+        try out.images.append(im2);
+    }
+
     // Hits — translate box origin. Pointer fields (vtable/ctx/state)
     // are pointer-stable across walks so the cached values stay valid.
     for (entry.hits) |h| {
@@ -323,6 +338,7 @@ pub fn snapshotEntry(
     q_start: usize,
     t_start: usize,
     ti_start: usize,
+    i_start: usize,
     h_start: usize,
     tri_vertex_base: u32,
     origin: [2]f32,
@@ -356,6 +372,13 @@ pub fn snapshotEntry(
     errdefer cache.allocator.free(tri_indices);
     for (tri_indices) |*i| i.* -= tri_vertex_base;
 
+    const images = try cache.allocator.dupe(element.ImageDraw, out.images.items[i_start..]);
+    errdefer cache.allocator.free(images);
+    for (images) |*im| {
+        im.dst_pos[0] -= ox;
+        im.dst_pos[1] -= oy;
+    }
+
     const hits = try cache.allocator.dupe(element.Hit, out.hits.items[h_start..]);
     errdefer cache.allocator.free(hits);
     for (hits) |*h| {
@@ -369,6 +392,7 @@ pub fn snapshotEntry(
         .quads = quads,
         .tris = tris,
         .tri_indices = tri_indices,
+        .images = images,
         .hits = hits,
         .box = .{
             .x = 0,
@@ -398,6 +422,7 @@ test "BlockCache: insert/lookup roundtrip" {
     const quads = try testing.allocator.alloc(qp.QuadInstance, 0);
     const tris = try testing.allocator.alloc(tri_pipeline.Vertex, 0);
     const tri_indices = try testing.allocator.alloc(u32, 0);
+    const images = try testing.allocator.alloc(element.ImageDraw, 0);
     const hits = try testing.allocator.alloc(element.Hit, 0);
 
     try cache.insert(key, .{
@@ -406,6 +431,7 @@ test "BlockCache: insert/lookup roundtrip" {
         .quads = quads,
         .tris = tris,
         .tri_indices = tri_indices,
+        .images = images,
         .hits = hits,
         .box = .{ .x = 0, .y = 0, .w = 100, .h = 20, .baseline = 0 },
     });
@@ -438,6 +464,7 @@ test "BlockCache: insert replaces existing entry" {
         .quads = try testing.allocator.alloc(qp.QuadInstance, 0),
         .tris = try testing.allocator.alloc(tri_pipeline.Vertex, 0),
         .tri_indices = try testing.allocator.alloc(u32, 0),
+        .images = try testing.allocator.alloc(element.ImageDraw, 0),
         .hits = try testing.allocator.alloc(element.Hit, 0),
         .box = .{ .x = 0, .y = 0, .w = 1, .h = 1, .baseline = 0 },
     });
@@ -449,6 +476,7 @@ test "BlockCache: insert replaces existing entry" {
         .quads = try testing.allocator.alloc(qp.QuadInstance, 0),
         .tris = try testing.allocator.alloc(tri_pipeline.Vertex, 0),
         .tri_indices = try testing.allocator.alloc(u32, 0),
+        .images = try testing.allocator.alloc(element.ImageDraw, 0),
         .hits = try testing.allocator.alloc(element.Hit, 0),
         .box = .{ .x = 0, .y = 0, .w = 2, .h = 2, .baseline = 0 },
     });
@@ -474,6 +502,7 @@ test "BlockCache: clear frees all entries" {
             .quads = try testing.allocator.alloc(qp.QuadInstance, 1),
             .tris = try testing.allocator.alloc(tri_pipeline.Vertex, 0),
             .tri_indices = try testing.allocator.alloc(u32, 0),
+            .images = try testing.allocator.alloc(element.ImageDraw, 0),
             .hits = try testing.allocator.alloc(element.Hit, 0),
             .box = .{ .x = 0, .y = 0, .w = 10, .h = 5, .baseline = 0 },
         });

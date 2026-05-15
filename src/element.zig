@@ -560,6 +560,12 @@ pub const DrawList = struct {
     /// arrays into its VBO/IBO and issues one `vkCmdDrawIndexed`.
     tris: std.ArrayList(tri_pipeline.Vertex),
     tri_indices: std.ArrayList(u32),
+    /// Raster image layer (stage 14c). One entry per `:::image-stream`
+    /// component that has a decoded texture ready. Each carries the
+    /// pre-allocated descriptor set (owned by the component) and a
+    /// world-space rect; the host's ImagePipeline records one draw
+    /// per entry, binding the descriptor between draws.
+    images: std.ArrayList(ImageDraw),
     /// Hit-test layer. Populated alongside glyphs / quads during the
     /// layout walk; only elements with a non-null `vtable.on_input`
     /// register an entry. Walked in reverse on each mouse event so
@@ -575,6 +581,7 @@ pub const DrawList = struct {
             .quads = std.ArrayList(qp.QuadInstance).init(allocator),
             .tris = std.ArrayList(tri_pipeline.Vertex).init(allocator),
             .tri_indices = std.ArrayList(u32).init(allocator),
+            .images = std.ArrayList(ImageDraw).init(allocator),
             .hits = std.ArrayList(Hit).init(allocator),
         };
     }
@@ -584,6 +591,7 @@ pub const DrawList = struct {
         self.quads.deinit();
         self.tris.deinit();
         self.tri_indices.deinit();
+        self.images.deinit();
         self.hits.deinit();
         self.* = undefined;
     }
@@ -595,8 +603,19 @@ pub const DrawList = struct {
         self.quads.clearRetainingCapacity();
         self.tris.clearRetainingCapacity();
         self.tri_indices.clearRetainingCapacity();
+        self.images.clearRetainingCapacity();
         self.hits.clearRetainingCapacity();
     }
+};
+
+/// One raster image draw — the component supplies an already-allocated
+/// descriptor set referencing its texture, and a world-space rect.
+/// The renderer iterates `DrawList.images` in order, issuing one
+/// `vkCmdDraw(6,1,0,0)` per entry with the descriptor bound.
+pub const ImageDraw = struct {
+    descriptor_set: *anyopaque, // VkDescriptorSet (kept *anyopaque so element.zig avoids vk.h)
+    dst_pos: [2]f32,
+    dst_size: [2]f32,
 };
 
 const glyph_cache_mod = @import("text/glyph_cache.zig");

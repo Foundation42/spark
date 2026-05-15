@@ -23,6 +23,7 @@ const atlas_mod = @import("gpu/atlas.zig");
 const tp = @import("gpu/text_pipeline.zig");
 const qp = @import("gpu/quad_pipeline.zig");
 const tri_pipeline_mod = @import("gpu/tri_pipeline.zig");
+const image_pipeline_mod = @import("gpu/image_pipeline.zig");
 const face_mod = @import("font/face.zig");
 const registry_mod = @import("font/registry.zig");
 const glyph_cache_mod = @import("text/glyph_cache.zig");
@@ -41,6 +42,7 @@ const llm_stream_component = @import("components/llm_stream.zig");
 const slider_component = @import("components/slider.zig");
 const svg_component = @import("components/svg.zig");
 const svg_stream_component = @import("components/svg_stream.zig");
+const image_stream_component = @import("components/image_stream.zig");
 const state_mod = @import("state.zig");
 const update = @import("update.zig");
 const demo_server_mod = @import("demo_server.zig");
@@ -85,6 +87,11 @@ const MAX_QUADS: u32 = 2048;
 // screen; bump when document density justifies.
 const MAX_TRI_VERTICES: u32 = 65536;
 const MAX_TRI_INDICES: u32 = 196608;
+/// Stage 14c — cap on concurrent `:::image-stream` components. Each
+/// owns one descriptor slot from the ImagePipeline's pool. Bump if
+/// the demo grows past this; the cost per slot is one VkDescriptorSet
+/// (~16 bytes of GPU state + tracking).
+const MAX_IMAGES: u32 = 32;
 
 /// Per-frame context owned by main(), borrowed by `drawCb` through
 /// the renderer's `*anyopaque` slot. Carries everything `drawCb`
@@ -107,6 +114,7 @@ const FrameCtx = struct {
     text_pipeline: *tp.TextPipeline,
     quad_pipeline: *qp.QuadPipeline,
     tri_pipeline: *tri_pipeline_mod.TrianglePipeline,
+    image_pipeline: *image_pipeline_mod.ImagePipeline,
 
     // Layout prerequisites (borrowed from main)
     allocator: std.mem.Allocator,
@@ -293,6 +301,16 @@ const FrameCtx = struct {
             v.pos[0] *= z;
             v.pos[1] *= z;
         }
+        // Same transform on image draws — dst_pos/dst_size land at
+        // the image pipeline as push constants in display pixels, so
+        // we apply the scroll/zoom here for symmetry with quads.
+        for (self.dl.images.items) |*im| {
+            im.dst_pos[1] -= sy;
+            im.dst_pos[0] *= z;
+            im.dst_pos[1] *= z;
+            im.dst_size[0] *= z;
+            im.dst_size[1] *= z;
+        }
 
         // Quads stay frozen between layouts (no animation on them);
         // upload once per layout instead of per frame.
@@ -405,9 +423,16 @@ fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) 
     };
 
     // ── Record draws — quads first, glyphs on top ──────────────────
-    // Triangles first (SVG fills sit under chrome + glyphs), then
-    // quads, then text on top.
+    // Triangles → images → quads → text. SVG fills + raster images
+    // sit under quad chrome (panels, underlines) and below glyphs so
+    // the document chrome reads on top of generated visuals.
     fc.tri_pipeline.recordDraw(cmd, extent, @intCast(fc.dl.tri_indices.items.len));
+    if (fc.dl.images.items.len > 0) {
+        fc.image_pipeline.bind(cmd, extent);
+        for (fc.dl.images.items) |im| {
+            fc.image_pipeline.recordOne(cmd, extent, @ptrCast(@alignCast(im.descriptor_set)), im.dst_pos, im.dst_size);
+        }
+    }
     fc.quad_pipeline.recordDraw(cmd, extent, @intCast(fc.dl.quads.items.len));
     fc.text_pipeline.recordDraw(cmd, extent, @intCast(fc.dl.glyphs.items.len));
 }
@@ -721,7 +746,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 8 / stage 14b (parallel cache-miss layouts)\n", .{});
+    try stdout.print("text_engine demo — session 8 / stage 14c (:::image-stream — raster image gen)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
     try stdout.print("  demo.md bytes:         {d}\n", .{demo_md.len});
@@ -754,6 +779,16 @@ pub fn main() !void {
         MAX_TRI_INDICES,
     );
     defer tri_pipeline_inst.deinit();
+
+    // Stage 14c — image pipeline for `:::image-stream`. Owns the
+    // descriptor pool sized to MAX_IMAGES; each component allocates
+    // one slot.
+    var image_pipeline_inst = try image_pipeline_mod.ImagePipeline.init(
+        &ctx,
+        swapchain.format,
+        MAX_IMAGES,
+    );
+    defer image_pipeline_inst.deinit();
 
     const font_path = std.posix.getenv("TEXT_ENGINE_FONT") orelse
         "/usr/share/fonts/TTF/DejaVuSans.ttf";
@@ -880,6 +915,8 @@ pub fn main() !void {
     defer svg_component.deinitGlobals();
     try svg_stream_component.install(&registry, &host_state, &io_channel, &env, job_system);
     defer svg_stream_component.deinitGlobals();
+    try image_stream_component.install(&registry, &host_state, &io_channel, &env, &ctx, &image_pipeline_inst);
+    defer image_stream_component.deinitGlobals();
 
     // Stage 13d.2 — micro-benchmark serial vs parallel tessellation
     // on Petunias.svg before the markdown parse begins. Runs once at
@@ -966,6 +1003,7 @@ pub fn main() !void {
         .text_pipeline = &pipeline,
         .quad_pipeline = &quad_pipeline,
         .tri_pipeline = &tri_pipeline_inst,
+        .image_pipeline = &image_pipeline_inst,
         .allocator = allocator,
         .fonts = &fonts,
         .cache = &cache,

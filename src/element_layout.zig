@@ -100,6 +100,7 @@ pub fn layoutAndRenderCached(
     const q_start = out.quads.items.len;
     const t_start = out.tris.items.len;
     const ti_start = out.tri_indices.items.len;
+    const i_start = out.images.items.len;
     const h_start = out.hits.items.len;
     const tri_vertex_base: u32 = @intCast(out.tris.items.len);
 
@@ -114,6 +115,7 @@ pub fn layoutAndRenderCached(
         q_start,
         t_start,
         ti_start,
+        i_start,
         h_start,
         tri_vertex_base,
         origin,
@@ -766,6 +768,13 @@ fn blitPrivate(out: *element.DrawList, src: *const element.DrawList, origin: [2]
     try out.tri_indices.appendSlice(src.tri_indices.items);
     for (out.tri_indices.items[ti_start..]) |*idx| idx.* += tri_vertex_base;
 
+    for (src.images.items) |im| {
+        var im2 = im;
+        im2.dst_pos[0] += ox;
+        im2.dst_pos[1] += oy;
+        try out.images.append(im2);
+    }
+
     for (src.hits.items) |h| {
         var h2 = h;
         h2.box.x += ox;
@@ -792,6 +801,8 @@ fn snapshotFromPrivate(
     errdefer cache.allocator.free(tris);
     const tri_indices = try cache.allocator.dupe(u32, src.tri_indices.items);
     errdefer cache.allocator.free(tri_indices);
+    const images = try cache.allocator.dupe(element.ImageDraw, src.images.items);
+    errdefer cache.allocator.free(images);
     const hits = try cache.allocator.dupe(element.Hit, src.hits.items);
     errdefer cache.allocator.free(hits);
 
@@ -801,6 +812,7 @@ fn snapshotFromPrivate(
         .quads = quads,
         .tris = tris,
         .tri_indices = tri_indices,
+        .images = images,
         .hits = hits,
         .box = .{
             .x = 0,

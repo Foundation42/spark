@@ -127,3 +127,16 @@ Same triangle pipeline, but the SVG isn't on disk — it's authored by **Recraft
 
 :::svg-stream {#fresh_svg auto_start=false provider=openai endpoint=https://openrouter.ai/api/v1/chat/completions model=recraft/recraft-v4.1-vector api_key_env=OPENROUTER_DYNABOOK prompt="A bowl of petunias, vector art, clean shapes, single bowl viewed from front, transparent background" max_tokens=8000 width=480}
 :::
+
+## Live raster image (stage 14c) — `:::image-stream`
+
+Same async I/O lane as `:::svg-stream`, but the data URL is a PNG — and the decode path runs through **stb_image** instead of the SVG tessellator, dropping the pixels into a per-component `VkImage` + sampler. The wire format is identical to Recraft (OpenAI-shaped `/chat/completions`, `stream:false`, image lives in `message.images[0].image_url.url`); only the MIME prefix and decoder swap out.
+
+:::input {#ask_image target=#fresh_image action=start placeholder="Describe an image… (Enter to generate)" width=100%}
+:::
+
+:::button {#run_image label="Run default prompt (robot drinking coffee)" target=#fresh_image action=start}
+:::
+
+:::image-stream {#fresh_image auto_start=false provider=openai endpoint=https://openrouter.ai/api/v1/chat/completions model=google/gemini-3.1-flash-image-preview api_key_env=OPENROUTER_DYNABOOK prompt="A friendly robot sitting at a wooden table, drinking a steaming mug of coffee. Soft natural lighting." max_tokens=4000 width=480}
+:::

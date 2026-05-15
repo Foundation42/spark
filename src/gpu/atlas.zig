@@ -420,12 +420,16 @@ pub const Atlas = struct {
     }
 };
 
-const Staging = struct {
+/// Host-visible staging buffer used by Atlas (and other GPU resources
+/// — image_texture etc.) to copy bytes from CPU to a device-local
+/// `VkImage`. Pub so siblings in `src/gpu/` can reuse without each
+/// open-coding the same vkBuffer + memory + map dance.
+pub const Staging = struct {
     buffer: c.VkBuffer,
     memory: c.VkDeviceMemory,
     mapped: [*]u8,
 
-    fn init(pd: c.VkPhysicalDevice, dev: c.VkDevice, size: u64) !Staging {
+    pub fn init(pd: c.VkPhysicalDevice, dev: c.VkDevice, size: u64) !Staging {
         var bci = std.mem.zeroes(c.VkBufferCreateInfo);
         bci.sType = c.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         bci.size = size;
@@ -460,7 +464,7 @@ const Staging = struct {
         };
     }
 
-    fn deinit(self: *Staging, dev: c.VkDevice) void {
+    pub fn deinit(self: *Staging, dev: c.VkDevice) void {
         c.vkUnmapMemory(dev, self.memory);
         c.vkDestroyBuffer(dev, self.buffer, null);
         c.vkFreeMemory(dev, self.memory, null);
@@ -468,7 +472,7 @@ const Staging = struct {
     }
 };
 
-fn findMemoryType(
+pub fn findMemoryType(
     pd: c.VkPhysicalDevice,
     type_bits: u32,
     required: c.VkMemoryPropertyFlags,
@@ -484,7 +488,7 @@ fn findMemoryType(
     return error.NoSuitableMemoryType;
 }
 
-fn cmdImageBarrier(
+pub fn cmdImageBarrier(
     cmd: c.VkCommandBuffer,
     image: c.VkImage,
     old_layout: c.VkImageLayout,
