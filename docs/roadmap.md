@@ -417,21 +417,93 @@ Demo: three `Run …` buttons sit next to three idle
 `:::llm-stream` blocks (Ollama / DeepSeek / OpenRouter-Gemini).
 Click to trigger; click again to watch a fresh stream paint in.
 
-## Then — input field (stage 13c)
+## Shipped — input field (stage 13c)
 
-Closes the user→LLM authoring loop properly. A `:::input` text
-field with cursor + selection + IME, paired with `:::button` to
-fire the prompt as the user's message. Demo: a single chat
-session where the user can type, click send, watch the streamed
-response, type again. That's the v1 of the live-document
-substrate's headline use case.
+`:::input` — single-line editable text field. Cursor + UTF-8
+buffer + caret blink + arrows / home / end / backspace / delete /
+enter. Click to focus (vtable's `focusable=true` propagates onto
+the walker's Hit), Esc clears focus. Enter dispatches
+`registry.handleUpdate(target, action, body=buffer)`.
 
-## Then — more components (stage 13d+)
+`element.InputEvent` grew `char_input`, `key_down`,
+`focus_gained`, `focus_lost` channels; `KeyEvent` carries the
+GLFW keycode + mod mask. `FrameCtx.focused: ?Hit` tracks current
+focus; GLFW char callback registered alongside the existing key
++ scroll callbacks.
 
-3D scene (eventually integrates with matryoshka), live chart
-beyond sparkline, form, table. Each is a self-contained
-component module; the contract is fixed by stage 7. Repetitive
-work, not architectural.
+`:::llm-stream.handleUpdate` now respects a non-empty body as a
+prompt override — so the input dispatches the typed text as the
+new prompt, while the button keeps the canned default for retry.
+
+Demo: three input fields, one above each LLM stream. Type a
+question, hit Enter, three providers answer in parallel.
+
+## Shipped — `:::svg` + triangle pipeline (stage 13d.1)
+
+End-to-end vector graphics. New mini SVG parser scoped to the
+Recraft V4.1 subset (M/L/C/z paths with rgb fills + translate).
+New CPU tessellator: recursive cubic-Bezier flattening +
+Mapbox-port earcut for arbitrary simple polygons (with hole
+stitching). New Vulkan triangle pipeline (VBO + IBO indexed
+draw, flat-colour shaders, premul alpha blend matching
+quad/text). Render order: triangles → quads → text so SVG fills
+sit under chrome + glyphs.
+
+`:::svg {src= width= height=}` reads a file, parses,
+tessellates once at create time, caches the mesh per-component,
+transforms viewBox coords to screen at layout. Failure flips to
+red placeholder.
+
+The Petunias.svg fixture (125 paths, 4174 triangles) became the
+calibration target — Recraft V4.1's output is sharply
+constrained (no `<g>`, no gradients, no strokes), which kept
+the parser tight.
+
+## Shipped — parallel tessellation (stage 13d.2)
+
+`svg_tessellate.tessellateParallel(allocator, paths, mesh,
+job_system, opts)` — one Job per `<path>`, each worker
+tessellates into its own `c_allocator`-backed `Mesh`, serial
+merge on the main thread with index rebasing.
+
+**8.17×** speedup on Petunias's 125 paths (22 ms → 2.7 ms).
+Basically linear scaling because path costs are wildly uneven (1
+cubic vs 30+ cubics) and the work-stealing pool absorbs the
+long-tail without main-thread coordination. Equivalence test
+confirms identical vertex + index counts across serial /
+parallel paths.
+
+## Shipped — `:::svg-stream` (stage 13d.3)
+
+`:::svg-stream {provider= endpoint= model= api_key_env= prompt=
+max_tokens= width= auto_start=}` — vector graphics generated
+on demand by an image-class model. Default targets
+`recraft/recraft-v4.1-vector` on OpenRouter.
+
+The wire format is **not** chat-shaped despite the
+`/chat/completions` endpoint. Send `stream:false`, accumulate
+raw HTTP chunks, parse the JSON envelope on `.end`, find
+`choices[0].message.images[0].image_url.url`
+("`data:image/svg+xml;base64,...`"), strip the prefix, base64-
+decode, run through `svg.parse` + `tessellateParallel`. Phase
+model is `{idle, loading, done, failed}` — there's no real
+intermediate streaming state since Recraft itself is one-shot.
+
+Refactored the IoChannel completion routing in the process:
+`io.PendingHeader` (function-pointer first field of every
+PendingX struct) replaces the old result-kind switch in
+`drainHandler`. Adding a new consumer no longer touches
+`main.zig`.
+
+## Then — more components (stage 13d.4+)
+
+Raster `:::image` (PNG/JPG via base64 data URL, mirrors the
+SVG-stream shape with a texture pipeline instead of triangles).
+More SVG generators (Stability SD-Vector, Bytedance Doubao-Vector
+on OpenRouter). 3D scene (eventually integrates with
+matryoshka), live chart beyond sparkline, form, table. Each is
+a self-contained component module; the contract is fixed by
+stage 7. Repetitive work, not architectural.
 
 ## Parallel — retained layout cache
 

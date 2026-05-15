@@ -357,18 +357,58 @@ TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
   the stream on `action=start` — cancels any in-flight (nulls
   the back-pointer, the worker keeps running but the completion
   handler discards), clears content + line buffer, resets the
-  arena, kicks off a fresh fetch. Demo now has three `Run …`
-  buttons next to three idle `:::llm-stream` blocks; click to
-  trigger, click again to re-run. ~7.5k fps idle.
+  arena, kicks off a fresh fetch.
+
+- [x] **Stage 13c — `:::input` field.** Single-line editable
+  text field with UTF-8 buffer + caret blink + arrows / home /
+  end / backspace / delete / enter. Click to focus, Esc clears.
+  `element.InputEvent` grew `char_input`, `key_down`,
+  `focus_gained`, `focus_lost` channels. `Hit.focusable` via the
+  vtable so the walker stamps it onto the emitted Hit
+  automatically — a manual `hits.append` would get shadowed by
+  the walker's. `:::llm-stream.handleUpdate` accepts the typed
+  text as a prompt override; button keeps the canned default for
+  retry.
+
+- [x] **Stage 13d.1 — `:::svg` + triangle pipeline + earcut.**
+  End-to-end vector graphics. Mini SVG parser (M/L/C/z + rgb
+  fills + translate, ~600 lines), Bezier flatten + Mapbox-port
+  earcut tessellator with hole stitching (~700 lines), new
+  Vulkan VBO+IBO triangle pipeline + shaders. Render order:
+  triangles → quads → text. `:::svg {src= width= height=}` reads
+  a file, parses, tessellates once, caches the mesh. Petunias.svg
+  fixture lands as a 125-path, 4174-triangle bowl-of-petunias.
+
+- [x] **Stage 13d.2 — parallel tessellation.**
+  `tessellateParallel` fans out one Job per `<path>` across the
+  JobSystem, each worker tessellates into its own
+  `c_allocator`-backed Mesh, serial merge on the main thread
+  with index rebasing. **8.17× speedup** on Petunias (22 ms → 2.7
+  ms), basically linear because path costs are wildly uneven and
+  the work-stealer absorbs the long-tail. Equivalence test
+  confirms identical vert/index counts across serial / parallel.
+
+- [x] **Stage 13d.3 — `:::svg-stream` (Recraft V4.1).** Live
+  vector generation. Send `stream:false` to OpenRouter (Recraft
+  is one-shot despite the chat-completions wrapper), accumulate
+  raw response, on `.end` parse the JSON envelope, extract
+  `choices[0].message.images[0].image_url.url`, base64-decode the
+  data URL, run through `svg.parse` + `tessellateParallel`,
+  swap in the mesh. Refactored IoChannel completion routing in
+  the process: every `PendingX` struct now starts with an
+  `io.PendingHeader` (function-pointer first field), so
+  `drainHandler` dispatches polymorphically and new consumers no
+  longer touch `main.zig`.
 
 ## What's next
 
-[`docs/roadmap.md`](docs/roadmap.md). Open queue: **stage 13b**
-(input field + button — closes the user→LLM authoring loop),
-**stage 10** (headless documents), **retained layout cache**
-(skip re-walk when neither tree nor inputs changed; the
-stream-driven re-parse dropped FPS from 9.3k→5.9k during
-streaming, so this is now load-bearing), **crisp zoom**
-(multi-size atlas + re-layout-on-zoom), **persistent URL cache**
-(disk-backed so remote widgets survive restarts). None of them
-block each other.
+[`docs/roadmap.md`](docs/roadmap.md). Open queue: **retained
+layout cache** (now load-bearing — per-chunk re-parse re-walks
+the whole doc, fine for one stream but stresses three+),
+**stage 10** (headless documents — composition-track
+completion), **SVG cache** (content-addressable disk cache
+keyed on model+prompt; Recraft is $0.08 per image), **raster
+`:::image`** (PNG/JPG via OpenRouter image-class models —
+plumbing mirrors svg-stream), **crisp zoom** (multi-size atlas
++ re-layout-on-zoom), **persistent URL cache** (disk-backed
+remote widgets across restarts).
