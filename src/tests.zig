@@ -16,6 +16,7 @@ test {
     _ = @import("components/input.zig");
     _ = @import("components/llm_stream.zig");
     _ = @import("components/svg.zig");
+    _ = @import("components/svg_stream.zig");
     _ = @import("components/slider.zig");
     _ = @import("dotenv.zig");
     _ = @import("io_channel.zig");

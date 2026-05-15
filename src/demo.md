@@ -114,3 +114,16 @@ A new triangle pipeline + CPU tessellator (Bezier flatten + earcut) renders SVG 
 
 :::svg {#petunias src=src/test_data/Petunias.svg width=480}
 :::
+
+## Live vector generation (stage 13d.3) — `:::svg-stream`
+
+Same triangle pipeline, but the SVG isn't on disk — it's authored by **Recraft V4.1** via OpenRouter. Recraft turns out to be a one-shot image-generation model behind a chat-completions endpoint: the SVG comes back base64-encoded inside `message.images[0].image_url`. We decode, parse, **parallel-tessellate through the JobSystem from 13d.2**, and swap in the mesh. Type a prompt, hit Enter, and after 5–15s of upstream queue the figure pops in. The renderer never blocks — every byte of the HTTP wait happens off-thread on the IoChannel.
+
+:::input {#ask_petunia target=#fresh_svg action=start placeholder="Describe an SVG… (Enter to generate)" width=100%}
+:::
+
+:::button {#run_petunia label="Run default prompt (a bowl of petunias)" target=#fresh_svg action=start}
+:::
+
+:::svg-stream {#fresh_svg auto_start=false provider=openai endpoint=https://openrouter.ai/api/v1/chat/completions model=recraft/recraft-v4.1-vector api_key_env=OPENROUTER_DYNABOOK prompt="A bowl of petunias, vector art, clean shapes, single bowl viewed from front, transparent background" max_tokens=8000 width=480}
+:::

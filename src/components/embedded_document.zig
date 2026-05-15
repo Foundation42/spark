@@ -200,6 +200,11 @@ const OverlayKV = struct {
 /// pointer to it (for cancellation). The completion handler owns
 /// its lifetime — frees it after applying or discarding the result.
 const PendingFetch = struct {
+    /// Polymorphic completion header (stage 13d.3). Host's drain
+    /// loop dispatches via `header.handle_completion`. Must be the
+    /// first field; `user_data` is `@intFromPtr(&pending)` and the
+    /// host reads the first usize.
+    header: io.PendingHeader = .{ .handle_completion = handleCompletion },
     allocator: std.mem.Allocator,
     /// Set to null by `deinit_` if the Component is destroyed while
     /// the fetch is in flight.

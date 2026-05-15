@@ -134,6 +134,22 @@ pub const Completion = struct {
     result: Result,
 };
 
+/// Polymorphic completion header. By convention every owner-side
+/// "Pending" struct begins with one of these; `user_data` is then
+/// `@intFromPtr(&pending)`, and the host's drain loop reads the
+/// first usize at `user_data` to dispatch.
+///
+/// Pre-stage-13d.3 the host's drainHandler routed by Result kind
+/// (`.ok/.err` → embedded-document, `.chunk/.end/.end_err` →
+/// llm-stream). That broke the moment a second `.chunk`-shaped
+/// consumer (svg-stream) needed routing too. This header lets each
+/// pending fetch carry its own completion handler — `svg-stream`
+/// and `llm-stream` produce the same Result variants but route to
+/// different code without the host having to special-case either.
+pub const PendingHeader = struct {
+    handle_completion: *const fn (Completion) void,
+};
+
 pub const IoChannel = struct {
     allocator: std.mem.Allocator,
     jobs: *jobs_mod.JobSystem,

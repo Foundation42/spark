@@ -131,6 +131,11 @@ const Phase = enum {
 };
 
 const PendingStream = struct {
+    /// First field — host's drain loop reads this directly to
+    /// dispatch the completion back to our handler. Stage 13d.3
+    /// introduced this convention so multiple consumers can share
+    /// the IoChannel without the host coding paths per consumer.
+    header: io.PendingHeader = .{ .handle_completion = handleCompletion },
     allocator: std.mem.Allocator,
     /// Null = cancelled. Subsequent chunk/end completions release
     /// owned bytes and discard.

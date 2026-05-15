@@ -39,6 +39,7 @@ const input_component = @import("components/input.zig");
 const llm_stream_component = @import("components/llm_stream.zig");
 const slider_component = @import("components/slider.zig");
 const svg_component = @import("components/svg.zig");
+const svg_stream_component = @import("components/svg_stream.zig");
 const state_mod = @import("state.zig");
 const update = @import("update.zig");
 const demo_server_mod = @import("demo_server.zig");
@@ -609,18 +610,15 @@ fn scrollCb(window: ?*win.c.GLFWwindow, _: f64, yoffset: f64) callconv(.C) void 
     fc.state.dirty = true;
 }
 
-/// `IoChannel.drain` handler. Stage 13a now has two consumers —
-/// embedded-document (one-shot http_get) and llm-stream (chunked
-/// http_stream). v0 routes by result kind: `.ok`/`.err` to the
-/// one-shot consumer, `.chunk`/`.end`/`.end_err` to the streaming
-/// consumer. Fragile if multiple consumers ever issue the same
-/// kind of request; revisit with a proper router-table when that
-/// happens.
+/// `IoChannel.drain` handler. Polymorphic dispatch through the
+/// `PendingHeader` that every consumer puts as the first field of
+/// its Pending struct (stage 13d.3). `user_data` is
+/// `@intFromPtr(&pending)`; we read the first usize there and call
+/// it. Adding a new consumer (svg-stream, future audio-stream)
+/// doesn't touch this file.
 fn drainHandler(_: *io_channel_mod.IoChannel, comp: io_channel_mod.Completion) void {
-    switch (comp.result) {
-        .ok, .err => embedded_document_component.handleCompletion(comp),
-        .chunk, .end, .end_err => llm_stream_component.handleCompletion(comp),
-    }
+    const header: *const io_channel_mod.PendingHeader = @ptrFromInt(comp.user_data);
+    header.handle_completion(comp);
 }
 
 /// HSV → RGB conversion using the standard six-sextant formula. `h`
@@ -703,7 +701,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 7 / stage 13d.2 (parallel SVG tessellation)\n", .{});
+    try stdout.print("text_engine demo — session 7 / stage 13d.3 (:::svg-stream — Recraft live)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
     try stdout.print("  demo.md bytes:         {d}\n", .{demo_md.len});
@@ -860,6 +858,8 @@ pub fn main() !void {
     defer input_component.deinitGlobals();
     try svg_component.install(&registry, job_system);
     defer svg_component.deinitGlobals();
+    try svg_stream_component.install(&registry, &host_state, &io_channel, &env, job_system);
+    defer svg_stream_component.deinitGlobals();
 
     // Stage 13d.2 — micro-benchmark serial vs parallel tessellation
     // on Petunias.svg before the markdown parse begins. Runs once at
