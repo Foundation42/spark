@@ -186,6 +186,11 @@ const Component = struct {
     max_tokens: u32 = DEFAULT_MAX_TOKENS,
 
     err_name: ?[]u8 = null,
+
+    /// Bumped on phase transitions, mesh swap, handle_update — every
+    /// path that changes the visible output. Drives retained
+    /// layout-cache invalidation.
+    version: u64 = 0,
 };
 
 pub const factory: component_mod.Factory = .{
@@ -332,6 +337,7 @@ fn handleUpdate(ctx: *anyopaque, action: []const u8, body: []const u8) anyerror!
         if (c.err_name) |old| a.free(old);
         c.err_name = a.dupe(u8, @errorName(e)) catch null;
     };
+    c.version +%= 1;
     if (parent_state_ref) |ps| ps.dirty = true;
 }
 
@@ -422,6 +428,7 @@ fn handleCompletion(comp: io.Completion) void {
                     if (c.err_name) |old| a.free(old);
                     c.err_name = a.dupe(u8, @errorName(e)) catch null;
                 };
+                c.version +%= 1;
                 if (parent_state_ref) |ps| ps.dirty = true;
             }
             freePending(p);
@@ -433,6 +440,7 @@ fn handleCompletion(comp: io.Completion) void {
                 const a = c.allocator;
                 if (c.err_name) |old| a.free(old);
                 c.err_name = a.dupe(u8, @errorName(e)) catch null;
+                c.version +%= 1;
                 if (parent_state_ref) |ps| ps.dirty = true;
             }
             freePending(p);
@@ -508,7 +516,13 @@ fn finalizeResponse(c: *Component) !void {
 
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
+    .content_version = contentVersion,
 };
+
+fn contentVersion(ctx: *anyopaque) u64 {
+    const c: *const Component = @ptrCast(@alignCast(ctx));
+    return c.version;
+}
 
 fn layoutAndRender(
     ctx: *anyopaque,

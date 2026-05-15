@@ -28,6 +28,7 @@ const registry_mod = @import("font/registry.zig");
 const glyph_cache_mod = @import("text/glyph_cache.zig");
 const element = @import("element.zig");
 const element_layout = @import("element_layout.zig");
+const layout_cache_mod = @import("layout_cache.zig");
 const markdown = @import("markdown.zig");
 const ansi = @import("ansi.zig");
 const component = @import("component.zig");
@@ -124,6 +125,15 @@ const FrameCtx = struct {
     // Mutable scratch — `dl` accumulates this layout pass's draw work
     dl: *element.DrawList,
 
+    // Stage 14a — retained per-block layout cache. Owned by main;
+    // cleared on theme swap / full re-parse (neither happens in the
+    // current demo after startup). The walker consults this through
+    // `LayoutCtx.cache_blocks` for every cacheable child of a stack_v
+    // container — hits blit cached glyph/quad/tri/hit ranges with an
+    // origin offset, misses fall through to a full walk and snapshot
+    // the result back into the cache.
+    block_cache: *layout_cache_mod.BlockCache,
+
     // Cached viewport for resize detection. Starts at {0,0} so the
     // first `drawCb` call sees a mismatch and triggers the initial
     // layout, unifying init and resize paths.
@@ -214,6 +224,7 @@ const FrameCtx = struct {
             // they emit. Embedded-doc layoutAndRender save+swap+
             // restores around its child subtree.
             .state = @ptrCast(self.state),
+            .cache_blocks = self.block_cache,
         };
         var ansi_lc = lc;
         ansi_lc.theme = self.ansi_theme;
@@ -228,11 +239,11 @@ const FrameCtx = struct {
         // Layout in WORLD coordinates — no scroll/zoom applied here.
         // The transform pass at the bottom of this function maps
         // world → screen.
-        const top_box = try element_layout.layoutAndRender(self.top_stack, .{ 40, 40 }, c, &lc, self.dl);
-        const ansi_box = try element_layout.layoutAndRender(self.ansi_tree, .{ 40, top_box.y + top_box.h + 8 }, c, &ansi_lc, self.dl);
+        const top_box = try element_layout.layoutAndRenderCached(self.top_stack, .{ 40, 40 }, c, &lc, self.dl);
+        const ansi_box = try element_layout.layoutAndRenderCached(self.ansi_tree, .{ 40, top_box.y + top_box.h + 8 }, c, &ansi_lc, self.dl);
 
         self.pulse_start = @intCast(self.dl.glyphs.items.len);
-        const sdf_box = try element_layout.layoutAndRender(self.sdf_block, .{ 40, ansi_box.y + ansi_box.h }, c, &lc, self.dl);
+        const sdf_box = try element_layout.layoutAndRenderCached(self.sdf_block, .{ 40, ansi_box.y + ansi_box.h }, c, &lc, self.dl);
         self.pulse_count = @intCast(self.dl.glyphs.items.len - self.pulse_start);
 
         // Recompute max scrollable distance from world content height
@@ -701,7 +712,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 7 / stage 13d.3 (:::svg-stream — Recraft live)\n", .{});
+    try stdout.print("text_engine demo — session 8 / stage 14a (retained layout cache)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
     try stdout.print("  demo.md bytes:         {d}\n", .{demo_md.len});
@@ -907,6 +918,15 @@ pub fn main() !void {
     var dl = element.DrawList.init(allocator);
     defer dl.deinit();
 
+    // Stage 14a — retained per-block layout cache. Reused across every
+    // re-layout pass; lives for the program lifetime. See
+    // `layout_cache.zig` for the cacheability rules — built-in
+    // paragraph/heading/code_block/thematic_break participate
+    // automatically; custom components opt in via vtable.content_version
+    // and out via vtable.disable_cache.
+    var block_cache = layout_cache_mod.BlockCache.init(allocator);
+    defer block_cache.deinit();
+
     // ANSI uses a mono-bodied derivation of the theme so spacing is
     // terminal-like. Bold + italic still fall back to the proportional
     // variants of the main theme — mono bold / italic font loads are
@@ -940,6 +960,7 @@ pub fn main() !void {
         .ansi_tree = ansi_tree,
         .sdf_block = sdf_block,
         .dl = &dl,
+        .block_cache = &block_cache,
         .start_ms = start_ms,
         .state = &host_state,
     };
@@ -1068,10 +1089,17 @@ pub fn main() !void {
         frame_ctx.pulse_count,
     });
     try stdout.print("  quads:                 {d}\n", .{frame_ctx.dl.quads.items.len});
-    try stdout.print("  cache:                 {d} miss / {d} hit ({d:.1}% hit rate)\n", .{
+    try stdout.print("  glyph cache:           {d} miss / {d} hit ({d:.1}% hit rate)\n", .{
         cache.misses,
         cache.hits,
         cache.hitRate() * 100.0,
+    });
+    try stdout.print("  layout cache:          {d} hit / {d} miss / {d} skip ({d:.1}% hit rate, {d} entries)\n", .{
+        block_cache.hits,
+        block_cache.misses,
+        block_cache.skipped,
+        block_cache.hitRate() * 100.0,
+        block_cache.entries.count(),
     });
     try stdout.print("  frames:                {d} in {d}ms ({d:.1} fps)\n", .{
         frame_count,

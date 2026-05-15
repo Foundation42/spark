@@ -255,6 +255,23 @@ pub const ElementVTable = struct {
     /// the host's input dispatcher can wire focus correctly.
     /// Default false — only text-bearing widgets (`:::input`) opt in.
     focusable: bool = false,
+    /// Optional content-version getter for the retained layout cache
+    /// (stage 14a). Returns a monotonic counter the component bumps
+    /// on every internal mutation (chart append, LLM stream chunk,
+    /// SVG mesh swap, input caret edit, etc.). The cache keys
+    /// include this — a bump produces a fresh key → cache miss →
+    /// re-walk. `null` means "treat as content-version 0", which is
+    /// correct for pure-by-pointer-identity components.
+    content_version: ?*const fn (ctx: *anyopaque) u64 = null,
+    /// Disable caching for this component at the outer Element level.
+    /// Set when the component's layout output depends on external
+    /// state the cache key can't see — reading `state.*` at layout
+    /// time (slider thumb position), per-frame animation (input
+    /// caret blink), or recursive composition whose inner mutations
+    /// can't be summarised in a single version counter
+    /// (embedded-document). Inner stack_v walks still cache their
+    /// own children — only the outer block-grain cache is suppressed.
+    disable_cache: bool = false,
 };
 
 /// One input event delivered to a component's `on_input`. Stage 13c
@@ -506,6 +523,12 @@ pub const LayoutCtx = struct {
     /// child state before delegating into the child element tree.
     /// `null` keeps the dispatcher on its fallback path.
     state: ?*anyopaque = null,
+    /// Optional per-block layout cache (stage 14a). When non-null,
+    /// the walker consults it for each cacheable child of a stack_v
+    /// container — hits blit cached glyph/quad/tri ranges with an
+    /// origin offset; misses walk fresh + snapshot back into the
+    /// cache. `null` falls through to the unconditional walk path.
+    cache_blocks: ?*layout_cache_mod.BlockCache = null,
 };
 
 /// GPU draw work accumulated during the walk. Quads land first
@@ -568,3 +591,4 @@ const glyph_cache_mod = @import("text/glyph_cache.zig");
 const atlas_mod = @import("gpu/atlas.zig");
 const qp = @import("gpu/quad_pipeline.zig");
 const tri_pipeline = @import("gpu/tri_pipeline.zig");
+const layout_cache_mod = @import("layout_cache.zig");

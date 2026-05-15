@@ -95,6 +95,11 @@ const Component = struct {
 
     phase: Phase = .ready,
     err_name: ?[]u8 = null, // owned by allocator (NOT arena)
+
+    /// Bumped on src= change / re-tessellate so the retained layout
+    /// cache invalidates the block. Static SVGs (no src changes
+    /// post-create) stay at version 0 → permanent cache hit.
+    version: u64 = 0,
 };
 
 fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
@@ -164,6 +169,7 @@ fn update(ctx: *anyopaque, spec: *const components.Spec) anyerror!void {
             c.phase = .failed;
             c.err_name = c.allocator.dupe(u8, @errorName(e)) catch null;
         };
+        c.version +%= 1;
     }
 }
 
@@ -211,7 +217,13 @@ fn loadAndTessellate(c: *Component) !void {
 
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
+    .content_version = contentVersion,
 };
+
+fn contentVersion(ctx: *anyopaque) u64 {
+    const c: *const Component = @ptrCast(@alignCast(ctx));
+    return c.version;
+}
 
 const ERR_BORDER: [4]f32 = .{ 0.85, 0.30, 0.30, 0.95 };
 const ERR_BG: [4]f32 = .{ 0.30, 0.08, 0.08, 0.60 };

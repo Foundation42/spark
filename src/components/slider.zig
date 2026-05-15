@@ -140,6 +140,11 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .on_input = onInput,
+    // Slider reads `state.${target}` at layout time to position its
+    // thumb — the value isn't captured in any component-owned counter,
+    // so the cache key can't see it move. Bypass the cache; the slider
+    // is cheap to walk anyway (two quads + a hit).
+    .disable_cache = true,
 };
 
 // ── Visual constants — local, not theme yet ───────────────────────

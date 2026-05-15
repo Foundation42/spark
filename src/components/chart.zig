@@ -80,6 +80,9 @@ const Component = struct {
     color: [4]f32 = DEFAULT_COLOR,
     bg: [4]f32 = DEFAULT_BG,
     radius: f32 = 4,
+    /// Bumped on every visible-state mutation (append/clear/applySpec).
+    /// Drives retained layout-cache invalidation.
+    version: u64 = 0,
 
     /// Apply attrs from a Spec onto the component. Values that fail
     /// to parse keep the previous (or default) field value — louder
@@ -114,11 +117,13 @@ const Component = struct {
         self.samples[self.write_idx] = value;
         self.write_idx = (self.write_idx + 1) % self.capacity;
         if (self.filled < self.capacity) self.filled += 1;
+        self.version +%= 1;
     }
 
     fn clear(self: *Component) void {
         self.write_idx = 0;
         self.filled = 0;
+        self.version +%= 1;
     }
 
     /// Logical index 0..filled-1 (0 = oldest, filled-1 = newest).
@@ -162,6 +167,7 @@ fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!c
 fn update(ctx: *anyopaque, spec: *const components.Spec) anyerror!void {
     const c: *Component = @ptrCast(@alignCast(ctx));
     c.applySpec(spec);
+    c.version +%= 1;
 }
 
 fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
@@ -183,7 +189,13 @@ fn handleUpdate(ctx: *anyopaque, action: []const u8, body: []const u8) anyerror!
 
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
+    .content_version = contentVersion,
 };
+
+fn contentVersion(ctx: *anyopaque) u64 {
+    const c: *const Component = @ptrCast(@alignCast(ctx));
+    return c.version;
+}
 
 fn layoutAndRender(
     ctx: *anyopaque,

@@ -177,6 +177,12 @@ const Component = struct {
 
     /// Set when `.failed`. Owned by the Component.
     err_name: ?[]u8 = null,
+
+    /// Bumped on every visible-state mutation (chunk, phase change,
+    /// re-fire). The retained layout cache keys on this so the
+    /// stream's block re-walks each chunk while everything else in
+    /// the document stays cached.
+    version: u64 = 0,
 };
 
 pub const factory: component_mod.Factory = .{
@@ -364,6 +370,7 @@ fn handleUpdate(ctx: *anyopaque, action: []const u8, body: []const u8) anyerror!
         if (c.err_name) |old| a.free(old);
         c.err_name = a.dupe(u8, @errorName(e)) catch null;
     };
+    c.version +%= 1;
     if (parent_state_ref) |ps| ps.dirty = true;
 }
 
@@ -463,12 +470,14 @@ pub fn handleCompletion(comp: io.Completion) void {
             processChunk(c, bytes) catch |e| {
                 std.log.err("llm-stream: chunk processing failed: {s}", .{@errorName(e)});
             };
+            c.version +%= 1;
             if (parent_state_ref) |ps| ps.dirty = true;
         },
         .end => {
             if (p.component) |c| {
                 c.phase = .done;
                 c.pending = null;
+                c.version +%= 1;
                 if (parent_state_ref) |ps| ps.dirty = true;
             }
             freePending(p);
@@ -480,6 +489,7 @@ pub fn handleCompletion(comp: io.Completion) void {
                 const a = c.allocator;
                 if (c.err_name) |old| a.free(old);
                 c.err_name = a.dupe(u8, @errorName(e)) catch null;
+                c.version +%= 1;
                 if (parent_state_ref) |ps| ps.dirty = true;
             }
             freePending(p);
@@ -648,7 +658,13 @@ fn rerenderContent(c: *Component) !void {
 
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
+    .content_version = contentVersion,
 };
+
+fn contentVersion(ctx: *anyopaque) u64 {
+    const c: *const Component = @ptrCast(@alignCast(ctx));
+    return c.version;
+}
 
 fn layoutAndRender(
     ctx: *anyopaque,
@@ -671,9 +687,20 @@ fn layoutAndRender(
             return try renderPlaceholder(msg, .loading, origin, constraints, lc, out);
         },
         .streaming, .done => {
-            const saved = lc.state;
+            const saved_state = lc.state;
+            // Inner cache bypass: every chunk re-parses the child
+            // Element tree from scratch, so the children's pointer
+            // identities change each tick. Caching them would
+            // accumulate dead entries indefinitely. The outer
+            // llm-stream block already gets an own cache entry that
+            // invalidates per chunk — that's where the savings live.
+            const saved_cache = lc.cache_blocks;
             lc.state = @ptrCast(c.child_state);
-            defer lc.state = saved;
+            lc.cache_blocks = null;
+            defer {
+                lc.state = saved_state;
+                lc.cache_blocks = saved_cache;
+            }
             return try element_layout.layoutAndRender(c.root, origin, constraints, lc, out);
         },
         .failed => {

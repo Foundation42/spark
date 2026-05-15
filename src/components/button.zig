@@ -77,6 +77,9 @@ const Component = struct {
     width: ?box_helpers.Length, // null = intrinsic
     height: f32,
     last_box: element.Box = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    /// Bumped on every spec ingest so the retained layout cache
+    /// re-walks the button when its attrs change.
+    version: u64 = 0,
 
     fn ingest(self: *Component, spec: *const components.Spec) !void {
         const a = self.allocator;
@@ -137,6 +140,7 @@ const Component = struct {
         self.body = new_body;
         self.width = width_opt;
         self.height = height_opt;
+        self.version +%= 1;
     }
 };
 
@@ -173,7 +177,13 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .on_input = onInput,
+    .content_version = contentVersion,
 };
+
+fn contentVersion(ctx: *anyopaque) u64 {
+    const c: *const Component = @ptrCast(@alignCast(ctx));
+    return c.version;
+}
 
 // ── Visual constants ────────────────────────────────────────────────
 

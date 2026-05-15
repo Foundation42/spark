@@ -50,6 +50,10 @@ const Component = struct {
     width: Length,
     height: Length,
     radius: f32,
+    /// Bumped on every mutation; consulted by the retained layout
+    /// cache so a state-driven attr change invalidates the cached
+    /// block. See `layout_cache.zig`.
+    version: u64 = 0,
 
     fn fromSpec(spec: *const components.Spec) Component {
         var c: Component = .{
@@ -99,7 +103,9 @@ fn create(
 
 fn update(ctx: *anyopaque, spec: *const components.Spec) anyerror!void {
     const c: *Component = @ptrCast(@alignCast(ctx));
+    const prev_version = c.version;
     c.* = Component.fromSpec(spec);
+    c.version = prev_version +% 1;
 }
 
 fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
@@ -121,6 +127,7 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
 /// state opaquely (charts, scrolling logs, …).
 fn handleUpdate(ctx: *anyopaque, action: []const u8, body: []const u8) anyerror!void {
     const c: *Component = @ptrCast(@alignCast(ctx));
+    c.version +%= 1;
     const value = std.mem.trim(u8, body, " \t\r\n");
     if (std.mem.eql(u8, action, "set-color")) {
         if (parseColor(value)) |col| c.color = col;
@@ -140,7 +147,13 @@ fn handleUpdate(ctx: *anyopaque, action: []const u8, body: []const u8) anyerror!
 
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
+    .content_version = contentVersion,
 };
+
+fn contentVersion(ctx: *anyopaque) u64 {
+    const c: *const Component = @ptrCast(@alignCast(ctx));
+    return c.version;
+}
 
 fn layoutAndRender(
     ctx: *anyopaque,

@@ -33,6 +33,7 @@ const element = @import("element.zig");
 const text_layout = @import("text/layout.zig");
 const shape = @import("font/shape.zig");
 const qp = @import("gpu/quad_pipeline.zig");
+const layout_cache = @import("layout_cache.zig");
 
 pub const Error = error{
     /// `text` or `line_break` appeared at a position where only block
@@ -49,6 +50,70 @@ pub const Error = error{
 // `ctx.theme.*` — see element.zig for the named fields. Walker
 // reaches them through LayoutCtx so the host can swap themes
 // without touching engine internals.
+
+/// Cache-aware entry point. Wraps `layoutAndRender` for elements that
+/// are eligible to be cached at the block grain (stage 14a). Use this
+/// at top-level call sites and inside stack_v walks; bypass when you
+/// know you want a fresh walk (e.g. inside a custom component that
+/// owns its own DrawList).
+///
+/// Hit → blit cached glyph/quad/tri/hit ranges with origin offset.
+/// Miss → fall through to `layoutAndRender`, then snapshot the
+/// appended ranges back into the cache in block-local coordinates.
+/// No cache wired, or element not eligible → plain walk.
+pub fn layoutAndRenderCached(
+    elem: element.Element,
+    origin: [2]f32,
+    constraints: element.Constraints,
+    ctx: *element.LayoutCtx,
+    out: *element.DrawList,
+) anyerror!element.Box {
+    const cache = ctx.cache_blocks orelse return layoutAndRender(elem, origin, constraints, ctx, out);
+    if (!layout_cache.cacheableLeaf(elem)) {
+        cache.skipped += 1;
+        return layoutAndRender(elem, origin, constraints, ctx, out);
+    }
+    const id = layout_cache.elementIdentity(elem);
+    if (id == 0) {
+        cache.skipped += 1;
+        return layoutAndRender(elem, origin, constraints, ctx, out);
+    }
+
+    const key = layout_cache.keyFor(elem, constraints, ctx.theme);
+    const version = layout_cache.versionFor(elem);
+
+    if (cache.lookup(key, version)) |entry| {
+        return try layout_cache.blitEntry(out, entry, origin);
+    }
+
+    // Miss: walk into the live DrawList at `origin`, then snapshot the
+    // appended ranges back into the cache (translated to block-local
+    // coordinates) so the next walk hits.
+    const g_start = out.glyphs.items.len;
+    const q_start = out.quads.items.len;
+    const t_start = out.tris.items.len;
+    const ti_start = out.tri_indices.items.len;
+    const h_start = out.hits.items.len;
+    const tri_vertex_base: u32 = @intCast(out.tris.items.len);
+
+    const box = try layoutAndRender(elem, origin, constraints, ctx, out);
+
+    try layout_cache.snapshotEntry(
+        cache,
+        key,
+        version,
+        out,
+        g_start,
+        q_start,
+        t_start,
+        ti_start,
+        h_start,
+        tri_vertex_base,
+        origin,
+        box,
+    );
+    return box;
+}
 
 /// Lay out + render `elem` with its top-left at `origin`. Returns the
 /// element's measured `Box` (in display pixels). Constraints are
@@ -387,7 +452,7 @@ fn layoutStackV(
     var max_w: f32 = 0;
     for (children, 0..) |child, i| {
         if (i != 0) y += gap;
-        const child_box = try layoutAndRender(
+        const child_box = try layoutAndRenderCached(
             child,
             .{ origin[0], y },
             constraints,

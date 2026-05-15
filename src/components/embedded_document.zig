@@ -600,6 +600,13 @@ fn findAttr(attrs: []const components.Attr, key: []const u8) ?[]const u8 {
 
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
+    // Embedded-doc composes a whole inner tree whose state can mutate
+    // without the outer wrapper seeing it (the child State's dirty
+    // bubble wakes the renderer but doesn't bump us). Caching the
+    // outer block as a unit would freeze the inner snapshot. Disable
+    // outer caching; the inner stack_v walk caches its own children,
+    // which is where the savings live anyway.
+    .disable_cache = true,
 };
 
 fn layoutAndRender(

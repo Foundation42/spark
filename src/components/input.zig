@@ -208,6 +208,12 @@ const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .on_input = onInput,
     .focusable = true,
+    // Caret blinks on a wall-clock timer + the field re-renders every
+    // keystroke. Either could be plumbed through a version counter,
+    // but the field is cheap to walk (one quad, one underline, one
+    // shape() of the buffer) and caching it would mean bumping per
+    // frame anyway. Walk fresh, save the bookkeeping.
+    .disable_cache = true,
 };
 
 // ── Visual constants ────────────────────────────────────────────────
