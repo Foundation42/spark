@@ -22,6 +22,7 @@ const renderer = @import("gpu/renderer.zig");
 const atlas_mod = @import("gpu/atlas.zig");
 const tp = @import("gpu/text_pipeline.zig");
 const qp = @import("gpu/quad_pipeline.zig");
+const tri_pipeline_mod = @import("gpu/tri_pipeline.zig");
 const face_mod = @import("font/face.zig");
 const registry_mod = @import("font/registry.zig");
 const glyph_cache_mod = @import("text/glyph_cache.zig");
@@ -37,6 +38,7 @@ const embedded_document_component = @import("components/embedded_document.zig");
 const input_component = @import("components/input.zig");
 const llm_stream_component = @import("components/llm_stream.zig");
 const slider_component = @import("components/slider.zig");
+const svg_component = @import("components/svg.zig");
 const state_mod = @import("state.zig");
 const update = @import("update.zig");
 const demo_server_mod = @import("demo_server.zig");
@@ -73,6 +75,12 @@ const ATLAS_COLOR_SIZE: u32 = 1024;
 // headroom; bump again if/when doc density justifies.
 const MAX_GLYPHS: u32 = 8192;
 const MAX_QUADS: u32 = 2048;
+// Stage 13d.1 caps. Petunias.svg flattens to ~5–10k triangles
+// (verts + indices each ≈3× tri count for triangle lists).
+// 65k / 196k is comfortable headroom for a few SVGs co-existing on
+// screen; bump when document density justifies.
+const MAX_TRI_VERTICES: u32 = 65536;
+const MAX_TRI_INDICES: u32 = 196608;
 
 /// Per-frame context owned by main(), borrowed by `drawCb` through
 /// the renderer's `*anyopaque` slot. Carries everything `drawCb`
@@ -94,6 +102,7 @@ const FrameCtx = struct {
     // GPU
     text_pipeline: *tp.TextPipeline,
     quad_pipeline: *qp.QuadPipeline,
+    tri_pipeline: *tri_pipeline_mod.TrianglePipeline,
 
     // Layout prerequisites (borrowed from main)
     allocator: std.mem.Allocator,
@@ -157,6 +166,7 @@ const FrameCtx = struct {
     // proper long-term fix — TODO captured at the SSBO-emit sites.
     glyph_overflow_logged: bool = false,
     quad_overflow_logged: bool = false,
+    tri_overflow_logged: bool = false,
 
     // Scroll + zoom (stage post-11, ad-hoc — the demo's full doc
     // height now exceeds typical viewport once embedded docs are
@@ -252,6 +262,14 @@ const FrameCtx = struct {
             q.dst_size[1] *= z;
             q.radius *= z;
         }
+        // Same transform on triangle vertices — they live in world
+        // space alongside quads + glyphs, and the tri shader expects
+        // screen-space pixels just like the others.
+        for (self.dl.tris.items) |*v| {
+            v.pos[1] -= sy;
+            v.pos[0] *= z;
+            v.pos[1] *= z;
+        }
 
         // Quads stay frozen between layouts (no animation on them);
         // upload once per layout instead of per frame.
@@ -266,6 +284,21 @@ const FrameCtx = struct {
                     .{ @errorName(err), self.dl.quads.items.len, MAX_QUADS },
                 );
                 self.quad_overflow_logged = true;
+            }
+            return err;
+        };
+
+        // Stage 13d.1 — upload triangle mesh once per layout.
+        // SVGs are static post-tessellation, so per-layout upload
+        // is appropriate; if streamed re-tessellation lands (13d.3)
+        // we'll reconsider.
+        self.tri_pipeline.writeMesh(self.dl.tris.items, self.dl.tri_indices.items) catch |err| {
+            if (!self.tri_overflow_logged) {
+                std.debug.print(
+                    "WARN: triangle write failed ({s}) — {d} verts / {d} indices (cap {d}/{d}). Bump MAX_TRI_*. Logging suppressed for further frames.\n",
+                    .{ @errorName(err), self.dl.tris.items.len, self.dl.tri_indices.items.len, MAX_TRI_VERTICES, MAX_TRI_INDICES },
+                );
+                self.tri_overflow_logged = true;
             }
             return err;
         };
@@ -349,6 +382,9 @@ fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) 
     };
 
     // ── Record draws — quads first, glyphs on top ──────────────────
+    // Triangles first (SVG fills sit under chrome + glyphs), then
+    // quads, then text on top.
+    fc.tri_pipeline.recordDraw(cmd, extent, @intCast(fc.dl.tri_indices.items.len));
     fc.quad_pipeline.recordDraw(cmd, extent, @intCast(fc.dl.quads.items.len));
     fc.text_pipeline.recordDraw(cmd, extent, @intCast(fc.dl.glyphs.items.len));
 }
@@ -624,7 +660,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 7 / stage 13c (:::input field)\n", .{});
+    try stdout.print("text_engine demo — session 7 / stage 13d.1 (:::svg + triangle pipeline)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
     try stdout.print("  demo.md bytes:         {d}\n", .{demo_md.len});
@@ -649,6 +685,14 @@ pub fn main() !void {
 
     var quad_pipeline = try qp.QuadPipeline.init(&ctx, swapchain.format, MAX_QUADS);
     defer quad_pipeline.deinit();
+
+    var tri_pipeline_inst = try tri_pipeline_mod.TrianglePipeline.init(
+        &ctx,
+        swapchain.format,
+        MAX_TRI_VERTICES,
+        MAX_TRI_INDICES,
+    );
+    defer tri_pipeline_inst.deinit();
 
     const font_path = std.posix.getenv("TEXT_ENGINE_FONT") orelse
         "/usr/share/fonts/TTF/DejaVuSans.ttf";
@@ -722,6 +766,7 @@ pub fn main() !void {
     try registry.register("box", box_component.factory);
     try registry.register("chart", chart_component.factory);
     try registry.register("slider", slider_component.factory);
+    try registry.register("svg", svg_component.factory);
     try button_component.install(&registry);
     defer button_component.deinitGlobals();
     // input_component install needs parent_state — we know
@@ -826,6 +871,7 @@ pub fn main() !void {
     var frame_ctx = FrameCtx{
         .text_pipeline = &pipeline,
         .quad_pipeline = &quad_pipeline,
+        .tri_pipeline = &tri_pipeline_inst,
         .allocator = allocator,
         .fonts = &fonts,
         .cache = &cache,

@@ -14,6 +14,8 @@ pub fn build(b: *std.Build) void {
     const text_frag_spv = compileShaderStage(b, "text", "frag");
     const quad_vert_spv = compileShaderStage(b, "quad", "vert");
     const quad_frag_spv = compileShaderStage(b, "quad", "frag");
+    const tri_vert_spv = compileShaderStage(b, "tri", "vert");
+    const tri_frag_spv = compileShaderStage(b, "tri", "frag");
 
     // ── Bundle SPIR-V into a generated Zig module ──────────────────
     // The compiled blobs need `align(4)` because Vulkan's `pCode` field
@@ -25,11 +27,15 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(text_frag_spv, "text.frag.spv");
     _ = wf.addCopyFile(quad_vert_spv, "quad.vert.spv");
     _ = wf.addCopyFile(quad_frag_spv, "quad.frag.spv");
+    _ = wf.addCopyFile(tri_vert_spv, "tri.vert.spv");
+    _ = wf.addCopyFile(tri_frag_spv, "tri.frag.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const text_vert align(4) = @embedFile("text.vert.spv").*;
         \\pub const text_frag align(4) = @embedFile("text.frag.spv").*;
         \\pub const quad_vert align(4) = @embedFile("quad.vert.spv").*;
         \\pub const quad_frag align(4) = @embedFile("quad.frag.spv").*;
+        \\pub const tri_vert align(4) = @embedFile("tri.vert.spv").*;
+        \\pub const tri_frag align(4) = @embedFile("tri.frag.spv").*;
         \\
     );
 

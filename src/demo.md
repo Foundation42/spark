@@ -107,3 +107,10 @@ Same component yet again, *third* provider — OpenRouter is itself OpenAI-compa
 
 :::llm-stream {#chat_router auto_start=false provider=openai endpoint=https://openrouter.ai/api/v1/chat/completions model=google/gemini-2.5-flash api_key_env=OPENROUTER_DYNABOOK prompt="In 4 short lines, write a haiku about three providers streaming markdown into the same Vulkan-rendered document. Use a level-2 markdown heading for the title." max_tokens=120}
 :::
+
+## Vector graphics (stage 13d.1) — `:::svg`
+
+A new triangle pipeline + CPU tessellator (Bezier flatten + earcut) renders SVG figures alongside the markdown. Recraft V4.1 generated this bowl-of-petunias from a one-line prompt; we load the file from disk, parse the M/L/C/z subset, flatten cubics to polylines, earcut to triangles, and feed the lot through a flat-fill VBO+IBO pipeline. **The Guide approves.**
+
+:::svg {#petunias src=src/test_data/Petunias.svg width=480}
+:::

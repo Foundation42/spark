@@ -518,6 +518,13 @@ pub const LayoutCtx = struct {
 pub const DrawList = struct {
     glyphs: std.ArrayList(tp.GlyphInstance),
     quads: std.ArrayList(qp.QuadInstance),
+    /// Triangle mesh layer (stage 13d.1). Populated by `:::svg`
+    /// during layoutAndRender; rendered first (under quads + text)
+    /// so background fills sit behind chrome. Indices reference
+    /// `tris` vertices; the host's TrianglePipeline copies both
+    /// arrays into its VBO/IBO and issues one `vkCmdDrawIndexed`.
+    tris: std.ArrayList(tri_pipeline.Vertex),
+    tri_indices: std.ArrayList(u32),
     /// Hit-test layer. Populated alongside glyphs / quads during the
     /// layout walk; only elements with a non-null `vtable.on_input`
     /// register an entry. Walked in reverse on each mouse event so
@@ -531,6 +538,8 @@ pub const DrawList = struct {
         return .{
             .glyphs = std.ArrayList(tp.GlyphInstance).init(allocator),
             .quads = std.ArrayList(qp.QuadInstance).init(allocator),
+            .tris = std.ArrayList(tri_pipeline.Vertex).init(allocator),
+            .tri_indices = std.ArrayList(u32).init(allocator),
             .hits = std.ArrayList(Hit).init(allocator),
         };
     }
@@ -538,6 +547,8 @@ pub const DrawList = struct {
     pub fn deinit(self: *DrawList) void {
         self.glyphs.deinit();
         self.quads.deinit();
+        self.tris.deinit();
+        self.tri_indices.deinit();
         self.hits.deinit();
         self.* = undefined;
     }
@@ -547,6 +558,8 @@ pub const DrawList = struct {
     pub fn clearRetainingCapacity(self: *DrawList) void {
         self.glyphs.clearRetainingCapacity();
         self.quads.clearRetainingCapacity();
+        self.tris.clearRetainingCapacity();
+        self.tri_indices.clearRetainingCapacity();
         self.hits.clearRetainingCapacity();
     }
 };
@@ -554,3 +567,4 @@ pub const DrawList = struct {
 const glyph_cache_mod = @import("text/glyph_cache.zig");
 const atlas_mod = @import("gpu/atlas.zig");
 const qp = @import("gpu/quad_pipeline.zig");
+const tri_pipeline = @import("gpu/tri_pipeline.zig");
