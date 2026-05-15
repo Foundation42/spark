@@ -46,6 +46,7 @@
 
 const std = @import("std");
 const svg = @import("svg.zig");
+const jobs_mod = @import("jobs.zig");
 
 pub const Point = svg.Point;
 
@@ -102,6 +103,107 @@ pub const TessellateOptions = struct {
 /// can be batched alongside other paths' meshes. Per-path color
 /// is baked into every emitted vertex — there's no per-draw color
 /// state.
+/// Tessellate the entire SVG document. Two variants:
+///
+///   * `tessellateSerial` — single-threaded, the v0 path. Useful
+///     as a baseline for benchmarks and as a fallback if `JobSystem`
+///     isn't available (e.g. tests).
+///
+///   * `tessellateParallel` — splits the work across the JobSystem
+///     with one job per `<path>`. Each worker tessellates into a
+///     thread-local mesh (allocator: `c_allocator`, thread-safe);
+///     the calling thread merges them all into `out_mesh` after
+///     the counter drops to zero, re-basing indices as it goes.
+///
+/// Both variants leave `out_mesh` populated with the same set of
+/// triangles (up to ordering — parallel preserves path order in the
+/// merged mesh; render order is paths[0] first, since merge walks
+/// in index order).
+pub fn tessellateSerial(
+    allocator: std.mem.Allocator,
+    paths: []const svg.Path,
+    out_mesh: *Mesh,
+    opts: TessellateOptions,
+) !void {
+    for (paths) |path| {
+        _ = tessellatePath(allocator, path, out_mesh, opts) catch continue;
+    }
+}
+
+const ParallelContext = struct {
+    paths: []const svg.Path,
+    results: []PathResult,
+    opts: TessellateOptions,
+};
+
+const PathResult = struct {
+    /// Thread-allocated (c_allocator) — the merge phase frees them
+    /// after re-basing indices into `out_mesh`.
+    vertices: []Vertex = &.{},
+    indices: []u32 = &.{},
+};
+
+pub fn tessellateParallel(
+    allocator: std.mem.Allocator,
+    paths: []const svg.Path,
+    out_mesh: *Mesh,
+    job_system: *jobs_mod.JobSystem,
+    opts: TessellateOptions,
+) !void {
+    if (paths.len == 0) return;
+
+    const results = try allocator.alloc(PathResult, paths.len);
+    defer allocator.free(results);
+    for (results) |*r| r.* = .{};
+
+    var ctx = ParallelContext{ .paths = paths, .results = results, .opts = opts };
+    var counter = jobs_mod.Counter.init(0);
+    // batch_size=1 — Petunias-style paths have wildly different
+    // cost (1 cubic vs 30 cubics), so per-path batching gives the
+    // work-stealer the most flexibility to balance load. A larger
+    // batch only helps if individual jobs are too small to amortise
+    // scheduling overhead, which isn't the case here.
+    job_system.parallelFor(
+        @intCast(paths.len),
+        1,
+        tessellateOneJob,
+        @ptrCast(&ctx),
+        &counter,
+    );
+    job_system.waitFor(&counter);
+
+    // Serial merge — walk per-path results in order, append verts,
+    // re-base indices. Same on-screen Z order as serial because we
+    // iterate `paths` in index order.
+    for (results) |r| {
+        if (r.vertices.len == 0) continue;
+        const base_idx: u32 = @intCast(out_mesh.vertices.items.len);
+        try out_mesh.vertices.appendSlice(r.vertices);
+        try out_mesh.indices.ensureUnusedCapacity(r.indices.len);
+        for (r.indices) |li| out_mesh.indices.appendAssumeCapacity(base_idx + li);
+        std.heap.c_allocator.free(r.vertices);
+        std.heap.c_allocator.free(r.indices);
+    }
+}
+
+fn tessellateOneJob(job: *jobs_mod.Job) void {
+    const range = job.getData(jobs_mod.BatchRange);
+    const ctx: *const ParallelContext = @ptrCast(@alignCast(range.context));
+    var i = range.start;
+    while (i < range.end) : (i += 1) {
+        var local = Mesh.init(std.heap.c_allocator);
+        // Tessellate one path. On any error, leave the result
+        // empty so the merge step skips it — partial output beats
+        // total failure for a single bad path.
+        _ = tessellatePath(std.heap.c_allocator, ctx.paths[i], &local, ctx.opts) catch {
+            local.deinit();
+            continue;
+        };
+        ctx.results[i].vertices = local.vertices.toOwnedSlice() catch &.{};
+        ctx.results[i].indices = local.indices.toOwnedSlice() catch &.{};
+    }
+}
+
 pub fn tessellatePath(
     allocator: std.mem.Allocator,
     path: svg.Path,
@@ -782,6 +884,29 @@ test "tessellate: translate baked into vertex positions" {
     _ = try tessellatePath(arena.allocator(), path, &mesh, .{});
     try testing.expectEqual(@as(f32, 100), mesh.vertices.items[0].pos[0]);
     try testing.expectEqual(@as(f32, 200), mesh.vertices.items[0].pos[1]);
+}
+
+test "tessellate: serial and parallel produce identical triangle counts" {
+    // Equivalence harness — the actual ordering of triangles
+    // inside the merged mesh is the same (merge walks paths[] in
+    // index order), so vertex+index counts should match exactly.
+    const source = @embedFile("test_data/Petunias.svg");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const doc = try svg.parse(arena.allocator(), source);
+
+    var serial_mesh = Mesh.init(testing.allocator);
+    defer serial_mesh.deinit();
+    try tessellateSerial(arena.allocator(), doc.paths, &serial_mesh, .{});
+
+    const job_system = try jobs_mod.JobSystem.init(testing.allocator, 0);
+    defer job_system.deinit();
+    var parallel_mesh = Mesh.init(testing.allocator);
+    defer parallel_mesh.deinit();
+    try tessellateParallel(testing.allocator, doc.paths, &parallel_mesh, job_system, .{});
+
+    try testing.expectEqual(serial_mesh.vertices.items.len, parallel_mesh.vertices.items.len);
+    try testing.expectEqual(serial_mesh.indices.items.len, parallel_mesh.indices.items.len);
 }
 
 test "tessellate: Petunias.svg flattens to a positive triangle count" {

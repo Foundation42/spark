@@ -45,6 +45,8 @@ const demo_server_mod = @import("demo_server.zig");
 const jobs_mod = @import("jobs.zig");
 const io_channel_mod = @import("io_channel.zig");
 const dotenv_mod = @import("dotenv.zig");
+const svg_mod = @import("svg.zig");
+const svg_tess = @import("svg_tessellate.zig");
 
 /// Demo document — parsed by the vendored cmark + mapper into an
 /// Element tree at startup. Same render path as the hand-built
@@ -624,6 +626,47 @@ fn drainHandler(_: *io_channel_mod.IoChannel, comp: io_channel_mod.Completion) v
 /// HSV → RGB conversion using the standard six-sextant formula. `h`
 /// is degrees [0, 360); `s` and `v` are [0, 1]. Used by the demo to
 /// paint each animated SDF glyph with its own rainbow hue.
+/// Stage 13d.2 — measure tessellation cost serial vs parallel.
+/// Runs once at startup on the Petunias.svg fixture so we have a
+/// concrete speedup number for the journey doc and a regression
+/// signal if the JobSystem ever stops scaling. ~10 ms total; pure
+/// startup-time cost, no impact on the render loop.
+fn runTessellationBenchmark(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    job_system: *jobs_mod.JobSystem,
+    stdout: anytype,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const doc = try svg_mod.parse(arena.allocator(), source);
+
+    const t0 = std.time.nanoTimestamp();
+    var serial_mesh = svg_tess.Mesh.init(allocator);
+    defer serial_mesh.deinit();
+    try svg_tess.tessellateSerial(allocator, doc.paths, &serial_mesh, .{});
+    const t1 = std.time.nanoTimestamp();
+
+    var parallel_mesh = svg_tess.Mesh.init(allocator);
+    defer parallel_mesh.deinit();
+    try svg_tess.tessellateParallel(allocator, doc.paths, &parallel_mesh, job_system, .{});
+    const t2 = std.time.nanoTimestamp();
+
+    const serial_us: f64 = @as(f64, @floatFromInt(t1 - t0)) / 1000.0;
+    const parallel_us: f64 = @as(f64, @floatFromInt(t2 - t1)) / 1000.0;
+    const speedup: f64 = if (parallel_us > 0) serial_us / parallel_us else 0;
+    try stdout.print(
+        "  svg tessellate ({d} paths, {d} tris): serial {d:.1} us, parallel {d:.1} us → {d:.2}x\n",
+        .{
+            doc.paths.len,
+            serial_mesh.indices.items.len / 3,
+            serial_us,
+            parallel_us,
+            speedup,
+        },
+    );
+}
+
 fn hsvToRgb(h_deg: f32, s: f32, v: f32) [3]f32 {
     const c = v * s;
     const h_prime = @mod(h_deg / 60.0, 6.0);
@@ -660,7 +703,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 7 / stage 13d.1 (:::svg + triangle pipeline)\n", .{});
+    try stdout.print("text_engine demo — session 7 / stage 13d.2 (parallel SVG tessellation)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
     try stdout.print("  demo.md bytes:         {d}\n", .{demo_md.len});
@@ -766,7 +809,6 @@ pub fn main() !void {
     try registry.register("box", box_component.factory);
     try registry.register("chart", chart_component.factory);
     try registry.register("slider", slider_component.factory);
-    try registry.register("svg", svg_component.factory);
     try button_component.install(&registry);
     defer button_component.deinitGlobals();
     // input_component install needs parent_state — we know
@@ -816,6 +858,21 @@ pub fn main() !void {
     defer llm_stream_component.deinitGlobals();
     try input_component.install(&registry, &host_state);
     defer input_component.deinitGlobals();
+    try svg_component.install(&registry, job_system);
+    defer svg_component.deinitGlobals();
+
+    // Stage 13d.2 — micro-benchmark serial vs parallel tessellation
+    // on Petunias.svg before the markdown parse begins. Runs once at
+    // startup so the journey doc has a concrete speedup number; cost
+    // is ~10 ms total which is invisible in the startup banner.
+    // (Skip if the file isn't there — keeps the demo bootable when
+    // a host strips test_data.)
+    if (std.fs.cwd().readFileAlloc(allocator, "src/test_data/Petunias.svg", 4 * 1024 * 1024)) |source| {
+        defer allocator.free(source);
+        runTessellationBenchmark(allocator, source, job_system, stdout) catch |e| {
+            try stdout.print("  svg bench skipped: {s}\n", .{@errorName(e)});
+        };
+    } else |_| {}
 
     // Stage 11 — spin up the local demo HTTP server BEFORE the parse
     // so the remote :::embedded-document fetch succeeds. Listens on

@@ -39,6 +39,7 @@ const components = @import("../markdown_components.zig");
 const component_mod = @import("../component.zig");
 const svg = @import("../svg.zig");
 const tess = @import("../svg_tessellate.zig");
+const jobs_mod = @import("../jobs.zig");
 const box_helpers = @import("box.zig");
 const text_layout = @import("../text/layout.zig");
 const shape = @import("../font/shape.zig");
@@ -46,6 +47,24 @@ const shape = @import("../font/shape.zig");
 pub const Error = error{
     SvgMissingSrc,
 };
+
+/// Module global — set by install() (stage 13d.2). When present,
+/// loadAndTessellate uses parallel fork-join across the worker
+/// pool; when null (component used in a host that doesn't install
+/// a JobSystem), falls back to the single-threaded serial path.
+var job_system_ref: ?*jobs_mod.JobSystem = null;
+
+pub fn install(
+    registry: *component_mod.Registry,
+    job_system: *jobs_mod.JobSystem,
+) !void {
+    job_system_ref = job_system;
+    try registry.register("svg", factory);
+}
+
+pub fn deinitGlobals() void {
+    job_system_ref = null;
+}
 
 pub const factory: component_mod.Factory = .{
     .create = create,
@@ -172,8 +191,14 @@ fn loadAndTessellate(c: *Component) !void {
         .vertices = std.ArrayList(tess.Vertex).init(aa),
         .indices = std.ArrayList(u32).init(aa),
     };
-    for (doc.paths) |path| {
-        _ = tess.tessellatePath(aa, path, &mesh, .{}) catch continue;
+
+    // Stage 13d.2 — fan-out across the JobSystem if installed.
+    // The serial fallback path stays in place for tests + any host
+    // that doesn't wire a pool.
+    if (job_system_ref) |js| {
+        try tess.tessellateParallel(c.allocator, doc.paths, &mesh, js, .{});
+    } else {
+        try tess.tessellateSerial(aa, doc.paths, &mesh, .{});
     }
     c.vertices = mesh.vertices.items;
     c.indices = mesh.indices.items;
