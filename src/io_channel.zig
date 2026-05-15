@@ -47,10 +47,12 @@ pub const Error = error{
 
 pub const RequestKind = enum {
     http_get,
+    http_stream,
 };
 
 pub const Request = union(RequestKind) {
     http_get: HttpGetRequest,
+    http_stream: HttpStreamRequest,
 };
 
 pub const HttpGetRequest = struct {
@@ -61,16 +63,64 @@ pub const HttpGetRequest = struct {
     max_bytes: usize = 8 * 1024 * 1024,
 };
 
+pub const HttpMethod = enum { GET, POST };
+
+pub const HttpStreamRequest = struct {
+    /// Borrowed reference; IoChannel dupes internally.
+    url: []const u8,
+    method: HttpMethod = .POST,
+    /// Optional request body (e.g. JSON for an LLM chat call).
+    /// Duped internally so caller may free post-submit.
+    body: ?[]const u8 = null,
+    /// Optional content-type header. `null` defaults to
+    /// `application/json` when `body` is set, omitted otherwise.
+    content_type: ?[]const u8 = null,
+    /// Additional request headers (Bearer auth, x-api-key, etc).
+    /// Both name and value are duped into the worker context, so
+    /// the caller's slice may be freed immediately after submit.
+    extra_headers: ?[]const Header = null,
+    /// Read-buffer size — the granularity at which the worker
+    /// observes the response and posts `chunk` completions. Bigger
+    /// = fewer completions / less main-thread routing overhead;
+    /// smaller = lower latency per token.
+    chunk_size: usize = 2048,
+};
+
+pub const Header = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+/// Owned counterpart used inside the worker context (post-dupe).
+const OwnedHeader = struct {
+    name: []u8,
+    value: []u8,
+};
+
 pub const ResultKind = enum {
     ok,
     err,
+    chunk,
+    end,
+    end_err,
 };
 
 pub const Result = union(ResultKind) {
-    /// Body bytes; owned by the channel's allocator. Free with
-    /// [`IoChannel.releaseOk`] or `channel.allocator.free(body)`.
+    /// One-shot fetch success. Body bytes owned by the channel's
+    /// allocator; free with [`IoChannel.releaseOk`] or
+    /// `channel.allocator.free(body)`.
     ok: []u8,
+    /// One-shot fetch error.
     err: anyerror,
+    /// Streaming chunk — more completions follow under the same
+    /// Handle. Bytes owned by the channel's allocator (same release
+    /// path as `.ok`).
+    chunk: []u8,
+    /// Stream finished cleanly. The Handle is retired; no more
+    /// completions will arrive for it.
+    end: void,
+    /// Stream errored mid-flight. The Handle is retired.
+    end_err: anyerror,
 };
 
 pub const Handle = u64;
@@ -108,7 +158,8 @@ pub const IoChannel = struct {
         for (self.completions.items) |c| {
             switch (c.result) {
                 .ok => |body| self.allocator.free(body),
-                .err => {},
+                .chunk => |bytes| self.allocator.free(bytes),
+                .err, .end, .end_err => {},
             }
         }
         self.completions.deinit(self.allocator);
@@ -139,6 +190,71 @@ pub const IoChannel = struct {
         job.setData(*HttpGetCtx, ctx);
         self.jobs.schedule(job);
 
+        return handle;
+    }
+
+    /// Add a streaming HTTP request to the worker pool. Each chunk
+    /// arriving on the wire produces a `.chunk` Completion (caller
+    /// must free via [`releaseOk`] — same release path); the stream
+    /// is terminated by exactly one `.end` or `.end_err`. All
+    /// carry the same Handle.
+    pub fn submitHttpStream(
+        self: *IoChannel,
+        req: HttpStreamRequest,
+        user_data: usize,
+    ) !Handle {
+        const handle = self.next_handle.fetchAdd(1, .monotonic);
+        const a = self.allocator;
+
+        const ctx = try a.create(HttpStreamCtx);
+        errdefer a.destroy(ctx);
+
+        const url_dup = try a.dupe(u8, req.url);
+        errdefer a.free(url_dup);
+
+        const body_dup: ?[]u8 = if (req.body) |b| try a.dupe(u8, b) else null;
+        errdefer if (body_dup) |b| a.free(b);
+
+        const ct_dup: ?[]u8 = if (req.content_type) |ct| try a.dupe(u8, ct) else null;
+        errdefer if (ct_dup) |ct| a.free(ct);
+
+        // Dupe extra headers into a flat slice we can hand to the
+        // worker. Failure mid-loop unwinds via errdefer freeing what's
+        // already been allocated.
+        const headers_src: []const Header = req.extra_headers orelse &.{};
+        const headers_dup = try a.alloc(OwnedHeader, headers_src.len);
+        var headers_filled: usize = 0;
+        errdefer {
+            for (headers_dup[0..headers_filled]) |h| {
+                a.free(h.name);
+                a.free(h.value);
+            }
+            a.free(headers_dup);
+        }
+        for (headers_src, 0..) |h, i| {
+            const n = try a.dupe(u8, h.name);
+            errdefer a.free(n);
+            const v = try a.dupe(u8, h.value);
+            errdefer a.free(v);
+            headers_dup[i] = .{ .name = n, .value = v };
+            headers_filled = i + 1;
+        }
+
+        ctx.* = .{
+            .channel = self,
+            .url = url_dup,
+            .method = req.method,
+            .body = body_dup,
+            .content_type = ct_dup,
+            .extra_headers = headers_dup,
+            .handle = handle,
+            .user_data = user_data,
+            .chunk_size = req.chunk_size,
+        };
+
+        var job = jobs_mod.Job{ .func = httpStreamJob };
+        job.setData(*HttpStreamCtx, ctx);
+        self.jobs.schedule(job);
         return handle;
     }
 
@@ -260,9 +376,169 @@ fn postOrLeak(ch: *IoChannel, c: Completion) void {
     ch.postCompletion(c) catch {
         switch (c.result) {
             .ok => |body| ch.allocator.free(body),
-            .err => {},
+            .chunk => |bytes| ch.allocator.free(bytes),
+            .err, .end, .end_err => {},
         }
     };
+}
+
+// ── HTTP stream job (POST + chunked response) ───────────────────────
+
+const HttpStreamCtx = struct {
+    channel: *IoChannel,
+    url: []u8,
+    method: HttpMethod,
+    body: ?[]u8,
+    content_type: ?[]u8,
+    extra_headers: []OwnedHeader, // empty slice if none
+    handle: Handle,
+    user_data: usize,
+    chunk_size: usize,
+};
+
+fn httpStreamJob(job: *jobs_mod.Job) void {
+    const ctx = job.getData(*HttpStreamCtx);
+    const ch = ctx.channel;
+    const a = ch.allocator;
+
+    defer {
+        a.free(ctx.url);
+        if (ctx.body) |b| a.free(b);
+        if (ctx.content_type) |ct| a.free(ct);
+        for (ctx.extra_headers) |h| {
+            a.free(h.name);
+            a.free(h.value);
+        }
+        a.free(ctx.extra_headers);
+        a.destroy(ctx);
+    }
+
+    const endWithErr = struct {
+        fn call(channel: *IoChannel, h: Handle, ud: usize, e: anyerror) void {
+            postOrLeak(channel, .{
+                .handle = h,
+                .user_data = ud,
+                .result = .{ .end_err = e },
+            });
+        }
+    }.call;
+
+    var client = std.http.Client{ .allocator = a };
+    defer client.deinit();
+
+    const uri = std.Uri.parse(ctx.url) catch |e| {
+        endWithErr(ch, ctx.handle, ctx.user_data, e);
+        return;
+    };
+
+    var server_header_buffer: [16 * 1024]u8 = undefined;
+
+    const method: std.http.Method = switch (ctx.method) {
+        .GET => .GET,
+        .POST => .POST,
+    };
+
+    // Assemble the std.http header list: one slot for content-type
+    // (if a body is set), plus any caller-supplied auth/custom
+    // headers. Allocated dynamically — the count is request-shaped
+    // and >0-arg flat arrays don't play well with Zig's
+    // const-anyway eval here.
+    const ct_count: usize = if (ctx.body != null) 1 else 0;
+    const total = ct_count + ctx.extra_headers.len;
+    const hdr_list = a.alloc(std.http.Header, total) catch |e| {
+        endWithErr(ch, ctx.handle, ctx.user_data, e);
+        return;
+    };
+    defer a.free(hdr_list);
+    if (ctx.body != null) {
+        hdr_list[0] = .{
+            .name = "content-type",
+            .value = ctx.content_type orelse "application/json",
+        };
+    }
+    for (ctx.extra_headers, 0..) |h, i| {
+        hdr_list[ct_count + i] = .{ .name = h.name, .value = h.value };
+    }
+
+    var req = client.open(method, uri, .{
+        .server_header_buffer = &server_header_buffer,
+        .extra_headers = hdr_list,
+    }) catch |e| {
+        endWithErr(ch, ctx.handle, ctx.user_data, e);
+        return;
+    };
+    defer req.deinit();
+
+    if (ctx.body) |b| {
+        req.transfer_encoding = .{ .content_length = b.len };
+    }
+
+    req.send() catch |e| {
+        endWithErr(ch, ctx.handle, ctx.user_data, e);
+        return;
+    };
+
+    if (ctx.body) |b| {
+        req.writeAll(b) catch |e| {
+            endWithErr(ch, ctx.handle, ctx.user_data, e);
+            return;
+        };
+        req.finish() catch |e| {
+            endWithErr(ch, ctx.handle, ctx.user_data, e);
+            return;
+        };
+    }
+
+    req.wait() catch |e| {
+        endWithErr(ch, ctx.handle, ctx.user_data, e);
+        return;
+    };
+
+    if (req.response.status != .ok) {
+        endWithErr(ch, ctx.handle, ctx.user_data, Error.HttpStatusNotOk);
+        return;
+    }
+
+    // Read loop. Each successful read posts one `.chunk` completion
+    // owning a freshly-duped slice of `bytes_read` bytes.
+    while (true) {
+        const chunk_buf = a.alloc(u8, ctx.chunk_size) catch |e| {
+            endWithErr(ch, ctx.handle, ctx.user_data, e);
+            return;
+        };
+        const n = req.read(chunk_buf) catch |e| {
+            a.free(chunk_buf);
+            endWithErr(ch, ctx.handle, ctx.user_data, e);
+            return;
+        };
+        if (n == 0) {
+            a.free(chunk_buf);
+            break;
+        }
+        // Trim to actual read size to avoid streaming garbage past
+        // the wire-truthful slice; resize-in-place is cheap.
+        const trimmed: []u8 = if (a.resize(chunk_buf, n)) chunk_buf[0..n] else blk: {
+            const tight = a.alloc(u8, n) catch {
+                a.free(chunk_buf);
+                endWithErr(ch, ctx.handle, ctx.user_data, error.OutOfMemory);
+                return;
+            };
+            @memcpy(tight, chunk_buf[0..n]);
+            a.free(chunk_buf);
+            break :blk tight;
+        };
+        postOrLeak(ch, .{
+            .handle = ctx.handle,
+            .user_data = ctx.user_data,
+            .result = .{ .chunk = trimmed },
+        });
+    }
+
+    postOrLeak(ch, .{
+        .handle = ctx.handle,
+        .user_data = ctx.user_data,
+        .result = .{ .end = {} },
+    });
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -404,6 +680,84 @@ test "IoChannel: handler can post a follow-up completion without deadlock" {
     }.h);
     try testing.expectEqual(@as(usize, 1), n2);
     try testing.expectEqual(@as(usize, 1), saw);
+}
+
+test "IoChannel: stream variants — chunks then end, in order, freed on undrained deinit" {
+    const jobs = try jobs_mod.JobSystem.init(testing.allocator, 2);
+    defer jobs.deinit();
+
+    var ch = IoChannel.init(testing.allocator, jobs);
+
+    // Three chunk completions + one end. Build owned slices so the
+    // deinit path has to free the chunk bytes (undrained on purpose).
+    const c1 = try testing.allocator.dupe(u8, "alpha");
+    const c2 = try testing.allocator.dupe(u8, "beta");
+    const c3 = try testing.allocator.dupe(u8, "gamma");
+    try ch.postCompletion(.{ .handle = 42, .user_data = 0, .result = .{ .chunk = c1 } });
+    try ch.postCompletion(.{ .handle = 42, .user_data = 0, .result = .{ .chunk = c2 } });
+    try ch.postCompletion(.{ .handle = 42, .user_data = 0, .result = .{ .chunk = c3 } });
+    try ch.postCompletion(.{ .handle = 42, .user_data = 0, .result = .{ .end = {} } });
+
+    // Leave them undrained — deinit must release the chunk bytes
+    // without leaking (testing.allocator catches any leak).
+    ch.deinit();
+}
+
+test "IoChannel: stream — drained chunks land in order under same handle" {
+    const jobs = try jobs_mod.JobSystem.init(testing.allocator, 2);
+    defer jobs.deinit();
+
+    var ch = IoChannel.init(testing.allocator, jobs);
+    defer ch.deinit();
+
+    const c1 = try testing.allocator.dupe(u8, "Hello, ");
+    const c2 = try testing.allocator.dupe(u8, "world!");
+    try ch.postCompletion(.{ .handle = 7, .user_data = 0, .result = .{ .chunk = c1 } });
+    try ch.postCompletion(.{ .handle = 7, .user_data = 0, .result = .{ .chunk = c2 } });
+    try ch.postCompletion(.{ .handle = 7, .user_data = 0, .result = .{ .end = {} } });
+
+    const Acc = struct {
+        ch: *IoChannel,
+        buf: *std.ArrayList(u8),
+        ended: *bool,
+        order_ok: *bool,
+        last_handle: *Handle,
+    };
+    var buf = std.ArrayList(u8).init(testing.allocator);
+    defer buf.deinit();
+    var ended = false;
+    var order_ok = true;
+    var last_handle: Handle = 0;
+    var acc = Acc{
+        .ch = &ch,
+        .buf = &buf,
+        .ended = &ended,
+        .order_ok = &order_ok,
+        .last_handle = &last_handle,
+    };
+
+    const n = ch.drain(&acc, struct {
+        fn h(a: *Acc, comp: Completion) void {
+            if (a.last_handle.* != 0 and a.last_handle.* != comp.handle) {
+                a.order_ok.* = false;
+            }
+            a.last_handle.* = comp.handle;
+            switch (comp.result) {
+                .chunk => |bytes| {
+                    a.buf.appendSlice(bytes) catch {};
+                    a.ch.releaseOk(bytes);
+                },
+                .end => a.ended.* = true,
+                .end_err => a.ended.* = true,
+                else => {},
+            }
+        }
+    }.h);
+
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expectEqualStrings("Hello, world!", buf.items);
+    try testing.expect(ended);
+    try testing.expect(order_ok);
 }
 
 test "IoChannel: worker-thread postCompletion via scheduled job" {

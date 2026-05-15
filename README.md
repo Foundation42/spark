@@ -317,14 +317,46 @@ TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
   during loading nulls the `PendingFetch.component` slot so the
   completion handler discards cleanly. Foundation re-usable for
   LLM streams (stage 13), file-watcher hot-reload, MCP pipes.
-  ~9.3k fps Release with all of {8a, 8b, 9, 11, 12} live.
+- [x] **Stage 13a — live LLM authoring.** `IoChannel` grew a
+  `submitHttpStream` variant (POST + chunked response,
+  `.chunk`/`.end`/`.end_err` `Result` variants). New
+  `:::llm-stream` component posts an Ollama chat-completion
+  request with `stream: true`; NDJSON chunks land on the drain
+  queue per frame; line-buffered parser extracts each
+  `message.content` token and appends to a display buffer; the
+  accumulated buffer is re-parsed as markdown on every chunk so
+  the child Element tree grows token-by-token. Phases
+  `.loading` → `.streaming` → `.done` (or `.failed`); placeholders
+  for the off-content states. Cancellation uses the same
+  Pending↔Component back-pointer discipline as stage 12. Routing
+  in main.zig's `drainHandler` is kind-based (one-shot →
+  embedded-document, stream → llm-stream); will need a real
+  router-table when multiple consumers issue the same request
+  kind.
+- [x] **Stage 13a.5 — multi-provider streaming.** Same component,
+  pluggable provider. `provider=openai` switches the body shape
+  (OpenAI-compatible `max_tokens` field, `Authorization: Bearer`
+  header) and the chunk parser (SSE events with `data:` framing
+  and `[DONE]` terminator instead of NDJSON). One wire-format
+  covers DeepSeek, OpenRouter, OpenAI proper, Together, Groq,
+  Mistral, and anything else that speaks OpenAI's chat API.
+  `IoChannel.HttpStreamRequest` grew `extra_headers` to plumb
+  the auth header. Tiny `src/dotenv.zig` reads `~/.env`'s
+  `KEY=VALUE` pairs at startup; `api_key_env=` attribute names
+  which entry the factory should read for the Bearer token. Demo
+  now stacks three providers side-by-side — local Ollama, remote
+  DeepSeek, and Gemini-2.5-Flash via OpenRouter — all streaming
+  into the same Vulkan-rendered document concurrently. ~7.6k fps
+  steady-state with three providers live.
 
 ## What's next
 
-[`docs/roadmap.md`](docs/roadmap.md). Open queue: **stage 13**
-(real components — 3D scene, charts beyond sparkline, input
-field, button), **stage 10** (headless documents), **retained
-layout cache** (skip re-walk when neither tree nor inputs
-changed), **crisp zoom** (multi-size atlas + re-layout-on-zoom),
-**persistent URL cache** (disk-backed so remote widgets survive
-restarts). None of them block each other.
+[`docs/roadmap.md`](docs/roadmap.md). Open queue: **stage 13b**
+(input field + button — closes the user→LLM authoring loop),
+**stage 10** (headless documents), **retained layout cache**
+(skip re-walk when neither tree nor inputs changed; the
+stream-driven re-parse dropped FPS from 9.3k→5.9k during
+streaming, so this is now load-bearing), **crisp zoom**
+(multi-size atlas + re-layout-on-zoom), **persistent URL cache**
+(disk-backed so remote widgets survive restarts). None of them
+block each other.

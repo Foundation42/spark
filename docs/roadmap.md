@@ -338,12 +338,72 @@ embedded-document overlay snapshot/refresh helpers. The
 Pending↔Component cancellation invariant is captured in
 `memory/project_io_channel_cancellation.md`.
 
-## Then — real components (stages 13+)
+## Shipped — live LLM authoring (stage 13a)
+
+The headline payoff of stage 12. `IoChannel` grew a streaming
+variant (`submitHttpStream` + `Result.chunk/.end/.end_err`); the
+new `:::llm-stream` component posts a `stream: true` chat
+request to Ollama and renders the response as a child markdown
+tree that re-parses on every chunk. Tokens visibly stream into
+the document.
+
+Memory: every Component holds `content: []u8` (accumulated
+`message.content` from each chunk) + a per-instance arena that's
+reset before each re-parse. The arena reset means the
+intermediate Element trees don't accumulate; only the raw
+content buffer + the latest parsed tree are live.
+
+Routing: completions dispatch by result kind in main.zig's
+`drainHandler` (`.ok`/`.err` → embedded-document; `.chunk`/`.end`
+/`.end_err` → llm-stream). Fragile-by-design; a real router
+table lands when a third consumer needs the same kind.
+
+Cost: re-parsing the whole accumulated content on each chunk
+drops FPS from ~9.3k baseline to ~5.9k during active streaming
+and recovers post-stream. Stage's retained layout cache is the
+right fix — currently parked.
+
+Demo: a `:::llm-stream` block in `demo.md` prompts `qwen3.5:2b`
+for a Vulkan haiku and watches the heading + lines materialise.
+Disable the demo block (or stop Ollama) to fall back to a red
+"LLM stream failed: …" placeholder.
+
+## Shipped — multi-provider streaming (stage 13a.5)
+
+`provider` attr added: `ollama` (default) or `openai`. The
+OpenAI mode covers DeepSeek, OpenRouter, OpenAI proper, Together,
+Groq, Mistral, and anything else that speaks the
+`POST /chat/completions` SSE-streaming wire format — they all
+share the same body shape (`messages`/`stream`/`max_tokens`) and
+the same chunk shape (`choices[0].delta.content`,
+`data: {...}\n\n` events, `data: [DONE]` terminator). One
+implementation, an entire ecosystem.
+
+`IoChannel.HttpStreamRequest` grew an `extra_headers` slice so
+Bearer-token auth (and any future custom headers) can ride along.
+The worker dupes them into its context and forwards to
+`client.open(..., .extra_headers = ...)`.
+
+API keys come from `~/.env` via a deliberately tiny
+`src/dotenv.zig` (KEY=VALUE pairs, optional quoted values,
+comments + blank lines skipped, last-write-wins on duplicates).
+The factory reads `api_key_env=NAME` from the spec to know which
+entry to pull. Process env vars are NOT consulted — keeps the
+key-discovery story to one place. Add a process-env fallback
+later if a deployment needs it.
+
+Demo now stacks three providers side-by-side: local Ollama,
+remote DeepSeek, and `google/gemini-2.5-flash` via OpenRouter.
+All three streaming concurrently runs at ~7.6k fps Release.
+
+## Then — more components (stage 13b+)
 
 3D scene (eventually integrates with matryoshka), live chart,
-slider, input field, button. Each is a self-contained component
-module; the contract is fixed by stage 7. Repetitive work, not
-architectural.
+input field, button. Each is a self-contained component module;
+the contract is fixed by stage 7. **Input field + button** is
+the natural pair for stage 13b — closes the user→LLM authoring
+loop (type into a field, click submit, watch the
+`:::llm-stream` answer flow in below).
 
 ## Parallel — retained layout cache
 

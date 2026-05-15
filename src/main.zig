@@ -33,12 +33,14 @@ const component = @import("component.zig");
 const box_component = @import("components/box.zig");
 const chart_component = @import("components/chart.zig");
 const embedded_document_component = @import("components/embedded_document.zig");
+const llm_stream_component = @import("components/llm_stream.zig");
 const slider_component = @import("components/slider.zig");
 const state_mod = @import("state.zig");
 const update = @import("update.zig");
 const demo_server_mod = @import("demo_server.zig");
 const jobs_mod = @import("jobs.zig");
 const io_channel_mod = @import("io_channel.zig");
+const dotenv_mod = @import("dotenv.zig");
 
 /// Demo document — parsed by the vendored cmark + mapper into an
 /// Element tree at startup. Same render path as the hand-built
@@ -507,12 +509,18 @@ fn scrollCb(window: ?*win.c.GLFWwindow, _: f64, yoffset: f64) callconv(.C) void 
     fc.state.dirty = true;
 }
 
-/// `IoChannel.drain` handler. Routes every completion to
-/// embedded_document.handleCompletion — the only consumer today.
-/// When the LLM tier lands (stage 13/14), this grows a switch on
-/// `comp.user_data`'s tag or on a router table.
+/// `IoChannel.drain` handler. Stage 13a now has two consumers —
+/// embedded-document (one-shot http_get) and llm-stream (chunked
+/// http_stream). v0 routes by result kind: `.ok`/`.err` to the
+/// one-shot consumer, `.chunk`/`.end`/`.end_err` to the streaming
+/// consumer. Fragile if multiple consumers ever issue the same
+/// kind of request; revisit with a proper router-table when that
+/// happens.
 fn drainHandler(_: *io_channel_mod.IoChannel, comp: io_channel_mod.Completion) void {
-    embedded_document_component.handleCompletion(comp);
+    switch (comp.result) {
+        .ok, .err => embedded_document_component.handleCompletion(comp),
+        .chunk, .end, .end_err => llm_stream_component.handleCompletion(comp),
+    }
 }
 
 /// HSV → RGB conversion using the standard six-sextant formula. `h`
@@ -554,7 +562,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 6 / stage 12 (async I/O channel)\n", .{});
+    try stdout.print("text_engine demo — session 6 / stage 13a.5 (multi-provider LLM streaming)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
     try stdout.print("  demo.md bytes:         {d}\n", .{demo_md.len});
@@ -679,8 +687,21 @@ pub fn main() !void {
     // Stage 9 — install the embedded-document factory now that theme
     // + registry + parent state + io_channel all exist. Has to
     // happen before any parse runs.
+    // ── Stage 13a.5 — env loader ───────────────────────────────────
+    // `~/.env`'s KEY=VALUE pairs land in `env`, which the llm-stream
+    // factory pulls API keys from at create-time. Missing file is
+    // silent — the factory just rejects an `api_key_env=` attr it
+    // can't resolve.
+    var env = dotenv_mod.DotEnv.init(allocator);
+    defer env.deinit();
+    env.loadDefault() catch |e| {
+        try stdout.print("  ~/.env load:          {s} (continuing)\n", .{@errorName(e)});
+    };
+
     try embedded_document_component.install(&registry, &theme, &host_state, &io_channel);
     defer embedded_document_component.deinitGlobals();
+    try llm_stream_component.install(&registry, &theme, &host_state, &io_channel, &env);
+    defer llm_stream_component.deinitGlobals();
 
     // Stage 11 — spin up the local demo HTTP server BEFORE the parse
     // so the remote :::embedded-document fetch succeeds. Listens on

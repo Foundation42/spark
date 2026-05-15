@@ -447,6 +447,15 @@ pub fn handleCompletion(comp: io.Completion) void {
     if (c_opt) |c| c.pending = null;
 
     switch (comp.result) {
+        // Stream variants don't apply to embedded-document — it only
+        // issues http_get. Defensive: never hits the wire.
+        .chunk, .end, .end_err => {
+            if (io_channel_ref) |ch| switch (comp.result) {
+                .chunk => |bytes| ch.releaseOk(bytes),
+                else => {},
+            };
+            return;
+        },
         .err => {
             if (c_opt) |c| {
                 c.phase = .failed;

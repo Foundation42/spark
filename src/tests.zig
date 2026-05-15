@@ -12,7 +12,9 @@ test {
     _ = @import("components/box.zig");
     _ = @import("components/chart.zig");
     _ = @import("components/embedded_document.zig");
+    _ = @import("components/llm_stream.zig");
     _ = @import("components/slider.zig");
+    _ = @import("dotenv.zig");
     _ = @import("io_channel.zig");
     _ = @import("jobs.zig");
     _ = @import("state.zig");
