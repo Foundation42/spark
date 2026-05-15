@@ -38,9 +38,31 @@ const jobs_mod = @import("jobs.zig");
 
 /// Stage 14b — parallel stack_v walk thresholds. The dispatcher falls
 /// back to serial when these aren't met; dispatch overhead dominates
-/// for short stacks. Override via env var for benchmarking.
+/// for short stacks.
+///
+/// **14b parked (2026-05-15).** PARALLEL_MIN_WALKS is set to a value
+/// that disables dispatch unconditionally because the parallel path
+/// hangs the main thread when `:::svg-stream` finalises a response.
+/// The HTTP-stream job stays on a JobSystem worker for the entire
+/// upstream wait (5-15s); with multiple streams + `:::image-stream`
+/// in flight, most worker slots are blocked on the wire. When
+/// `finalizeResponse` then calls `tess.tessellateParallel`, only main
+/// + the remaining free workers are available to drain the
+/// tessellation queue — and once the layout pass dispatches its own
+/// parallel walk on top of that, the system spends all its time in
+/// `Counter.wait` spin loops with no work to do.
+///
+/// The infrastructure (lock, classification, blit/snapshot) is
+/// retained; just the dispatch threshold is raised. Two fixes for
+/// the next session:
+///   1. Move long-running HTTP work off the shared JobSystem onto a
+///      dedicated pool so it doesn't starve compute workers.
+///   2. Tighten the parallel-walk threshold to count only walks
+///      whose layout is genuinely expensive (currently the count
+///      includes cheap chart/svg-stream re-walks that don't justify
+///      the dispatch overhead).
 const PARALLEL_MIN_CHILDREN: usize = 4;
-const PARALLEL_MIN_WALKS: usize = 2;
+const PARALLEL_MIN_WALKS: usize = std.math.maxInt(usize);
 
 pub const Error = error{
     /// `text` or `line_break` appeared at a position where only block
