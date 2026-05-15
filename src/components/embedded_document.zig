@@ -43,27 +43,51 @@
 //! Both are deferred because the smell is isolated to this one
 //! file. Captured in journey-session-5.md.
 //!
-//! ### Remote sources (stage 11)
+//! ### Remote sources (stage 11 / 12)
 //!
 //! `src=` may be:
 //!
 //!   * A filesystem path (`"src/widgets/foo.md"`, or absolute) — read
 //!     via `std.fs.cwd().readFileAlloc`, no caching (filesystem is
-//!     fast enough that re-reads aren't worth tracking).
+//!     fast enough that re-reads aren't worth tracking). Synchronous.
 //!   * An HTTP(S) URL (`"http://127.0.0.1:8080/foo.md"`,
-//!     `"https://gist.githubusercontent.com/..."`) — fetched via
-//!     `std.http.Client.fetch` and cached in a module-level
-//!     `url_cache` keyed by URL string. Cache lifetime is program
-//!     lifetime; `deinitGlobals()` frees it at host shutdown.
+//!     `"https://gist.githubusercontent.com/..."`) — fetched
+//!     **asynchronously** via the host's [`IoChannel`](../io_channel.zig)
+//!     and cached in a module-level `url_cache` keyed by URL string.
+//!     Cache lifetime is program lifetime; `deinitGlobals()` frees
+//!     it at host shutdown. Until the fetch lands, the Component
+//!     renders a small "loading…" placeholder.
 //!   * A `file://` URL — equivalent to the filesystem path of the
 //!     URL's path component. Convenience for authors who want to
 //!     write all `src=`s in URL form for consistency.
 //!
 //! HTTPS uses Zig's std.crypto.tls — the system trust store is
 //! loaded on first use. Failures (network, 4xx/5xx, TLS handshake)
-//! return `EmbeddedDocumentReadFailed`, which the registry's
-//! resolve path turns into the "missing component" placeholder
-//! visual. Loud but recoverable.
+//! flip the Component into `.failed`, which renders a red "fetch
+//! failed" placeholder. Loud but recoverable; recreate the spec
+//! (e.g. by changing the `#id`) to retry.
+//!
+//! ### Async lifecycle (stage 12)
+//!
+//! A URL fetch that misses the cache goes through three phases:
+//!
+//!   1. **create**: build a Component shell (allocator, arena,
+//!      child_state with parent), apply parent overlays, mark
+//!      `phase = .loading`, snapshot overlays + scope into a
+//!      heap-allocated [`PendingFetch`], submit an `IoChannel`
+//!      job with the Pending pointer as `user_data`.
+//!   2. **draining** (main thread, per-frame): once the worker
+//!      posts a Completion, [`handleCompletion`] parses the body,
+//!      caches it, swaps the Component to `.ready`, and bubbles
+//!      `state.dirty` so the renderer re-lays out next frame.
+//!   3. **cancellation**: if the Component is destroyed before the
+//!      fetch lands (e.g. registry GC swept it after the parent
+//!      re-parsed without referencing it), `deinit_` nulls the
+//!      `PendingFetch.component` slot. The completion handler sees
+//!      the null, frees the body + Pending, returns.
+//!
+//! Lifetime of `PendingFetch` is owned by the completion handler;
+//! the Component holds a pointer to it for cancellation only.
 //!
 //! ### Interactive components inside embedded docs (not supported)
 //!
@@ -90,6 +114,9 @@ const components = @import("../markdown_components.zig");
 const component_mod = @import("../component.zig");
 const markdown = @import("../markdown.zig");
 const state_mod = @import("../state.zig");
+const io = @import("../io_channel.zig");
+const text_layout = @import("../text/layout.zig");
+const shape = @import("../font/shape.zig");
 
 pub const Error = error{
     EmbeddedDocumentMissingId,
@@ -102,6 +129,7 @@ pub const Error = error{
 var registry_ref: ?*component_mod.Registry = null;
 var theme_ref: ?*const element.Theme = null;
 var parent_state_ref: ?*state_mod.State = null;
+var io_channel_ref: ?*io.IoChannel = null;
 /// Allocator used for the URL cache; same as the registry's
 /// allocator. Captured at install() time so cache lookups don't
 /// need to thread an allocator everywhere.
@@ -117,10 +145,12 @@ pub fn install(
     registry: *component_mod.Registry,
     theme: *const element.Theme,
     parent_state: *state_mod.State,
+    io_channel: *io.IoChannel,
 ) !void {
     registry_ref = registry;
     theme_ref = theme;
     parent_state_ref = parent_state;
+    io_channel_ref = io_channel;
     cache_allocator = registry.allocator;
     try registry.register("embedded-document", factory);
 }
@@ -141,12 +171,50 @@ pub fn deinitGlobals() void {
     registry_ref = null;
     theme_ref = null;
     parent_state_ref = null;
+    io_channel_ref = null;
 }
 
 pub const factory: component_mod.Factory = .{
     .create = create,
     .update = update,
     .deinit = deinit_,
+};
+
+const Phase = enum {
+    /// `root` is a parsed Element tree; layoutAndRender delegates to it.
+    ready,
+    /// Awaiting an in-flight async fetch; layoutAndRender renders a
+    /// "loading…" placeholder.
+    loading,
+    /// Fetch errored or post-fetch parse failed; layoutAndRender
+    /// renders a red "fetch failed" placeholder.
+    failed,
+};
+
+const OverlayKV = struct {
+    key: []u8,
+    value: []u8,
+};
+
+/// Heap-allocated request-side context. The Component holds a
+/// pointer to it (for cancellation). The completion handler owns
+/// its lifetime — frees it after applying or discarding the result.
+const PendingFetch = struct {
+    allocator: std.mem.Allocator,
+    /// Set to null by `deinit_` if the Component is destroyed while
+    /// the fetch is in flight.
+    component: ?*Component,
+    /// Borrowed slice into the IoChannel's `next_handle` epoch —
+    /// retained here for diagnostics. Not used for routing (the
+    /// pointer round-trip in user_data does that).
+    handle: io.Handle,
+    /// Owned by Pending. Duped at submit time so we can cache the
+    /// body keyed by URL when it lands.
+    url: []u8,
+    /// Snapshot of non-`src` spec attrs at submit time. Re-applied
+    /// onto child_state at completion (so parent values land AFTER
+    /// frontmatter, preserving the parent-wins rule).
+    overlays: []OverlayKV,
 };
 
 const Component = struct {
@@ -156,11 +224,20 @@ const Component = struct {
     /// Child state. Set up with `parent = parent_state_ref` so
     /// child-side mutations wake the root renderer.
     child_state: *state_mod.State,
-    /// Parsed root of the embedded document.
+    /// Parsed root of the embedded document. Only valid when
+    /// `phase == .ready`.
     root: element.Element,
     /// Cache-key scope; owned by the Component for deinit's
     /// `registry.deinitScope` call.
     scope: []u8,
+    /// Lifecycle phase. .ready for synchronous paths (file://, cache
+    /// hits) from the moment `create` returns. .loading for the
+    /// cache-miss URL path until the completion handler swaps in
+    /// the parsed root. .failed on terminal errors.
+    phase: Phase = .ready,
+    /// Held when `phase == .loading` so `deinit_` can null its
+    /// `.component` field and signal cancel.
+    pending: ?*PendingFetch = null,
 };
 
 fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
@@ -170,17 +247,9 @@ fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!c
     const id_raw = spec.id orelse return error.EmbeddedDocumentMissingId;
     const src_path = findAttr(spec.attrs, "src") orelse return error.EmbeddedDocumentMissingSrc;
 
-    // Load the source via scheme dispatch — filesystem path or
-    // HTTP(S) URL. `source` always ends up owned by `allocator` for
-    // the duration of this function; we copy out anything we need
-    // into per-instance storage before returning.
-    const source = loadSource(allocator, src_path) catch
-        return error.EmbeddedDocumentReadFailed;
-    defer allocator.free(source);
-
-    // Per-instance allocations. Construction order matters for
-    // errdefer cleanup — child_state.deinit relies on its allocator
-    // being initialised, etc.
+    // Per-instance allocations common to every phase. Construction
+    // order matters for errdefer cleanup — child_state.deinit relies
+    // on its allocator being initialised, etc.
     const c = try allocator.create(Component);
     errdefer allocator.destroy(c);
 
@@ -198,38 +267,235 @@ fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!c
     const scope = try allocator.dupe(u8, id_raw);
     errdefer allocator.free(scope);
 
-    // Populate child state with frontmatter, then overlay parent
-    // attrs (parent always wins). Doing this before the parse so the
-    // parse sees the final state during ${path} substitution.
-    var body: []const u8 = source;
-    if (state_mod.extractFrontmatter(source)) |fm| {
-        body = fm.rest;
-        var tmp = try state_mod.parseFrontmatter(allocator, fm.body);
-        defer tmp.deinit();
-        var it = tmp.map.iterator();
-        while (it.next()) |entry| {
-            try child_state.set(entry.key_ptr.*, entry.value_ptr.*);
-        }
-    }
-    try applyParentOverlays(child_state, spec);
-
-    const root = try markdown.parseWithStateAndScope(
-        arena.allocator(),
-        body,
-        theme_ref.?,
-        registry_ref.?,
-        child_state,
-        scope,
-    );
-
     c.* = .{
         .allocator = allocator,
         .arena = arena,
         .child_state = child_state,
-        .root = root,
+        .root = element.Element{ .paragraph = &[_]element.Element{} }, // overwritten on ready paths; never reached in .loading/.failed
         .scope = scope,
+        .phase = .loading, // optimistic; switch to .ready on every sync path below
+        .pending = null,
     };
+
+    // ── Scheme dispatch ─────────────────────────────────────────────
+    // Local file or cached URL: synchronous path. Cache-miss URL:
+    // kick off an async fetch, leave the Component in .loading.
+    const is_url = std.mem.startsWith(u8, src_path, "http://") or std.mem.startsWith(u8, src_path, "https://");
+
+    if (is_url) {
+        if (url_cache.get(src_path)) |cached| {
+            try fulfillFromBytes(c, cached, spec);
+            return .{ .vtable = &vtable, .ctx = @ptrCast(c) };
+        }
+        // Apply parent overlays NOW so an `update()` call that lands
+        // before the completion sees a coherent child_state. Frontmatter
+        // is applied later by the completion handler, then overlays
+        // re-applied (so parent still wins on conflict).
+        try applyParentOverlays(child_state, spec);
+        try submitAsyncFetch(c, src_path, spec);
+        return .{ .vtable = &vtable, .ctx = @ptrCast(c) };
+    }
+
+    // Filesystem path (raw or file://): keep the synchronous flow —
+    // local reads are fast and the loading-state machinery isn't
+    // worth the complexity here.
+    const source = readLocal(allocator, src_path) catch
+        return error.EmbeddedDocumentReadFailed;
+    defer allocator.free(source);
+    try fulfillFromBytes(c, source, spec);
     return .{ .vtable = &vtable, .ctx = @ptrCast(c) };
+}
+
+/// Shared finalisation: takes a Component shell and a source
+/// buffer, applies frontmatter + overlays, parses, swaps the root
+/// in, marks `.ready`. Used by both the sync paths and the
+/// completion handler.
+fn fulfillFromBytes(c: *Component, source: []const u8, spec: *const components.Spec) !void {
+    var body: []const u8 = source;
+    if (state_mod.extractFrontmatter(source)) |fm| {
+        body = fm.rest;
+        var tmp = try state_mod.parseFrontmatter(c.allocator, fm.body);
+        defer tmp.deinit();
+        var it = tmp.map.iterator();
+        while (it.next()) |entry| {
+            try c.child_state.set(entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
+    try applyParentOverlays(c.child_state, spec);
+
+    const root = try markdown.parseWithStateAndScope(
+        c.arena.allocator(),
+        body,
+        theme_ref.?,
+        registry_ref.?,
+        c.child_state,
+        c.scope,
+    );
+    c.root = root;
+    c.phase = .ready;
+}
+
+/// Variant of `fulfillFromBytes` for the completion handler, which
+/// doesn't have a live `Spec` anymore — applies the snapshotted
+/// overlay KVs from the PendingFetch instead.
+fn fulfillFromBytesWithOverlays(c: *Component, source: []const u8, overlays: []const OverlayKV) !void {
+    var body: []const u8 = source;
+    if (state_mod.extractFrontmatter(source)) |fm| {
+        body = fm.rest;
+        var tmp = try state_mod.parseFrontmatter(c.allocator, fm.body);
+        defer tmp.deinit();
+        var it = tmp.map.iterator();
+        while (it.next()) |entry| {
+            try c.child_state.set(entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
+    for (overlays) |kv| {
+        try c.child_state.set(kv.key, kv.value);
+    }
+
+    const root = try markdown.parseWithStateAndScope(
+        c.arena.allocator(),
+        body,
+        theme_ref.?,
+        registry_ref.?,
+        c.child_state,
+        c.scope,
+    );
+    c.root = root;
+    c.phase = .ready;
+}
+
+fn submitAsyncFetch(c: *Component, url: []const u8, spec: *const components.Spec) !void {
+    const ch = io_channel_ref orelse return error.EmbeddedDocumentNotInstalled;
+    const a = c.allocator;
+
+    const pending = try a.create(PendingFetch);
+    errdefer a.destroy(pending);
+
+    const url_copy = try a.dupe(u8, url);
+    errdefer a.free(url_copy);
+
+    // Snapshot non-`src` attrs. We dupe both key and value into
+    // PendingFetch.allocator so the snapshot survives past the
+    // current parse arena.
+    var overlay_list: std.ArrayListUnmanaged(OverlayKV) = .{};
+    errdefer {
+        for (overlay_list.items) |kv| {
+            a.free(kv.key);
+            a.free(kv.value);
+        }
+        overlay_list.deinit(a);
+    }
+    for (spec.attrs) |attr| {
+        if (std.mem.eql(u8, attr.key, "src")) continue;
+        const k = try a.dupe(u8, attr.key);
+        errdefer a.free(k);
+        const v = try a.dupe(u8, attr.value);
+        errdefer a.free(v);
+        try overlay_list.append(a, .{ .key = k, .value = v });
+    }
+    const overlays = try overlay_list.toOwnedSlice(a);
+    errdefer a.free(overlays);
+
+    pending.* = .{
+        .allocator = a,
+        .component = c,
+        .handle = 0,
+        .url = url_copy,
+        .overlays = overlays,
+    };
+
+    const handle = try ch.submitHttpGet(url, @intFromPtr(pending));
+    pending.handle = handle;
+    c.pending = pending;
+    c.phase = .loading;
+}
+
+/// Read a local (non-URL) source. Same path the synchronous flow
+/// used pre-stage-12; broken out so the URL path can stay clean.
+fn readLocal(allocator: std.mem.Allocator, src: []const u8) ![]const u8 {
+    const path: []const u8 = if (std.mem.startsWith(u8, src, "file://"))
+        src["file://".len..]
+    else
+        src;
+    return try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
+}
+
+fn freePending(p: *PendingFetch) void {
+    const a = p.allocator;
+    for (p.overlays) |kv| {
+        a.free(kv.key);
+        a.free(kv.value);
+    }
+    a.free(p.overlays);
+    a.free(p.url);
+    a.destroy(p);
+}
+
+/// Drain target. Main thread calls this once per frame via
+/// `IoChannel.drain`. Resolves a completion against the originating
+/// Pending: caches the body, finishes the parse, bubbles dirty.
+/// Owned bodies are released here in all paths (cache transfers
+/// ownership but dupes; cancellation frees outright).
+pub fn handleCompletion(comp: io.Completion) void {
+    const p: *PendingFetch = @ptrFromInt(comp.user_data);
+    defer freePending(p);
+
+    const c_opt = p.component;
+    // Decouple the Pending↔Component link regardless of outcome so
+    // deinit_ doesn't try to follow a freed pointer later.
+    if (c_opt) |c| c.pending = null;
+
+    switch (comp.result) {
+        .err => {
+            if (c_opt) |c| {
+                c.phase = .failed;
+                if (parent_state_ref) |ps| ps.dirty = true;
+            }
+            // No body to free on the error path.
+        },
+        .ok => |body_owned| {
+            // Always cache the bytes (the next mount of the same URL
+            // gets the fast sync path), even if THIS Component was
+            // cancelled. Cache ownership: body is duped into the
+            // cache_allocator; the io-channel-owned slice is freed
+            // immediately after.
+            const a = cache_allocator orelse {
+                if (io_channel_ref) |ch| ch.releaseOk(body_owned);
+                return;
+            };
+            const cached_copy = a.dupe(u8, body_owned) catch {
+                if (io_channel_ref) |ch| ch.releaseOk(body_owned);
+                return;
+            };
+            if (io_channel_ref) |ch| ch.releaseOk(body_owned);
+
+            // Only insert into the cache if we don't have a copy
+            // already (a concurrent second fetch racing the first
+            // would otherwise leak the older copy).
+            if (url_cache.get(p.url) == null) {
+                const key = a.dupe(u8, p.url) catch {
+                    a.free(cached_copy);
+                    return;
+                };
+                url_cache.put(a, key, cached_copy) catch {
+                    a.free(key);
+                    a.free(cached_copy);
+                    return;
+                };
+            } else {
+                a.free(cached_copy);
+            }
+
+            if (c_opt) |c| {
+                const bytes = url_cache.get(p.url) orelse return;
+                fulfillFromBytesWithOverlays(c, bytes, p.overlays) catch {
+                    c.phase = .failed;
+                };
+                if (parent_state_ref) |ps| ps.dirty = true;
+            }
+        },
+    }
 }
 
 fn update(ctx: *anyopaque, spec: *const components.Spec) anyerror!void {
@@ -243,10 +509,25 @@ fn update(ctx: *anyopaque, spec: *const components.Spec) anyerror!void {
     // child Element tree mid-stream. Author changes `#id` to force a
     // destroy + create cycle through the registry's auto-recreation
     // path.
+    //
+    // If a fetch is still in flight, refresh the snapshotted overlays
+    // on the PendingFetch too — so when the completion lands, the
+    // *latest* parent values are applied after the frontmatter.
+    if (c.pending) |p| {
+        try refreshPendingOverlays(p, spec);
+    }
 }
 
 fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     const c: *Component = @ptrCast(@alignCast(ctx));
+    // If a fetch is in flight, signal cancel by nulling the back
+    // pointer. The completion handler will see this, free the body
+    // (if it lands) plus the PendingFetch itself, and skip the
+    // parse + dirty-bubble work.
+    if (c.pending) |p| {
+        p.component = null;
+        c.pending = null;
+    }
     // Sweep child instances FIRST: their bindings unsubscribe from
     // child_state cleanly while child_state still exists. Without
     // this ordering, child Binding.destroy would call
@@ -260,6 +541,37 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     allocator.destroy(c);
 }
 
+/// Replace the snapshotted overlays on a Pending so the completion
+/// handler applies the most recent parent values. Allocates a fresh
+/// list; frees the previous one on success.
+fn refreshPendingOverlays(p: *PendingFetch, spec: *const components.Spec) !void {
+    const a = p.allocator;
+    var new_list: std.ArrayListUnmanaged(OverlayKV) = .{};
+    errdefer {
+        for (new_list.items) |kv| {
+            a.free(kv.key);
+            a.free(kv.value);
+        }
+        new_list.deinit(a);
+    }
+    for (spec.attrs) |attr| {
+        if (std.mem.eql(u8, attr.key, "src")) continue;
+        const k = try a.dupe(u8, attr.key);
+        errdefer a.free(k);
+        const v = try a.dupe(u8, attr.value);
+        errdefer a.free(v);
+        try new_list.append(a, .{ .key = k, .value = v });
+    }
+    const new_slice = try new_list.toOwnedSlice(a);
+    // Replace + free old.
+    for (p.overlays) |kv| {
+        a.free(kv.key);
+        a.free(kv.value);
+    }
+    a.free(p.overlays);
+    p.overlays = new_slice;
+}
+
 fn applyParentOverlays(child_state: *state_mod.State, spec: *const components.Spec) !void {
     for (spec.attrs) |a| {
         if (std.mem.eql(u8, a.key, "src")) continue;
@@ -270,55 +582,6 @@ fn applyParentOverlays(child_state: *state_mod.State, spec: *const components.Sp
 fn findAttr(attrs: []const components.Attr, key: []const u8) ?[]const u8 {
     for (attrs) |a| if (std.mem.eql(u8, a.key, key)) return a.value;
     return null;
-}
-
-/// Detect the `src=` scheme and dispatch. Returns bytes owned by
-/// `allocator` — caller's responsibility to free. For URL sources,
-/// the bytes are duped out of the cache so each Component gets its
-/// own copy (lifetime is then bound to the Component's allocator,
-/// matching the filesystem path).
-fn loadSource(allocator: std.mem.Allocator, src: []const u8) ![]const u8 {
-    if (std.mem.startsWith(u8, src, "http://") or std.mem.startsWith(u8, src, "https://")) {
-        const cached = try cachedFetch(src);
-        return try allocator.dupe(u8, cached);
-    }
-    const path: []const u8 = if (std.mem.startsWith(u8, src, "file://"))
-        src["file://".len..]
-    else
-        src;
-    // 1 MiB cap is plenty for any reasonable doc; bumped when
-    // content demand justifies.
-    return try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
-}
-
-/// Fetch + cache. Returns a slice OWNED by the cache (do not free
-/// it directly — caller dupes if it needs an independent copy).
-fn cachedFetch(url: []const u8) ![]const u8 {
-    const a = cache_allocator orelse return error.EmbeddedDocumentNotInstalled;
-
-    if (url_cache.get(url)) |bytes| return bytes;
-
-    var client = std.http.Client{ .allocator = a };
-    defer client.deinit();
-
-    var body = std.ArrayList(u8).init(a);
-    errdefer body.deinit();
-
-    const result = client.fetch(.{
-        .location = .{ .url = url },
-        .response_storage = .{ .dynamic = &body },
-        .max_append_size = 8 * 1024 * 1024,
-    }) catch return error.EmbeddedDocumentReadFailed;
-
-    if (result.status != .ok) return error.EmbeddedDocumentReadFailed;
-
-    const url_key = try a.dupe(u8, url);
-    errdefer a.free(url_key);
-    const owned = try body.toOwnedSlice();
-    errdefer a.free(owned);
-
-    try url_cache.put(a, url_key, owned);
-    return owned;
 }
 
 const vtable: element.ElementVTable = .{
@@ -334,15 +597,114 @@ fn layoutAndRender(
 ) anyerror!element.Box {
     const c: *const Component = @ptrCast(@alignCast(ctx));
 
-    // Input-scope swap: while we walk the embedded subtree, any Hit
-    // emitted by an interactive child component should carry our
-    // child_state pointer (not the host's). Save+restore so peers
-    // after us in the parent's layout get the parent's state back.
-    const saved = lc.state;
-    lc.state = @ptrCast(c.child_state);
-    defer lc.state = saved;
+    switch (c.phase) {
+        .ready => {
+            // Input-scope swap: while we walk the embedded subtree,
+            // any Hit emitted by an interactive child component
+            // should carry our child_state pointer (not the host's).
+            const saved = lc.state;
+            lc.state = @ptrCast(c.child_state);
+            defer lc.state = saved;
+            return try element_layout.layoutAndRender(c.root, origin, constraints, lc, out);
+        },
+        .loading => {
+            const url: []const u8 = if (c.pending) |p| p.url else "";
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "loading {s}…", .{url}) catch "loading…";
+            return try renderPlaceholder(msg, .loading, origin, constraints, lc, out);
+        },
+        .failed => {
+            return try renderPlaceholder("fetch failed", .failed, origin, constraints, lc, out);
+        },
+    }
+}
 
-    return try element_layout.layoutAndRender(c.root, origin, constraints, lc, out);
+const PlaceholderScheme = enum { loading, failed };
+
+const PLACEHOLDER_RADIUS: f32 = 6;
+const PLACEHOLDER_BORDER_PX: f32 = 2;
+const PLACEHOLDER_PAD_X: f32 = 12;
+const PLACEHOLDER_PAD_Y: f32 = 8;
+const PLACEHOLDER_MIN_W: f32 = 240;
+
+const LOADING_BORDER: [4]f32 = .{ 0.55, 0.65, 0.80, 0.85 };
+const LOADING_BG: [4]f32 = .{ 0.10, 0.13, 0.18, 0.55 };
+const FAILED_BORDER: [4]f32 = .{ 0.85, 0.30, 0.30, 0.95 };
+const FAILED_BG: [4]f32 = .{ 0.30, 0.08, 0.08, 0.60 };
+
+fn renderPlaceholder(
+    msg: []const u8,
+    scheme: PlaceholderScheme,
+    origin: [2]f32,
+    constraints: element.Constraints,
+    lc: *element.LayoutCtx,
+    out: *element.DrawList,
+) !element.Box {
+    const border_rgba = switch (scheme) {
+        .loading => LOADING_BORDER,
+        .failed => FAILED_BORDER,
+    };
+    const bg_rgba = switch (scheme) {
+        .loading => LOADING_BG,
+        .failed => FAILED_BG,
+    };
+    const style = lc.theme.body;
+    const m = lc.fonts.metrics(style.font_id);
+
+    var arena = std.heap.ArenaAllocator.init(lc.allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    const hb = lc.fonts.hbFont(style.font_id);
+    const run = try shape.shapeUtf8(arena_alloc, hb, msg);
+
+    const fscale = lc.fonts.scale(style.font_id);
+    var text_w: f32 = 0;
+    for (run.glyphs) |g| text_w += g.x_advance * fscale;
+
+    const intrinsic_w = text_w + 2 * PLACEHOLDER_PAD_X;
+    const total_w: f32 = if (std.math.isFinite(constraints.max_w))
+        constraints.max_w
+    else
+        @max(intrinsic_w, PLACEHOLDER_MIN_W);
+    const total_h: f32 = m.line_height + 2 * PLACEHOLDER_PAD_Y;
+
+    try out.quads.append(.{
+        .dst_pos = .{ origin[0], origin[1] },
+        .dst_size = .{ total_w, total_h },
+        .color = border_rgba,
+        .radius = PLACEHOLDER_RADIUS,
+    });
+    try out.quads.append(.{
+        .dst_pos = .{ origin[0] + PLACEHOLDER_BORDER_PX, origin[1] + PLACEHOLDER_BORDER_PX },
+        .dst_size = .{ total_w - 2 * PLACEHOLDER_BORDER_PX, total_h - 2 * PLACEHOLDER_BORDER_PX },
+        .color = bg_rgba,
+        .radius = @max(0, PLACEHOLDER_RADIUS - PLACEHOLDER_BORDER_PX),
+    });
+
+    const baseline_y = origin[1] + PLACEHOLDER_PAD_Y + m.ascender;
+    _ = try text_layout.appendShapedRun(
+        &out.glyphs,
+        lc.fonts,
+        lc.cache,
+        lc.mono_atlas,
+        lc.color_atlas,
+        run,
+        style.font_id,
+        origin[0] + PLACEHOLDER_PAD_X,
+        baseline_y,
+        style.color,
+        style.hot_color,
+        style.attention,
+    );
+
+    return .{
+        .x = origin[0],
+        .y = origin[1],
+        .w = total_w,
+        .h = total_h,
+        .baseline = baseline_y,
+    };
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -375,4 +737,67 @@ test "parent overlay overrides child frontmatter" {
     const spec: components.Spec = .{ .name = "embedded-document", .attrs = &attrs };
     try applyParentOverlays(&s, &spec);
     try testing.expectEqualStrings("420", s.get("target_orbit").?); // parent won
+}
+
+test "refreshPendingOverlays: replaces snapshot atomically, no leaks" {
+    const a = testing.allocator;
+
+    // Build a PendingFetch with an initial overlay snapshot.
+    const k1 = try a.dupe(u8, "panel_color");
+    const v1 = try a.dupe(u8, "red");
+    var initial = try a.alloc(OverlayKV, 1);
+    initial[0] = .{ .key = k1, .value = v1 };
+
+    const url = try a.dupe(u8, "http://x/y");
+    var p = PendingFetch{
+        .allocator = a,
+        .component = null,
+        .handle = 0,
+        .url = url,
+        .overlays = initial,
+    };
+    defer {
+        for (p.overlays) |kv| {
+            a.free(kv.key);
+            a.free(kv.value);
+        }
+        a.free(p.overlays);
+        a.free(p.url);
+    }
+
+    // Refresh with a spec carrying two attrs (one new key, one
+    // updated value, plus the reserved src= which must be filtered).
+    const attrs = [_]components.Attr{
+        .{ .key = "src", .value = "ignored" },
+        .{ .key = "panel_color", .value = "blue" },
+        .{ .key = "label", .value = "fresh" },
+    };
+    const spec: components.Spec = .{ .name = "embedded-document", .attrs = &attrs };
+    try refreshPendingOverlays(&p, &spec);
+
+    try testing.expectEqual(@as(usize, 2), p.overlays.len);
+    try testing.expectEqualStrings("panel_color", p.overlays[0].key);
+    try testing.expectEqualStrings("blue", p.overlays[0].value);
+    try testing.expectEqualStrings("label", p.overlays[1].key);
+    try testing.expectEqualStrings("fresh", p.overlays[1].value);
+}
+
+test "freePending: releases all owned slices (testing-allocator leak check)" {
+    const a = testing.allocator;
+    const k = try a.dupe(u8, "k");
+    const v = try a.dupe(u8, "v");
+    var overlays = try a.alloc(OverlayKV, 1);
+    overlays[0] = .{ .key = k, .value = v };
+
+    const url = try a.dupe(u8, "http://example/");
+    const p = try a.create(PendingFetch);
+    p.* = .{
+        .allocator = a,
+        .component = null,
+        .handle = 0,
+        .url = url,
+        .overlays = overlays,
+    };
+    freePending(p);
+    // testing.allocator will fail the test on any unfreed allocation.
 }

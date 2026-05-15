@@ -292,10 +292,6 @@ TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
   embed works dependency-free. Parent reactive state crosses the
   network boundary: `primary=${state.box_color}` on the URL embed
   drives the remote widget's first bar through the colour cycle.
-  ~11.5k fps Release with everything (8a + 8b + 9 + 11) live.
-  **v0 limitations** captured on the roadmap: the fetch is
-  synchronous on the main thread (stage 12 fix), and there's no
-  persistent cache yet.
 - [x] **Polish — scroll, zoom, keyboard nav, embedded-input
   scope.** Mouse wheel scrolls (60 px / notch, eased tween toward
   target); Ctrl+wheel zooms (×1.10 / notch, clamped 0.25–4);
@@ -310,13 +306,25 @@ TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
   when stress-tested through nested resolves; rule captured in
   memory as `project_registry_pointer_rules.md` so future
   recursive factories don't rederive it.
+- [x] **Stage 12 — async I/O channel.** Work-stealing thread pool
+  in `src/jobs.zig` (Chase-Lev deque, ported from valkyr) +
+  `IoChannel` in `src/io_channel.zig` (fire-and-forget submit,
+  mutex-guarded MPSC completion queue, main-thread `drain` once
+  per frame). `embedded-document` HTTP fetch migrated off the
+  main thread: the Component renders a soft-grey "loading…"
+  placeholder until the body lands, then swaps to the parsed
+  child tree and bubbles `state.dirty`. Cancellation: `deinit_`
+  during loading nulls the `PendingFetch.component` slot so the
+  completion handler discards cleanly. Foundation re-usable for
+  LLM streams (stage 13), file-watcher hot-reload, MCP pipes.
+  ~9.3k fps Release with all of {8a, 8b, 9, 11, 12} live.
 
 ## What's next
 
-[`docs/roadmap.md`](docs/roadmap.md). **Stage 12 — async I/O
-channel** is the headline rebuild: a dedicated worker thread +
-lock-free bidirectional channel so HTTP fetch, LLM streams, and
-file-watcher events all run off the main loop. Stage 10 (headless
-documents), retained layout cache, and crisp-zoom (multi-size
-atlas + re-layout on zoom change) round out the queue. None of
-them block each other.
+[`docs/roadmap.md`](docs/roadmap.md). Open queue: **stage 13**
+(real components — 3D scene, charts beyond sparkline, input
+field, button), **stage 10** (headless documents), **retained
+layout cache** (skip re-walk when neither tree nor inputs
+changed), **crisp zoom** (multi-size atlas + re-layout-on-zoom),
+**persistent URL cache** (disk-backed so remote widgets survive
+restarts). None of them block each other.

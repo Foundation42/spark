@@ -280,43 +280,63 @@ flywheel pieces:
   content-addressed caching layer. Same shape as 9, different
   loader.
 
-## Next — async I/O channel (stage 12)
+## Shipped — async I/O channel (stage 12)
 
 Stage 11 v0 put `std.http.Client.fetch` synchronously inside
 `embedded_document.create`, which runs on the main thread during
-parse. Localhost works fine; a slow / failed / hung remote would
-freeze the renderer with no visible feedback. The same shape is
-wrong for the eventual LLM-stream input path, file-watcher
+parse. Localhost worked fine; a slow / failed / hung remote would
+have frozen the renderer with no visible feedback. The same shape
+is wrong for the eventual LLM-stream input path, file-watcher
 hot-reload, MCP-tool subprocess pipes, and anything else that can
 block.
 
-The rebuild is a dedicated I/O worker thread + bidirectional
-lock-free channel:
+The fix is a two-layer concurrency primitive:
 
-- **Worker side.** Owns `std.http.Client`, file watchers, future
-  LLM-stream readers. Polls its inbound request queue, blocks on
-  the appropriate primitive (recv / read / select), posts results
-  to the outbound queue.
-- **Channel.** Lock-free SPSC ring buffers (one per direction;
-  bump to MPMC if a worker pool ever lands). Tagged-union payload
-  so one channel carries `FetchRequest` / `FetchResult` /
-  `StreamChunk` / `FileChange` / future variants.
-- **Main side.** Submits requests, never blocks. Each frame polls
-  the inbound queue; transitions component state on results
-  (e.g. `:::embedded-document` flips from "loading" placeholder to
-  ready when the bytes arrive). `state.dirty` triggers the
-  normal re-layout path.
+- **`src/jobs.zig`** — work-stealing thread pool (Chase-Lev deque),
+  ported from valkyr. Worker count defaults to `cpu_count - 2`,
+  min 2. Workers own per-worker LIFO deques, steal FIFO when their
+  own deque is empty, progressive yield → 100µs sleep when idle.
+  Foundation primitive — reused later for parallel layout, mesh
+  build, anything CPU-bound.
+- **`src/io_channel.zig`** — `IoChannel` on top: `submitHttpGet`
+  packages a request into a Job, schedules it onto the pool;
+  worker runs the blocking fetch; pushes a `Completion` onto a
+  mutex-guarded MPSC completion queue. Main thread calls
+  `channel.drain(handler)` once per frame; handler routes the
+  completion to whatever component owns the in-flight request
+  (today: `embedded-document` only). Mutex queue (not lock-free
+  MPSC) is fine for v0 — completion volume is tiny; swap a Vyukov
+  MPSC in when load justifies.
 
-`:::embedded-document` becomes the first migration: factory.create
-posts a `FetchRequest`, returns immediately with a "loading"
-visual; when the channel delivers bytes, the cached instance
-parses + state-transitions; next frame re-layouts.
+`embedded-document` is the first migration: factory.create posts
+a fetch and returns a Component in `phase = .loading`; the
+component renders a soft-grey "loading {url}…" placeholder until
+the bytes land. Completion handler caches the body, applies
+frontmatter + snapshotted parent overlays, parses, swaps the
+Component to `.ready`, bubbles `state.dirty` to wake the next
+re-layout.
+
+Cancellation discipline: `deinit_` during the loading phase
+nulls the `PendingFetch.component` slot so the completion
+handler discards the body cleanly without dereferencing freed
+Component memory. PendingFetch is owned by the completion
+handler; Component holds it only for cancel-signaling.
+
+Local file `src=` paths stay synchronous — filesystem reads are
+fast and the loading-state machinery isn't worth the complexity
+there.
 
 LLM streaming + file-watcher hot-reload (stage 13+) layer on the
-same channel without touching the contract again.
+same channel without touching the contract again — they just need
+new `Request` variants (currently `http_get` only) and matching
+completion routing.
 
-Saved in `memory/feedback_async_io.md` so the principle survives
-to the rebuild session.
+Tests cover the channel end-to-end (synthetic post→drain
+roundtrip, worker-thread post via scheduled job, deinit
+releasing undrained bodies, handler-can-resubmit) and the
+embedded-document overlay snapshot/refresh helpers. The
+Pending↔Component cancellation invariant is captured in
+`memory/project_io_channel_cancellation.md`.
 
 ## Then — real components (stages 13+)
 

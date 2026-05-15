@@ -37,6 +37,8 @@ const slider_component = @import("components/slider.zig");
 const state_mod = @import("state.zig");
 const update = @import("update.zig");
 const demo_server_mod = @import("demo_server.zig");
+const jobs_mod = @import("jobs.zig");
+const io_channel_mod = @import("io_channel.zig");
 
 /// Demo document — parsed by the vendored cmark + mapper into an
 /// Element tree at startup. Same render path as the hand-built
@@ -505,6 +507,14 @@ fn scrollCb(window: ?*win.c.GLFWwindow, _: f64, yoffset: f64) callconv(.C) void 
     fc.state.dirty = true;
 }
 
+/// `IoChannel.drain` handler. Routes every completion to
+/// embedded_document.handleCompletion — the only consumer today.
+/// When the LLM tier lands (stage 13/14), this grows a switch on
+/// `comp.user_data`'s tag or on a router table.
+fn drainHandler(_: *io_channel_mod.IoChannel, comp: io_channel_mod.Completion) void {
+    embedded_document_component.handleCompletion(comp);
+}
+
 /// HSV → RGB conversion using the standard six-sextant formula. `h`
 /// is degrees [0, 360); `s` and `v` are [0, 1]. Used by the demo to
 /// paint each animated SDF glyph with its own rainbow hue.
@@ -544,7 +554,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 5 / stage 11 (remote :::embedded-document)\n", .{});
+    try stdout.print("text_engine demo — session 6 / stage 12 (async I/O channel)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
     try stdout.print("  demo.md bytes:         {d}\n", .{demo_md.len});
@@ -654,10 +664,22 @@ pub fn main() !void {
     var host_state = (try state_mod.fromSource(allocator, demo_md)) orelse state_mod.State.init(allocator);
     defer host_state.deinit();
 
+    // ── Stage 12 — async I/O channel ───────────────────────────────
+    // Work-stealing thread pool + fire-and-forget IoChannel sit
+    // between the renderer and any blocking I/O (HTTP fetches today;
+    // LLM streams + file watcher + MCP pipes soon). Owned by main
+    // so worker threads outlive the renderer; deinit order is
+    // strictly reverse-of-init to make sure workers join before the
+    // channel's completion queue is freed.
+    const job_system = try jobs_mod.JobSystem.init(allocator, 0);
+    defer job_system.deinit();
+    var io_channel = io_channel_mod.IoChannel.init(allocator, job_system);
+    defer io_channel.deinit();
+
     // Stage 9 — install the embedded-document factory now that theme
-    // + registry + parent state all exist. Has to happen before any
-    // parse runs.
-    try embedded_document_component.install(&registry, &theme, &host_state);
+    // + registry + parent state + io_channel all exist. Has to
+    // happen before any parse runs.
+    try embedded_document_component.install(&registry, &theme, &host_state, &io_channel);
     defer embedded_document_component.deinitGlobals();
 
     // Stage 11 — spin up the local demo HTTP server BEFORE the parse
@@ -795,6 +817,12 @@ pub fn main() !void {
     while (!window.shouldClose()) {
         window.pollEvents();
         processInput(&window, &frame_ctx) catch {};
+
+        // Stage 12 — drain async I/O completions. Each completion is
+        // routed to its originating component (today: only
+        // embedded-document fetches); the handler may mark state
+        // dirty, which the renderer picks up below.
+        _ = io_channel.drain(&io_channel, drainHandler);
 
         const now_ms = std.time.milliTimestamp();
         if (now_ms - last_update_ms >= UPDATE_CYCLE_MS) {
