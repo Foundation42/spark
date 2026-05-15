@@ -34,6 +34,7 @@ const box_component = @import("components/box.zig");
 const button_component = @import("components/button.zig");
 const chart_component = @import("components/chart.zig");
 const embedded_document_component = @import("components/embedded_document.zig");
+const input_component = @import("components/input.zig");
 const llm_stream_component = @import("components/llm_stream.zig");
 const slider_component = @import("components/slider.zig");
 const state_mod = @import("state.zig");
@@ -140,6 +141,13 @@ const FrameCtx = struct {
     mouse_y: f32 = 0,
     mouse_down: bool = false,
     captured: ?element.Hit = null,
+
+    // Stage 13c — keyboard focus. Set when a mouse_down lands on a
+    // hit whose `focusable=true`; cleared on click-outside or Esc.
+    // While non-null, GLFW key + char callbacks route here instead
+    // of the scroll/zoom nav handler. Compared by `ctx` pointer
+    // identity across re-layouts (component instances persist).
+    focused: ?element.Hit = null,
 
     // Stage 11 lesson: SSBO overflow used to swallow itself via the
     // `catch return` in drawCb / runLayout, turning a 2048-glyph
@@ -377,7 +385,26 @@ fn processInput(window: *win.Window, fc: *FrameCtx) !void {
         // Press transition. Hit-test in reverse so the deepest
         // (last-emitted) element wins; capture for the duration of
         // the press.
-        if (findHit(fc.dl.hits.items, x, y)) |hit| {
+        const maybe_hit = findHit(fc.dl.hits.items, x, y);
+
+        // Focus management. A click on a focusable hit grabs focus
+        // (firing focus_lost on the prior holder if it changed). A
+        // click anywhere else — non-focusable hit OR empty space —
+        // clears focus. Identity is compared by ctx pointer because
+        // Hit structs are rebuilt every layout but components
+        // persist.
+        const new_focus_ctx: ?*anyopaque = blk: {
+            if (maybe_hit) |h| if (h.focusable) break :blk h.ctx;
+            break :blk null;
+        };
+        const old_focus_ctx: ?*anyopaque = if (fc.focused) |f| f.ctx else null;
+        if (new_focus_ctx != old_focus_ctx) {
+            if (fc.focused) |old| dispatch(old, .focus_lost, fc.state) catch {};
+            fc.focused = if (maybe_hit) |h| if (h.focusable) h else null else null;
+            if (fc.focused) |new| dispatch(new, .focus_gained, fc.state) catch {};
+        }
+
+        if (maybe_hit) |hit| {
             fc.captured = hit;
             try dispatch(hit, .{ .mouse_down = .{
                 .local = .{ x - hit.box.x, y - hit.box.y },
@@ -441,6 +468,27 @@ fn keyCb(window: ?*win.c.GLFWwindow, key: c_int, _: c_int, action: c_int, mods: 
     if (ud == null) return;
     const fc: *FrameCtx = @ptrCast(@alignCast(ud));
 
+    // Esc always clears focus, regardless of who holds it.
+    if (key == win.c.GLFW_KEY_ESCAPE and fc.focused != null) {
+        const old = fc.focused.?;
+        fc.focused = null;
+        dispatch(old, .focus_lost, fc.state) catch {};
+        fc.state.dirty = true;
+        return;
+    }
+
+    // While a component holds focus (input field, etc.), keys go to
+    // it. The nav handler (PgUp/PgDn/zoom) is suppressed so typing
+    // into a field doesn't also scroll the page.
+    if (fc.focused) |hit| {
+        dispatch(hit, .{ .key_down = .{
+            .key = @intCast(key),
+            .mods = @intCast(mods),
+        } }, fc.state) catch {};
+        fc.state.dirty = true;
+        return;
+    }
+
     const ctrl = (mods & win.c.GLFW_MOD_CONTROL) != 0;
 
     if (ctrl) {
@@ -476,6 +524,19 @@ fn keyCb(window: ?*win.c.GLFWwindow, key: c_int, _: c_int, action: c_int, mods: 
         win.c.GLFW_KEY_END => fc.target_scroll_y = fc.max_scroll_y,
         else => return,
     }
+}
+
+// GLFW char callback — fires once per printable character (post-IME,
+// post-shift composition). Routes to the focused component as a
+// `char_input` event. Non-printable keys (arrows, enter, backspace)
+// never reach here; they come through `keyCb` as `.key_down`.
+fn charCb(window: ?*win.c.GLFWwindow, codepoint: c_uint) callconv(.C) void {
+    const ud = win.c.glfwGetWindowUserPointer(window);
+    if (ud == null) return;
+    const fc: *FrameCtx = @ptrCast(@alignCast(ud));
+    const hit = fc.focused orelse return;
+    dispatch(hit, .{ .char_input = @intCast(codepoint) }, fc.state) catch {};
+    fc.state.dirty = true;
 }
 
 // GLFW scroll callback. Ctrl-held → zoom; plain → vertical scroll.
@@ -563,7 +624,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 6 / stage 13b (button → LLM trigger)\n", .{});
+    try stdout.print("text_engine demo — session 7 / stage 13c (:::input field)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
     try stdout.print("  demo.md bytes:         {d}\n", .{demo_md.len});
@@ -663,6 +724,9 @@ pub fn main() !void {
     try registry.register("slider", slider_component.factory);
     try button_component.install(&registry);
     defer button_component.deinitGlobals();
+    // input_component install needs parent_state — we know
+    // host_state lives long enough (declared just below this block)
+    // so we move the install to after host_state init. See below.
     // Embedded-document factory needs theme + registry + parent
     // state captured at install time — see embedded_document.zig's
     // "module-globals smell" note for why.
@@ -705,6 +769,8 @@ pub fn main() !void {
     defer embedded_document_component.deinitGlobals();
     try llm_stream_component.install(&registry, &theme, &host_state, &io_channel, &env);
     defer llm_stream_component.deinitGlobals();
+    try input_component.install(&registry, &host_state);
+    defer input_component.deinitGlobals();
 
     // Stage 11 — spin up the local demo HTTP server BEFORE the parse
     // so the remote :::embedded-document fetch succeeds. Listens on
@@ -783,6 +849,7 @@ pub fn main() !void {
     win.c.glfwSetWindowUserPointer(window.handle, @ptrCast(&frame_ctx));
     _ = win.c.glfwSetScrollCallback(window.handle, scrollCb);
     _ = win.c.glfwSetKeyCallback(window.handle, keyCb);
+    _ = win.c.glfwSetCharCallback(window.handle, charCb);
 
     const exit_after_ms: ?i64 = if (std.process.getEnvVarOwned(allocator, "TEXT_ENGINE_EXIT_AFTER")) |s| blk: {
         defer allocator.free(s);

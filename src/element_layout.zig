@@ -126,6 +126,12 @@ pub fn layoutAndRender(
                     // the host state; embedded-doc walks swap it to
                     // the doc's child state before delegating.
                     .state = ctx.state,
+                    // Propagate vtable focusability so the input
+                    // dispatcher can grab keyboard focus on click.
+                    // Without this, the walker's Hit shadows any Hit
+                    // a component emitted itself — meaning a text
+                    // field's own focusable=true would be lost.
+                    .focusable = cu.vtable.focusable,
                 });
             }
             return box;

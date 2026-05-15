@@ -250,17 +250,39 @@ pub const ElementVTable = struct {
         event: InputEvent,
         state: *anyopaque,
     ) anyerror!void = null,
+    /// True if this component wants keyboard focus on click. The
+    /// element_layout walker stamps this onto the emitted `Hit` so
+    /// the host's input dispatcher can wire focus correctly.
+    /// Default false — only text-bearing widgets (`:::input`) opt in.
+    focusable: bool = false,
 };
 
-/// One input event delivered to a component's `on_input`. Mouse-only
-/// for stage 7f; keyboard / IME land when a text-input component
-/// arrives. `local` is the mouse position **relative to the
-/// component's laid-out top-left** (so a slider doesn't need to
-/// recompute its origin to figure out where the thumb dropped).
+/// One input event delivered to a component's `on_input`. Stage 13c
+/// added keyboard + focus channels for the `:::input` field; mouse
+/// channels stayed as-is. `local` (on MouseEvent) is the mouse
+/// position **relative to the component's laid-out top-left** (so a
+/// slider doesn't need to recompute its origin to figure out where
+/// the thumb dropped).
 pub const InputEvent = union(enum) {
     mouse_down: MouseEvent,
     mouse_up: MouseEvent,
     mouse_move: MouseEvent,
+    /// Unicode codepoint typed (post-IME). Fires from GLFW's char
+    /// callback — represents a printable character intent. Carries
+    /// only the codepoint; non-printable keys (arrows, backspace,
+    /// enter) come through `key_down` instead.
+    char_input: u32,
+    /// Non-printable key press. `key` is a raw GLFW keycode; `mods`
+    /// is the GLFW modifier mask (`GLFW_MOD_SHIFT` etc — see
+    /// `win.c.GLFW_MOD_*`).
+    key_down: KeyEvent,
+    /// Component gained keyboard focus. Sent by the dispatcher
+    /// **before** any subsequent `key_down` / `char_input`.
+    focus_gained: void,
+    /// Component lost keyboard focus (click landed elsewhere, Esc,
+    /// or destruction). Components should commit pending state on
+    /// receipt — they won't see further keys until refocused.
+    focus_lost: void,
 };
 
 pub const MouseEvent = struct {
@@ -270,6 +292,13 @@ pub const MouseEvent = struct {
     /// True while the corresponding button is held. Lets `mouse_move`
     /// double as a "drag" channel without a separate event kind.
     button_down: bool,
+};
+
+pub const KeyEvent = struct {
+    /// Raw GLFW key code (`GLFW_KEY_*`).
+    key: i32,
+    /// GLFW modifier bitmask (`GLFW_MOD_SHIFT | GLFW_MOD_CONTROL …`).
+    mods: u32,
 };
 
 /// One hit-test layer entry — the laid-out box of an interactive
@@ -290,6 +319,12 @@ pub const Hit = struct {
     /// pre-input-scoping behaviour for callers that haven't wired
     /// LayoutCtx.state yet.
     state: ?*anyopaque = null,
+    /// True if a click on this hit should grab keyboard focus.
+    /// Default false — only components that want char/key events
+    /// (`:::input`) opt in. Focus-grab clears any previous focus
+    /// holder (which gets a `.focus_lost`); subsequent key + char
+    /// events route here until focus moves again.
+    focusable: bool = false,
 };
 
 /// Parent-imposed bounds. Stage 1 walker mostly ignores these — text

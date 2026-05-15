@@ -332,22 +332,34 @@ fn kickStream(c: *Component) !void {
     c.pending = pending;
 }
 
-/// Component-target dispatch. Today's only action is `start` —
-/// trigger (or re-trigger) the stream. `body` is unused for now;
-/// reserved for future "alter prompt and run" or "set system
-/// message on the fly" cases.
-fn handleUpdate(ctx: *anyopaque, action: []const u8, _: []const u8) anyerror!void {
+/// Component-target dispatch.
+///
+///   * `action=start`, empty `body` → re-fire with the existing
+///     prompt. Used by `:::button` for "retry with original prompt".
+///   * `action=start`, non-empty `body` → replace `c.prompt` with
+///     `body` (owned dupe) and re-fire. Used by `:::input` so the
+///     user's typed text becomes the new prompt.
+fn handleUpdate(ctx: *anyopaque, action: []const u8, body: []const u8) anyerror!void {
     const c: *Component = @ptrCast(@alignCast(ctx));
-    if (std.mem.eql(u8, action, "start")) {
-        kickStream(c) catch |e| {
-            std.log.err("llm-stream: kickStream failed: {s}", .{@errorName(e)});
-            c.phase = .failed;
-            const a = c.allocator;
-            if (c.err_name) |old| a.free(old);
-            c.err_name = a.dupe(u8, @errorName(e)) catch null;
+    if (!std.mem.eql(u8, action, "start")) return;
+
+    if (body.len > 0) {
+        const new_prompt = c.allocator.dupe(u8, body) catch |e| {
+            std.log.err("llm-stream: prompt dupe failed: {s}", .{@errorName(e)});
+            return;
         };
-        if (parent_state_ref) |ps| ps.dirty = true;
+        c.allocator.free(c.prompt);
+        c.prompt = new_prompt;
     }
+
+    kickStream(c) catch |e| {
+        std.log.err("llm-stream: kickStream failed: {s}", .{@errorName(e)});
+        c.phase = .failed;
+        const a = c.allocator;
+        if (c.err_name) |old| a.free(old);
+        c.err_name = a.dupe(u8, @errorName(e)) catch null;
+    };
+    if (parent_state_ref) |ps| ps.dirty = true;
 }
 
 fn update(ctx: *anyopaque, _: *const components.Spec) anyerror!void {

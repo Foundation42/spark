@@ -71,9 +71,12 @@ The block below is the *same factory* — but loaded over HTTP from a localhost 
 
 ## Live LLM authoring (stage 13a) — local Ollama
 
-The block below is *not* a static document — it is being written by a local language model right now, streaming token by token through an [IoChannel](../src/io_channel.zig). Each chunk is line-buffered NDJSON; the `message.content` tokens accumulate into a markdown buffer that is re-parsed and re-rendered on every chunk. Click *Run* to trigger; click again to re-run.
+The block below is *not* a static document — it is being written by a local language model right now, streaming token by token through an [IoChannel](../src/io_channel.zig). Each chunk is line-buffered NDJSON; the `message.content` tokens accumulate into a markdown buffer that is re-parsed and re-rendered on every chunk. Click *Run* to fire the canned prompt, or **type into the input field and hit Enter** to send your own (stage 13c). The button keeps the default prompt around as a quick retry.
 
-:::button {#run_local label="Run local (Ollama)" target=#chat_local action=start}
+:::input {#ask_local target=#chat_local action=start placeholder="Ask qwen3.5… (Enter to send)" width=100%}
+:::
+
+:::button {#run_local label="Run default prompt (Ollama)" target=#chat_local action=start}
 :::
 
 :::llm-stream {#chat_local auto_start=false model=qwen3.5:2b prompt="In 4 short lines, write a haiku about Vulkan rendering text glyphs through a markdown document. Use a level-2 markdown heading for the title." max_tokens=120}
@@ -83,7 +86,10 @@ The block below is *not* a static document — it is being written by a local la
 
 Same component, different provider. `provider=openai` switches the body shape (OpenAI-compatible `max_tokens` field, `Authorization: Bearer` header) and the chunk parser (SSE events instead of NDJSON). The API key lives in `~/.env` as `DEEPSEEK_DYNABOOK`; `api_key_env=` names which entry to read. The fetch goes out over real internet — **and the renderer never blocks waiting** because every byte of work happens on a worker thread.
 
-:::button {#run_remote label="Run DeepSeek (remote)" target=#chat_remote action=start}
+:::input {#ask_remote target=#chat_remote action=start placeholder="Ask DeepSeek… (Enter to send)" width=100%}
+:::
+
+:::button {#run_remote label="Run default prompt (DeepSeek)" target=#chat_remote action=start}
 :::
 
 :::llm-stream {#chat_remote auto_start=false provider=openai endpoint=https://api.deepseek.com/chat/completions model=deepseek-chat api_key_env=DEEPSEEK_DYNABOOK prompt="In 4 short lines, write a haiku about a network packet finding its way home through a worker thread. Use a level-2 markdown heading for the title." max_tokens=120}
@@ -93,7 +99,10 @@ Same component, different provider. `provider=openai` switches the body shape (O
 
 Same component yet again, *third* provider — OpenRouter is itself OpenAI-compatible and fronts dozens of upstream models. Pointed at `google/gemini-2.5-flash` here, but `anthropic/claude-haiku-4`, `openai/gpt-4o-mini`, `meta-llama/llama-3.3-70b-instruct`, and others all drop in just by changing `model=`. The OpenAI wire format earned its place as the lingua franca.
 
-:::button {#run_router label="Run Gemini-Flash (via OpenRouter)" target=#chat_router action=start}
+:::input {#ask_router target=#chat_router action=start placeholder="Ask Gemini Flash… (Enter to send)" width=100%}
+:::
+
+:::button {#run_router label="Run default prompt (Gemini)" target=#chat_router action=start}
 :::
 
 :::llm-stream {#chat_router auto_start=false provider=openai endpoint=https://openrouter.ai/api/v1/chat/completions model=google/gemini-2.5-flash api_key_env=OPENROUTER_DYNABOOK prompt="In 4 short lines, write a haiku about three providers streaming markdown into the same Vulkan-rendered document. Use a level-2 markdown heading for the title." max_tokens=120}

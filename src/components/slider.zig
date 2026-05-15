@@ -231,6 +231,9 @@ fn onInput(
         .mouse_down => |m| try applyDrag(c, state, m.local[0]),
         .mouse_move => |m| if (m.button_down) try applyDrag(c, state, m.local[0]),
         .mouse_up => {},
+        // Keyboard / focus channels (stage 13c) — sliders don't take
+        // focus; ignore.
+        .char_input, .key_down, .focus_gained, .focus_lost => {},
     }
 }
 
