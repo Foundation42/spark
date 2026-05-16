@@ -423,6 +423,24 @@ pub const Theme = struct {
     bold_italic_font_id: registry_mod.FontId,
     /// Mono variant at body display size, for inline code spans.
     code_inline_font_id: registry_mod.FontId,
+    /// Fallback font for codepoints the primary font doesn't cover —
+    /// typically a colour-emoji face. Null disables fallback; in that
+    /// case codepoints outside the primary's cmap render as `.notdef`
+    /// boxes (FT's standard placeholder). When non-null, the markdown
+    /// parser scans every text leaf and splits it on coverage
+    /// boundaries: codepoints the primary has stay in the primary
+    /// run; codepoints only the fallback has spin off into a sibling
+    /// text leaf with `font_id = fallback_font_id`. The inline-flow
+    /// walker handles the resulting mixed-font runs without any
+    /// further special-casing — same baseline-resolution math as for
+    /// emphasis/strong cascades.
+    fallback_font_id: ?registry_mod.FontId = null,
+    /// FontRegistry handle the parser uses for coverage queries. Same
+    /// registry the host populated `body.font_id` etc. against — the
+    /// parser needs it (not the layout pass) to decide where to split
+    /// text leaves at parse time. Null disables splitting (same effect
+    /// as null `fallback_font_id`).
+    font_registry: ?*registry_mod.FontRegistry = null,
 
     // ── Cascade colour overrides ────────────────────────────────────
     code_inline_color: [4]f32 = .{ 0.72, 0.88, 1.0, 1.0 },

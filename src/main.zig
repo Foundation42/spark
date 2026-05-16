@@ -850,7 +850,7 @@ pub fn main() !void {
     const bold_italic_id = try fonts.load(bold_italic_path.ptr, 20);
     const code_inline_id = try fonts.load(mono_path.ptr, 20);
     const code_block_id = try fonts.load(mono_path.ptr, 18);
-    _ = try fonts.load(emoji_path.ptr, 28); // emoji_id; markdown doesn't reach it without font fallback (parked)
+    const emoji_id = try fonts.load(emoji_path.ptr, 28);
     const sdf_id = try fonts.loadSdf(font_path.ptr, 44);
 
     var cache = glyph_cache_mod.GlyphCache.init(allocator);
@@ -882,6 +882,13 @@ pub fn main() !void {
         .strong_font_id = bold_id,
         .bold_italic_font_id = bold_italic_id,
         .code_inline_font_id = code_inline_id,
+        // Emoji fallback (stage 5c). The markdown parser scans every
+        // text leaf and splits on coverage: Latin + symbols stay with
+        // the primary cascade font; pictographic codepoints route to
+        // this colour-emoji entry. The inline-flow walker treats the
+        // resulting mixed-font runs the same as emphasis / strong.
+        .fallback_font_id = emoji_id,
+        .font_registry = &fonts,
     };
 
     // ── Component registry (stage 7b) ──────────────────────────────

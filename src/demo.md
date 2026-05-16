@@ -8,7 +8,9 @@ state:
   config_hidden: "true"
 ---
 
-# text_engine
+# text_engine 🚀✨
+
+Live-document runtime — colour emoji 🎨 flows inline with text 🌸, mathematical signs ✓ ✗ ≈ ≠ ∞ ≤ ≥ pick up the body font, and rich glyphs (rocket 🚀, sparkles ✨, flower 🌸, palette 🎨, party 🎉, star ⭐, fire 🔥, heart ❤️) ride the colour atlas alongside everything else.
 
 ## Stage 3 — markdown source becomes the tree
 

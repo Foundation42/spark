@@ -280,4 +280,17 @@ pub const FontRegistry = struct {
     pub fn actualPx(self: *const FontRegistry, id: FontId) u32 {
         return self.entries.items[id].actual_px;
     }
+
+    /// Does this font's cmap map `codepoint` to a real glyph? Used by
+    /// the markdown parser to decide whether a text leaf needs to be
+    /// split into mixed-font runs (typically: body font has Latin and
+    /// most symbols; emoji font has the pictographic ranges). The
+    /// underlying FT call is a hash lookup on the face's cmap, cheap
+    /// to invoke per codepoint at parse time. Returns false when the
+    /// font would otherwise render the codepoint as the `.notdef`
+    /// placeholder (FT's glyph_id 0).
+    pub fn hasCodepoint(self: *FontRegistry, id: FontId, codepoint: u32) bool {
+        const f = &self.entries.items[id].face;
+        return face_mod.c.FT_Get_Char_Index(f.handle, codepoint) != 0;
+    }
 };

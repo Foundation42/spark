@@ -395,6 +395,148 @@ fn mapBlockChildren(
 
 // ── Inline mapping ─────────────────────────────────────────────────
 
+/// Emit one (or more) `.text` elements for a markdown TEXT node,
+/// splitting on font-coverage boundaries when the theme has a fallback
+/// font registered. Codepoints the primary font (cascade.font_id) has
+/// stay in primary runs; codepoints only the fallback covers spin off
+/// into sibling text leaves with `font_id = fallback`. Combining marks
+/// (ZWJ + variation selectors) stick with the run they're modifying so
+/// emoji ligature sequences (👨‍👩‍👧, ❤️, etc.) stay intact.
+///
+/// Falls back to the pre-fallback single-leaf path when the theme has
+/// no `font_registry` or `fallback_font_id` — keeps the parser usable
+/// in test contexts where no real registry exists.
+fn appendTextWithFallback(
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(element.Element),
+    text: []const u8,
+    cascade: element.Style,
+    theme: *const element.Theme,
+) Error!void {
+    const fonts = theme.font_registry;
+    const fallback_id = theme.fallback_font_id;
+    if (fonts == null or fallback_id == null) {
+        const owned = try arena.dupe(u8, text);
+        try out.append(.{ .text = .{ .content = owned, .style = cascade } });
+        return;
+    }
+    const reg = fonts.?;
+    const fid = fallback_id.?;
+    const primary = cascade.font_id;
+
+    _ = std.unicode.Utf8View.init(text) catch {
+        // Malformed UTF-8 — keep the leaf intact. Splitting per-byte
+        // would produce garbage; better to render the box-of-shame
+        // once than to fragment the text and lose meaning.
+        const owned = try arena.dupe(u8, text);
+        try out.append(.{ .text = .{ .content = owned, .style = cascade } });
+        return;
+    };
+
+    var seg_start: usize = 0;
+    var pos: usize = 0;
+    var seg_uses_fallback = false;
+    var first = true;
+
+    while (pos < text.len) {
+        const cp_len = std.unicode.utf8ByteSequenceLength(text[pos]) catch {
+            pos += 1;
+            continue;
+        };
+        const end = pos + cp_len;
+        if (end > text.len) break;
+        const cp = std.unicode.utf8Decode(text[pos..end]) catch {
+            pos = end;
+            continue;
+        };
+
+        // Peek the next codepoint so VS16 (U+FE0F → "render as emoji")
+        // and VS15 (U+FE0E → "render as text") can override the
+        // coverage check on the base codepoint. Without this, dual-
+        // presentation codepoints like U+2764 (heart) — which most
+        // text fonts ship as a monochrome glyph — would always route
+        // to the primary, losing the colour-emoji rendering the
+        // source explicitly requested via VS16.
+        var next_cp: ?u32 = null;
+        if (end < text.len) {
+            if (std.unicode.utf8ByteSequenceLength(text[end])) |nl| {
+                if (end + nl <= text.len) {
+                    if (std.unicode.utf8Decode(text[end .. end + nl])) |ncp| {
+                        next_cp = ncp;
+                    } else |_| {}
+                }
+            } else |_| {}
+        }
+
+        const use_fb = pickFontForCodepoint(reg, primary, fid, cp, next_cp, seg_uses_fallback);
+        if (first) {
+            seg_uses_fallback = use_fb;
+            first = false;
+        } else if (use_fb != seg_uses_fallback) {
+            try emitTextSegment(arena, out, text[seg_start..pos], cascade, fid, seg_uses_fallback);
+            seg_start = pos;
+            seg_uses_fallback = use_fb;
+        }
+        pos = end;
+    }
+    if (pos > seg_start) {
+        try emitTextSegment(arena, out, text[seg_start..pos], cascade, fid, seg_uses_fallback);
+    }
+}
+
+/// Per-codepoint dispatcher. Combining marks (ZWJ, variation selectors,
+/// zero-width spaces) inherit from the current segment so emoji
+/// ligature sequences stay intact even when the body font happens to
+/// claim ZWJ as a non-printing character.
+fn pickFontForCodepoint(
+    fonts: *registry_mod.FontRegistry,
+    primary: registry_mod.FontId,
+    fallback: registry_mod.FontId,
+    cp: u32,
+    next_cp: ?u32,
+    current_uses_fallback: bool,
+) bool {
+    switch (cp) {
+        // ZWJ, ZWNJ, variation selectors 15/16, zero-width spaces —
+        // inherit from the run they're decorating. (VS16 itself joins
+        // the prior base's run; the lookahead below handled the base's
+        // routing on the previous iteration.)
+        0x200B, 0x200C, 0x200D, 0xFE0E, 0xFE0F => return current_uses_fallback,
+        else => {},
+    }
+    // Explicit presentation overrides via Variation Selector
+    // immediately following the base codepoint. Standard Unicode
+    // emoji-presentation rule.
+    if (next_cp) |nc| {
+        if (nc == 0xFE0F and fonts.hasCodepoint(fallback, cp)) return true;
+        if (nc == 0xFE0E and fonts.hasCodepoint(primary, cp)) return false;
+    }
+    if (fonts.hasCodepoint(primary, cp)) return false;
+    if (fonts.hasCodepoint(fallback, cp)) return true;
+    return false; // neither has it — let primary render `.notdef`
+}
+
+/// Append one font-homogeneous slice as a `.text` element. When
+/// `use_fallback` is true, override the cascade's `font_id` to the
+/// fallback (every other style field — colour, attention, link, etc.
+/// — passes through unchanged so cascade behaviour outside font
+/// selection is preserved).
+fn emitTextSegment(
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(element.Element),
+    slice: []const u8,
+    cascade: element.Style,
+    fallback: registry_mod.FontId,
+    use_fallback: bool,
+) Error!void {
+    const owned = try arena.dupe(u8, slice);
+    var style = cascade;
+    if (use_fallback) style.font_id = fallback;
+    try out.append(.{ .text = .{ .content = owned, .style = style } });
+}
+
+const registry_mod = @import("font/registry.zig");
+
 /// Iterate `parent`'s direct children, mapping each as inline content.
 /// Used by PARAGRAPH and HEADING (containers whose children are
 /// inline), and recursively by emphasis/strong/code/link container
@@ -432,8 +574,7 @@ fn appendInline(
                 std.mem.span(literal_ptr)
             else
                 "";
-            const owned = try arena.dupe(u8, literal);
-            try out.append(.{ .text = .{ .content = owned, .style = cascade } });
+            try appendTextWithFallback(arena, out, literal, cascade, theme);
         },
 
         cmark.CMARK_NODE_SOFTBREAK => {
