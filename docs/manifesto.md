@@ -261,3 +261,11 @@ contract was built to hold them. That was the point.
 ## In one line
 
 **Markdown is the universal interface. Make it live.**
+
+---
+
+> *In the beginning was the markdown. And the markdown said: let
+> there be live components. And there were live components. And
+> it was good.*
+>
+> — somewhere in the Encyclopaedia Galactica, mid-2026
