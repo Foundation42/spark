@@ -666,13 +666,88 @@ dimensions match; reallocated otherwise. Descriptor rewritten in
 place via `vkUpdateDescriptorSets` so cached layout entries stay
 valid.
 
-## Parallel — markdown ↔ ANSI composability (stage 5b)
+## Shipped — markdown ↔ ANSI composability (stage 5b)
 
-Originally planned as stage-5-followup but bumped by the vision
-work. ` ```ansi ``` ` fenced code blocks in markdown route
-through `ansi.parse`, output stuffed into `CodeContent.sub_block`;
-`layoutCodeBlock` recurses into it. Closes the markdown-↔-ANSI
-loop. Small commit (~50 LOC). Lands when convenient.
+` ```ansi ``` ` fenced code blocks in markdown route through
+`ansi.parse`; the result lands as `CodeContent.sub_block` and
+`layoutCodeBlock` recurses into it with the same chrome the
+`.raw` arm gives. Theme is cloned with `body = code_block` so SGR
+text picks up the mono font for terminal-like spacing — same
+pattern `main.zig` uses for the standalone ANSI demo. Closes the
+markdown-↔-ANSI loop the `CodeContent` contract was designed for.
+~70 LOC production + 95 LOC tests.
+
+## Shipped — emoji font fallback (stage 5c)
+
+Theme grew `fallback_font_id` + `font_registry` pointers; the
+markdown parser scans every text leaf and splits on coverage
+boundaries — codepoints the primary font has stay in primary
+runs, codepoints only the fallback covers spin off into sibling
+text leaves with `font_id = fallback`. Inline-flow walker handles
+the resulting mixed-font runs identically to emphasis/strong
+cascades.
+
+Variation Selector 16 (U+FE0F) on a dual-presentation base like
+U+2764 (❤) forces the colour-emoji route even when the body font
+has a monochrome glyph for the same base. VS15 (U+FE0E)
+symmetrically pins to primary. ZWJ + variation selectors +
+zero-width spaces inherit from the run they're decorating so
+multi-codepoint emoji ligature sequences stay on one font.
+~185 LOC.
+
+## Shipped — crisp zoom (multi-size atlas)
+
+Zoom used to be a post-layout scale on a fixed-size bitmap, so
+any non-1 zoom level fuzzed text through bilinear filtering. Now
+the atlas grows per zoom bucket: when a paragraph lays out at
+zoom=N, each glyph gets rasterised at `style.font_id.display_px ×
+N` pixels and the layout emits a world-space dst_size that
+shrinks by `1/N`. The host's existing `× zoom` post-layout
+multiply then takes the world quad to native bitmap pixels on
+screen — 1:1 bilinear sampling, crisp at every zoom level.
+
+`FontRegistry.effectiveFontId(base, target_px)` looks up (or
+lazily creates) a sibling entry with the same TTF reopened at a
+different rasterisation size. SDF + strike-only colour fonts
+return their base id (their bitmaps are zoom-independent — SDF's
+distance field AAs at any display size, emoji strikes are fixed
+in the font file).
+
+`world_scale = base.display_px / eff.actual_px` collapses to the
+right thing across all lanes: 1.0 for mono z=1 (bit-identical to
+the pre-crisp path); 1/N for mono z=N (scaled bitmap fills the
+same world footprint); `base.scale` for SDF and strike-only colour
+(zoom-independent bitmaps).
+
+Prewarm runs on the main thread before workers fan out, iterating
+only the host-loaded base entries (effective entries are
+dead-end leaves; cascading onto them produces exponential blow-up
+via `display_px × zoom` compounding). `AtlasFull` triggers a
+coarse LRU reset — clear glyph cache + atlas reset + block cache
+clear + retry once. Sub-frame "blink" recovery rather than a
+freeze. ~470 LOC across font registry / layout / atlas / main.
+
+Viewport-aware `max_w`: layout's wrap constraint is now
+`extent.width / zoom - 80`, so the world-coord column width
+shrinks as you zoom in (text re-wraps tighter, fits inside the
+viewport) and expands as you zoom out (more words per line, no
+right-side gutter). Browser-style "the whole page zooms".
+
+Mono atlas bumped 768 → 2048 (4 MB R8, trivial on any modern
+GPU) to hold ~30 distinct zoom levels' worth before the LRU path
+kicks in.
+
+## Shipped — half-pixel chop fix
+
+Removed a 0.5-texel UV inset that was originally meant to defend
+against neighbour-glyph bleed at downscale, but the atlas
+already keeps a 2-texel zero-cleared gutter between glyphs and
+bilinear sampling can never reach further than 1 texel past a
+quad edge. The inset was redundant — and at 1:1 it turned the
+top + bottom rows into a 52.5/47.5 mix with the gutter, visibly
+clipping the bottom (and top) half-pixel of every glyph. Removed
+→ texel-center alignment at integer zoom levels, downscale paths
+still protected by the gutter.
 
 ## Shipped — scroll + zoom (post-stage-11)
 
@@ -692,12 +767,13 @@ clamping happens at the callback (scroll) and at the end of
 Zoom range 0.25× – 4×, 10% per wheel-notch step. Scroll: 60 px per
 wheel-notch.
 
-**v0 limitation: pre-rasterized text becomes fuzzy at non-1.0 zoom.**
-The atlas glyphs are at fixed pixel sizes; the transform stretches
-them. SDF glyphs (ATTENTION) stay crisp because the SDF shader
-re-resolves at any scale. The proper crisp-zoom fix is a
-multi-size font atlas + re-layout-on-zoom-change — moderate
-rebuild, deferred.
+~~**v0 limitation: pre-rasterized text becomes fuzzy at non-1.0 zoom.**~~
+~~The atlas glyphs are at fixed pixel sizes; the transform stretches~~
+~~them. SDF glyphs (ATTENTION) stay crisp because the SDF shader~~
+~~re-resolves at any scale.~~ Crisp zoom landed in session 10 — text
+is now pixel-perfect at every magnification via a multi-size atlas
+keyed by `(font, glyph, target_px)`. See the "Shipped — crisp zoom
+(multi-size atlas)" section above.
 
 ~10k fps Release with active scroll/zoom + all of 8a/8b/9/11
 running.

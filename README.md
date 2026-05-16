@@ -508,6 +508,55 @@ TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
   when expensive siblings push us over, but chart-only-dirty
   frames stay serial.
 
+### Session 10 — composability + crisp zoom + emoji fallback
+
+- [x] **Stage 5b — markdown ↔ ANSI composability.** ` ```ansi ``` `
+  fenced code blocks now hand their body to `ansi.parse`; the
+  result lands as `CodeContent.sub_block` and `layoutCodeBlock`
+  recurses into it with the same chrome `.raw` produces. Theme is
+  cloned with `body = code_block` so SGR text picks up the mono
+  font. Closes the markdown-↔-ANSI loop the `CodeContent` contract
+  was designed for.
+
+- [x] **Half-pixel chop fix.** Removed a 0.5-texel UV inset that
+  was originally meant to defend against neighbour-glyph bleed at
+  downscale, but the 2-texel atlas gutter already prevents bleed.
+  At 1:1 the inset turned glyph top/bottom rows into a 52.5/47.5
+  mix with the gutter — visibly clipping every glyph's bottom
+  half-pixel (most noticeable on descenders). Removed → texel-
+  centre alignment restored.
+
+- [x] **Crisp zoom — multi-size atlas.** Zoom used to be a post-
+  layout scale on a fixed-size bitmap (fuzzy at non-1.0). Now the
+  atlas grows per zoom bucket: glyphs rasterise at
+  `style.font_id.display_px × zoom` and layout emits a world-space
+  dst_size that shrinks by `1/zoom`. The host's existing post-
+  layout `× zoom` multiply restores native bitmap pixels on screen
+  — 1:1 sampling, crisp at every zoom level. `FontRegistry`
+  exposes `effectiveFontId(base, target_px)` for the sized-sibling
+  lookup; SDF + strike-only colour (emoji) return base because
+  their bitmaps are intrinsically zoom-independent. Prewarm runs
+  on the main thread before workers fan out — workers see a frozen
+  registry, no realloc races, no FT thread-safety violations.
+  `AtlasFull` triggers a coarse-LRU reset (clear glyph cache +
+  atlas reset + block cache + retry) with sub-frame "blink"
+  recovery. Viewport-aware `max_w` so paragraphs re-wrap at every
+  zoom. Mono atlas bumped 768 → 2048 to hold ~30 zoom buckets.
+
+- [x] **Stage 5c — emoji font fallback.** Markdown text leaves used
+  to bind to a single cascade font_id, so any codepoint outside
+  that font's cmap rendered as `.notdef` (the box-of-shame). Now
+  `Theme.fallback_font_id` + `Theme.font_registry` enable parse-
+  time coverage splitting: codepoints the primary font has stay in
+  primary runs, codepoints only the fallback covers spin off into
+  sibling `.text` elements with `font_id = fallback`. The inline-
+  flow walker handles mixed-font runs identically to
+  emphasis/strong cascades. VS16 (U+FE0F) on a dual-presentation
+  base like U+2764 (❤) forces the colour-emoji route even when
+  the body font has a monochrome glyph; VS15 (U+FE0E)
+  symmetrically pins to primary. ZWJ inheritance keeps multi-
+  codepoint emoji ligature sequences on one font.
+
 ## Manifesto
 
 [`docs/manifesto.md`](docs/manifesto.md) — written mid-session-9
@@ -523,8 +572,8 @@ class probes** (Stability SD-Vector, Bytedance Doubao-Vector,
 OpenAI gpt-image-1 — curl-first reconnaissance per
 [[reference-recraft-wire]]), **selection + clipboard for
 `:::input`** (shift-arrow, double-click word selection, ctrl-A/C/V),
-**stage 5b — markdown ↔ ANSI composability** (~50 LOC, fenced
-` ```ansi ``` ` blocks route into `CodeContent.sub_block`),
 **cache-warming headless demo** (manifesto pattern made concrete),
-**crisp zoom** (multi-size atlas + re-layout-on-zoom),
+**per-bucket atlas LRU** (the principled answer to session 10's
+coarse reset — evict the OLDEST size bucket on `AtlasFull` instead
+of resetting everything; no blink frames at all),
 **MCP / WASM provenance components**.
