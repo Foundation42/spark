@@ -117,8 +117,13 @@ pub fn collectReferencedPaths(
 /// block; any line whose trimmed content is exactly `:::` closes it.
 /// Fenced code blocks (` ``` ` or `~~~`) are tracked and the scanner
 /// passes through them verbatim so embedded `:::` in code samples
-/// doesn't get hijacked. Nesting `:::` inside another `:::` is not
-/// supported at this stage — first `:::` close ends the block.
+/// doesn't get hijacked. Nested `:::` is supported (stage 15c.1):
+/// inside a block, a `:::name` line bumps a depth counter and the
+/// matching `:::` decrements it; only the depth-zero `:::` ends
+/// the outer block. The nested directives stay verbatim in the
+/// parent's body so a constraint-layout provider (`:::flex`,
+/// `:::grid`) can re-run `preprocess` on its body in `create` to
+/// extract its children.
 ///
 /// `state` is optional; when non-null, attribute values containing
 /// `${path}` are looked up in the state and substituted at parse
@@ -130,6 +135,11 @@ pub fn preprocess(arena: std.mem.Allocator, source: []const u8, state: ?*const s
     try out.ensureUnusedCapacity(source.len);
 
     var in_block = false;
+    // Nesting depth inside the current outer block. Bumped by a
+    // nested `:::name` line, decremented by the matching `:::`.
+    // The outer block closes only when a `:::` is encountered at
+    // depth 0.
+    var depth: u32 = 0;
     var current: Spec = undefined;
     var body_buf = std.ArrayList(u8).init(arena);
 
@@ -141,7 +151,25 @@ pub fn preprocess(arena: std.mem.Allocator, source: []const u8, state: ?*const s
         const trimmed = std.mem.trim(u8, line, " \t\r");
 
         if (in_block) {
+            // Nested `:::name {…}` — keep verbatim, bump depth.
+            if (std.mem.startsWith(u8, trimmed, ":::") and trimmed.len > 3) {
+                const after = std.mem.trimLeft(u8, trimmed[3..], " \t");
+                if (after.len > 0 and isNameStart(after[0])) {
+                    depth += 1;
+                    try body_buf.appendSlice(line);
+                    try body_buf.append('\n');
+                    continue;
+                }
+            }
             if (std.mem.eql(u8, trimmed, ":::")) {
+                if (depth > 0) {
+                    // Closer for a nested block — keep verbatim.
+                    depth -= 1;
+                    try body_buf.appendSlice(line);
+                    try body_buf.append('\n');
+                    continue;
+                }
+                // Depth-zero `:::` — closes the outer block.
                 const body_trimmed = std.mem.trim(u8, body_buf.items, "\n\r");
                 current.body = try arena.dupe(u8, body_trimmed);
                 const idx = specs.items.len;
@@ -578,6 +606,49 @@ test "preprocess: leaves fenced code alone" {
     , null);
     try std.testing.expectEqual(@as(usize, 0), p.specs.len);
     try std.testing.expect(std.mem.indexOf(u8, p.source, ":::not-a-directive") != null);
+}
+
+test "preprocess: nested ::: blocks stay in the outer body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = try preprocess(arena.allocator(),
+        \\:::flex {direction=row gap=20}
+        \\:::box {color=red}
+        \\:::
+        \\:::box {color=blue}
+        \\:::
+        \\:::
+        \\
+    , null);
+    // One outer flex spec; the two nested box directives stay
+    // verbatim in its body for the flex factory to re-extract.
+    try std.testing.expectEqual(@as(usize, 1), p.specs.len);
+    try std.testing.expectEqualStrings("flex", p.specs[0].name);
+    try std.testing.expect(std.mem.indexOf(u8, p.specs[0].body, ":::box {color=red}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.specs[0].body, ":::box {color=blue}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.specs[0].body, ":::") != null);
+}
+
+test "preprocess: deeply nested ::: blocks track depth correctly" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = try preprocess(arena.allocator(),
+        \\:::flex
+        \\:::flex
+        \\:::box
+        \\:::
+        \\:::
+        \\:::
+        \\
+    , null);
+    try std.testing.expectEqual(@as(usize, 1), p.specs.len);
+    try std.testing.expectEqualStrings("flex", p.specs[0].name);
+    // The inner-flex + inner-box pair stays in the outer body.
+    const body = p.specs[0].body;
+    // Two `:::flex` shouldn't appear (outer is consumed); one
+    // `:::flex` remains (the inner). And one `:::box`.
+    try std.testing.expect(std.mem.indexOf(u8, body, ":::flex") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, ":::box") != null);
 }
 
 test "preprocess: unterminated block errors" {
