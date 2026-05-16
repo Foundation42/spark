@@ -8,11 +8,32 @@
 //!
 //! Attribute grammar:
 //!
-//!     :::grid {#id columns=3 gap=12}
+//!     :::grid {#id columns="100px 1fr 1fr" row-gap=8 column-gap=16}
 //!     :::box {color=red width=100% height=80 radius=8}
 //!     :::
 //!     ...more cells...
 //!     :::
+//!
+//! ### Tracks
+//!
+//! `columns` accepts either an integer count (`columns=3` → three
+//! `1fr` flex tracks) or a space-separated track list:
+//!   * `100px` (or bare `100`) — fixed-width track.
+//!   * `1fr`, `2fr`, … — flex track that takes a share of the
+//!     remaining width proportional to its `fr` weight.
+//!
+//! Resolution: sum the fixed widths, subtract from `max_w` (along
+//! with `(columns − 1) × column_gap`), then distribute what's left
+//! across the flex tracks by `fr` weight. A track list with no
+//! flex tracks underfills cleanly; a list with no fixed tracks
+//! recovers the equal-width behaviour of `columns=N`.
+//!
+//! ### Gaps
+//!
+//! `row-gap` and `column-gap` set the two axes independently;
+//! `gap` is a shorthand that sets both. Last-attribute-wins
+//! semantics, so `{gap=12 column-gap=24}` resolves to
+//! `row_gap=12, column_gap=24`.
 //!
 //! ## Required #id
 //!
@@ -21,24 +42,19 @@
 //! `dashboard/auto:0`) instead of colliding with outer-document
 //! `auto:N` keys. Missing id → `error.GridMissingId`.
 //!
-//! ## Layout (Phase F.1 MVP)
+//! ## Layout (stage 15e)
 //!
-//! Equal-width columns derived from `constraints.max_w`:
-//!
-//!     col_width = (max_w - (columns - 1) * gap) / columns
-//!
-//! Cell at index `i` lands at column `i % columns`, row
-//! `i / columns`. Children receive a child-constraint with
-//! `max_w = col_width`, so `:::box {width=100%}` fills its cell.
+//! Each cell `i` lands at column `i % columns`, row `i / columns`.
+//! Children receive a child-constraint with `max_w =
+//! track_width[col]`, so `:::box {width=100%}` fills its track.
 //! Row height = tallest child in the row; the next row starts
-//! `row_height + gap` below.
+//! `row_height + row_gap` below.
 //!
 //! Per-cell bounds still flow through the kiwi solver via the
 //! children's own `layoutViaConstraints` calls (the `:::box` case
 //! today; any future grid child that opts in). Cell *positioning*
-//! is imperative in the MVP — same trade-off as Phase C.2. Later
-//! lift to solver-driven track sizing (`1fr`, named tracks) once
-//! a concrete demand surfaces.
+//! is imperative — solver-driven negotiation between rows + cells
+//! lands when a measure pass arrives.
 
 const std = @import("std");
 const element = @import("../element.zig");
@@ -54,9 +70,24 @@ pub const Error = error{
     GridNotInstalled,
 };
 
+/// Upper bound on column count — well above any sane document
+/// grid. Inline-storing the track list dodges per-update arena
+/// growth (applyAttrs runs on every host-driven attribute change).
+pub const MAX_TRACKS: usize = 32;
+
+/// One column track. `fixed` = pixel width; `flex` = share weight
+/// (the `fr` unit), distributing `(avail - fixed_total -
+/// total_column_gap)` proportionally across all flex tracks.
+pub const TrackSpec = union(enum) {
+    fixed: f32,
+    flex: f32,
+};
+
 const Component = struct {
-    columns: u32,
-    gap: f32,
+    tracks: [MAX_TRACKS]TrackSpec,
+    track_count: u32,
+    row_gap: f32,
+    column_gap: f32,
     /// Owns every allocation the parsed child tree refers to.
     arena: std.heap.ArenaAllocator,
     /// Parsed child root — typically a `container.stack_v` whose
@@ -113,8 +144,10 @@ fn create(
     errdefer allocator.destroy(c);
 
     c.* = .{
-        .columns = 1,
-        .gap = 0,
+        .tracks = undefined,
+        .track_count = 0,
+        .row_gap = 0,
+        .column_gap = 0,
         .arena = std.heap.ArenaAllocator.init(allocator),
         .root = element.Element{ .paragraph = &[_]element.Element{} },
         .scope = undefined,
@@ -160,20 +193,114 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
 }
 
 fn applyAttrs(c: *Component, spec: *const components.Spec) void {
-    c.columns = 1;
-    c.gap = 0;
+    // Defaults: single flex track, no gap. A grid with no `columns`
+    // attr renders as a vertical stack — same shape `:::flex
+    // {direction=column}` produces.
+    c.tracks[0] = .{ .flex = 1.0 };
+    c.track_count = 1;
+    c.row_gap = 0;
+    c.column_gap = 0;
     for (spec.attrs) |a| {
         if (std.mem.eql(u8, a.key, "columns")) {
-            const n = std.fmt.parseInt(u32, std.mem.trim(u8, a.value, " \t"), 10) catch continue;
-            if (n >= 1) c.columns = n;
+            const n = parseColumns(a.value, &c.tracks);
+            if (n > 0) c.track_count = n;
         } else if (std.mem.eql(u8, a.key, "gap")) {
-            if (box_component.parseLength(a.value)) |l| {
-                c.gap = switch (l) {
-                    .pixels => |p| p,
-                    else => 0,
-                };
+            if (parsePixelLength(a.value)) |p| {
+                c.row_gap = p;
+                c.column_gap = p;
             }
+        } else if (std.mem.eql(u8, a.key, "row-gap")) {
+            if (parsePixelLength(a.value)) |p| c.row_gap = p;
+        } else if (std.mem.eql(u8, a.key, "column-gap")) {
+            if (parsePixelLength(a.value)) |p| c.column_gap = p;
         }
+    }
+}
+
+/// Extract a pixel value from a length string, dropping percent /
+/// auto since those don't make sense for a gap.
+fn parsePixelLength(s: []const u8) ?f32 {
+    return switch (box_component.parseLength(s) orelse return null) {
+        .pixels => |p| p,
+        else => null,
+    };
+}
+
+/// Parse the `columns=…` attribute into a track list. Accepts
+/// either an integer count ("3" → three `1fr` tracks) or a
+/// space-separated track list ("100px 1fr 1fr"). Returns the
+/// number of tracks written into `out`; clamped at `MAX_TRACKS`.
+pub fn parseColumns(s: []const u8, out: *[MAX_TRACKS]TrackSpec) u32 {
+    const trimmed = std.mem.trim(u8, s, " \t");
+    if (trimmed.len == 0) return 0;
+
+    // Plain integer N → N × 1fr tracks. Matches the simple-case
+    // ergonomics from the Phase F.1 commit so existing `columns=3`
+    // call sites keep working.
+    if (std.fmt.parseInt(u32, trimmed, 10)) |n| {
+        const count = @min(@as(u32, @intCast(@min(n, MAX_TRACKS))), @as(u32, MAX_TRACKS));
+        var i: u32 = 0;
+        while (i < count) : (i += 1) out[i] = .{ .flex = 1.0 };
+        return count;
+    } else |_| {}
+
+    var count: u32 = 0;
+    var it = std.mem.tokenizeAny(u8, trimmed, " \t");
+    while (it.next()) |token| {
+        if (count >= MAX_TRACKS) break;
+        if (parseTrack(token)) |t| {
+            out[count] = t;
+            count += 1;
+        }
+    }
+    return count;
+}
+
+/// Parse one track token: `1fr` / `2.5fr` → flex; `100px` / `100`
+/// → fixed. Percent tokens are rejected — defer until a concrete
+/// callsite asks for them.
+pub fn parseTrack(s: []const u8) ?TrackSpec {
+    const trimmed = std.mem.trim(u8, s, " \t");
+    if (trimmed.len == 0) return null;
+    if (std.mem.endsWith(u8, trimmed, "fr")) {
+        const num = std.fmt.parseFloat(f32, trimmed[0 .. trimmed.len - 2]) catch return null;
+        if (num <= 0) return null;
+        return .{ .flex = num };
+    }
+    return switch (box_component.parseLength(trimmed) orelse return null) {
+        .pixels => |p| .{ .fixed = p },
+        else => null,
+    };
+}
+
+/// Resolve track widths against the available width. Fixed tracks
+/// take their pixel value as-is; flex tracks share the remainder
+/// in proportion to their `fr` weight. Negative leftovers clamp
+/// to zero (oversubscribed fixed tracks underfill).
+pub fn resolveTrackWidths(
+    tracks: []const TrackSpec,
+    avail_w: f32,
+    column_gap: f32,
+    out: *[MAX_TRACKS]f32,
+) void {
+    if (tracks.len == 0) return;
+    const cols_f: f32 = @floatFromInt(tracks.len);
+    const total_gap = column_gap * @max(0.0, cols_f - 1.0);
+
+    var fixed_total: f32 = 0;
+    var flex_total: f32 = 0;
+    for (tracks) |t| switch (t) {
+        .fixed => |p| fixed_total += p,
+        .flex => |f| flex_total += f,
+    };
+
+    const remaining = @max(0.0, avail_w - total_gap - fixed_total);
+
+    for (tracks, 0..) |t, i| {
+        out[i] = switch (t) {
+            .fixed => |p| p,
+            .flex => |f| if (flex_total > 0) remaining * (f / flex_total) else 0,
+        };
     }
 }
 
@@ -202,20 +329,31 @@ fn layoutAndRender(
         else => &[_]element.Element{},
     };
 
-    if (cells.len == 0 or c.columns == 0) {
+    if (cells.len == 0 or c.track_count == 0) {
         return .{ .x = origin[0], .y = origin[1], .w = 0, .h = 0, .baseline = 0 };
     }
 
-    // Equal-width tracks derived from the available width. When
-    // `max_w` is infinite (unconstrained), fall back to a reasonable
-    // default so children at `width=100%` still get a sensible cell.
+    // Resolve track widths from the available width. When `max_w`
+    // is infinite (unconstrained), fall back to a reasonable
+    // default so flex tracks at `width=100%` still get a sensible
+    // cell.
     const avail_w: f32 = if (std.math.isFinite(constraints.max_w))
         constraints.max_w
     else
         640.0;
-    const cols_f: f32 = @floatFromInt(c.columns);
-    const total_gap_w: f32 = c.gap * (cols_f - 1);
-    const col_width: f32 = @max(0.0, (avail_w - total_gap_w) / cols_f);
+    var track_widths: [MAX_TRACKS]f32 = undefined;
+    const tracks = c.tracks[0..c.track_count];
+    resolveTrackWidths(tracks, avail_w, c.column_gap, &track_widths);
+
+    // Precompute the per-column x offset so cell placement is O(1).
+    var track_offsets: [MAX_TRACKS]f32 = undefined;
+    {
+        var off: f32 = 0;
+        for (tracks, 0..) |_, i| {
+            track_offsets[i] = off;
+            off += track_widths[i] + c.column_gap;
+        }
+    }
 
     var cur_row: usize = 0;
     var row_y: f32 = origin[1];
@@ -223,19 +361,19 @@ fn layoutAndRender(
     var max_x: f32 = origin[0];
 
     for (cells, 0..) |*cell, i| {
-        const col: usize = i % c.columns;
-        const row: usize = i / c.columns;
+        const col: usize = i % c.track_count;
+        const row: usize = i / c.track_count;
 
         // Crossed a row boundary — advance vertical cursor by the
         // previous row's height plus a row gap.
         if (row != cur_row) {
-            row_y += row_h + c.gap;
+            row_y += row_h + c.row_gap;
             row_h = 0;
             cur_row = row;
         }
 
-        const cell_x = origin[0] + @as(f32, @floatFromInt(col)) * (col_width + c.gap);
-        const cell_constraints: element.Constraints = .{ .max_w = col_width };
+        const cell_x = origin[0] + track_offsets[col];
+        const cell_constraints: element.Constraints = .{ .max_w = track_widths[col] };
 
         const cell_box = try element_layout.layoutAndRender(
             cell.*,
@@ -264,84 +402,168 @@ fn layoutAndRender(
 
 const testing = std.testing;
 
-test "applyAttrs parses columns + gap" {
-    var c: Component = .{
-        .columns = 1,
-        .gap = 0,
+fn emptyComponent() Component {
+    return .{
+        .tracks = undefined,
+        .track_count = 0,
+        .row_gap = 0,
+        .column_gap = 0,
         .arena = std.heap.ArenaAllocator.init(testing.allocator),
         .root = element.Element{ .paragraph = &[_]element.Element{} },
         .scope = undefined,
         .version = 0,
     };
-    defer c.arena.deinit();
+}
 
+test "parseTrack: pixel and fr" {
+    try testing.expectEqual(@as(f32, 100), parseTrack("100").?.fixed);
+    try testing.expectEqual(@as(f32, 100), parseTrack("100px").?.fixed);
+    try testing.expectEqual(@as(f32, 1), parseTrack("1fr").?.flex);
+    try testing.expectEqual(@as(f32, 2.5), parseTrack("2.5fr").?.flex);
+    try testing.expect(parseTrack("0fr") == null); // weight must be positive
+    try testing.expect(parseTrack("garbage") == null);
+    try testing.expect(parseTrack("") == null);
+}
+
+test "parseColumns: integer shorthand expands to N flex tracks" {
+    var buf: [MAX_TRACKS]TrackSpec = undefined;
+    const n = parseColumns("3", &buf);
+    try testing.expectEqual(@as(u32, 3), n);
+    try testing.expectEqual(@as(f32, 1.0), buf[0].flex);
+    try testing.expectEqual(@as(f32, 1.0), buf[1].flex);
+    try testing.expectEqual(@as(f32, 1.0), buf[2].flex);
+}
+
+test "parseColumns: mixed fixed + fr list" {
+    var buf: [MAX_TRACKS]TrackSpec = undefined;
+    const n = parseColumns("100px 1fr 2fr", &buf);
+    try testing.expectEqual(@as(u32, 3), n);
+    try testing.expectEqual(@as(f32, 100), buf[0].fixed);
+    try testing.expectEqual(@as(f32, 1), buf[1].flex);
+    try testing.expectEqual(@as(f32, 2), buf[2].flex);
+}
+
+test "parseColumns: garbage tokens are silently skipped" {
+    var buf: [MAX_TRACKS]TrackSpec = undefined;
+    const n = parseColumns("100px notatrack 1fr", &buf);
+    try testing.expectEqual(@as(u32, 2), n);
+    try testing.expectEqual(@as(f32, 100), buf[0].fixed);
+    try testing.expectEqual(@as(f32, 1), buf[1].flex);
+}
+
+test "parseColumns: empty string returns zero tracks" {
+    var buf: [MAX_TRACKS]TrackSpec = undefined;
+    try testing.expectEqual(@as(u32, 0), parseColumns("", &buf));
+    try testing.expectEqual(@as(u32, 0), parseColumns("   ", &buf));
+}
+
+test "resolveTrackWidths: pure flex divides evenly" {
+    const tracks = [_]TrackSpec{ .{ .flex = 1 }, .{ .flex = 1 }, .{ .flex = 1 } };
+    var widths: [MAX_TRACKS]f32 = undefined;
+    resolveTrackWidths(&tracks, 312, 6, &widths); // 312 - 12 (2*gap) = 300; /3 = 100
+    try testing.expectEqual(@as(f32, 100), widths[0]);
+    try testing.expectEqual(@as(f32, 100), widths[1]);
+    try testing.expectEqual(@as(f32, 100), widths[2]);
+}
+
+test "resolveTrackWidths: fixed + flex shares the remainder" {
+    const tracks = [_]TrackSpec{ .{ .fixed = 100 }, .{ .flex = 1 }, .{ .flex = 2 } };
+    var widths: [MAX_TRACKS]f32 = undefined;
+    // avail=412, column_gap=6 → total_gap=12 → remaining for flex = 412 - 12 - 100 = 300.
+    // 1fr + 2fr → 1/3 (100px) and 2/3 (200px).
+    resolveTrackWidths(&tracks, 412, 6, &widths);
+    try testing.expectEqual(@as(f32, 100), widths[0]);
+    try testing.expectApproxEqAbs(@as(f32, 100), widths[1], 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 200), widths[2], 1e-3);
+}
+
+test "resolveTrackWidths: oversubscribed fixed tracks underfill (no negative widths)" {
+    const tracks = [_]TrackSpec{ .{ .fixed = 500 }, .{ .flex = 1 } };
+    var widths: [MAX_TRACKS]f32 = undefined;
+    resolveTrackWidths(&tracks, 200, 0, &widths);
+    try testing.expectEqual(@as(f32, 500), widths[0]); // fixed honoured
+    try testing.expectEqual(@as(f32, 0), widths[1]); // flex clamped to zero
+}
+
+test "resolveTrackWidths: no flex tracks → underfill, no panic on flex_total=0" {
+    const tracks = [_]TrackSpec{ .{ .fixed = 100 }, .{ .fixed = 50 } };
+    var widths: [MAX_TRACKS]f32 = undefined;
+    resolveTrackWidths(&tracks, 400, 0, &widths);
+    try testing.expectEqual(@as(f32, 100), widths[0]);
+    try testing.expectEqual(@as(f32, 50), widths[1]);
+}
+
+test "applyAttrs parses integer columns + uniform gap" {
+    var c = emptyComponent();
+    defer c.arena.deinit();
     const attrs = [_]components.Attr{
         .{ .key = "columns", .value = "3" },
         .{ .key = "gap", .value = "16" },
     };
-    const spec: components.Spec = .{ .name = "grid", .attrs = &attrs };
-    applyAttrs(&c, &spec);
+    applyAttrs(&c, &.{ .name = "grid", .attrs = &attrs });
 
-    try testing.expectEqual(@as(u32, 3), c.columns);
-    try testing.expectEqual(@as(f32, 16), c.gap);
+    try testing.expectEqual(@as(u32, 3), c.track_count);
+    try testing.expectEqual(@as(f32, 1.0), c.tracks[0].flex);
+    try testing.expectEqual(@as(f32, 16), c.row_gap);
+    try testing.expectEqual(@as(f32, 16), c.column_gap);
 }
 
-test "applyAttrs defaults to columns=1, gap=0" {
-    var c: Component = .{
-        .columns = 5, // start non-default
-        .gap = 99,
-        .arena = std.heap.ArenaAllocator.init(testing.allocator),
-        .root = element.Element{ .paragraph = &[_]element.Element{} },
-        .scope = undefined,
-        .version = 0,
-    };
+test "applyAttrs parses mixed track list" {
+    var c = emptyComponent();
     defer c.arena.deinit();
-
-    const spec: components.Spec = .{ .name = "grid" };
-    applyAttrs(&c, &spec);
-
-    try testing.expectEqual(@as(u32, 1), c.columns);
-    try testing.expectEqual(@as(f32, 0), c.gap);
-}
-
-test "applyAttrs rejects columns=0 (keeps prior value)" {
-    var c: Component = .{
-        .columns = 2,
-        .gap = 0,
-        .arena = std.heap.ArenaAllocator.init(testing.allocator),
-        .root = element.Element{ .paragraph = &[_]element.Element{} },
-        .scope = undefined,
-        .version = 0,
-    };
-    defer c.arena.deinit();
-
     const attrs = [_]components.Attr{
-        .{ .key = "columns", .value = "0" },
+        .{ .key = "columns", .value = "200px 1fr 1fr" },
     };
-    const spec: components.Spec = .{ .name = "grid", .attrs = &attrs };
-    applyAttrs(&c, &spec);
+    applyAttrs(&c, &.{ .name = "grid", .attrs = &attrs });
 
-    // applyAttrs resets to default (1) before applying, so a
-    // rejected value leaves the default in place — not the prior 2.
-    try testing.expectEqual(@as(u32, 1), c.columns);
+    try testing.expectEqual(@as(u32, 3), c.track_count);
+    try testing.expectEqual(@as(f32, 200), c.tracks[0].fixed);
+    try testing.expectEqual(@as(f32, 1), c.tracks[1].flex);
+    try testing.expectEqual(@as(f32, 1), c.tracks[2].flex);
+}
+
+test "applyAttrs: row-gap and column-gap override gap independently" {
+    var c = emptyComponent();
+    defer c.arena.deinit();
+    const attrs = [_]components.Attr{
+        .{ .key = "gap", .value = "12" }, // shorthand sets both
+        .{ .key = "column-gap", .value = "24" }, // last-wins overrides one axis
+    };
+    applyAttrs(&c, &.{ .name = "grid", .attrs = &attrs });
+
+    try testing.expectEqual(@as(f32, 12), c.row_gap);
+    try testing.expectEqual(@as(f32, 24), c.column_gap);
+}
+
+test "applyAttrs: row-gap alone leaves column-gap at zero" {
+    var c = emptyComponent();
+    defer c.arena.deinit();
+    const attrs = [_]components.Attr{
+        .{ .key = "row-gap", .value = "8" },
+    };
+    applyAttrs(&c, &.{ .name = "grid", .attrs = &attrs });
+
+    try testing.expectEqual(@as(f32, 8), c.row_gap);
+    try testing.expectEqual(@as(f32, 0), c.column_gap);
+}
+
+test "applyAttrs: defaults to single flex track, zero gaps" {
+    var c = emptyComponent();
+    defer c.arena.deinit();
+    applyAttrs(&c, &.{ .name = "grid" });
+
+    try testing.expectEqual(@as(u32, 1), c.track_count);
+    try testing.expectEqual(@as(f32, 1.0), c.tracks[0].flex);
+    try testing.expectEqual(@as(f32, 0), c.row_gap);
+    try testing.expectEqual(@as(f32, 0), c.column_gap);
 }
 
 test "applyAttrs accepts pixel gap with px suffix" {
-    var c: Component = .{
-        .columns = 1,
-        .gap = 0,
-        .arena = std.heap.ArenaAllocator.init(testing.allocator),
-        .root = element.Element{ .paragraph = &[_]element.Element{} },
-        .scope = undefined,
-        .version = 0,
-    };
+    var c = emptyComponent();
     defer c.arena.deinit();
+    const attrs = [_]components.Attr{ .{ .key = "gap", .value = "14px" } };
+    applyAttrs(&c, &.{ .name = "grid", .attrs = &attrs });
 
-    const attrs = [_]components.Attr{
-        .{ .key = "gap", .value = "14px" },
-    };
-    const spec: components.Spec = .{ .name = "grid", .attrs = &attrs };
-    applyAttrs(&c, &spec);
-
-    try testing.expectEqual(@as(f32, 14), c.gap);
+    try testing.expectEqual(@as(f32, 14), c.row_gap);
+    try testing.expectEqual(@as(f32, 14), c.column_gap);
 }

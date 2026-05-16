@@ -81,9 +81,11 @@ The first multi-child constraint-aware provider. `:::flex` walks its children wi
 :::
 :::
 
-## Grid layout (stage 15d)
+## Grid layout (stage 15d/e)
 
-The second multi-child constraint-aware provider. `:::grid` lays its body out into equal-width tracks (`columns=N`), row-major, gap between cells, auto-height rows sized to the tallest cell. Each cell still goes through the kiwi solver for its own bounds — the grid parent allocates the track, the cell constrains its size inside it. `:::flex` handles 1D; `:::grid` handles 2D; both stack cleanly inside each other.
+The second multi-child constraint-aware provider. `:::grid` lays its body out into tracks (`columns=N` for `N` equal columns, or a CSS-style list like `"100px 1fr 1fr"` mixing fixed and flexible widths), row-major, with independent `row-gap` and `column-gap`. Each cell still goes through the kiwi solver for its own bounds — the grid parent allocates the track, the cell constrains its size inside it. `:::flex` handles 1D; `:::grid` handles 2D; both stack cleanly inside each other.
+
+A 3×2 dashboard with equal columns and uniform gap:
 
 :::grid {#dashboard columns=3 gap=12}
 :::box {color=red width=100% height=60 radius=6}
@@ -102,6 +104,19 @@ The second multi-child constraint-aware provider. `:::grid` lays its body out in
 :::
 
 :::box {color=purple width=100% height=60 radius=6}
+:::
+:::
+
+Mixed fixed + flex tracks — `180px 1fr 1fr` gives a fixed-width sidebar plus two equal-width panels that share whatever's left. Resize the window: the sidebar holds its width while the two flex tracks negotiate for the remainder.
+
+:::grid {#sidebar_layout columns="180px 1fr 1fr" column-gap=16 row-gap=8}
+:::box {color=cyan width=100% height=80 radius=6}
+:::
+
+:::box {color=magenta width=100% height=80 radius=6}
+:::
+
+:::box {color=orange width=100% height=80 radius=6}
 :::
 :::
 
