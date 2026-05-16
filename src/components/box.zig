@@ -222,6 +222,12 @@ fn layoutViaConstraints(
     h_target: f32,
     out: *element.DrawList,
 ) anyerror!element.Box {
+    // Stage-14b parallel walker reaches us on worker threads —
+    // serialise solver + bounds_map mutation across all callers.
+    // See `LayoutContext.mutex` for the full rationale.
+    layout_ctx.mutex.lock();
+    defer layout_ctx.mutex.unlock();
+
     const bounds = try layout_ctx.getBounds(@intFromPtr(c));
 
     var c1 = try kiwi.expr(alloc, bounds.x_min).eq(@as(f64, origin[0])).required();

@@ -39,6 +39,19 @@ pub const LayoutContext = struct {
     /// walker to constrain `child[i+1].x_min == child[i].x_max +
     /// gap` without the children needing to expose their VarIds.
     bounds_map: std.AutoHashMapUnmanaged(u64, ElementBounds) = .{},
+    /// Guards all solver + bounds_map mutation. The stage-14b
+    /// parallel walker dispatches cache-miss `:::box` blocks onto
+    /// worker threads, and every such block currently runs the
+    /// constraint-path (`box.layoutViaConstraints`) which mints
+    /// variables, adds constraints, solves, and reads back values.
+    /// The kiwi solver's internal `AutoArrayHashMap`s carry Zig's
+    /// pointer-stability safety lock, which trips the moment two
+    /// workers touch the solver concurrently. We lock the whole
+    /// add-constraints + updateVariables + value-read sequence so
+    /// each worker's per-box pattern is atomic w.r.t. the others.
+    /// Critical section is ~10-30µs per box — well within the
+    /// frame budget even when serialising across N workers.
+    mutex: std.Thread.Mutex = .{},
 
     pub fn init(alloc: std.mem.Allocator) std.mem.Allocator.Error!LayoutContext {
         return .{
