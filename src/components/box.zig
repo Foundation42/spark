@@ -201,10 +201,18 @@ fn layoutAndRender(
     };
 }
 
-/// Constraint-path layout. Mints four bounds variables, registers
-/// the four required equalities, asks the solver for the resolved
-/// positions, emits the quad. Costs ~10-30µs per box on top of the
-/// fallback path's near-zero — well within the frame budget.
+/// Constraint-path layout. Fetches the box's bounds quad from the
+/// LayoutContext's element pool (keyed by `@intFromPtr(component)`
+/// so parent providers can reach the same vars to negotiate
+/// against), registers four required equalities, asks the solver
+/// for resolved positions, emits the quad.
+///
+/// Per-pass solver overhead: ~10-30µs per box on top of the
+/// fallback path's near-zero — well within the frame budget. The
+/// `getBounds` route means a future `:::flex` parent walker can
+/// look up *this* box's bounds before walking into it, and
+/// constrain `box[i+1].x_min == box[i].x_max + gap` without the
+/// box having to expose its variable handles.
 fn layoutViaConstraints(
     c: *const Component,
     layout_ctx: *layout_context_mod.LayoutContext,
@@ -214,33 +222,30 @@ fn layoutViaConstraints(
     h_target: f32,
     out: *element.DrawList,
 ) anyerror!element.Box {
-    const x_min = try layout_ctx.solver.addVariable(null);
-    const x_max = try layout_ctx.solver.addVariable(null);
-    const y_min = try layout_ctx.solver.addVariable(null);
-    const y_max = try layout_ctx.solver.addVariable(null);
+    const bounds = try layout_ctx.getBounds(@intFromPtr(c));
 
-    var c1 = try kiwi.expr(alloc, x_min).eq(@as(f64, origin[0])).required();
+    var c1 = try kiwi.expr(alloc, bounds.x_min).eq(@as(f64, origin[0])).required();
     defer c1.deinit(alloc);
     _ = try layout_ctx.solver.addConstraint(c1);
 
-    var c2 = try kiwi.expr(alloc, y_min).eq(@as(f64, origin[1])).required();
+    var c2 = try kiwi.expr(alloc, bounds.y_min).eq(@as(f64, origin[1])).required();
     defer c2.deinit(alloc);
     _ = try layout_ctx.solver.addConstraint(c2);
 
-    var c3 = try kiwi.expr(alloc, x_max).minus(x_min).eq(@as(f64, w_target)).required();
+    var c3 = try kiwi.expr(alloc, bounds.x_max).minus(bounds.x_min).eq(@as(f64, w_target)).required();
     defer c3.deinit(alloc);
     _ = try layout_ctx.solver.addConstraint(c3);
 
-    var c4 = try kiwi.expr(alloc, y_max).minus(y_min).eq(@as(f64, h_target)).required();
+    var c4 = try kiwi.expr(alloc, bounds.y_max).minus(bounds.y_min).eq(@as(f64, h_target)).required();
     defer c4.deinit(alloc);
     _ = try layout_ctx.solver.addConstraint(c4);
 
     layout_ctx.solver.updateVariables();
 
-    const sx: f32 = @floatCast(layout_ctx.solver.value(x_min));
-    const sy: f32 = @floatCast(layout_ctx.solver.value(y_min));
-    const sw: f32 = @floatCast(layout_ctx.solver.value(x_max) - layout_ctx.solver.value(x_min));
-    const sh: f32 = @floatCast(layout_ctx.solver.value(y_max) - layout_ctx.solver.value(y_min));
+    const sx: f32 = @floatCast(layout_ctx.solver.value(bounds.x_min));
+    const sy: f32 = @floatCast(layout_ctx.solver.value(bounds.y_min));
+    const sw: f32 = @floatCast(layout_ctx.solver.value(bounds.x_max) - layout_ctx.solver.value(bounds.x_min));
+    const sh: f32 = @floatCast(layout_ctx.solver.value(bounds.y_max) - layout_ctx.solver.value(bounds.y_min));
 
     try out.quads.append(.{
         .dst_pos = .{ sx, sy },

@@ -18,29 +18,78 @@
 const std = @import("std");
 pub const kiwi = @import("kiwi/root.zig");
 
+/// Four-variable bounding box for a layout-participating element.
+/// `(x_min, y_min)` is the top-left corner; `(x_max, y_max)` is
+/// bottom-right. The walker reads positions back via
+/// `solver.value(x)` after each pass settles.
+pub const ElementBounds = struct {
+    x_min: kiwi.VariableId,
+    x_max: kiwi.VariableId,
+    y_min: kiwi.VariableId,
+    y_max: kiwi.VariableId,
+};
+
 pub const LayoutContext = struct {
+    alloc: std.mem.Allocator,
     solver: kiwi.Solver,
+    /// Per-pass element → bounds map. Keyed by an opaque u64 the
+    /// caller chooses (typically `@intFromPtr(component_ctx)`,
+    /// which is unique per live component instance). Cleared on
+    /// `beginPass`. Phase C `:::flex` reaches in via the parent's
+    /// walker to constrain `child[i+1].x_min == child[i].x_max +
+    /// gap` without the children needing to expose their VarIds.
+    bounds_map: std.AutoHashMapUnmanaged(u64, ElementBounds) = .{},
 
     pub fn init(alloc: std.mem.Allocator) std.mem.Allocator.Error!LayoutContext {
-        return .{ .solver = try kiwi.Solver.init(alloc) };
+        return .{
+            .alloc = alloc,
+            .solver = try kiwi.Solver.init(alloc),
+        };
     }
 
     pub fn deinit(self: *LayoutContext) void {
+        self.bounds_map.deinit(self.alloc);
         self.solver.deinit();
         self.* = undefined;
     }
 
-    /// Reset the solver for a fresh layout pass. Pool allocations
-    /// stay; the variable / constraint / row maps clear; counters
-    /// reset to 1. Cheap (microseconds) compared to re-running
-    /// layout against the document tree.
+    /// Reset the solver and clear the bounds map for a fresh
+    /// layout pass. Pool allocations stay (capacities retained);
+    /// the variable / constraint / row / bounds maps clear;
+    /// counters reset to 1. Cheap (microseconds) compared to
+    /// re-running layout against the document tree.
     ///
     /// Phase B keeps this simple by resetting *every* pass —
-    /// constraints don't persist across frames. Phase B.3 (later)
-    /// converts to persistent variables keyed by element id so the
+    /// constraints don't persist across frames. A later phase
+    /// converts to persistent variables across frames so the
     /// retained-layout-cache hit rate carries into the solver.
     pub fn beginPass(self: *LayoutContext) void {
         self.solver.reset();
+        self.bounds_map.clearRetainingCapacity();
+    }
+
+    /// Mint (or return) the four bounds variables for an
+    /// element. Same key in the same pass returns the same
+    /// variables — the lookup is idempotent. Both the element
+    /// itself (when adding its width/height constraints) and any
+    /// parent provider (when adding sibling-relationship
+    /// constraints) call this with the same key to negotiate
+    /// against the same vars.
+    ///
+    /// Typical key choice: `@intFromPtr(component_ctx)`. Stable
+    /// for the lifetime of the component instance, unique among
+    /// concurrent components, no allocation needed.
+    pub fn getBounds(self: *LayoutContext, key: u64) std.mem.Allocator.Error!ElementBounds {
+        const gop = try self.bounds_map.getOrPut(self.alloc, key);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{
+                .x_min = try self.solver.addVariable(null),
+                .x_max = try self.solver.addVariable(null),
+                .y_min = try self.solver.addVariable(null),
+                .y_max = try self.solver.addVariable(null),
+            };
+        }
+        return gop.value_ptr.*;
     }
 };
 
@@ -64,6 +113,80 @@ test "beginPass clears solver state but preserves the context" {
     // gone; the next variable mint starts at id=1 again.
     const fresh = try ctx.solver.addVariable(null);
     try testing.expectEqual(@as(u32, 1), @intFromEnum(fresh));
+}
+
+test "getBounds is idempotent — same key returns same vars" {
+    var ctx = try LayoutContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const b1 = try ctx.getBounds(42);
+    const b2 = try ctx.getBounds(42);
+
+    try testing.expectEqual(b1.x_min, b2.x_min);
+    try testing.expectEqual(b1.x_max, b2.x_max);
+    try testing.expectEqual(b1.y_min, b2.y_min);
+    try testing.expectEqual(b1.y_max, b2.y_max);
+}
+
+test "getBounds: different keys get distinct variable sets" {
+    var ctx = try LayoutContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const a = try ctx.getBounds(1);
+    const b = try ctx.getBounds(2);
+
+    try testing.expect(@intFromEnum(a.x_min) != @intFromEnum(b.x_min));
+    try testing.expect(@intFromEnum(a.x_max) != @intFromEnum(b.x_max));
+}
+
+test "beginPass clears the bounds map; ids re-mint after" {
+    var ctx = try LayoutContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const before = try ctx.getBounds(99);
+    const first_var_id = @intFromEnum(before.x_min);
+    try testing.expectEqual(@as(u32, 1), first_var_id);
+
+    ctx.beginPass();
+
+    const after = try ctx.getBounds(99);
+    // beginPass resets the variable id counter; re-mint starts at 1.
+    try testing.expectEqual(@as(u32, 1), @intFromEnum(after.x_min));
+}
+
+test "two sibling boxes share a flex-style gap constraint" {
+    // The Phase C pattern in miniature: a parent allocates bounds
+    // for two children + an inter-sibling gap constraint.
+    // box1.x = 0, box1.width = 100; box2.x_min = box1.x_max + 20;
+    // box2.width = 100 — settles to box2 at x=120..220.
+    var ctx = try LayoutContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const a = try ctx.getBounds(@intFromPtr(&ctx)); // arbitrary key A
+    const b = try ctx.getBounds(@intFromPtr(&ctx) + 1); // arbitrary key B
+
+    var c1 = try kiwi.expr(testing.allocator, a.x_min).eq(@as(f64, 0)).required();
+    defer c1.deinit(testing.allocator);
+    _ = try ctx.solver.addConstraint(c1);
+
+    var c2 = try kiwi.expr(testing.allocator, a.x_max).minus(a.x_min).eq(@as(f64, 100)).required();
+    defer c2.deinit(testing.allocator);
+    _ = try ctx.solver.addConstraint(c2);
+
+    var c3 = try kiwi.expr(testing.allocator, b.x_min).minus(a.x_max).eq(@as(f64, 20)).required();
+    defer c3.deinit(testing.allocator);
+    _ = try ctx.solver.addConstraint(c3);
+
+    var c4 = try kiwi.expr(testing.allocator, b.x_max).minus(b.x_min).eq(@as(f64, 100)).required();
+    defer c4.deinit(testing.allocator);
+    _ = try ctx.solver.addConstraint(c4);
+
+    ctx.solver.updateVariables();
+
+    try testing.expectApproxEqAbs(@as(f64, 0), ctx.solver.value(a.x_min), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 100), ctx.solver.value(a.x_max), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 120), ctx.solver.value(b.x_min), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 220), ctx.solver.value(b.x_max), 1e-9);
 }
 
 test "the box-style four-var pattern settles to anchor + size" {
