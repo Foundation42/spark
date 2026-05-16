@@ -35,14 +35,17 @@ pub const AddEditVariableError = error{
     /// exact-value compare — see `strength.zig`.
     BadRequiredStrength,
     OutOfMemory,
+    InternalSolverError,
 };
 
 pub const RemoveEditVariableError = error{
     UnknownEditVariable,
+    OutOfMemory,
     InternalSolverError,
 };
 
 pub const SuggestValueError = error{
     UnknownEditVariable,
+    OutOfMemory,
     InternalSolverError,
 };

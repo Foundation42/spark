@@ -727,6 +727,135 @@ pub const Solver = struct {
         return entering;
     }
 
+    // ── Edit variables (per-frame reactive path) ───────────────────
+
+    /// Register a variable as editable. The solver inserts a
+    /// synthetic soft equality constraint (`v == 0` at the given
+    /// strength); later `suggestValue` calls drive the variable's
+    /// target via a fast delta path without re-pivoting most of
+    /// the tableau.
+    ///
+    /// `strength` is clipped to `[0, required]`; required-strength
+    /// is rejected with `BadRequiredStrength` (the whole point of
+    /// edit variables is they're soft).
+    pub fn addEditVariable(
+        self: *Solver,
+        v: VariableId,
+        strength: Strength,
+    ) errors.AddEditVariableError!void {
+        if (self.edits.contains(v)) return error.DuplicateEditVariable;
+
+        const clipped = strength_mod.clip(strength);
+        if (clipped == strength_mod.required) return error.BadRequiredStrength;
+
+        var c = constraint_mod.Constraint{
+            .expression = try @import("expression.zig").Expression.initTerm(
+                self.alloc,
+                @import("term.zig").Term.of(v),
+            ),
+            .op = .eq,
+            .strength = clipped,
+        };
+        defer c.deinit(self.alloc); // addConstraint clones internally
+
+        const c_id = self.addConstraint(c) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // A simple `v == 0` soft equality can't really fail
+            // with the other variants on a well-formed solver
+            // state, but propagate them as InternalSolverError if
+            // they do.
+            error.DuplicateConstraint,
+            error.UnsatisfiableConstraint,
+            error.InternalSolverError,
+            => return error.InternalSolverError,
+        };
+
+        const entry = self.constraints.get(c_id).?;
+        try self.edits.put(self.alloc, v, .{
+            .tag = entry.tag,
+            .constraint = c_id,
+            .constant = 0.0,
+        });
+    }
+
+    /// Forget an edit variable; tears down the underlying
+    /// synthetic constraint.
+    pub fn removeEditVariable(
+        self: *Solver,
+        v: VariableId,
+    ) errors.RemoveEditVariableError!void {
+        const info_kv = self.edits.fetchOrderedRemove(v) orelse return error.UnknownEditVariable;
+        self.removeConstraint(info_kv.value.constraint) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnknownConstraint, error.InternalSolverError => return error.InternalSolverError,
+        };
+    }
+
+    /// Suggest a new value for an edit variable. The solver
+    /// applies the delta to the marker row (or other / all rows
+    /// if the marker isn't basic) and then runs `dualOptimize`
+    /// to restore primal feasibility. This is the per-frame fast
+    /// path — typical cost is single-digit microseconds.
+    pub fn suggestValue(
+        self: *Solver,
+        v: VariableId,
+        value_in: f64,
+    ) errors.SuggestValueError!void {
+        const info_ptr = self.edits.getPtr(v) orelse return error.UnknownEditVariable;
+
+        const delta = value_in - info_ptr.constant;
+        info_ptr.constant = value_in;
+        const tag = info_ptr.tag;
+
+        // Apply the delta. The delta-walk path can fail (OOM
+        // appending to infeasible_rows); we capture and defer to
+        // after dualOptimize.
+        var apply_err: ?errors.SuggestValueError = null;
+        self.applyEditDelta(tag, delta) catch |e| switch (e) {
+            error.OutOfMemory => apply_err = error.OutOfMemory,
+        };
+
+        // RAII-style: always run dualOptimize so the tableau ends
+        // in a valid state. If dualOptimize itself fails, surface
+        // its error (the more specific one).
+        self.dualOptimize() catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InternalSolverError => return error.InternalSolverError,
+        };
+
+        if (apply_err) |e| return e;
+    }
+
+    /// Apply the suggest-delta to the tableau. Three cases per
+    /// kiwi's `suggestValue`: marker basic, other basic, neither
+    /// basic (walk all rows applying delta * marker-coeff).
+    fn applyEditDelta(
+        self: *Solver,
+        tag: Tag,
+        delta: f64,
+    ) std.mem.Allocator.Error!void {
+        if (self.rows.get(tag.marker)) |row_ptr| {
+            if (row_ptr.add(-delta) < 0.0) {
+                try self.infeasible_rows.append(self.alloc, tag.marker);
+            }
+            return;
+        }
+        if (self.rows.get(tag.other)) |row_ptr| {
+            if (row_ptr.add(delta) < 0.0) {
+                try self.infeasible_rows.append(self.alloc, tag.other);
+            }
+            return;
+        }
+        for (self.rows.keys(), self.rows.values()) |sym, row_ptr| {
+            const coeff = row_ptr.coefficientFor(tag.marker);
+            if (coeff != 0.0) {
+                if (row_ptr.add(delta * coeff) < 0.0 and sym.kind != .external) {
+                    try self.infeasible_rows.append(self.alloc, sym);
+                }
+            }
+        }
+    }
+
     // ── Public read path ────────────────────────────────────────────
 
     /// Refresh the cached `value()` of every variable from the
@@ -1035,6 +1164,120 @@ test "remove then re-add yields the same value" {
 
     try testing.expectApproxEqAbs(val1, val2, 1e-9);
     try testing.expectApproxEqAbs(@as(f64, 10), val2, 1e-9);
+}
+
+// ── Edit-variable tests ─────────────────────────────────────────────
+
+test "addEditVariable + suggestValue drives the variable" {
+    // From corpus: edit_managing_lifecycle / edit_suggest_value_weak_equality.
+    var s = try Solver.init(testing.allocator);
+    defer s.deinit();
+
+    const v = try s.addVariable("v");
+    try s.addEditVariable(v, strength_mod.medium);
+    try s.suggestValue(v, 42.0);
+
+    s.updateVariables();
+    try testing.expectApproxEqAbs(@as(f64, 42), s.value(v), 1e-9);
+}
+
+test "addEditVariable rejects required strength" {
+    // From corpus: strength_required_edit_var_is_error.
+    var s = try Solver.init(testing.allocator);
+    defer s.deinit();
+
+    const v = try s.addVariable(null);
+    try testing.expectError(
+        error.BadRequiredStrength,
+        s.addEditVariable(v, strength_mod.required),
+    );
+}
+
+test "addEditVariable twice returns DuplicateEditVariable" {
+    // From corpus: error_duplicate_edit_variable.
+    var s = try Solver.init(testing.allocator);
+    defer s.deinit();
+
+    const v = try s.addVariable(null);
+    try s.addEditVariable(v, strength_mod.medium);
+    try testing.expectError(
+        error.DuplicateEditVariable,
+        s.addEditVariable(v, strength_mod.medium),
+    );
+}
+
+test "suggestValue on unknown variable returns error" {
+    // From corpus: error_unknown_edit_variable.
+    var s = try Solver.init(testing.allocator);
+    defer s.deinit();
+
+    const v = try s.addVariable(null);
+    try testing.expectError(error.UnknownEditVariable, s.suggestValue(v, 5));
+}
+
+test "removeEditVariable forgets it; further suggestValue errors" {
+    var s = try Solver.init(testing.allocator);
+    defer s.deinit();
+
+    const v = try s.addVariable(null);
+    try s.addEditVariable(v, strength_mod.medium);
+    try testing.expect(s.hasEditVariable(v));
+
+    try s.removeEditVariable(v);
+    try testing.expect(!s.hasEditVariable(v));
+    try testing.expectError(error.UnknownEditVariable, s.suggestValue(v, 5));
+}
+
+test "repeated suggestValue updates incrementally (the per-frame path)" {
+    // From corpus: edit_repeated_suggest_reuses_pivots. We don't
+    // measure pivot reuse here, but verify that successive
+    // suggestions all reach the asked-for value.
+    var s = try Solver.init(testing.allocator);
+    defer s.deinit();
+
+    const v = try s.addVariable(null);
+    try s.addEditVariable(v, strength_mod.strong);
+
+    try s.suggestValue(v, 10.0);
+    s.updateVariables();
+    try testing.expectApproxEqAbs(@as(f64, 10), s.value(v), 1e-9);
+
+    try s.suggestValue(v, 100.0);
+    s.updateVariables();
+    try testing.expectApproxEqAbs(@as(f64, 100), s.value(v), 1e-9);
+
+    try s.suggestValue(v, -5.0);
+    s.updateVariables();
+    try testing.expectApproxEqAbs(@as(f64, -5), s.value(v), 1e-9);
+}
+
+test "suggested value reflows dependent variables" {
+    // The killer-demo flow in miniature: pin a derived variable
+    // via a required equation, edit the input, watch the derived
+    // value follow.
+    //   out == 2*in + 3  (required)
+    //   addEditVariable(in, strong); suggestValue(in, 5);  → out = 13
+    //   suggestValue(in, 10);                              → out = 23
+    var s = try Solver.init(testing.allocator);
+    defer s.deinit();
+
+    const in = try s.addVariable("in");
+    const out = try s.addVariable("out");
+
+    const c = try expr(testing.allocator, out).minus(expr(testing.allocator, in).times(2.0)).eq(@as(f64, 3)).required();
+    _ = try buildAndAdd(&s, testing.allocator, c);
+
+    try s.addEditVariable(in, strength_mod.strong);
+
+    try s.suggestValue(in, 5.0);
+    s.updateVariables();
+    try testing.expectApproxEqAbs(@as(f64, 5), s.value(in), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 13), s.value(out), 1e-9);
+
+    try s.suggestValue(in, 10.0);
+    s.updateVariables();
+    try testing.expectApproxEqAbs(@as(f64, 10), s.value(in), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 23), s.value(out), 1e-9);
 }
 
 test "remove preserves other constraints" {
