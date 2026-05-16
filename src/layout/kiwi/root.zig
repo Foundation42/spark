@@ -32,3 +32,9 @@ pub const Strength = strength.Strength;
 pub const Term = @import("term.zig").Term;
 pub const Expression = @import("expression.zig").Expression;
 pub const Constraint = @import("constraint.zig").Constraint;
+
+const builder = @import("builder.zig");
+pub const expr = builder.expr;
+pub const ExprBuilder = builder.ExprBuilder;
+pub const PartialConstraint = builder.PartialConstraint;
+pub const BuilderError = builder.BuilderError;

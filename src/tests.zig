@@ -30,6 +30,7 @@ test {
     _ = @import("layout/kiwi/term.zig");
     _ = @import("layout/kiwi/expression.zig");
     _ = @import("layout/kiwi/constraint.zig");
+    _ = @import("layout/kiwi/builder.zig");
     _ = @import("state.zig");
     _ = @import("svg.zig");
     _ = @import("svg_tessellate.zig");
