@@ -84,6 +84,16 @@ pub const FontRegistry = struct {
     /// Populated lazily on first request via `effectiveFontId`. Values
     /// index into `entries` like any other FontId.
     sized_lookup: std.AutoHashMap(SizedKey, FontId),
+    /// Number of "base" entries (the ones the host explicitly loaded
+    /// via `load` / `loadSdf`). Effective entries that
+    /// `effectiveFontId` lazily creates do NOT bump this counter.
+    /// `prewarmEffectiveSizesForZoom` iterates only the base range so
+    /// it can't cascade onto already-derived entries — each derived
+    /// entry has its own `display_px`, which would otherwise become
+    /// the "base" for the next prewarm's `target = display_px × zoom`
+    /// math, doubling the entry count per zoom step (and inflating
+    /// `display_px` exponentially until `ppem × 64` overflows i32).
+    base_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, ft: face_mod.Library) FontRegistry {
         return .{
@@ -115,7 +125,9 @@ pub const FontRegistry = struct {
         path: [*:0]const u8,
         display_px: u32,
     ) !FontId {
-        return self.loadInner(path, display_px, display_px, .mono);
+        const id = try self.loadInner(path, display_px, display_px, .mono);
+        self.base_count = self.entries.items.len;
+        return id;
     }
 
     /// Load a font for the SDF lane. FT always rasterises at the
@@ -130,7 +142,9 @@ pub const FontRegistry = struct {
         path: [*:0]const u8,
         display_px: u32,
     ) !FontId {
-        return self.loadInner(path, display_px, SDF_SOURCE_PX, .sdf);
+        const id = try self.loadInner(path, display_px, SDF_SOURCE_PX, .sdf);
+        self.base_count = self.entries.items.len;
+        return id;
     }
 
     fn loadInner(
@@ -306,9 +320,20 @@ pub const FontRegistry = struct {
     /// Snapshots the entry count up front so we don't iterate over
     /// entries we lazily create during this very call.
     pub fn prewarmEffectiveSizesForZoom(self: *FontRegistry, zoom: f32) !void {
-        const snapshot_len = self.entries.items.len;
+        // ONLY iterate over base entries (the ones the host loaded
+        // explicitly). Cascading onto previously-created effective
+        // entries causes exponential blow-up: each prewarm call
+        // doubles the entry count, and `display_px × zoom` compounds
+        // across zoom steps until `ppem × 64` overflows i32 (was
+        // hitting `actual_px ≈ 33 M` after ~10 zoom inputs).
+        //
+        // The layout walker only ever calls `effectiveFontId` with a
+        // base FontId (every `Style.font_id` traces back to a Theme
+        // slot, which always references a base), so derived entries
+        // are dead-end leaves — there's no need to prewarm sizes
+        // derived from them.
         var i: usize = 0;
-        while (i < snapshot_len) : (i += 1) {
+        while (i < self.base_count) : (i += 1) {
             const base = self.entries.items[i];
             const target_f: f32 = @max(@as(f32, 1.0), @round(@as(f32, @floatFromInt(base.display_px)) * zoom));
             const target_px: u32 = @intFromFloat(target_f);
