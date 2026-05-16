@@ -80,6 +80,18 @@ pub const GlyphCache = struct {
         self.* = undefined;
     }
 
+    /// Drop every cached glyph. Paired with `Atlas.reset()` by the
+    /// host's AtlasFull recovery path — after both calls, the next
+    /// layout pass re-rasterises whatever glyphs the visible viewport
+    /// actually needs (at whatever zoom is current), so the working
+    /// set shrinks back to what's on screen instead of every glyph
+    /// every visited zoom bucket has ever shaped.
+    pub fn clear(self: *GlyphCache) void {
+        self.map.clearRetainingCapacity();
+        self.hits = 0;
+        self.misses = 0;
+    }
+
     /// Look up a glyph in the cache. On miss, rasterise via the
     /// font registry's face and route based on the registered lane:
     /// mono goes to the R8 atlas straight from FT; colour goes to

@@ -222,6 +222,28 @@ pub const Atlas = struct {
         return .{ .x = 0, .y = new_top, .w = w, .h = h };
     }
 
+    /// Reset the shelf packer AND zero-fill the underlying image so
+    /// stale glyph data can't bleed into the cleared gutter rings
+    /// around freshly-packed glyphs (bilinear sampling reaches one
+    /// texel past a quad edge — without zero-fill it would mix the
+    /// new glyph's edge with whatever the previous occupant left
+    /// behind, producing visible halos).
+    ///
+    /// Called from the host's AtlasFull recovery path: glyph cache is
+    /// cleared, atlas reset, then layout retried. All cached UV refs
+    /// to the OLD layout must be invalidated by the caller — the
+    /// shelf packer no longer remembers them, so layout-cache blits
+    /// would emit stale rects otherwise.
+    pub fn reset(self: *Atlas) !void {
+        self.shelf = .{};
+        const bpp = self.format.bytesPerPixel();
+        const size: usize = @as(usize, self.extent.width) * @as(usize, self.extent.height) * @as(usize, bpp);
+        const zeros = try std.heap.page_allocator.alloc(u8, size);
+        defer std.heap.page_allocator.free(zeros);
+        @memset(zeros, 0);
+        try self.uploadRegion(0, 0, self.extent.width, self.extent.height, zeros);
+    }
+
     /// Upload a `pixels` buffer of size `w*h*bytesPerPixel` into the
     /// atlas at `(dst_x, dst_y)`. Synchronous — returns after the
     /// copy is done and the image is back in SHADER_READ_ONLY_OPTIMAL.

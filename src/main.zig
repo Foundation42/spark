@@ -407,16 +407,34 @@ fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) 
     // guarantees an initial layout before the first draw.
     const extent_changed = extent.width != fc.last_extent.width or extent.height != fc.last_extent.height;
     if (extent_changed or fc.state.dirty) {
-        fc.runLayout(extent) catch |err| {
-            // SsboOverflow / AtlasFull etc. — drop this frame quietly.
-            // Surface the first occurrence so silent failures aren't
-            // invisible. (Stage 10: shouldn't fire in practice; bump
-            // ATLAS_MONO_SIZE or add eviction if it does.)
-            if (!fc.glyph_overflow_logged) {
-                std.debug.print("WARN: runLayout failed ({s}) at zoom={d:.3}, extent={d}x{d}\n", .{ @errorName(err), fc.zoom, extent.width, extent.height });
-                fc.glyph_overflow_logged = true;
-            }
-            return;
+        fc.runLayout(extent) catch |err| switch (err) {
+            error.AtlasFull => {
+                // Coarse LRU: drop every cached glyph + reset both
+                // atlases + clear the block-layout cache (its cached
+                // GlyphInstance UVs point into the now-stale atlas
+                // rects). Next layout re-rasterises only what the
+                // current viewport actually needs — the working set
+                // shrinks back to "visible glyphs at the current
+                // zoom" instead of "every glyph at every zoom bucket
+                // ever visited this session". One retry, then give up
+                // gracefully if the single frame really doesn't fit.
+                std.debug.print("INFO: AtlasFull at zoom={d:.3} — resetting glyph caches and retrying\n", .{fc.zoom});
+                fc.cache.clear();
+                fc.mono_atlas.reset() catch return;
+                fc.color_atlas.reset() catch return;
+                fc.block_cache.clear();
+                fc.runLayout(extent) catch {
+                    std.debug.print("WARN: runLayout still failing after atlas reset — dropping frame\n", .{});
+                    return;
+                };
+            },
+            else => {
+                if (!fc.glyph_overflow_logged) {
+                    std.debug.print("WARN: runLayout failed ({s}) at zoom={d:.3}, extent={d}x{d}\n", .{ @errorName(err), fc.zoom, extent.width, extent.height });
+                    fc.glyph_overflow_logged = true;
+                }
+                return;
+            },
         };
         fc.last_extent = extent;
         fc.state.clearDirty();
