@@ -1,0 +1,224 @@
+/* Manifesto PDF stylesheet — weasyprint */
+
+@page {
+    size: A4;
+    margin: 0.85in 0.75in 0.85in 0.75in;
+    @bottom-center {
+        content: counter(page);
+        font-family: "Inter", "Helvetica Neue", Arial, sans-serif;
+        font-size: 9pt;
+        color: #888;
+    }
+    @top-right {
+        content: string(chapter);
+        font-family: "Inter", "Helvetica Neue", Arial, sans-serif;
+        font-size: 9pt;
+        color: #aaa;
+    }
+}
+
+@page :first {
+    @top-right { content: none; }
+    @bottom-center { content: none; }
+}
+
+html {
+    font-family: "Charter", "Georgia", "Iowan Old Style", serif;
+    font-size: 11pt;
+    line-height: 1.55;
+    color: #222;
+}
+
+body {
+    text-align: justify;
+    hyphens: auto;
+}
+
+h1, h2, h3, h4 {
+    font-family: "Inter", "Helvetica Neue", Arial, sans-serif;
+    color: #111;
+    page-break-after: avoid;
+}
+
+h1 {
+    string-set: chapter content();
+    font-size: 22pt;
+    font-weight: 800;
+    margin: 1.6em 0 0.6em 0;
+    letter-spacing: -0.01em;
+}
+
+h1:first-of-type {
+    margin-top: 0;
+}
+
+h2 {
+    font-size: 15pt;
+    font-weight: 700;
+    margin: 1.6em 0 0.5em 0;
+    padding-top: 0.3em;
+    border-top: 1px solid #ddd;
+    letter-spacing: -0.005em;
+}
+
+h3 {
+    font-size: 12pt;
+    font-weight: 700;
+    margin: 1.3em 0 0.3em 0;
+}
+
+h4 {
+    font-size: 11pt;
+    font-weight: 700;
+    margin: 1em 0 0.2em 0;
+    color: #333;
+}
+
+p {
+    margin: 0 0 0.7em 0;
+    orphans: 2;
+    widows: 2;
+}
+
+strong {
+    color: #000;
+    font-weight: 700;
+}
+
+em {
+    color: #333;
+}
+
+a {
+    color: #1a5490;
+    text-decoration: none;
+}
+
+ul, ol {
+    margin: 0.4em 0 0.9em 0;
+    padding-left: 1.4em;
+}
+
+li {
+    margin-bottom: 0.35em;
+}
+
+li > p {
+    margin-bottom: 0.4em;
+}
+
+blockquote {
+    margin: 1em 1.5em;
+    padding: 0.6em 1em;
+    border-left: 3px solid #888;
+    color: #444;
+    font-style: italic;
+    page-break-inside: avoid;
+}
+
+blockquote em {
+    color: #222;
+}
+
+blockquote p:last-child {
+    margin-bottom: 0;
+}
+
+code {
+    font-family: "JetBrains Mono", "Fira Code", "SF Mono", Consolas, monospace;
+    font-size: 0.88em;
+    background: #f4f3ef;
+    padding: 0.06em 0.32em;
+    border-radius: 3px;
+    color: #54473b;
+}
+
+pre {
+    font-family: "JetBrains Mono", "Fira Code", "SF Mono", Consolas, monospace;
+    font-size: 9pt;
+    background: #f4f3ef;
+    padding: 0.7em 0.9em;
+    border-radius: 4px;
+    line-height: 1.4;
+    overflow-wrap: break-word;
+    white-space: pre-wrap;
+    page-break-inside: avoid;
+    margin: 0.7em 0;
+}
+
+pre code {
+    background: transparent;
+    padding: 0;
+    font-size: inherit;
+    color: #333;
+}
+
+hr {
+    border: none;
+    border-top: 1px solid #ccc;
+    margin: 1.6em 0;
+}
+
+figure {
+    margin: 1.4em auto;
+    text-align: center;
+    page-break-inside: avoid;
+}
+
+figure img {
+    max-width: 90%;
+    height: auto;
+    border: 1px solid #ddd;
+    border-radius: 3px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+}
+
+figcaption {
+    font-family: "Inter", "Helvetica Neue", Arial, sans-serif;
+    font-size: 9pt;
+    color: #666;
+    margin-top: 0.5em;
+    font-style: italic;
+}
+
+/* Page break before the roadmap appendix */
+h1.roadmap-start {
+    page-break-before: always;
+}
+
+/* Title-page styling — pandoc emits id, not class */
+#title-block-header {
+    text-align: center;
+    margin: 1.5in 0 2em 0;
+    page-break-after: avoid;
+}
+
+#title-block-header h1.title {
+    font-size: 32pt;
+    margin: 0 0 0.4em 0;
+    border: none;
+    font-weight: 800;
+    letter-spacing: -0.015em;
+}
+
+#title-block-header .subtitle {
+    font-family: "Inter", "Helvetica Neue", Arial, sans-serif;
+    font-size: 14pt;
+    color: #555;
+    font-style: italic;
+    margin: 0.2em 0 1.5em 0;
+}
+
+#title-block-header .author, #title-block-header .date {
+    font-family: "Inter", "Helvetica Neue", Arial, sans-serif;
+    font-size: 10pt;
+    color: #777;
+    margin: 0.2em 0;
+}
+
+/* Closing-verse image: centered, slightly smaller */
+figure.bookend img {
+    max-width: 55%;
+    border: none;
+    box-shadow: none;
+}
