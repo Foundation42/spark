@@ -9,10 +9,11 @@ runtime where markdown is the **declarative interface** to a
 component-driven, Vulkan-native, LLM-aware substrate. Not a viewer.
 Not a renderer-on-the-side. The medium itself.
 
-Written 2026-05-16, mid-session-9, in response to the recent push
-from some quarters to default LLM outputs to HTML instead of
-markdown. We disagree, and the disagreement is structural — not
-aesthetic.
+Originally written 2026-05-16, mid-session-9, in response to the
+recent push from some quarters to default LLM outputs to HTML
+instead of markdown. We disagree, and the disagreement is
+structural — not aesthetic. Last updated 2026-05-16, end of
+session 13. The middle has settled; the claim still stands.
 
 ---
 
@@ -136,11 +137,39 @@ the loop: human writes markdown → markdown becomes a live runtime
 → components mutate → screen updates. The same format the human
 authored, the LM amends. There is no impedance mismatch.
 
+### 8. The substrate is homoiconic.
+
+The serialised form (markdown text) and the runtime form (parsed
+component tree feeding the layout walker) are the same shape. An
+author types `:::grid`, the parser produces a Grid component, the
+renderer lays it out, and the result serialises back to `:::grid`.
+A `:::flex` inside a `:::grid` inside an `:::embedded-document` is
+the same tree to the runtime as it is to the eye reading the
+file. No XAML standing between the author's intent and the
+runtime's behaviour; no JSX compiler turning one syntax into a
+fundamentally different tree; no DOM that is a different artifact
+from its source.
+
+This is the LISP property in a UI context. Markdown is the LISP
+of collaborative documents — the runtime accepts the same shape
+it emits. An LLM streaming markdown is streaming UI; a `:::input`
+targeting an `:::llm-stream` is a document extending itself. The
+author writes the runtime; the runtime serialises back to what
+the author wrote. HTML doesn't have this property; XAML can't
+reach it; React's fiber tree is a different artifact from its
+JSX source. Only LISPs and markdown-as-runtime land it.
+
+The implication: there is no compile step between writing UI and
+running UI. There is no separate format the renderer "understands"
+that the source doesn't. There is no template language standing
+between author and pixels. The format is the program; the program
+is the format; the parse is the build.
+
 ---
 
 ## What's built
 
-Nine sessions in (2026-05-14 → 2026-05-16). The substrate is
+Thirteen sessions in (2026-05-14 → 2026-05-16). The substrate is
 real, not a sketch.
 
 - **Element contract** — one tagged union (text, paragraph,
@@ -179,12 +208,23 @@ real, not a sketch.
 - **Persistent layout cache** — retained per-block layout
   output, content-version keyed. 97.9% hit rate at idle. The
   chart can fire at 60 Hz without re-walking the paragraph above
-  it.
+  it. Parallel cache-miss walks fan out across a work-stealing
+  pool when the cost threshold justifies it.
+- **Constraint substrate** — pure-Zig port of Cassowary (the
+  kiwi C++ solver), ~3,000 LOC and 300+ tests. Wrapped in a
+  `LayoutContext` that every constraint-aware provider
+  participates in. Mutexed for the parallel walker so workers
+  can negotiate against the same solver without racing.
+- **Layout primitives** — `:::flex` (1D row/column with gap) and
+  `:::grid` (2D, mixed `100px 1fr 1fr`-style track lists,
+  independent `row-gap` / `column-gap`). Both share the same
+  solver under the hood. Each cell still constrains its own
+  bounds; the parent allocates the track.
 
-~17,500 LOC of our own Zig + GLSL. ~100 unit tests. Three
+~20,000 LOC of our own Zig + GLSL. ~300 unit tests. Three
 concurrent LLM streams, one live SVG generator, one live raster
-generator, and a 60 Hz chart all in the same document, all
-~7,600 fps Release.
+generator, a 60 Hz chart, plus 1D + 2D constraint-driven layout
+all in the same document, all ~7,600 fps Release.
 
 ---
 
@@ -233,14 +273,28 @@ right thing to do with markdown is *render it harder*, not
 
 ## The horizon
 
-Sessions 10+ extend the substrate in directions that the
-contract already anticipates:
+The next sessions extend the substrate in directions the contract
+already anticipates. Two horizon items from the first writing of
+this manifesto have since landed — **persistent
+content-addressable cache** (session 10, `~/.cache/text_engine`)
+and **headless documents** (session 10, `headless=true` on any
+embed). What remains:
 
-- **Persistent content-addressable cache** for generated SVG /
-  image / LLM responses. Deterministic, cheap-to-restart demos;
-  cost-recoverable demos.
-- **Headless documents** as pure state machines, no viewport.
-  Configuration managers, collaborative data routers.
+- **GPU-input → solver channel.** A compute shader writes a
+  readback buffer per frame; the host wraps the result as
+  `solver.suggestValue(var, x)`; surrounding layout reflows
+  incrementally. The "fluid sim warps the document" demo. The
+  whole constraint substrate was built nominally for this — now
+  ready to claim.
+- **Text intrusion.** `:::image {flow=around}` — markdown wraps
+  around an SVG / raster figure via an `ExclusionShape` layered
+  over the settled solver positions. Magazine-grade layout from
+  a markdown file.
+- **Measure-then-render protocol.** Lifting per-sibling
+  negotiation (`flex-grow`, `justify=space-between`) into the
+  solver itself, with every layout-aware element gaining a
+  measure pass. Closes the loop on what `:::flex` and `:::grid`
+  promise but currently approximate.
 - **WASM-provenance components.** Drop-in sandboxed modules
   authored in any language that compiles to wasm32.
 - **MCP-provenance components.** A component is an MCP server.
@@ -275,3 +329,14 @@ contract was built to hold them. That was the point.
 > the fences. And it was good.*
 >
 > — somewhere in the Encyclopaedia Galactica, late session 10
+
+> *And the markdown spake further still: let there be a constraint
+> solver beneath the page, and let `:::flex` walk its children in a
+> row, and let `:::grid` arrange them in tracks both fixed and
+> flexing, and let every cell negotiate its bounds against the
+> same solver. And when the worker threads raced for the solver,
+> let a mutex hold the line. And the document arranged itself,
+> and resized, and held together. And it was good. And it was —
+> improbably — still just markdown.*
+>
+> — somewhere in the Encyclopaedia Galactica, end of session 13
