@@ -26,6 +26,7 @@ test {
     _ = @import("io_channel.zig");
     _ = @import("jobs.zig");
     _ = @import("layout_cache.zig");
+    _ = @import("layout/kiwi/strength.zig");
     _ = @import("state.zig");
     _ = @import("svg.zig");
     _ = @import("svg_tessellate.zig");
