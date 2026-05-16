@@ -77,6 +77,7 @@ const dotenv = @import("../dotenv.zig");
 const svg = @import("../svg.zig");
 const tess = @import("../svg_tessellate.zig");
 const jobs_mod = @import("../jobs.zig");
+const asset_cache_mod = @import("../asset_cache.zig");
 const text_layout = @import("../text/layout.zig");
 const shape = @import("../font/shape.zig");
 const box_helpers = @import("box.zig");
@@ -97,6 +98,7 @@ var parent_state_ref: ?*state_mod.State = null;
 var io_channel_ref: ?*io.IoChannel = null;
 var env_ref: ?*const dotenv.DotEnv = null;
 var job_system_ref: ?*jobs_mod.JobSystem = null;
+var asset_cache_ref: ?*asset_cache_mod.AssetCache = null;
 
 pub fn install(
     registry: *component_mod.Registry,
@@ -104,12 +106,14 @@ pub fn install(
     io_channel: *io.IoChannel,
     env: ?*const dotenv.DotEnv,
     job_system: *jobs_mod.JobSystem,
+    asset_cache: ?*asset_cache_mod.AssetCache,
 ) !void {
     registry_ref = registry;
     parent_state_ref = parent_state;
     io_channel_ref = io_channel;
     env_ref = env;
     job_system_ref = job_system;
+    asset_cache_ref = asset_cache;
     try registry.register("svg-stream", factory);
 }
 
@@ -119,6 +123,7 @@ pub fn deinitGlobals() void {
     io_channel_ref = null;
     env_ref = null;
     job_system_ref = null;
+    asset_cache_ref = null;
 }
 
 const DEFAULT_OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions";
@@ -140,6 +145,24 @@ pub const Provider = enum {
 
 const Phase = enum { idle, loading, done, failed };
 
+/// Cache-key shape version. Bump if the key inputs ever change so old
+/// entries are silently bypassed (they remain on disk until evicted).
+const CACHE_KEY_PREFIX = "svg-stream:v1";
+
+fn computeCacheKey(c: *const Component) asset_cache_mod.Key {
+    var mt_buf: [16]u8 = undefined;
+    const mt = std.fmt.bufPrint(&mt_buf, "{d}", .{c.max_tokens}) catch "?";
+    return asset_cache_mod.AssetCache.keyFor(&.{
+        CACHE_KEY_PREFIX,
+        @tagName(c.provider),
+        c.endpoint,
+        c.model,
+        c.system orelse "",
+        c.prompt,
+        mt,
+    });
+}
+
 const PendingSvgStream = struct {
     /// Polymorphic dispatch header — drainHandler reads this to
     /// route the completion. Must be first field.
@@ -148,6 +171,10 @@ const PendingSvgStream = struct {
     /// Null = cancelled. Subsequent completions release owned bytes
     /// and return.
     component: ?*Component,
+    /// Snapshotted at submit time so a successful `.end` writes to
+    /// the same key the request was issued under — even if the
+    /// component's prompt or model has been mutated mid-flight.
+    cache_key: asset_cache_mod.Key,
 };
 
 const Component = struct {
@@ -288,6 +315,35 @@ fn kickStream(c: *Component) !void {
     freeMesh(c);
     c.phase = .loading;
 
+    const cache_key = computeCacheKey(c);
+
+    // Cache fast path. A hit skips the network entirely — read bytes,
+    // run the same finalizeResponse the network path uses. On a
+    // corrupt/incompatible cached entry, drop it and fall through.
+    if (asset_cache_ref) |cache| {
+        if (cache.get(cache_key) catch |e| blk: {
+            std.log.warn("svg-stream: cache get failed: {s}", .{@errorName(e)});
+            break :blk null;
+        }) |cached_bytes| {
+            defer c.allocator.free(cached_bytes);
+            c.response.appendSlice(c.allocator, cached_bytes) catch |e| {
+                std.log.warn("svg-stream: cache append failed: {s}; refetching", .{@errorName(e)});
+                c.response.clearRetainingCapacity();
+            };
+            if (c.response.items.len > 0) {
+                if (finalizeResponse(c)) |_| {
+                    c.version +%= 1;
+                    if (parent_state_ref) |ps| ps.dirty = true;
+                    return;
+                } else |e| {
+                    std.log.warn("svg-stream: cache finalize failed: {s}; refetching", .{@errorName(e)});
+                    c.response.clearRetainingCapacity();
+                    c.phase = .loading;
+                }
+            }
+        }
+    }
+
     var scratch = std.heap.ArenaAllocator.init(c.allocator);
     defer scratch.deinit();
     const sa = scratch.allocator();
@@ -304,7 +360,7 @@ fn kickStream(c: *Component) !void {
 
     const pending = try c.allocator.create(PendingSvgStream);
     errdefer c.allocator.destroy(pending);
-    pending.* = .{ .allocator = c.allocator, .component = c };
+    pending.* = .{ .allocator = c.allocator, .component = c, .cache_key = cache_key };
 
     const handle = try ch.submitHttpStream(.{
         .url = c.endpoint,
@@ -428,6 +484,20 @@ fn handleCompletion(comp: io.Completion) void {
                     if (c.err_name) |old| a.free(old);
                     c.err_name = a.dupe(u8, @errorName(e)) catch null;
                 };
+                // Persist successful responses to the asset cache so the
+                // next run replays without burning another $0.08.
+                if (c.phase == .done) {
+                    if (asset_cache_ref) |cache| {
+                        var source_buf: [256]u8 = undefined;
+                        const source = std.fmt.bufPrint(&source_buf, "svg-stream:{s}:{s}", .{ @tagName(c.provider), c.model }) catch null;
+                        cache.put(p.cache_key, c.response.items, .{
+                            .source = source,
+                            .content_type = "application/json",
+                        }) catch |e| {
+                            std.log.warn("svg-stream: cache put failed: {s}", .{@errorName(e)});
+                        };
+                    }
+                }
                 c.version +%= 1;
                 if (parent_state_ref) |ps| ps.dirty = true;
             }

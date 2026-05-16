@@ -49,6 +49,7 @@ const demo_server_mod = @import("demo_server.zig");
 const jobs_mod = @import("jobs.zig");
 const io_channel_mod = @import("io_channel.zig");
 const dotenv_mod = @import("dotenv.zig");
+const asset_cache_mod = @import("asset_cache.zig");
 const svg_mod = @import("svg.zig");
 const svg_tess = @import("svg_tessellate.zig");
 
@@ -740,13 +741,26 @@ fn hsvToRgb(h_deg: f32, s: f32, v: f32) [3]f32 {
     return .{ r + m, g + m, b + m };
 }
 
+/// XDG-style cache directory for persistent assets. Honours
+/// `$XDG_CACHE_HOME` if set; otherwise falls back to `$HOME/.cache`.
+/// Returns an owned path; caller frees via `allocator.free`.
+fn computeAssetCacheDir(allocator: std.mem.Allocator) ![]u8 {
+    if (std.process.getEnvVarOwned(allocator, "XDG_CACHE_HOME")) |xdg| {
+        defer allocator.free(xdg);
+        return try std.fs.path.join(allocator, &.{ xdg, "text_engine", "assets" });
+    } else |_| {}
+    const home = try std.process.getEnvVarOwned(allocator, "HOME");
+    defer allocator.free(home);
+    return try std.fs.path.join(allocator, &.{ home, ".cache", "text_engine", "assets" });
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 8 / stage 14c (:::image-stream — raster image gen)\n", .{});
+    try stdout.print("text_engine demo — session 9 / stage 14e (persistent asset cache)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
     try stdout.print("  demo.md bytes:         {d}\n", .{demo_md.len});
@@ -917,6 +931,29 @@ pub fn main() !void {
         try stdout.print("  ~/.env load:          {s} (continuing)\n", .{@errorName(e)});
     };
 
+    // ── Stage 14e — persistent asset cache ─────────────────────────
+    // Browser-style content-addressable cache for expensive remote
+    // assets (Recraft SVG envelopes, Gemini image envelopes). Keyed
+    // on sha256(provider | model | prompt) by each consumer; cache
+    // hits skip the network entirely. Default budget 500 MB; LRU
+    // eviction on overflow.
+    const asset_cache_dir = try computeAssetCacheDir(allocator);
+    defer allocator.free(asset_cache_dir);
+    const asset_cache = try asset_cache_mod.AssetCache.init(allocator, asset_cache_dir, 500 * 1024 * 1024);
+    defer asset_cache.deinit();
+    {
+        const s = asset_cache.stats();
+        try stdout.print(
+            "  asset cache:          {d} entries / {d:.1} MB / {d:.0} MB budget @ {s}\n",
+            .{
+                s.entry_count,
+                @as(f64, @floatFromInt(s.total_bytes)) / (1024.0 * 1024.0),
+                @as(f64, @floatFromInt(s.budget_bytes)) / (1024.0 * 1024.0),
+                asset_cache_dir,
+            },
+        );
+    }
+
     try embedded_document_component.install(&registry, &theme, &host_state, &io_channel);
     defer embedded_document_component.deinitGlobals();
     try llm_stream_component.install(&registry, &theme, &host_state, &io_channel, &env);
@@ -925,9 +962,9 @@ pub fn main() !void {
     defer input_component.deinitGlobals();
     try svg_component.install(&registry, job_system);
     defer svg_component.deinitGlobals();
-    try svg_stream_component.install(&registry, &host_state, &io_channel, &env, job_system);
+    try svg_stream_component.install(&registry, &host_state, &io_channel, &env, job_system, asset_cache);
     defer svg_stream_component.deinitGlobals();
-    try image_stream_component.install(&registry, &host_state, &io_channel, &env, &ctx, &image_pipeline_inst);
+    try image_stream_component.install(&registry, &host_state, &io_channel, &env, &ctx, &image_pipeline_inst, asset_cache);
     defer image_stream_component.deinitGlobals();
 
     // Stage 13d.2 — micro-benchmark serial vs parallel tessellation

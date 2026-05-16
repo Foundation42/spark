@@ -50,6 +50,7 @@ const dotenv = @import("../dotenv.zig");
 const vk = @import("../gpu/vk.zig");
 const image_texture_mod = @import("../gpu/image_texture.zig");
 const image_pipeline_mod = @import("../gpu/image_pipeline.zig");
+const asset_cache_mod = @import("../asset_cache.zig");
 const text_layout = @import("../text/layout.zig");
 const shape = @import("../font/shape.zig");
 const box_helpers = @import("box.zig");
@@ -77,6 +78,7 @@ var io_channel_ref: ?*io.IoChannel = null;
 var env_ref: ?*const dotenv.DotEnv = null;
 var vk_ctx_ref: ?*const vk.Context = null;
 var image_pipeline_ref: ?*image_pipeline_mod.ImagePipeline = null;
+var asset_cache_ref: ?*asset_cache_mod.AssetCache = null;
 
 pub fn install(
     registry: *component_mod.Registry,
@@ -85,6 +87,7 @@ pub fn install(
     env: ?*const dotenv.DotEnv,
     vk_ctx: *const vk.Context,
     image_pipeline: *image_pipeline_mod.ImagePipeline,
+    asset_cache: ?*asset_cache_mod.AssetCache,
 ) !void {
     registry_ref = registry;
     parent_state_ref = parent_state;
@@ -92,6 +95,7 @@ pub fn install(
     env_ref = env;
     vk_ctx_ref = vk_ctx;
     image_pipeline_ref = image_pipeline;
+    asset_cache_ref = asset_cache;
     try registry.register("image-stream", factory);
 }
 
@@ -102,6 +106,7 @@ pub fn deinitGlobals() void {
     env_ref = null;
     vk_ctx_ref = null;
     image_pipeline_ref = null;
+    asset_cache_ref = null;
 }
 
 const DEFAULT_OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
@@ -123,6 +128,24 @@ pub const Provider = enum {
 
 const Phase = enum { idle, loading, done, failed };
 
+/// Cache-key shape version. Bump if the key inputs ever change so old
+/// entries are silently bypassed (they remain on disk until evicted).
+const CACHE_KEY_PREFIX = "image-stream:v1";
+
+fn computeCacheKey(c: *const Component) asset_cache_mod.Key {
+    var mt_buf: [16]u8 = undefined;
+    const mt = std.fmt.bufPrint(&mt_buf, "{d}", .{c.max_tokens}) catch "?";
+    return asset_cache_mod.AssetCache.keyFor(&.{
+        CACHE_KEY_PREFIX,
+        @tagName(c.provider),
+        c.endpoint,
+        c.model,
+        c.system orelse "",
+        c.prompt,
+        mt,
+    });
+}
+
 const PendingImageStream = struct {
     /// Polymorphic dispatch header — drainHandler reads this to
     /// route the completion. Must be first field.
@@ -131,6 +154,9 @@ const PendingImageStream = struct {
     /// Null = cancelled. Subsequent completions release owned bytes
     /// and return.
     component: ?*Component,
+    /// Snapshotted at submit time so a successful `.end` writes to
+    /// the same key the request was issued under.
+    cache_key: asset_cache_mod.Key,
 };
 
 const Component = struct {
@@ -264,6 +290,35 @@ fn kickStream(c: *Component) !void {
     // resources unconditionally per re-fire.
     c.phase = .loading;
 
+    const cache_key = computeCacheKey(c);
+
+    // Cache fast path. Bypass the network if we already have this
+    // request's envelope on disk; on parse/finalize failure, fall
+    // through to a fresh fetch.
+    if (asset_cache_ref) |cache| {
+        if (cache.get(cache_key) catch |e| blk: {
+            std.log.warn("image-stream: cache get failed: {s}", .{@errorName(e)});
+            break :blk null;
+        }) |cached_bytes| {
+            defer c.allocator.free(cached_bytes);
+            c.response.appendSlice(c.allocator, cached_bytes) catch |e| {
+                std.log.warn("image-stream: cache append failed: {s}; refetching", .{@errorName(e)});
+                c.response.clearRetainingCapacity();
+            };
+            if (c.response.items.len > 0) {
+                if (finalizeResponse(c)) |_| {
+                    c.version +%= 1;
+                    if (parent_state_ref) |ps| ps.dirty = true;
+                    return;
+                } else |e| {
+                    std.log.warn("image-stream: cache finalize failed: {s}; refetching", .{@errorName(e)});
+                    c.response.clearRetainingCapacity();
+                    c.phase = .loading;
+                }
+            }
+        }
+    }
+
     var scratch = std.heap.ArenaAllocator.init(c.allocator);
     defer scratch.deinit();
     const sa = scratch.allocator();
@@ -280,7 +335,7 @@ fn kickStream(c: *Component) !void {
 
     const pending = try c.allocator.create(PendingImageStream);
     errdefer c.allocator.destroy(pending);
-    pending.* = .{ .allocator = c.allocator, .component = c };
+    pending.* = .{ .allocator = c.allocator, .component = c, .cache_key = cache_key };
 
     const handle = try ch.submitHttpStream(.{
         .url = c.endpoint,
@@ -401,6 +456,18 @@ fn handleCompletion(comp: io.Completion) void {
                     if (c.err_name) |old| a.free(old);
                     c.err_name = a.dupe(u8, @errorName(e)) catch null;
                 };
+                if (c.phase == .done) {
+                    if (asset_cache_ref) |cache| {
+                        var source_buf: [256]u8 = undefined;
+                        const source = std.fmt.bufPrint(&source_buf, "image-stream:{s}:{s}", .{ @tagName(c.provider), c.model }) catch null;
+                        cache.put(p.cache_key, c.response.items, .{
+                            .source = source,
+                            .content_type = "application/json",
+                        }) catch |e| {
+                            std.log.warn("image-stream: cache put failed: {s}", .{@errorName(e)});
+                        };
+                    }
+                }
                 c.version +%= 1;
                 if (parent_state_ref) |ps| ps.dirty = true;
             }
