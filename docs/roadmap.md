@@ -806,52 +806,98 @@ set / clear / SGR-0 reset / combined SGR. ~120 LOC across
 `element.zig`, `ansi.zig`, `element_layout.zig`, `demo.md`,
 `tests.zig`.
 
-## Next — constraint layout substrate (stage 15)
+## Shipped — kiwi constraint solver (stage 15A)
 
-The next architectural-tier expansion. Brainstormed late session 10,
-design committed at start of session 11 (2026-05-16). Replaces the
-hierarchical block-walker cursor math in `element_layout.zig` with a
-flat linear-constraint system; providers (`:::flex`, `:::grid`,
-`:::table`, `:::stack`, `:::dock`, `:::masonry`) declare relationships
-into a shared solver, the solver settles, the walker reads positions.
+Pure-Zig port of Chris Colbert's kiwi (modern Cassowary, BSD-3,
+~3000 LOC C++). Incremental dual-simplex tableau, four-tier
+strengths (required / strong / medium / weak), edit variables for
+reactive inputs. Lives at `src/layout/kiwi/` as a self-contained
+module with zero text_engine deps — clean boundary, tested in
+isolation. ~3,000 LOC + 300+ unit tests (Zig translation of the
+canonical kiwi C++ test corpus, partial — translation is task #201,
+still pending). One session of recon (kiwi source map, Rust port
+translation guide, canonical test corpus), one session of porting
+primitives + solver core, ongoing corpus translation. Closes Phase
+A of the stage 15 plan.
 
-Full position in [`layout.md`](layout.md). Headlines:
+## Shipped — LayoutContext + :::box integration (stage 15B)
 
-- **Solver**: pure-Zig port of kiwi (Chris Colbert's modern Cassowary,
-  BSD-3, ~3000 LOC C++). Incremental dual-simplex, four-tier strengths
-  (required / strong / medium / weak), edit variables for reactive
-  inputs. Lives at `src/layout/kiwi/` as a self-contained module with
-  zero text_engine deps — clean boundary, easy to test in isolation.
-- **Bidirectional GPU channel**: compute shaders write to readback
-  buffers; host wraps the result as edit variables; surrounding
-  layout reflows incrementally. Gives the "fluid sim warps the
-  document" demo *without* putting an LP solver on the GPU (branchy
-  incremental simplex is not GPU-friendly; LP-on-GPU costs more than
-  it saves at our problem size).
-- **Text intrusion / exclusion**: separate second pass. Components
-  emit `ExclusionShape` (rect → polygon → per-line); text engine
-  consults them when breaking lines. CSS `shape-outside` semantics
-  layered on top of the solver.
-- **Strength discipline**: required for box-model invariants, strong
-  for provider structural rules, medium for author prefs, weak for
-  content hints. Documented in `layout.md` so debugging the solver
-  doesn't become miserable.
+`LayoutContext` wraps the kiwi `Solver` plus a `bounds_map` keyed
+by `@intFromPtr(component_ctx)` — opaque stable keys, no string
+ids required from components. Each frame: `solver.reset()`
+(preserves pool capacity), constraint-aware providers declare
+constraints on their children, `updateVariables` settles, walker
+reads positions from `bounds_map`. `:::box` migrated to the
+constraint path: declares `x`, `y`, `width`, `height` variables,
+posts the box-model edit constraints, reads its laid-out rect
+back through `getBounds(@intFromPtr(c))`. The old hierarchical
+cursor math still runs for non-constraint elements (paragraphs,
+headings) — they live alongside constraint-aware providers in
+the same walker. Phase B closed.
 
-Phasing (each ships value standalone):
+## Shipped — :::flex provider (stage 15C)
 
-- **A — `kiwi.zig`**: pure-Zig solver port + ~150 tests. ~2 sessions.
-  Library-grade, no integration yet.
-- **B — first integration**: `LayoutContext`, `:::box` migrated to
-  declare via constraints, walker reads from solver. ~1 session.
-- **C — `:::flex`**: row / column, gap, grow, shrink. ~1 session.
-- **D — GPU-input channel**: one shader → edit-var → reflow demo.
-  ~1 session.
-- **E — text intrusion**: rect exclusions, `:::image {flow=around}`.
-  ~1 session.
-- **F — `:::grid` + `:::table`**: the real layout primitives.
-  ~2 sessions.
+First constraint-aware provider. `:::flex {#id direction=row gap=N}`
+arranges children left-to-right (column direction parked) with a
+uniform gap. Each child is constraint-aware (`:::box` today); the
+flex parent allocates per-child track widths and posts position
+constraints into the shared solver. Body re-parsed via
+`markdown.parseWithStateAndScope` so children carry full reactive
+state. Flex-grow / shrink / justify=space-between deferred — those
+need a measure-pass protocol (Phase C.3, parked). Phase C v0
+shipped end of session 12.
 
-Total: ~8 sessions to land the substrate + first four providers.
+## Shipped — :::grid provider + parallel-walk hardening (stage 15F.1, 15d.1, 15e)
+
+The first multi-axis layout primitive. `:::grid {#id
+columns="100px 1fr 1fr" column-gap=N row-gap=N}` arranges children
+row-major across mixed fixed/flex tracks. `MAX_TRACKS=32` inline
+storage avoids arena growth across `update()`. `parseTrack`
+handles `100px`, `100`, `1fr`, `2.5fr`; rejects `0fr` and garbage.
+`resolveTrackWidths` sums fixed widths, subtracts from
+`(avail - total_gap)`, distributes the remainder by `fr` weight,
+clamps to 0.
+
+Mid-session-13 a parallel-walk race surfaced: the stage-14b
+dispatcher reached `box.layoutViaConstraints` on worker threads,
+multiple workers wrote to the shared `LayoutContext.solver`
+concurrently, and Zig 0.14's `AutoArrayHashMap` pointer-stability
+safety lock tripped under `row.substitute → cells.fetchOrderedRemove`.
+Fix (stage 15d.1): `LayoutContext` grew a `std.Thread.Mutex` held
+across the full add-constraints + `updateVariables` + value-read
+sequence in `box.layoutViaConstraints` via `defer unlock`. ~19 LOC
+of real change. Critical section ~10-30µs per box. Re-enabled the
+parallel walker for grid + flex layouts under load.
+
+Stage 15e replaced the early equal-width-track grid with the
+fr-track + axis-split gap form. Closes Phase F.1; `:::table` and
+named tracks defer. Manifest of the constraint layer: ~300 tests
+across solver primitives + LayoutContext + flex + grid.
+
+## Next — GPU-input channel + text intrusion (stage 15D, 15E)
+
+The two remaining phases of the stage 15 substrate plan, both of
+which the kiwi port + LayoutContext + parallel-walk hardening
+were built nominally to host.
+
+- **GPU-input → solver channel (Phase D).** Compute shader writes
+  a readback buffer per frame; host wraps the result as
+  `solver.suggestValue(var, x)`; surrounding layout reflows
+  incrementally. Gives the "fluid sim warps the document" demo
+  without putting an LP solver on the GPU. The constraint
+  substrate is the load-bearing piece; the rest is plumbing the
+  GPU readback channel onto solver edit variables.
+- **Text intrusion / exclusion (Phase E).** `:::image {flow=around}`
+  — markdown wraps around an SVG / raster figure via an
+  `ExclusionShape` layered over the settled solver positions. CSS
+  `shape-outside` semantics; per-line break decisions consult the
+  exclusion shapes. Magazine-grade layout from a markdown file.
+
+Strength discipline (required / strong / medium / weak) and the
+measure-then-render protocol (lifting per-sibling negotiation —
+`flex-grow`, `justify=space-between` — into the solver itself,
+parked from stage 15C) layer onto either phase when each one
+lands. Full design position in [`layout.md`](layout.md).
 
 ## Eventually — LM connection (tier 3)
 
