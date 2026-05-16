@@ -81,6 +81,30 @@ The first multi-child constraint-aware provider. `:::flex` walks its children wi
 :::
 :::
 
+## Grid layout (stage 15d)
+
+The second multi-child constraint-aware provider. `:::grid` lays its body out into equal-width tracks (`columns=N`), row-major, gap between cells, auto-height rows sized to the tallest cell. Each cell still goes through the kiwi solver for its own bounds — the grid parent allocates the track, the cell constrains its size inside it. `:::flex` handles 1D; `:::grid` handles 2D; both stack cleanly inside each other.
+
+:::grid {#dashboard columns=3 gap=12}
+:::box {color=red width=100% height=60 radius=6}
+:::
+
+:::box {color=orange width=100% height=60 radius=6}
+:::
+
+:::box {color=yellow width=100% height=60 radius=6}
+:::
+
+:::box {color=green width=100% height=60 radius=6}
+:::
+
+:::box {color=cyan width=100% height=60 radius=6}
+:::
+
+:::box {color=purple width=100% height=60 radius=6}
+:::
+:::
+
 ## Composition (stage 9)
 
 The block below is a *whole other document* — `src/widgets/orbit_panel.md` — embedded recursively. Parent attrs (`panel_color=cyan`, `inner_color=magenta`) overlay the child's frontmatter; child components live in the same registry under the scope `orbit/...` so their ids can't collide with the parent's.
