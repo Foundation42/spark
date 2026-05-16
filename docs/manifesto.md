@@ -269,3 +269,9 @@ contract was built to hold them. That was the point.
 > it was good.*
 >
 > — somewhere in the Encyclopaedia Galactica, mid-2026
+
+> *And the markdown spake further: let there be crisp zoom at every
+> magnification, and emoji that flow inline, and ANSI fences inside
+> the fences. And it was good.*
+>
+> — somewhere in the Encyclopaedia Galactica, late session 10
