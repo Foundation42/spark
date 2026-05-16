@@ -820,8 +820,8 @@ Full position in [`layout.md`](layout.md). Headlines:
 - **Solver**: pure-Zig port of kiwi (Chris Colbert's modern Cassowary,
   BSD-3, ~3000 LOC C++). Incremental dual-simplex, four-tier strengths
   (required / strong / medium / weak), edit variables for reactive
-  inputs. Lives at `src/layout/kiwi/`, library-grade, zero text_engine
-  deps — drops into matryoshka / valkyr next.
+  inputs. Lives at `src/layout/kiwi/` as a self-contained module with
+  zero text_engine deps — clean boundary, easy to test in isolation.
 - **Bidirectional GPU channel**: compute shaders write to readback
   buffers; host wraps the result as edit variables; surrounding
   layout reflows incrementally. Gives the "fluid sim warps the

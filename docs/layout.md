@@ -80,14 +80,23 @@ a₁·v₁ + a₂·v₂ + ... + aₙ·vₙ + c
 A **constraint** is `expression OP 0` where `OP ∈ {==, ≤, ≥}`,
 plus a **strength**.
 
-Strengths form a four-tier scheme inherited from Cassowary:
+Strengths form a four-tier scheme inherited from Cassowary,
+packed via `create(a, b, c, w=1.0) = clamp(a*w,0,1000)*1e6 +
+clamp(b*w,0,1000)*1e3 + clamp(c*w,0,1000)`:
 
-| tier     | coefficient | meaning                              |
-|----------|-------------|--------------------------------------|
-| required | 1e9         | inviolable; infeasibility is an error|
-| strong   | 1e6         | structural; provider invariants      |
-| medium   | 1e3         | author preferences (`width=300`)     |
-| weak     | 1           | content-derived hints                |
+| tier     | coefficient        | meaning                              |
+|----------|--------------------|--------------------------------------|
+| required | 1.001001e9         | inviolable; infeasibility is an error|
+| strong   | 1e6                | structural; provider invariants      |
+| medium   | 1e3                | author preferences (`width=300`)     |
+| weak     | 1                  | content-derived hints                |
+
+The exact `required` value is `1_001_001_000.0` —
+`create(1000, 1000, 1000)`. **Do not** approximate it as `1e9` in
+the port: `BadRequiredStrength` is checked by exact-equality
+post-clip, so a near-required strength that drifts even slightly
+below would be accepted as an edit-variable strength when it
+shouldn't be.
 
 Soft constraints (anything below required) may be violated to
 make the system feasible; the solver minimises a weighted sum of
@@ -107,18 +116,18 @@ const x_max = try solver.addVariable("box.x_max");
 const width = try solver.addVariable("box.width");
 
 // width = x_max - x_min  (required)
-try solver.addConstraint(
-    layout.expr(width).eq(layout.expr(x_max).sub(x_min)).required(),
+_ = try solver.addConstraint(
+    layout.expr(width).eq(layout.expr(x_max).minus(x_min)).required(),
 );
 
 // width prefers 300 (medium)
-try solver.addConstraint(
+_ = try solver.addConstraint(
     layout.expr(width).eq(300).medium(),
 );
 
 // width is at least 100 (required)
-try solver.addConstraint(
-    layout.expr(width).ge(100).required(),
+_ = try solver.addConstraint(
+    layout.expr(width).geq(100).required(),
 );
 
 solver.updateVariables();
@@ -129,7 +138,30 @@ const w = solver.value(width);  // 300, unless something fights it
 This is the same library shape kiwi (C++), casuarius (Rust),
 kiwi.js, and friends all ship. The expression-builder DSL keeps
 callsites readable; the solver internals don't care how the
-expression got built.
+expression got built. Builder methods: `.plus` / `.minus` /
+`.times` / `.divide` / `.negate` for expressions; `.eq` / `.leq`
+/ `.geq` to terminate into a partial constraint; `.required` /
+`.strong` / `.medium` / `.weak` / `.atStrength(s)` for the final
+strength tier.
+
+### Beyond the basics
+
+Three Solver methods earn their keep in the text_engine flow:
+
+- **`removeVariable(VariableId)`** — explicit variable cleanup.
+  Neither Rust port has this; both reap via internal refcount.
+  Our re-parse / cache-invalidate flow wants explicit control so
+  the variable pool stays stable across re-parses keyed by
+  `Element.id`.
+- **`beginEdit()` / `commitEdit()`** — batched constraint edits.
+  Adopted from casuarius. A provider emitting many constraints
+  at once (table layout, grid set-up) defers the optimise pass
+  to `commitEdit`; without this, every `addConstraint` triggers
+  a full pass.
+- **`fetchChanges() → []const Change`** — borrowed-slice of
+  variables whose value changed since last fetch. Lets the
+  walker re-emit quads only for the elements that actually
+  moved, instead of polling every variable each frame.
 
 ---
 
@@ -166,19 +198,31 @@ and rely on it — not to reinvent it.
 
 ### Port plan
 
-Pure-Zig port. Lives under `src/layout/kiwi/`, library-grade with
-zero text_engine deps. Reasons:
+Pure-Zig port. Lives under `src/layout/kiwi/`, organised as a
+self-contained module with zero text_engine deps so the boundary
+stays clean (and so the solver can be lifted out and reused later
+if it ever needs to be). Reasons:
 
 - Project has **zero C++ deps** today (cmark, stb are C). Keep it.
 - Allocator-aware (per-frame arena for ephemeral constraint sets,
   long-lived heap for persistent variables).
-- Library-grade — drops into matryoshka / valkyr next.
 - Easier to debug; cleaner integration with our error sets.
 
-Reference: the canonical C++ kiwi source for algorithm fidelity,
-plus an existing Rust port (casuarius / cassowary-rs) for
-ownership patterns. Two cross-checks reduce the chance of
-porting bugs.
+Reference ports cross-checked during recon:
+
+- **kiwi C++ v1.4.2** (commit `613c5bce`) — the canonical
+  algorithm. Authoritative for simplex behavior, constants,
+  invariants.
+- **cassowary-rs v0.3.0** (commit `90d1df49`) — closer-to-kiwi
+  shape. `Variable(usize)` from atomic counter,
+  `Constraint(Arc<...>)` for pointer identity, `|REL|` macro DSL.
+  Wire-format mirror.
+- **casuarius v0.1.1** (commit `922a4735`) — actively
+  maintained, generic-over-Variable, method-chain DSL. Source of
+  the `begin_edit`/`commit_edit` / `fetch_changes` patterns we're
+  adopting.
+
+Three references reduce the chance of porting bugs.
 
 Estimated effort: ~2 focused sessions for the solver + tests,
 ~1 more for the integration layer.
