@@ -59,18 +59,38 @@ const Entry = struct {
     /// Pre-scaled to display units.
     metrics: face_mod.Metrics,
     lane: Lane,
+    /// Path to the source font file, duped into the registry's
+    /// allocator at load time. Held so `effectiveFontId` can reopen
+    /// the same TTF at a different rasterisation size for crisp zoom.
+    /// Null for entries that don't own their face (none currently —
+    /// every entry was created via `load*` and so has a path).
+    file_path: ?[:0]const u8 = null,
+};
+
+/// Composite key used to memoise zoom-scaled entries derived from a
+/// base FontId. `base` is what callers pass to layout (the style's
+/// logical font); `target_px` is the rasterisation size requested
+/// after `display_px × zoom` rounds to an integer.
+const SizedKey = struct {
+    base: FontId,
+    target_px: u32,
 };
 
 pub const FontRegistry = struct {
     allocator: std.mem.Allocator,
     ft: face_mod.Library,
     entries: std.ArrayList(Entry),
+    /// Memo of zoom-derived entries keyed by `(base, target_px)`.
+    /// Populated lazily on first request via `effectiveFontId`. Values
+    /// index into `entries` like any other FontId.
+    sized_lookup: std.AutoHashMap(SizedKey, FontId),
 
     pub fn init(allocator: std.mem.Allocator, ft: face_mod.Library) FontRegistry {
         return .{
             .allocator = allocator,
             .ft = ft,
             .entries = std.ArrayList(Entry).init(allocator),
+            .sized_lookup = std.AutoHashMap(SizedKey, FontId).init(allocator),
         };
     }
 
@@ -78,8 +98,10 @@ pub const FontRegistry = struct {
         for (self.entries.items) |*e| {
             e.hb.deinit();
             e.face.deinit();
+            if (e.file_path) |p| self.allocator.free(p);
         }
         self.entries.deinit();
+        self.sized_lookup.deinit();
         self.* = undefined;
     }
 
@@ -118,6 +140,13 @@ pub const FontRegistry = struct {
         request_px: u32,
         requested_lane: Lane,
     ) !FontId {
+        // Dupe the path so `effectiveFontId` can reopen this TTF at a
+        // different size later (Crisp Zoom). The C string is owned by
+        // the caller; we keep our own null-terminated copy.
+        const path_slice = std.mem.span(path);
+        const owned_path = try self.allocator.dupeZ(u8, path_slice);
+        errdefer self.allocator.free(owned_path);
+
         var new_face = try face_mod.Face.init(self.ft, path, 0);
         errdefer new_face.deinit();
         try new_face.setPixelSize(request_px);
@@ -170,8 +199,49 @@ pub const FontRegistry = struct {
             .scale = sc,
             .metrics = scaled_metrics,
             .lane = effective_lane,
+            .file_path = owned_path,
         });
         return @intCast(self.entries.items.len - 1);
+    }
+
+    /// Resolve a zoom-derived FontId for `base` at the given target
+    /// rasterisation size. Cheap when `target_px` matches `base`'s
+    /// `display_px` — returns `base` directly. Otherwise looks up (or
+    /// lazily creates) a sized sibling entry whose face has been
+    /// reopened at `target_px` so glyphs rasterise crisply at the new
+    /// display size. Hot path on every glyph at non-unit zoom; the
+    /// hashmap is amortised constant.
+    ///
+    /// The returned id shares its lane and component class with `base`
+    /// (mono / SDF / strike-fixed colour); only the rasterisation size
+    /// differs. Callers can pass it to any FontId-keyed accessor
+    /// (`metrics`, `scale`, `hbFont`, `face`) and reach the right
+    /// sized entry.
+    pub fn effectiveFontId(self: *FontRegistry, base: FontId, target_px: u32) !FontId {
+        const base_entry = self.entries.items[base];
+        if (target_px == base_entry.display_px) return base;
+        const key = SizedKey{ .base = base, .target_px = target_px };
+        if (self.sized_lookup.get(key)) |id| return id;
+
+        const path = base_entry.file_path orelse return base; // can't reopen without path
+        // Reopen the same TTF as a fresh entry at `target_px`. SDF
+        // entries keep their fixed source size — re-rastering an SDF
+        // at a different texel resolution doesn't make it "crisper",
+        // the distance field already covers any display size. Same
+        // base id maps onto itself at the request.
+        const lane_choice: Lane = if (base_entry.lane == .sdf) .sdf else .mono;
+        const request_px: u32 = if (base_entry.lane == .sdf) SDF_SOURCE_PX else target_px;
+        if (base_entry.lane == .sdf) {
+            // SDF source resolution is fixed; the layout pass already
+            // scales the dst rect to the display size. Memoise the
+            // base id under this key so we don't keep retrying.
+            try self.sized_lookup.put(key, base);
+            return base;
+        }
+
+        const new_id = try self.loadInner(path.ptr, target_px, request_px, lane_choice);
+        try self.sized_lookup.put(key, new_id);
+        return new_id;
     }
 
     pub fn lane(self: *const FontRegistry, id: FontId) Lane {
@@ -199,5 +269,15 @@ pub const FontRegistry = struct {
 
     pub fn displayPx(self: *const FontRegistry, id: FontId) u32 {
         return self.entries.items[id].display_px;
+    }
+
+    /// FT's actual rasterisation pixel size for this entry. Equals
+    /// `display_px` for scalable mono fonts; smaller (a strike size)
+    /// for CBDT/sbix emoji; fixed at the SDF source resolution for the
+    /// SDF lane. Layout uses this to convert effective-bitmap pixel
+    /// quantities to world units without dividing by `display_px /
+    /// actual_px` (= `scale`) and re-multiplying separately.
+    pub fn actualPx(self: *const FontRegistry, id: FontId) u32 {
+        return self.entries.items[id].actual_px;
     }
 };

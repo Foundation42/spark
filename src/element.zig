@@ -554,6 +554,14 @@ pub const LayoutCtx = struct {
     /// `null` = serial mode (no locking). Must be non-null whenever
     /// `job_system` is non-null and the walker may dispatch jobs.
     glyph_cache_lock: ?*std.Thread.Mutex = null,
+    /// Effective zoom factor for crisp-zoom rasterisation. The host
+    /// writes its current `zoom` (Ctrl+scroll output) here before each
+    /// layout pass. Layout runs in world coordinates regardless of
+    /// zoom — but text shaping rasterises glyphs at
+    /// `style.font_id.display_px × zoom` so the post-layout
+    /// world→screen multiply samples bitmaps at 1:1. Defaults to 1.0
+    /// for code paths that haven't been wired through yet.
+    zoom: f32 = 1.0,
 };
 
 /// GPU draw work accumulated during the walk. Quads land first

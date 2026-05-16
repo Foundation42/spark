@@ -92,7 +92,7 @@ pub fn layoutAndRenderCached(
         return layoutAndRender(elem, origin, constraints, ctx, out);
     }
 
-    const key = layout_cache.keyFor(elem, constraints, ctx.theme);
+    const key = layout_cache.keyFor(elem, constraints, ctx.theme, ctx.zoom);
     const version = layout_cache.versionFor(elem);
 
     if (cache.lookup(key, version)) |entry| {
@@ -461,6 +461,7 @@ fn layoutCodeBlock(
                         r.style.color,
                         r.style.hot_color,
                         r.style.attention,
+                        ctx.zoom,
                     );
                 }
                 y += m.line_height;
@@ -738,7 +739,7 @@ fn classifyChild(
     if (layout_cache.cacheableLeaf(elem)) {
         const id = layout_cache.elementIdentity(elem);
         if (id != 0) {
-            const key = layout_cache.keyFor(elem, constraints, ctx.theme);
+            const key = layout_cache.keyFor(elem, constraints, ctx.theme, ctx.zoom);
             const version = layout_cache.versionFor(elem);
             if (cache.lookup(key, version)) |entry| {
                 return .{ .cache_hit = entry };
@@ -1262,6 +1263,7 @@ fn emitLine(
             atom.style.color,
             atom.style.hot_color,
             atom.style.attention,
+            ctx.zoom,
         );
     }
 

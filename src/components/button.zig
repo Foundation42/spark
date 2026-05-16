@@ -269,6 +269,7 @@ fn layoutAndRender(
         BUTTON_LABEL,
         style.hot_color,
         style.attention,
+        lc.zoom,
     );
 
     const box: element.Box = .{

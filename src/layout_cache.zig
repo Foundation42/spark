@@ -86,6 +86,13 @@ pub const Key = struct {
     /// `Constraints.max_w` bit-pattern. Different widths → different
     /// wrap → different layout.
     max_w_bits: u32,
+    /// `LayoutCtx.zoom` bit-pattern. Crisp-zoom rasterises glyphs at
+    /// `display_px × zoom`, so the cached GlyphInstances' uv_min/max
+    /// point to size-specific atlas rects. A zoom change at the host
+    /// level (Ctrl+scroll) produces a fresh key here, leaving the old
+    /// entries intact so a round-trip back to the original zoom hits
+    /// without re-walking.
+    zoom_bits: u32,
     /// Theme pointer. Theme swap → invalidate.
     theme_ptr: usize,
 };
@@ -244,10 +251,12 @@ pub fn keyFor(
     elem: element.Element,
     constraints: element.Constraints,
     theme: *const element.Theme,
+    zoom: f32,
 ) Key {
     return .{
         .elem_id = elementIdentity(elem),
         .max_w_bits = @bitCast(constraints.max_w),
+        .zoom_bits = @bitCast(zoom),
         .theme_ptr = @intFromPtr(theme),
     };
 }
@@ -415,6 +424,7 @@ test "BlockCache: insert/lookup roundtrip" {
     const key: Key = .{
         .elem_id = 0xCAFE,
         .max_w_bits = @bitCast(@as(f32, 800)),
+        .zoom_bits = @bitCast(@as(f32, 1.0)),
         .theme_ptr = 0xABCD,
     };
 
@@ -454,6 +464,7 @@ test "BlockCache: insert replaces existing entry" {
     const key: Key = .{
         .elem_id = 0xCAFE,
         .max_w_bits = @bitCast(@as(f32, 800)),
+        .zoom_bits = @bitCast(@as(f32, 1.0)),
         .theme_ptr = 0xABCD,
     };
 
@@ -494,6 +505,7 @@ test "BlockCache: clear frees all entries" {
         const key: Key = .{
             .elem_id = i + 1,
             .max_w_bits = 0,
+            .zoom_bits = 0,
             .theme_ptr = 0,
         };
         try cache.insert(key, .{

@@ -465,6 +465,7 @@ fn placeholderLayoutAndRender(
         style.color,
         style.hot_color,
         style.attention,
+        lc.zoom,
     );
 
     return .{

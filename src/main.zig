@@ -243,6 +243,9 @@ const FrameCtx = struct {
             .cache_blocks = self.block_cache,
             .job_system = self.job_system,
             .glyph_cache_lock = self.glyph_cache_lock,
+            // Crisp-zoom: rasterise glyphs at zoom-scaled sizes so the
+            // post-layout `× zoom` multiply samples each bitmap at 1:1.
+            .zoom = self.zoom,
         };
         var ansi_lc = lc;
         ansi_lc.theme = self.ansi_theme;

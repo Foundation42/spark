@@ -85,9 +85,67 @@ pub fn appendShapedRun(
     color: [4]f32,
     hot_color: [4]f32,
     attention: f32,
+    /// Crisp-zoom: rasterise glyphs at `display_px × zoom` so the
+    /// post-layout world→screen scale samples each bitmap at exactly
+    /// 1:1. Defaults to 1.0 (no zoom) — when host passes its real
+    /// zoom, layout output stays in world coords and the GPU pass
+    /// scales bitmaps up by zoom for screen.
+    zoom: f32,
 ) !f32 {
     var x = pen_x;
-    const fscale = fonts.scale(font_id);
+    // Pen advances/offsets stay in BASE-font units (the run was shaped
+    // against the base hb_font). They scale to world by `base_scale`.
+    const base_scale = fonts.scale(font_id);
+
+    // Pick an effective entry sized for the current zoom. Mono fonts
+    // get a fresh face at `target_px`; SDF entries keep their fixed
+    // source size (the distance field is zoom-independent); strike-
+    // only colour fonts (emoji) also stay at the original strike.
+    //
+    // `effectiveFontId` may grow `FontRegistry.entries` and
+    // `sized_lookup` on its lazy-create path, so a parallel-walker
+    // worker calling it concurrently with another worker would race
+    // the same arrays the cache lock already protects. Wrap it in
+    // the cache lock when one is supplied — fast path when it isn't.
+    const base_display_px = fonts.displayPx(font_id);
+    const target_px: u32 = @intFromFloat(@max(@as(f32, 1.0), @round(@as(f32, @floatFromInt(base_display_px)) * zoom)));
+    const eff_id: registry_mod.FontId = blk: {
+        if (glyph_cache_lock) |m| {
+            m.lock();
+            defer m.unlock();
+            break :blk try fonts.effectiveFontId(font_id, target_px);
+        }
+        break :blk try fonts.effectiveFontId(font_id, target_px);
+    };
+
+    // World-space scale for everything that comes out of the EFFECTIVE
+    // entry's bitmap (bearings + rect dims). Defined so that
+    // `bitmap × world_scale = world units that the post-layout zoom
+    // multiply then takes to screen pixels`.
+    //
+    //   `world_scale = base.display_px / eff.actual_px`
+    //
+    // collapses to the right thing in every case:
+    //
+    //   * mono z=1: eff = base, eff.actual_px = base.display_px →
+    //     world_scale = 1, identical to the pre-crisp-zoom path.
+    //   * mono z=N: eff is a fresh face at target_px=base.display_px×N;
+    //     eff.actual_px = target_px → world_scale = 1/N, so a 2× bitmap
+    //     occupies the same WORLD footprint as the 1× bitmap; the
+    //     post-layout `× N` then takes it to N× screen pixels (crisp).
+    //   * SDF: eff = base (distance field is zoom-independent);
+    //     eff.actual_px = 64 → world_scale = base.display_px / 64 =
+    //     base.scale. Identical to the pre-crisp-zoom path at every
+    //     zoom, so SDF text keeps its existing world dst_size and
+    //     scales with the host's zoom multiply — correct behaviour.
+    //   * emoji: eff.actual_px = strike size (e.g. 136) at every zoom
+    //     → world_scale = base.display_px / 136 = base.scale. Emoji
+    //     stays the same world size regardless of zoom; zoom multiply
+    //     scales it on screen like the rest of the text.
+    const eff_world_scale: f32 =
+        @as(f32, @floatFromInt(base_display_px)) /
+        @as(f32, @floatFromInt(fonts.actualPx(eff_id)));
+
     const mono_w: f32 = @floatFromInt(mono_atlas.extent.width);
     const mono_h: f32 = @floatFromInt(mono_atlas.extent.height);
     const color_w: f32 = @floatFromInt(color_atlas.extent.width);
@@ -98,9 +156,9 @@ pub fn appendShapedRun(
             if (glyph_cache_lock) |m| {
                 m.lock();
                 defer m.unlock();
-                break :blk try cache.getOrRasterize(fonts, mono_atlas, color_atlas, font_id, g.glyph_id);
+                break :blk try cache.getOrRasterize(fonts, mono_atlas, color_atlas, eff_id, g.glyph_id);
             }
-            break :blk try cache.getOrRasterize(fonts, mono_atlas, color_atlas, font_id, g.glyph_id);
+            break :blk try cache.getOrRasterize(fonts, mono_atlas, color_atlas, eff_id, g.glyph_id);
         };
         if (entry.rect.w != 0 and entry.rect.h != 0) {
             const bx: f32 = @floatFromInt(entry.bearing_x);
@@ -108,11 +166,13 @@ pub fn appendShapedRun(
             const rw: f32 = @floatFromInt(entry.rect.w);
             const rh: f32 = @floatFromInt(entry.rect.h);
 
-            // All FT-pixel quantities scale by `fscale` to land in
-            // display units; `pen_x` and `baseline_y` are already
-            // display units coming in from the caller.
-            const dx = @round(x + (bx + g.x_offset) * fscale);
-            const dy = @round(baseline_y - (by - g.y_offset) * fscale);
+            // Bearings & rect are in the EFFECTIVE entry's actual-px
+            // units → use `eff_world_scale`. Per-glyph HB offsets stay
+            // in BASE units → `base_scale`. At zoom=1 the two collapse
+            // (same entry) and produce identical output to the
+            // pre-crisp-zoom path.
+            const dx = @round(x + bx * eff_world_scale + g.x_offset * base_scale);
+            const dy = @round(baseline_y - by * eff_world_scale + g.y_offset * base_scale);
 
             const aw: f32 = if (entry.kind == .color) color_w else mono_w;
             const ah: f32 = if (entry.kind == .color) color_h else mono_h;
@@ -133,7 +193,7 @@ pub fn appendShapedRun(
             // pixel of every glyph.
             try out.append(.{
                 .dst_pos = .{ dx, dy },
-                .dst_size = .{ rw * fscale, rh * fscale },
+                .dst_size = .{ rw * eff_world_scale, rh * eff_world_scale },
                 .uv_min = .{
                     @as(f32, @floatFromInt(entry.rect.x)) / aw,
                     @as(f32, @floatFromInt(entry.rect.y)) / ah,
@@ -150,7 +210,10 @@ pub fn appendShapedRun(
                 ._pad = 0,
             });
         }
-        x += g.x_advance * fscale;
+        // Advances came from BASE shaping — scale by base entry's
+        // strike factor (= 1 for scalable mono fonts; < 1 for the
+        // emoji strike-only path).
+        x += g.x_advance * base_scale;
     }
     return x;
 }
@@ -169,6 +232,7 @@ pub fn appendLineFromSpans(
     spans: []const Span,
     pen_x: f32,
     baseline_y: f32,
+    zoom: f32,
 ) !f32 {
     var x = pen_x;
     for (spans) |span| {
@@ -189,6 +253,7 @@ pub fn appendLineFromSpans(
             span.style.color,
             span.style.hot_color,
             span.style.attention,
+            zoom,
         );
     }
     return x;
@@ -211,6 +276,7 @@ pub fn layoutParagraph(
     paragraph: Paragraph,
     pen_x: f32,
     start_y: f32,
+    zoom: f32,
 ) !f32 {
     var y = start_y;
     for (paragraph.lines) |line| {
@@ -239,6 +305,7 @@ pub fn layoutParagraph(
             line.spans,
             pen_x,
             baseline_y,
+            zoom,
         );
         y += max_lh;
     }

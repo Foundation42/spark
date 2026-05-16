@@ -296,6 +296,7 @@ fn layoutAndRender(
             display_color,
             style.hot_color,
             style.attention,
+            lc.zoom,
         );
         if (show_buffer and c.cursor > 0 and c.cursor <= c.buffer.items.len) {
             // Shape the prefix separately to get caret x. Cheap for

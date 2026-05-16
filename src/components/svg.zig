@@ -330,6 +330,7 @@ fn renderError(
         style.color,
         style.hot_color,
         style.attention,
+        lc.zoom,
     );
     return .{ .x = origin[0], .y = origin[1], .w = total_w, .h = total_h, .baseline = baseline_y };
 }
