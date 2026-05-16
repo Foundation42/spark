@@ -528,7 +528,7 @@ pub const Solver = struct {
     fn optimize(
         self: *Solver,
         objective: *Row,
-    ) (errors.AddConstraintError || std.mem.Allocator.Error)!void {
+    ) error{ InternalSolverError, OutOfMemory }!void {
         while (true) {
             const entering = getEnteringSymbol(objective.*);
             if (entering.isInvalid()) return;
@@ -570,6 +570,161 @@ pub const Solver = struct {
             if (sym.kind != .dummy and coeff < 0.0) return sym;
         }
         return Symbol.invalid;
+    }
+
+    // ── removeConstraint pathway ────────────────────────────────────
+
+    /// Remove a previously-added constraint by handle. Restores
+    /// the tableau to a valid state and re-optimizes. Returns
+    /// `UnknownConstraint` if the handle was never produced by
+    /// `addConstraint` (or was already removed).
+    pub fn removeConstraint(
+        self: *Solver,
+        c_id: ConstraintId,
+    ) errors.RemoveConstraintError!void {
+        const removed = self.constraints.fetchOrderedRemove(c_id) orelse return error.UnknownConstraint;
+        var owned_cn = removed.value.constraint;
+        defer owned_cn.deinit(self.alloc);
+        const tag = removed.value.tag;
+        const strength = owned_cn.strength;
+
+        try self.removeConstraintEffects(tag, strength);
+
+        // Remove the marker — either it's basic (a row keyed by
+        // the marker, drop the row) or it's non-basic (pivot it
+        // out using `getMarkerLeavingRow`'s three-bucket
+        // precedence).
+        if (self.rows.fetchOrderedRemove(tag.marker)) |kv| {
+            kv.value.deinit(self.alloc);
+            self.alloc.destroy(kv.value);
+        } else {
+            const idx = self.getMarkerLeavingRow(tag.marker) orelse
+                return error.InternalSolverError;
+            const leaving_sym = self.rows.keys()[idx];
+            const lkv = self.rows.fetchOrderedRemove(leaving_sym);
+            std.debug.assert(lkv != null);
+            const row_ptr = lkv.?.value;
+            defer {
+                row_ptr.deinit(self.alloc);
+                self.alloc.destroy(row_ptr);
+            }
+            try row_ptr.solveForLhsRhs(self.alloc, leaving_sym, tag.marker);
+            try self.substitute(tag.marker, row_ptr.*);
+        }
+
+        try self.optimize(self.objective);
+    }
+
+    /// Pull the soft-constraint error contributions out of the
+    /// objective when removing the constraint.
+    fn removeConstraintEffects(
+        self: *Solver,
+        tag: Tag,
+        strength: Strength,
+    ) std.mem.Allocator.Error!void {
+        if (tag.marker.kind == .err) {
+            try self.removeMarkerEffects(tag.marker, strength);
+        }
+        if (tag.other.kind == .err) {
+            try self.removeMarkerEffects(tag.other, strength);
+        }
+    }
+
+    fn removeMarkerEffects(
+        self: *Solver,
+        marker: Symbol,
+        strength: Strength,
+    ) std.mem.Allocator.Error!void {
+        if (self.rows.get(marker)) |row_ptr| {
+            try self.objective.insertRow(self.alloc, row_ptr.*, -strength);
+        } else {
+            try self.objective.insertSymbol(self.alloc, marker, -strength);
+        }
+    }
+
+    /// Three-bucket precedence pivot selector used when removing
+    /// a constraint whose marker isn't basic. Bucket 1:
+    /// negative-coefficient non-external rows, min-ratio.
+    /// Bucket 2: positive-coefficient non-external rows, min-
+    /// ratio. Bucket 3: any External row with a non-zero
+    /// coefficient — last one wins. Mirrors C++ kiwi precisely;
+    /// this is the load-bearing detail flagged in the recon doc.
+    fn getMarkerLeavingRow(self: *Solver, marker: Symbol) ?usize {
+        var r1: f64 = std.math.floatMax(f64);
+        var r2: f64 = std.math.floatMax(f64);
+        var first_idx: ?usize = null;
+        var second_idx: ?usize = null;
+        var third_idx: ?usize = null;
+
+        for (self.rows.keys(), self.rows.values(), 0..) |sym, row_ptr, i| {
+            const c = row_ptr.coefficientFor(marker);
+            if (c == 0.0) continue;
+            if (sym.kind == .external) {
+                third_idx = i;
+            } else if (c < 0.0) {
+                const r = -row_ptr.constant / c;
+                if (r < r1) {
+                    r1 = r;
+                    first_idx = i;
+                }
+            } else {
+                const r = row_ptr.constant / c;
+                if (r < r2) {
+                    r2 = r;
+                    second_idx = i;
+                }
+            }
+        }
+
+        if (first_idx) |x| return x;
+        if (second_idx) |x| return x;
+        return third_idx;
+    }
+
+    // ── Dual optimization (feasibility restoration) ────────────────
+
+    /// Restore primal feasibility after a constraint constant
+    /// change. Drains `infeasible_rows`; each entry whose row is
+    /// still negative-constant gets a dual pivot. Used by
+    /// `suggestValue` (and silently after `removeConstraint`'s
+    /// substitute step, via the next call that drains the list).
+    fn dualOptimize(
+        self: *Solver,
+    ) error{ InternalSolverError, OutOfMemory }!void {
+        while (self.infeasible_rows.items.len > 0) {
+            const leaving = self.infeasible_rows.pop().?;
+            const row_ptr = self.rows.get(leaving) orelse continue;
+            if (row_ptr.constant >= 0.0) continue; // already feasible
+
+            const entering = self.getDualEnteringSymbol(row_ptr.*);
+            if (entering.isInvalid()) return error.InternalSolverError;
+
+            const kv = self.rows.fetchOrderedRemove(leaving);
+            std.debug.assert(kv != null);
+            const ptr = kv.?.value;
+            try ptr.solveForLhsRhs(self.alloc, leaving, entering);
+            try self.substitute(entering, ptr.*);
+            try self.rows.put(self.alloc, entering, ptr);
+        }
+    }
+
+    /// Symbol with the smallest objective-coefficient / row-
+    /// coefficient ratio among the row's positive-coefficient,
+    /// non-dummy cells. The dual variant of `getEnteringSymbol`.
+    fn getDualEnteringSymbol(self: *const Solver, row: Row) Symbol {
+        var entering: Symbol = Symbol.invalid;
+        var ratio: f64 = std.math.floatMax(f64);
+        for (row.cells.keys(), row.cells.values()) |sym, coeff| {
+            if (coeff > 0.0 and sym.kind != .dummy) {
+                const obj_coeff = self.objective.coefficientFor(sym);
+                const r = obj_coeff / coeff;
+                if (r < ratio) {
+                    ratio = r;
+                    entering = sym;
+                }
+            }
+        }
+        return entering;
     }
 
     // ── Public read path ────────────────────────────────────────────
@@ -836,6 +991,75 @@ test "addConstraint: returned id is tracked via hasConstraint" {
 
     const other: ConstraintId = @enumFromInt(@intFromEnum(id) + 999);
     try testing.expect(!s.hasConstraint(other));
+}
+
+test "removeConstraint: hasConstraint becomes false" {
+    var s = try Solver.init(testing.allocator);
+    defer s.deinit();
+
+    const v = try s.addVariable(null);
+    const c = try expr(testing.allocator, v).eq(@as(f64, 10)).required();
+    const id = try buildAndAdd(&s, testing.allocator, c);
+    try testing.expect(s.hasConstraint(id));
+
+    try s.removeConstraint(id);
+    try testing.expect(!s.hasConstraint(id));
+}
+
+test "removeConstraint: unknown id returns error" {
+    var s = try Solver.init(testing.allocator);
+    defer s.deinit();
+
+    const bogus: ConstraintId = @enumFromInt(999);
+    try testing.expectError(error.UnknownConstraint, s.removeConstraint(bogus));
+}
+
+test "remove then re-add yields the same value" {
+    // From corpus: remove_then_readd_idempotent.
+    var s = try Solver.init(testing.allocator);
+    defer s.deinit();
+
+    const v = try s.addVariable("v");
+
+    const c1 = try expr(testing.allocator, v).eq(@as(f64, 10)).required();
+    const id1 = try buildAndAdd(&s, testing.allocator, c1);
+    s.updateVariables();
+    const val1 = s.value(v);
+
+    try s.removeConstraint(id1);
+
+    const c2 = try expr(testing.allocator, v).eq(@as(f64, 10)).required();
+    _ = try buildAndAdd(&s, testing.allocator, c2);
+    s.updateVariables();
+    const val2 = s.value(v);
+
+    try testing.expectApproxEqAbs(val1, val2, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 10), val2, 1e-9);
+}
+
+test "remove preserves other constraints" {
+    // From corpus: add_remove_preserves_other_constraints.
+    // Pin two vars; remove one constraint; the other still holds.
+    var s = try Solver.init(testing.allocator);
+    defer s.deinit();
+
+    const a = try s.addVariable("a");
+    const b = try s.addVariable("b");
+
+    const c_a = try expr(testing.allocator, a).eq(@as(f64, 5)).required();
+    const id_a = try buildAndAdd(&s, testing.allocator, c_a);
+    const c_b = try expr(testing.allocator, b).eq(@as(f64, 7)).required();
+    _ = try buildAndAdd(&s, testing.allocator, c_b);
+
+    s.updateVariables();
+    try testing.expectApproxEqAbs(@as(f64, 5), s.value(a), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 7), s.value(b), 1e-9);
+
+    try s.removeConstraint(id_a);
+    s.updateVariables();
+
+    // b's constraint remains in force.
+    try testing.expectApproxEqAbs(@as(f64, 7), s.value(b), 1e-9);
 }
 
 test "addConstraint: difference constraint (mid = (a+b)/2; a=10; b=30)" {

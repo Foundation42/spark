@@ -24,6 +24,7 @@ pub const AddConstraintError = error{
 
 pub const RemoveConstraintError = error{
     UnknownConstraint,
+    OutOfMemory,
     InternalSolverError,
 };
 
