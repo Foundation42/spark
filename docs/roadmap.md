@@ -778,6 +778,53 @@ keyed by `(font, glyph, target_px)`. See the "Shipped — crisp zoom
 ~10k fps Release with active scroll/zoom + all of 8a/8b/9/11
 running.
 
+## Next — constraint layout substrate (stage 15)
+
+The next architectural-tier expansion. Brainstormed late session 10,
+design committed at start of session 11 (2026-05-16). Replaces the
+hierarchical block-walker cursor math in `element_layout.zig` with a
+flat linear-constraint system; providers (`:::flex`, `:::grid`,
+`:::table`, `:::stack`, `:::dock`, `:::masonry`) declare relationships
+into a shared solver, the solver settles, the walker reads positions.
+
+Full position in [`layout.md`](layout.md). Headlines:
+
+- **Solver**: pure-Zig port of kiwi (Chris Colbert's modern Cassowary,
+  BSD-3, ~3000 LOC C++). Incremental dual-simplex, four-tier strengths
+  (required / strong / medium / weak), edit variables for reactive
+  inputs. Lives at `src/layout/kiwi/`, library-grade, zero text_engine
+  deps — drops into matryoshka / valkyr next.
+- **Bidirectional GPU channel**: compute shaders write to readback
+  buffers; host wraps the result as edit variables; surrounding
+  layout reflows incrementally. Gives the "fluid sim warps the
+  document" demo *without* putting an LP solver on the GPU (branchy
+  incremental simplex is not GPU-friendly; LP-on-GPU costs more than
+  it saves at our problem size).
+- **Text intrusion / exclusion**: separate second pass. Components
+  emit `ExclusionShape` (rect → polygon → per-line); text engine
+  consults them when breaking lines. CSS `shape-outside` semantics
+  layered on top of the solver.
+- **Strength discipline**: required for box-model invariants, strong
+  for provider structural rules, medium for author prefs, weak for
+  content hints. Documented in `layout.md` so debugging the solver
+  doesn't become miserable.
+
+Phasing (each ships value standalone):
+
+- **A — `kiwi.zig`**: pure-Zig solver port + ~150 tests. ~2 sessions.
+  Library-grade, no integration yet.
+- **B — first integration**: `LayoutContext`, `:::box` migrated to
+  declare via constraints, walker reads from solver. ~1 session.
+- **C — `:::flex`**: row / column, gap, grow, shrink. ~1 session.
+- **D — GPU-input channel**: one shader → edit-var → reflow demo.
+  ~1 session.
+- **E — text intrusion**: rect exclusions, `:::image {flow=around}`.
+  ~1 session.
+- **F — `:::grid` + `:::table`**: the real layout primitives.
+  ~2 sessions.
+
+Total: ~8 sessions to land the substrate + first four providers.
+
 ## Eventually — LM connection (tier 3)
 
 Once the rendering channels (`attention`, `hot_color`, `fx_kind`)
@@ -800,6 +847,11 @@ Captured in [`memory/project_known_issues.md`](../../../.claude/projects/-home-c
   zoom.
 
 ## Parked — layout issues
+
+Specific edge cases in the current tree-walk layout. Stage 15
+(constraint substrate, see [`layout.md`](layout.md)) is the
+strategic answer to several of these; individual fixes may also
+land before then.
 
 - **Break-anywhere wrap** — a single word wider than `max_w`
   overflows. Character-level break fallback when no whitespace
