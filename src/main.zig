@@ -30,6 +30,7 @@ const glyph_cache_mod = @import("text/glyph_cache.zig");
 const element = @import("element.zig");
 const element_layout = @import("element_layout.zig");
 const layout_cache_mod = @import("layout_cache.zig");
+const layout_context_mod = @import("layout/context.zig");
 const markdown = @import("markdown.zig");
 const ansi = @import("ansi.zig");
 const component = @import("component.zig");
@@ -157,6 +158,13 @@ const FrameCtx = struct {
     job_system: *jobs_mod.JobSystem,
     glyph_cache_lock: *std.Thread.Mutex,
 
+    // Stage 15 Phase B — constraint layout. Owned by main; reset at
+    // the top of every runLayout. Components that participate in
+    // constraint-based layout (currently :::box only) read this via
+    // LayoutCtx.layout_context and mint variables / add constraints
+    // against the embedded kiwi solver.
+    layout_context: *layout_context_mod.LayoutContext,
+
     // Cached viewport for resize detection. Starts at {0,0} so the
     // first `drawCb` call sees a mismatch and triggers the initial
     // layout, unifying init and resize paths.
@@ -244,6 +252,12 @@ const FrameCtx = struct {
         // only do read-only lookups against a frozen entries array.
         try self.fonts.prewarmEffectiveSizesForZoom(self.zoom);
 
+        // Phase B: each layout pass starts with a fresh constraint
+        // solver. Components mint their variables and add their
+        // constraints during the walk; the solver settles per
+        // addConstraint.
+        self.layout_context.beginPass();
+
         var lc = element.LayoutCtx{
             .allocator = self.allocator,
             .fonts = self.fonts,
@@ -261,6 +275,10 @@ const FrameCtx = struct {
             // Crisp-zoom: rasterise glyphs at zoom-scaled sizes so the
             // post-layout `× zoom` multiply samples each bitmap at 1:1.
             .zoom = self.zoom,
+            // Phase B: constraint solver, reset above. Components
+            // that opt in (currently `:::box`) read positions from
+            // here after declaring constraints.
+            .layout_context = self.layout_context,
         };
         var ansi_lc = lc;
         ansi_lc.theme = self.ansi_theme;
@@ -1114,6 +1132,13 @@ pub fn main() !void {
     // pipeline; uncontested cost is a single atomic compare-exchange.
     var glyph_cache_lock = std.Thread.Mutex{};
 
+    // Stage 15 Phase B — constraint solver context. One per host;
+    // reset at the top of each runLayout. Components that opt in
+    // (currently :::box only) declare bounds variables and
+    // constraints against this during the walk.
+    var layout_context = try layout_context_mod.LayoutContext.init(allocator);
+    defer layout_context.deinit();
+
     // ANSI uses a mono-bodied derivation of the theme so spacing is
     // terminal-like. Bold + italic still fall back to the proportional
     // variants of the main theme — mono bold / italic font loads are
@@ -1151,6 +1176,7 @@ pub fn main() !void {
         .block_cache = &block_cache,
         .job_system = job_system,
         .glyph_cache_lock = &glyph_cache_lock,
+        .layout_context = &layout_context,
         .start_ms = start_ms,
         .state = &host_state,
     };

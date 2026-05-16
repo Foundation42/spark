@@ -616,6 +616,15 @@ pub const LayoutCtx = struct {
     /// world→screen multiply samples bitmaps at 1:1. Defaults to 1.0
     /// for code paths that haven't been wired through yet.
     zoom: f32 = 1.0,
+    /// Optional kiwi-backed constraint solver (stage 15, Phase B).
+    /// When non-null, constraint-aware components (currently
+    /// `:::box`) declare their bounds as solver variables and read
+    /// resolved positions from the solver after each pass. When null,
+    /// the same components fall back to imperative layout — same
+    /// visual output, different mechanism. Migration is incremental:
+    /// each new constraint-participating provider opts into this
+    /// channel as it lands.
+    layout_context: ?*layout_context_mod.LayoutContext = null,
 };
 
 /// GPU draw work accumulated during the walk. Quads land first
@@ -699,3 +708,4 @@ const qp = @import("gpu/quad_pipeline.zig");
 const tri_pipeline = @import("gpu/tri_pipeline.zig");
 const layout_cache_mod = @import("layout_cache.zig");
 const jobs_mod = @import("jobs.zig");
+const layout_context_mod = @import("layout/context.zig");
