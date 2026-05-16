@@ -13,7 +13,8 @@ Originally written 2026-05-16, mid-session-9, in response to the
 recent push from some quarters to default LLM outputs to HTML
 instead of markdown. We disagree, and the disagreement is
 structural — not aesthetic. Last updated 2026-05-16, end of
-session 13. The middle has settled; the claim still stands.
+session 13 — homoiconic claim sharpened through external review.
+The middle has settled; the claim still stands.
 
 ---
 
@@ -44,10 +45,15 @@ the calculus inverts.
   closing tags under load. Smaller, edge-deployed, locally-run
   models hit the wall much sooner. HTML-first defaults pull the
   ladder up behind the only models that can afford the format.
-- **Ecosystem capture is the actual play.** HTML output looks
-  rich inside a specific viewer. Outside it, it is sludge. Choosing
-  a format that only renders in your own UI is a moat. Call it
-  that.
+- **Extension is the seam; capture is closing it.** Markdown
+  gets extended — it has happened at least twice already (GFM,
+  MDX), and our own `:::name {attrs}` is the third. The question
+  isn't whether to extend; it's whether the extension layers onto
+  a surface anyone can read or whether it locks rendering to a
+  single viewer. HTML-first output looks rich inside a specific
+  renderer and is sludge outside it. That isn't progress; it's a
+  moat. The geology says extension wins on the open surface;
+  capture is what loses.
 
 CommonMark already won the format war for a reason. It is the
 ground that humans, agents, terminals, READMEs, PR descriptions,
@@ -139,31 +145,78 @@ authored, the LM amends. There is no impedance mismatch.
 
 ### 8. The substrate is homoiconic.
 
-The serialised form (markdown text) and the runtime form (parsed
-component tree feeding the layout walker) are the same shape. An
-author types `:::grid`, the parser produces a Grid component, the
-renderer lays it out, and the result serialises back to `:::grid`.
-A `:::flex` inside a `:::grid` inside an `:::embedded-document` is
-the same tree to the runtime as it is to the eye reading the
-file. No XAML standing between the author's intent and the
-runtime's behaviour; no JSX compiler turning one syntax into a
-fundamentally different tree; no DOM that is a different artifact
+Homoiconicity is representational identity between program text
+and the data the language manipulates. It says nothing about
+determinism — `(random)` doesn't return the same value twice and
+nobody calls that a crack in LISP. The claim decomposes into
+four axes, all the same kind of property:
+
+**i. Representational identity.** The serialised form (markdown
+text) and the runtime form (parsed component tree feeding the
+layout walker) are the same shape. An author types `:::grid`, the
+parser produces a Grid component, the renderer lays it out, and
+the result serialises back to `:::grid`. A `:::flex` inside a
+`:::grid` inside an `:::embedded-document` is the same tree to
+the runtime as it is to the eye reading the file. No XAML between
+author intent and runtime behaviour; no JSX compiler turning one
+syntax into a different tree; no DOM that is a different artifact
 from its source.
 
-This is the LISP property in a UI context. Markdown is the LISP
-of collaborative documents — the runtime accepts the same shape
-it emits. An LLM streaming markdown is streaming UI; a `:::input`
-targeting an `:::llm-stream` is a document extending itself. The
-author writes the runtime; the runtime serialises back to what
-the author wrote. HTML doesn't have this property; XAML can't
-reach it; React's fiber tree is a different artifact from its
-JSX source. Only LISPs and markdown-as-runtime land it.
+**ii. Source/image gap closed in practice.** A typical LISP image
+does not rewrite its own on-disk source as it runs — exotic,
+rare. Our substrate's normal operating mode is that. The document
+tree IS the source representation; when `:::llm-stream` streams
+output, it streams markdown directly into the live document, and
+serialising the runtime hands back markdown the parser can re-eat.
+No lossy compile step between source and image.
 
-The implication: there is no compile step between writing UI and
-running UI. There is no separate format the renderer "understands"
-that the source doesn't. There is no template language standing
-between author and pixels. The format is the program; the program
-is the format; the parse is the build.
+**iii. Modification surface in authored syntax.** At the document
+layer there is no structural API by which a component reaches
+across the tree and rewrites siblings. Composition happens by
+emitting markdown the parser re-eats; no substructural mutation
+interface exists. The runtime underneath constructs element trees
+directly in Zig — that's plumbing, same as LISP's `read` is C
+code building cons cells — but the only mutation surface the
+document exposes to its own components, to LMs streaming into it,
+or to human authors, is the surface syntax. Tree changes happen
+by re-parse, not by structural poke. This is the load-bearing
+invariant: **runtime state must always be representable in
+source.** Any future API that breaks this would first have to
+argue the substrate's central claim was wrong.
+
+**iv. Surface as fixed point.** The serialised surface is
+simultaneously three things at once: the surface a human authors,
+the form the runtime executes, and the representation the
+comprehender (LM) is most fluent in. One artifact, three readers
+— human, runtime, model — no translation layer between any pair.
+This is substrate-intrinsic, not plugin-relative: bolt an LM onto
+a LISP REPL and you get comprehension, but the model's
+high-fluency surface and S-expressions don't coincide, so the
+impedance wall stays. Ours coincide. And the coincidence isn't a
+2026 corpus accident — markdown is the comprehender's high-fluency
+surface because it is the human's structured-prose surface, and
+any future comprehender useful to humans is selected for fluency
+in the human-legible surface. The triple coincidence is a
+convergent attractor, not a temporary fact. The HTML-first push
+isn't a world where this coincidence is absent — it's the choice
+not to stand on it. The fixed point holds; the ecosystem declines
+the surface anyway. That is what "The wrong fork" is about.
+
+This is the LISP property in a UI context — and it generalises
+one axis further than LISP itself. Markdown is the LISP of
+collaborative documents: the runtime accepts the same shape it
+emits, an LM streams more of the same shape, a human reads the
+result. An LLM streaming markdown is streaming UI; a `:::input`
+targeting an `:::llm-stream` is a document extending itself. HTML
+doesn't have this property; XAML can't reach it; React's fiber
+tree is a different artifact from its JSX source.
+
+There is no compile step between writing UI and running UI. There
+is no separate format the renderer "understands" that the source
+doesn't. There is no template language standing between author
+and pixels. The format is the program; the program is the format;
+the parse is the build — and the surface is the fixed point where
+author, runtime, and comprehender meet without translation.
 
 ---
 
