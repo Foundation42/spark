@@ -117,26 +117,30 @@ pub fn appendShapedRun(
             const aw: f32 = if (entry.kind == .color) color_w else mono_w;
             const ah: f32 = if (entry.kind == .color) color_h else mono_h;
 
-            // Inset UV by half a texel on every side. Without this,
-            // a downscaled quad (e.g. 64-px SDF source drawn at 44 px
-            // display) bilinear-samples one texel BEYOND the glyph's
-            // rect at the quad edges — picking up the neighbour
-            // glyph's bitmap or the cleared atlas zone. Inset keeps
-            // the sampler entirely within the rect: at the cost of
-            // losing the outermost half-texel on each side, which is
-            // imperceptible at body-text scale and worth it for the
-            // SDF lane where bleeding causes visible halos / fuzz.
-            const inset: f32 = 0.5;
+            // UVs at exact texel-edge boundaries. With linear sampling
+            // and a quad sized to match the bitmap, this puts each
+            // fragment center directly on its corresponding texel
+            // center → crisp 1:1 reproduction.
+            //
+            // We used to inset by half a texel to defend against
+            // neighbour-glyph bleed under downscale, but the atlas
+            // already keeps a 2-texel zero-cleared gutter between
+            // glyphs (`GLYPH_PAD` in `gpu/atlas.zig`), and bilinear
+            // sampling can never reach further than 1 texel past a
+            // quad edge. So the inset was redundant — and at 1:1 it
+            // turned the top + bottom rows into a 52.5/47.5 mix with
+            // the gutter, visibly clipping the bottom (and top) half-
+            // pixel of every glyph.
             try out.append(.{
                 .dst_pos = .{ dx, dy },
                 .dst_size = .{ rw * fscale, rh * fscale },
                 .uv_min = .{
-                    (@as(f32, @floatFromInt(entry.rect.x)) + inset) / aw,
-                    (@as(f32, @floatFromInt(entry.rect.y)) + inset) / ah,
+                    @as(f32, @floatFromInt(entry.rect.x)) / aw,
+                    @as(f32, @floatFromInt(entry.rect.y)) / ah,
                 },
                 .uv_max = .{
-                    (@as(f32, @floatFromInt(entry.rect.x + entry.rect.w)) - inset) / aw,
-                    (@as(f32, @floatFromInt(entry.rect.y + entry.rect.h)) - inset) / ah,
+                    @as(f32, @floatFromInt(entry.rect.x + entry.rect.w)) / aw,
+                    @as(f32, @floatFromInt(entry.rect.y + entry.rect.h)) / ah,
                 },
                 .color = color,
                 .hot_color = hot_color,
