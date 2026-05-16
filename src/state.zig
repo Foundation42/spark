@@ -75,6 +75,11 @@ pub const State = struct {
     /// Bumped by every `set`. Hosts read it from their frame loop
     /// and call layout on a true→false transition.
     dirty: bool = false,
+    /// Independent of `dirty` — bumped by every `set` and cleared by
+    /// `clearPersistDirty`. Lets a host run a throttled "if dirty,
+    /// flush to disk" check on its own cadence without interfering
+    /// with the render-loop dirty signal.
+    persist_dirty: bool = false,
     /// Optional pointer up the document-composition chain (stage 9).
     /// When an embedded document is created, its child State's
     /// `parent` is set to the embedding document's State. `set`
@@ -126,6 +131,7 @@ pub const State = struct {
         }
         gop.value_ptr.* = try self.allocator.dupe(u8, value);
         self.dirty = true;
+        self.persist_dirty = true;
         var p = self.parent;
         while (p) |s| : (p = s.parent) s.dirty = true;
 
@@ -189,6 +195,88 @@ pub const State = struct {
     /// pass triggered by the mutation.
     pub fn clearDirty(self: *State) void {
         self.dirty = false;
+    }
+
+    /// Clear the persistence-dirty flag. Host calls after writing
+    /// state to disk.
+    pub fn clearPersistDirty(self: *State) void {
+        self.persist_dirty = false;
+    }
+
+    /// Serialize the map to a JSON file at `path`. Atomic write (tmp
+    /// + rename within the same directory) so a crash leaves either
+    /// the old file or the new one — never a partial. Parent
+    /// directories are created if missing.
+    ///
+    /// Format: `{"version":1,"entries":{"key":"value", ...}}`.
+    /// All values are strings — same shape as the in-memory map.
+    pub fn saveToFile(self: *const State, path: []const u8) !void {
+        const dirname = std.fs.path.dirname(path) orelse ".";
+        const basename = std.fs.path.basename(path);
+        try std.fs.cwd().makePath(dirname);
+        var dir = try std.fs.cwd().openDir(dirname, .{});
+        defer dir.close();
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const w = buf.writer();
+        try w.writeAll("{\"version\":1,\"entries\":{");
+        var first = true;
+        var it = self.map.iterator();
+        while (it.next()) |kv| {
+            if (!first) try w.writeAll(",");
+            first = false;
+            try std.json.stringify(kv.key_ptr.*, .{}, w);
+            try w.writeAll(":");
+            try std.json.stringify(kv.value_ptr.*, .{}, w);
+        }
+        try w.writeAll("}}\n");
+
+        const tmp_name = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{basename});
+        defer self.allocator.free(tmp_name);
+
+        {
+            const file = try dir.createFile(tmp_name, .{ .truncate = true });
+            defer file.close();
+            try file.writeAll(buf.items);
+            try file.sync();
+        }
+        try dir.rename(tmp_name, basename);
+    }
+
+    /// Load state values from a JSON file written by `saveToFile`.
+    /// Missing file is silent (returns `FileNotFound`); malformed
+    /// JSON / unknown version returns an error so the caller can
+    /// log + continue with defaults. Loaded values overwrite
+    /// existing same-key entries via `set()` (so subscribers fire
+    /// like a normal mutation would — relevant if loading happens
+    /// after components have subscribed). `persist_dirty` is
+    /// cleared after a successful load so the freshly-loaded state
+    /// doesn't immediately re-flush.
+    pub fn loadFromFile(self: *State, path: []const u8) !void {
+        const file = try std.fs.cwd().openFile(path, .{});
+        defer file.close();
+        const bytes = try file.readToEndAlloc(self.allocator, 16 * 1024 * 1024);
+        defer self.allocator.free(bytes);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, bytes, .{});
+        defer parsed.deinit();
+
+        if (parsed.value != .object) return error.InvalidStateFile;
+        const root = parsed.value.object;
+
+        const version_v = root.get("version") orelse return error.InvalidStateFile;
+        if (version_v != .integer or version_v.integer != 1) return error.InvalidStateFile;
+
+        const entries_v = root.get("entries") orelse return error.InvalidStateFile;
+        if (entries_v != .object) return error.InvalidStateFile;
+
+        var it = entries_v.object.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* != .string) continue; // skip malformed
+            try self.set(entry.key_ptr.*, entry.value_ptr.string);
+        }
+        self.persist_dirty = false;
     }
 };
 
@@ -522,4 +610,133 @@ test "subscribers fire only on the state where set was called" {
     try child.set("x", "v");
     try testing.expectEqual(@as(u32, 0), root_probe.counter); // root not fired
     try testing.expectEqual(@as(u32, 1), child_probe.counter);
+}
+
+// ── Persistence (stage 13b.2) ─────────────────────────────────────────
+
+fn persistTmpPath() ![]u8 {
+    var rand_buf: [12]u8 = undefined;
+    std.crypto.random.bytes(&rand_buf);
+    var hex_buf: [24]u8 = undefined;
+    const charset = "0123456789abcdef";
+    for (rand_buf, 0..) |b, i| {
+        hex_buf[i * 2] = charset[b >> 4];
+        hex_buf[i * 2 + 1] = charset[b & 0x0f];
+    }
+    return try std.fmt.allocPrint(testing.allocator, "/tmp/state-test-{s}.json", .{hex_buf});
+}
+
+test "persist: set flips persist_dirty; clearPersistDirty resets it" {
+    var s = State.init(testing.allocator);
+    defer s.deinit();
+    try testing.expect(!s.persist_dirty);
+    try s.set("a", "1");
+    try testing.expect(s.persist_dirty);
+    s.clearPersistDirty();
+    try testing.expect(!s.persist_dirty);
+    // dirty stays independent.
+    try testing.expect(s.dirty);
+}
+
+test "persist: save + load roundtrip preserves values" {
+    const path = try persistTmpPath();
+    defer testing.allocator.free(path);
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    {
+        var s = State.init(testing.allocator);
+        defer s.deinit();
+        try s.set("box_color", "red");
+        try s.set("box_radius", "12.50");
+        try s.set("nested.path", "deep");
+        try s.saveToFile(path);
+    }
+
+    {
+        var s = State.init(testing.allocator);
+        defer s.deinit();
+        try s.loadFromFile(path);
+        try testing.expectEqualStrings("red", s.get("box_color").?);
+        try testing.expectEqualStrings("12.50", s.get("box_radius").?);
+        try testing.expectEqualStrings("deep", s.get("nested.path").?);
+        // Load clears persist_dirty so we don't immediately re-flush.
+        try testing.expect(!s.persist_dirty);
+    }
+}
+
+test "persist: load overlays onto existing values (persisted wins)" {
+    const path = try persistTmpPath();
+    defer testing.allocator.free(path);
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    {
+        var s = State.init(testing.allocator);
+        defer s.deinit();
+        try s.set("box_color", "red"); // last session's value
+        try s.saveToFile(path);
+    }
+
+    var s = State.init(testing.allocator);
+    defer s.deinit();
+    try s.set("box_color", "blue"); // frontmatter default
+    try s.set("untouched", "keepme"); // not in saved file
+    try s.loadFromFile(path);
+    try testing.expectEqualStrings("red", s.get("box_color").?); // persisted wins
+    try testing.expectEqualStrings("keepme", s.get("untouched").?); // pre-existing kept
+}
+
+test "persist: load on missing file returns FileNotFound" {
+    var s = State.init(testing.allocator);
+    defer s.deinit();
+    try testing.expectError(error.FileNotFound, s.loadFromFile("/tmp/definitely-does-not-exist-state-test.json"));
+}
+
+test "persist: load rejects malformed JSON" {
+    const path = try persistTmpPath();
+    defer testing.allocator.free(path);
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    {
+        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("this is not json {{{");
+    }
+
+    var s = State.init(testing.allocator);
+    defer s.deinit();
+    try testing.expectError(error.SyntaxError, s.loadFromFile(path));
+}
+
+test "persist: load rejects wrong version" {
+    const path = try persistTmpPath();
+    defer testing.allocator.free(path);
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    {
+        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("{\"version\":99,\"entries\":{}}");
+    }
+
+    var s = State.init(testing.allocator);
+    defer s.deinit();
+    try testing.expectError(error.InvalidStateFile, s.loadFromFile(path));
+}
+
+test "persist: save is atomic — partial write would leave tmp file" {
+    // We can't easily simulate a partial write in-process, but verify
+    // the steady-state: after a successful save, no .tmp file remains
+    // alongside the target.
+    const path = try persistTmpPath();
+    defer testing.allocator.free(path);
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var s = State.init(testing.allocator);
+    defer s.deinit();
+    try s.set("x", "y");
+    try s.saveToFile(path);
+
+    const tmp_path = try std.fmt.allocPrint(testing.allocator, "{s}.tmp", .{path});
+    defer testing.allocator.free(tmp_path);
+    try testing.expectError(error.FileNotFound, std.fs.cwd().openFile(tmp_path, .{}));
 }

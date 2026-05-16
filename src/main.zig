@@ -754,13 +754,28 @@ fn computeAssetCacheDir(allocator: std.mem.Allocator) ![]u8 {
     return try std.fs.path.join(allocator, &.{ home, ".cache", "text_engine", "assets" });
 }
 
+/// XDG-style state file for persistent reactive-state values. Honours
+/// `$XDG_STATE_HOME` if set; otherwise falls back to
+/// `$HOME/.local/state`. State (slider positions, input contents) is
+/// user data, not regenerable cache — XDG conventions put it under a
+/// different root so `rm -rf ~/.cache` doesn't lose it.
+fn computeStateFilePath(allocator: std.mem.Allocator) ![]u8 {
+    if (std.process.getEnvVarOwned(allocator, "XDG_STATE_HOME")) |xdg| {
+        defer allocator.free(xdg);
+        return try std.fs.path.join(allocator, &.{ xdg, "text_engine", "state.json" });
+    } else |_| {}
+    const home = try std.process.getEnvVarOwned(allocator, "HOME");
+    defer allocator.free(home);
+    return try std.fs.path.join(allocator, &.{ home, ".local", "state", "text_engine", "state.json" });
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 9 / stage 14e (persistent asset cache)\n", .{});
+    try stdout.print("text_engine demo — session 9 / stage 13b.2 (persistent reactive state)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
     try stdout.print("  demo.md bytes:         {d}\n", .{demo_md.len});
@@ -892,6 +907,20 @@ pub fn main() !void {
     // cached component instances.
     var host_state = (try state_mod.fromSource(allocator, demo_md)) orelse state_mod.State.init(allocator);
     defer host_state.deinit();
+
+    // ── Stage 13b.2 — persistent state ─────────────────────────────
+    // Load previous session's state values (slider positions, button
+    // bodies, input contents) on top of the frontmatter defaults so a
+    // restart picks up where the user left off. Throttled save runs
+    // from the main loop every PERSIST_INTERVAL_FRAMES if dirty.
+    const state_path = try computeStateFilePath(allocator);
+    defer allocator.free(state_path);
+    host_state.loadFromFile(state_path) catch |e| switch (e) {
+        error.FileNotFound => {
+            try stdout.print("  state file:           (none yet) — first run\n", .{});
+        },
+        else => try stdout.print("  state file:           {s} (load failed: {s})\n", .{ state_path, @errorName(e) }),
+    };
 
     // ── Stage 12 — async I/O channel ───────────────────────────────
     // Work-stealing thread pool + fire-and-forget IoChannel sit
@@ -1184,9 +1213,32 @@ pub fn main() !void {
 
         try rdr.drawFrame();
         frame_count += 1;
+
+        // Stage 13b.2 — throttled state flush. Slider drags fire
+        // state.set at ~60 Hz; we don't want a file write per drag
+        // event. Coalesce by checking every PERSIST_INTERVAL_FRAMES
+        // (~1s at 60 fps; faster at high refresh) and flush if
+        // anything changed since the last write. The final flush at
+        // shutdown catches the tail.
+        const PERSIST_INTERVAL_FRAMES: u64 = 60;
+        if (frame_count % PERSIST_INTERVAL_FRAMES == 0 and host_state.persist_dirty) {
+            host_state.saveToFile(state_path) catch |e| {
+                std.log.warn("state save failed: {s}", .{@errorName(e)});
+            };
+            host_state.clearPersistDirty();
+        }
+
         if (exit_after_ms) |limit| {
             if (std.time.milliTimestamp() - frame_ctx.start_ms >= limit) break;
         }
+    }
+
+    // Final flush on graceful exit so the last <1s of mutations land.
+    if (host_state.persist_dirty) {
+        host_state.saveToFile(state_path) catch |e| {
+            std.log.warn("state final flush failed: {s}", .{@errorName(e)});
+        };
+        host_state.clearPersistDirty();
     }
 
     const elapsed_ms = std.time.milliTimestamp() - frame_ctx.start_ms;
