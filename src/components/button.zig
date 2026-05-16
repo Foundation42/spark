@@ -8,14 +8,17 @@
 //!     :::
 //!
 //! - `label`  (required) — text rendered inside the button.
-//! - `target` (required) — `#id` of the component to dispatch the
-//!   action onto. `#` prefix is optional; we strip it. State-target
-//!   dispatch (`target=state.path`) is deferred — pair this with the
-//!   existing `:::update` directive emitter when that case comes up.
-//! - `action` (required) — the `action=NAME` passed through to the
-//!   target's `Factory.handle_update(ctx, action, body)`.
-//! - `body`   (optional) — passed verbatim as the update body.
-//!   Default empty.
+//! - `target` (required) — either:
+//!     - `#id` (or bare `id`) of a component → fires
+//!       `registry.handleUpdate(id, action, body)`, OR
+//!     - `state.path` → writes `body` into the scope-local state at
+//!       `path`. `action=` is ignored on this branch (kept for
+//!       symmetry with the wire format).
+//! - `action` (required for component-target) — the `action=NAME`
+//!   passed through to the target's
+//!   `Factory.handle_update(ctx, action, body)`.
+//! - `body`   (optional) — passed verbatim as the update body / state
+//!   value. Default empty.
 //! - `width`  (optional) — pixel literal or `100%`. Default: intrinsic
 //!   to the label width plus padding.
 //! - `height` (optional) — pixel literal. Default 36.
@@ -23,12 +26,15 @@
 //! ### Click → dispatch
 //!
 //! Wires `on_input` to receive mouse events; on `mouse_up` of button 0
-//! (left), invokes `registry.handleUpdate(target, action, body)`. The
-//! state pointer passed to `on_input` is unused — the dispatch goes
-//! through the registry directly, not through state — so a button
-//! inside an `:::embedded-document` reaches the *host* registry, which
-//! is what we want (a button in a child doc that triggers a parent-
-//! scope component, or a sibling component in the same scope, etc).
+//! (left):
+//!   - **state-target** (`target=state.path`) writes `body` into the
+//!     scope-local state passed in by the dispatcher. A button inside
+//!     a child `:::embedded-document` therefore mutates *child* state,
+//!     not the host's — matching slider scoping (stage-9 follow-up).
+//!   - **component-target** (`target=#id`) calls
+//!     `registry.handleUpdate(target, action, body)` against the host
+//!     registry, which is what we want (a button in a child doc that
+//!     triggers a parent-scope or sibling-scope component, etc).
 //!
 //! Hover state is not yet plumbed — `mouse_move` doesn't propagate
 //! until the hit-test layer carries a "mouse entered" event. v0 button
@@ -39,6 +45,7 @@ const std = @import("std");
 const element = @import("../element.zig");
 const components = @import("../markdown_components.zig");
 const component_mod = @import("../component.zig");
+const state_mod = @import("../state.zig");
 const text_layout = @import("../text/layout.zig");
 const shape = @import("../font/shape.zig");
 const box_helpers = @import("box.zig");
@@ -113,12 +120,22 @@ const Component = struct {
 
         const label = label_raw orelse return Error.ButtonMissingLabel;
         const target_full = target_raw orelse return Error.ButtonMissingTarget;
-        const action = action_raw orelse return Error.ButtonMissingAction;
 
         const target = if (target_full.len > 0 and target_full[0] == '#')
             target_full[1..]
         else
             target_full;
+
+        // `action=` is required for component-target dispatch (the
+        // callee's `handle_update` arms switch on it). State-target
+        // dispatch ignores it — there's a single primitive verb (write
+        // body into state.path) — so leave it as a courtesy empty
+        // string when absent.
+        const is_state_target = std.mem.startsWith(u8, target, "state.");
+        const action = if (is_state_target)
+            action_raw orelse ""
+        else
+            action_raw orelse return Error.ButtonMissingAction;
 
         const new_label = try a.dupe(u8, label);
         errdefer a.free(new_label);
@@ -278,13 +295,30 @@ fn layoutAndRender(
 fn onInput(
     ctx: *anyopaque,
     event: element.InputEvent,
-    _: *anyopaque,
+    state_ptr: *anyopaque,
 ) anyerror!void {
     const c: *Component = @ptrCast(@alignCast(ctx));
     switch (event) {
         .mouse_up => |m| {
             if (m.button != 0) return; // primary only
-            if (c.target.len == 0 or c.action.len == 0) return;
+            if (c.target.len == 0) return;
+
+            // State-target: `target=state.path` writes `body` into the
+            // scope-local state. `action` is ignored — the wire format
+            // accepts it for symmetry with component-target, but state
+            // mutation is a single primitive verb.
+            if (std.mem.startsWith(u8, c.target, "state.")) {
+                const key = c.target["state.".len..];
+                if (key.len == 0) return;
+                const state: *state_mod.State = @ptrCast(@alignCast(state_ptr));
+                state.set(key, c.body) catch |e| {
+                    std.log.warn(":::button: state.set failed: path={s} err={s}", .{ key, @errorName(e) });
+                };
+                return;
+            }
+
+            // Component-target.
+            if (c.action.len == 0) return;
             const r = registry_ref orelse return;
             r.handleUpdate(c.target, c.action, c.body) catch |e| {
                 std.log.warn(":::button: dispatch failed: target=#{s} action={s} err={s}", .{
@@ -299,7 +333,6 @@ fn onInput(
 // ── Tests ───────────────────────────────────────────────────────────
 
 const testing = std.testing;
-const state_mod = @import("../state.zig");
 
 test "button: ingest stores label/target/action/body, strips # from target" {
     const attrs = [_]components.Attr{
@@ -366,4 +399,59 @@ test "button: update re-ingests attrs (label change)" {
 
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
     try testing.expectEqualStrings("New", c.label);
+}
+
+test "button: state-target dispatch writes body into state.path" {
+    const attrs = [_]components.Attr{
+        .{ .key = "label", .value = "Hide" },
+        .{ .key = "target", .value = "state.config_hidden" },
+        .{ .key = "body", .value = "true" },
+    };
+    const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
+
+    const inst = try create(testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+
+    var state = state_mod.State.init(testing.allocator);
+    defer state.deinit();
+
+    try onInput(inst.ctx, .{ .mouse_up = .{ .local = .{ 0, 0 }, .button = 0, .button_down = false } }, @ptrCast(&state));
+
+    try testing.expectEqualStrings("true", state.get("config_hidden").?);
+    try testing.expect(state.dirty);
+}
+
+test "button: state-target accepts missing action" {
+    const attrs = [_]components.Attr{
+        .{ .key = "label", .value = "x" },
+        .{ .key = "target", .value = "state.foo" },
+        .{ .key = "body", .value = "bar" },
+    };
+    const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
+    // No `action=` attr supplied — must NOT return ButtonMissingAction.
+    const inst = try create(testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+
+    const c: *Component = @ptrCast(@alignCast(inst.ctx));
+    try testing.expectEqualStrings("state.foo", c.target);
+    try testing.expectEqualStrings("", c.action);
+}
+
+test "button: state-target ignores right-mouse and key events" {
+    const attrs = [_]components.Attr{
+        .{ .key = "label", .value = "x" },
+        .{ .key = "target", .value = "state.foo" },
+        .{ .key = "body", .value = "1" },
+    };
+    const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
+
+    const inst = try create(testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+
+    var state = state_mod.State.init(testing.allocator);
+    defer state.deinit();
+
+    // Right button shouldn't fire.
+    try onInput(inst.ctx, .{ .mouse_up = .{ .local = .{ 0, 0 }, .button = 1, .button_down = false } }, @ptrCast(&state));
+    try testing.expect(state.get("foo") == null);
 }

@@ -5,6 +5,7 @@ state:
   box_radius: 12
   box_height: 80
   target_id: "SAT-04"
+  config_hidden: "true"
 ---
 
 # text_engine
@@ -152,12 +153,19 @@ still **parsed**, the frontmatter still populates the child state, the
 walking it. Use this shape for config docs, cache-warming widgets, or
 "model" docs whose state other (visible) docs observe.
 
-:::embedded-document {#config src="src/widgets/headless_config.md" headless=true}
+:::embedded-document {#config src="src/widgets/headless_config.md" headless=${state.config_hidden}}
 :::
 
-Click below to flip the flag at runtime through `handle_update` —
-the doc materialises (its full body + magenta box appear) and the
-surrounding stack-v re-flows to make room. Click again to hide it.
+The two buttons below are **state-target dispatch** (`target=state.path`)
+— they write straight into the demo's `state.config_hidden` value, and
+the embed's `headless=${state.config_hidden}` re-resolves through the
+reactive Binding subsystem. No `handle_update` involved on this path;
+the same lane sliders use, exposed to clicks. (The component-target
+`action=toggle-headless` arm on `:::embedded-document` is still wired
+for direct/LLM mutation — both paths coexist.)
 
-:::button {#toggle_config label="Toggle headless config doc" target=#config action=toggle-headless}
+:::button {#show_config label="Show config doc" target=state.config_hidden body=false}
+:::
+
+:::button {#hide_config label="Hide config doc" target=state.config_hidden body=true}
 :::
