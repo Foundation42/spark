@@ -526,32 +526,36 @@ Debug → `-O0` (default), ReleaseSafe / ReleaseFast → `-O`,
 ReleaseSmall → `-Os`. Text fragment SPIR-V shrank 34% (3040 →
 2008 bytes).
 
-## Parked — parallel cache-miss layouts (stage 14b)
+## Shipped — worker pool split (stage 14d)
 
-Built end-to-end then disabled. The infrastructure (mutex around
+Two `JobSystem` instances now live side by side, owned by main.
+The compute pool keeps the original sizing (`cpu_count - 2`
+workers, all hot for parallel layout + tessellation). The I/O
+pool is sized for concurrency, not parallelism — 24 workers,
+each happily parked on `req.read` for the upstream duration of
+a stream. `IoChannel.init` takes the I/O pool;
+`submitHttpGet` / `submitHttpStream` schedule onto it so blocking
+HTTP never touches the compute workers.
+
+Re-arms stage 14b by dropping `PARALLEL_MIN_WALKS` back to `2`
+in `src/element_layout.zig`. The infrastructure (mutex around
 GlyphCache, classification, blitPrivate / snapshotFromPrivate)
-stays live; the dispatch threshold is currently
-`maxInt(usize)` so it never fires.
+that was retained through the parked period now fires again.
+Multi-stream demo (3 LLM + svg-stream + image-stream) confirms
+no main-thread hang, no fan spinup.
 
-Reason: `httpStreamJob` is a `JobSystem` job that occupies a
-worker for the entire duration of an upstream wait (5-15s for
-Recraft / Gemini image preview). With three LLM streams +
-svg-stream + image-stream all in flight, ~5 worker slots are
-blocked on the wire. When `:::svg-stream` finalises and calls
-`tess.tessellateParallel` from the drain handler, main + the one
-free worker can't drain the 125-job tessellation queue fast
-enough — and the layout pass dispatching parallel walks on top
-of that hangs the main thread in Counter.wait spin loops.
+Zero contract changes — `submitHttpStream` still returns a
+Handle synchronously and posts completions through the channel
+asynchronously, same as before. Only the pool routing moved.
 
-Two fixes queued for session 9:
-1. **Split the worker pool** — separate blocking I/O from
-   compute. HTTP jobs go to a dedicated pool sized for
-   concurrency (4-8 workers, all blocking is fine); compute
-   stays on a pool sized for parallelism (cpu_count - 2).
-2. **Cost-aware classification** — only walks whose layout is
-   actually expensive justify dispatch. Chart re-render +
-   svg-stream re-emit are O(N) memcpy; not worth the
-   dispatch overhead even when their version bumps.
+## Parked — cost-aware parallel-walk classification
+
+Once 14d landed, cheap O(N) misses (chart re-render, svg-stream
+re-emit) still count toward the dispatch threshold even though
+the walk overhead exceeds the layout work itself. Heuristic to
+add: a "last walk took >N us" memoised cost on the element, or
+element-kind-based gating. Picked up when frame-time profiling
+flags it; not load-bearing today.
 
 ## Shipped — raster `:::image-stream` (stage 14c)
 

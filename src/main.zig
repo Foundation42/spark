@@ -886,9 +886,21 @@ pub fn main() !void {
     // so worker threads outlive the renderer; deinit order is
     // strictly reverse-of-init to make sure workers join before the
     // channel's completion queue is freed.
+    //
+    // ── Stage 14d — split compute and I/O pools ────────────────────
+    // The compute `job_system` sizes itself to `cpu_count - 2` and
+    // hosts parallel layout / SVG tessellation / future work. Blocking
+    // HTTP streams (5-15s on the wire each) get their own pool sized
+    // for *concurrency* — workers parked on `req.read` cost nothing,
+    // so we can afford 24 slots without contending with compute. This
+    // unparks stage 14b: with the parallel walker no longer fighting
+    // 5 stream workers for the same 6 deque slots, dispatch becomes
+    // safe again.
     const job_system = try jobs_mod.JobSystem.init(allocator, 0);
     defer job_system.deinit();
-    var io_channel = io_channel_mod.IoChannel.init(allocator, job_system);
+    const io_pool = try jobs_mod.JobSystem.init(allocator, 24);
+    defer io_pool.deinit();
+    var io_channel = io_channel_mod.IoChannel.init(allocator, io_pool);
     defer io_channel.deinit();
 
     // Stage 9 — install the embedded-document factory now that theme

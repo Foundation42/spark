@@ -419,20 +419,17 @@ TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
   ReleaseSafe / ReleaseFast → `-O`, ReleaseSmall → `-Os`. Text
   fragment SPIR-V shrank **34%** (3040 → 2008 bytes).
 
-- [⚠] **Stage 14b — parallel cache-miss layouts (built, then
-  parked).** One mutex around `GlyphCache.getOrRasterize` (the
-  only shared-write surface); classify-then-dispatch worker
-  pattern in `layoutStackVParallel` (workers walk into private
-  DrawLists at origin (0,0); main merges in order + snapshots).
-  Worked at idle. **Hangs the main thread** when multiple
-  `:::*-stream` HTTP fetches are in flight because
-  `httpStreamJob` occupies a `JobSystem` worker for 5-15 s of
-  upstream wait — the compute pool starves while tessellation +
-  layout dispatch compete for the few remaining workers.
-  `PARALLEL_MIN_WALKS` raised to `maxInt(usize)` so dispatch
-  never fires; the rest of the plumbing stays live. Session 9
-  splits the worker pool (blocking I/O ≠ compute) and drops the
-  threshold back to 2.
+- [x] **Stage 14b — parallel cache-miss layouts (re-armed by 14d).**
+  One mutex around `GlyphCache.getOrRasterize` (the only
+  shared-write surface); classify-then-dispatch worker pattern in
+  `layoutStackVParallel` (workers walk into private DrawLists at
+  origin (0,0); main merges in order + snapshots). Built in
+  session 8, then **parked** because `httpStreamJob` pinned
+  `JobSystem` workers for the entire 5-15 s upstream wait — with
+  multiple streams + the parallel walker on top, the compute pool
+  starved and the main thread spun in `Counter.wait`. Stage 14d
+  (worker pool split, below) removes the contention; dropping
+  `PARALLEL_MIN_WALKS` back to `2` re-arms the dispatcher.
 
 - [x] **Stage 14c — raster `:::image-stream` (Gemini image
   preview).** Mirror of `:::svg-stream` for image-class models.
@@ -448,13 +445,22 @@ TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
   glyphs. Texture reused across re-fires when dimensions match;
   reallocated + descriptor rewritten in place otherwise.
 
+- [x] **Stage 14d — worker pool split (compute ≠ I/O).** Two
+  `JobSystem` instances live side by side. The compute pool keeps
+  `cpu_count - 2` workers all hot for parallel layout +
+  tessellation; a dedicated I/O pool with 24 workers handles
+  blocking HTTP — each happily parked on `req.read` for the
+  upstream wait. `IoChannel` is now wired to the I/O pool;
+  `submitHttpGet` / `submitHttpStream` no longer touch compute
+  workers. Re-arms 14b by dropping `PARALLEL_MIN_WALKS` back to
+  `2`. The two pools coexist on the existing JobSystem shape with
+  zero contract changes.
+
 ## What's next
 
-[`docs/roadmap.md`](docs/roadmap.md). Open queue: **worker pool
-split** (unblocks 14b's parallel walker — blocking I/O on a
-dedicated pool, compute keeps the JobSystem), **persistent URL +
-asset cache** (Recraft + Gemini image preview are both ~$0.08
-per image; content-addressable disk cache keyed on
+[`docs/roadmap.md`](docs/roadmap.md). Open queue: **persistent
+URL + asset cache** (Recraft + Gemini image preview are both
+~$0.08 per image; content-addressable disk cache keyed on
 model+prompt+params), **stage 10** (headless documents —
 composition-track completion), **more image-class probes**
 (Stability SD-Vector, Bytedance Doubao-Vector, OpenAI gpt-image-1),

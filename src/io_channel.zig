@@ -13,6 +13,17 @@
 //!   4. Main thread calls [`drain`] once per frame to flush completions
 //!      through a caller-supplied handler.
 //!
+//! ### Worker pool routing (stage 14d)
+//!
+//! `jobs` must be a JobSystem dedicated to blocking I/O — sized for
+//! concurrency (16-32 workers, all happy to be parked on `req.read`),
+//! not for parallelism. The compute JobSystem (cpu_count-2 workers
+//! kept hot for parallel layout / tessellation) MUST NOT be passed
+//! here: each in-flight `:::llm-stream` / `:::svg-stream` /
+//! `:::image-stream` pins a worker for 5-15 seconds of upstream wait,
+//! and a handful of those starves compute outright. The split lets
+//! both shapes coexist.
+//!
 //! ### Why a mutex queue, not a lock-free MPSC?
 //!
 //! Completion volume is small — a handful of fetches per second,
