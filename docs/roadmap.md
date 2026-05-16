@@ -262,23 +262,30 @@ all of 8a + 8b + 9 active.
   (per-factory config pointer, or a `*Host` ctx through create) is
   the right fix.
 
-## Next — document composition continued (stages 10–11)
+## Shipped — headless documents (stage 10)
 
-See [`vision.md`](vision.md) "Document composition + the flywheel"
-for the full pitch. Stage 9 shipped above; the remaining two
-flywheel pieces:
+`:::embedded-document {headless=true}` parses the child markdown,
+populates child state, instantiates child components (auto_start
+streams fire, `:::chart` ingest works, registry routing by id
+stays intact) — but `layoutAndRender` short-circuits with a
+zero-size box and emits no draw data. Invisibility propagates
+behaviourally: nested visual content arbitrarily deep stays
+hidden regardless of its own `headless` flag, because the layout
+walker simply never descends.
 
-- **Stage 10 — headless documents.** A document parsed without
-  a viewport: factories instantiate, state lives, subscribers
-  fire, but no `layoutAndRender` runs. Other documents subscribe
-  to its state paths or read its AST via `markdown.parse`'s
-  return value. The runtime equivalent of a "data layer" doc — a
-  shared state machine that visible docs project from.
-- **Stage 11 — remote component sources.** The `src=` of a
-  `:::embedded-document` can be a URL. Loader is a factory that
-  fetches + parses + caches. Local-first; offline fallbacks;
-  content-addressed caching layer. Same shape as 9, different
-  loader.
+Two toggle paths land in the same stage. The reactive-attr path
+re-reads the `headless` attr on every `update()` call, so
+`headless=${state.x}` composes with the existing Binding subsystem
+— flip state, doc visibility flips. The `handle_update` path adds
+`set-headless` and `toggle-headless` actions for direct/LLM
+mutation without bouncing through state. The demo uses the
+reactive-attr path with state-target buttons (stage 13b.1).
+
+The cache-warming use case is the manifesto's pattern made
+concrete: a headless doc can hold `:::svg-stream` / `:::image-
+stream` components with `auto_start=true` that pre-fetch the
+asset cache for a visible doc later. Component instances exist,
+HTTP requests fire, meshes/textures build — just not on screen.
 
 ## Shipped — async I/O channel (stage 12)
 
@@ -548,14 +555,98 @@ Zero contract changes — `submitHttpStream` still returns a
 Handle synchronously and posts completions through the channel
 asynchronously, same as before. Only the pool routing moved.
 
-## Parked — cost-aware parallel-walk classification
+## Shipped — persistent asset cache (stage 14e)
 
-Once 14d landed, cheap O(N) misses (chart re-render, svg-stream
-re-emit) still count toward the dispatch threshold even though
-the walk overhead exceeds the layout work itself. Heuristic to
-add: a "last walk took >N us" memoised cost on the element, or
-element-kind-based gating. Picked up when frame-time profiling
-flags it; not load-bearing today.
+Browser-style content-addressable cache for expensive remote
+assets (Recraft V4.1 SVG envelopes, Gemini image preview envelopes
+— both ~$0.08/firing). New `src/asset_cache.zig` with flat-
+directory layout: `<hex-sha256>` bytes files plus a
+`manifest.json` index tracking per-entry `size`, `created_at_ms`,
+`last_accessed_at_ms`, optional `source` descriptor + `content_type`.
+Configurable byte budget (default 500 MB), LRU eviction on
+overflow, atomic manifest writes (tmp + `rename` within the cache
+dir). `pruneOlderThan` / `pruneAll` / `setBudget` knobs for
+future CLI / debug surfaces.
+
+Lives at `${XDG_CACHE_HOME:-$HOME/.cache}/text_engine/assets`.
+Each cacheable consumer derives its own key:
+`sha256(prefix | provider | endpoint | model | system | prompt | max_tokens)`.
+The prefix carries a schema version (`svg-stream:v1`,
+`image-stream:v1`) so a future key-shape change silently bypasses
+old entries rather than colliding.
+
+`:::svg-stream` and `:::image-stream` opt in. Cache-hit fast path
+in `kickStream` reads bytes synchronously (sub-ms on SSD), feeds
+them into the existing `finalizeResponse` parser, goes straight to
+`.done`. No `IoChannel` traffic, no spinner, no charge. On cache
+miss, the existing submit path runs; the successful `.end` writes
+the accumulated envelope to disk.
+
+## Shipped — state-target button dispatch (stage 13b.1)
+
+Button `onInput` splits at click time. `target=state.path`
+writes `body` straight into the scope-local state via the
+dispatcher's `on_input` state pointer (matching how `:::slider`
+and `:::input` have scoped state mutations since stage 9).
+`target=#id` keeps the existing `registry.handleUpdate` path
+against the host registry — a button in a child doc still
+reaches parent-scope or sibling-scope components.
+
+`action=` is optional for state-target dispatch (state mutation
+is a single primitive verb; the wire format accepts `action=`
+for symmetry with component-target but ignores it).
+
+Closes the reactive-attr loop end-to-end. Headless config demo
+now reads `headless=${state.config_hidden}` and uses two
+state-target buttons (Show / Hide) instead of bouncing through
+the `handle_update` arm.
+
+## Shipped — persistent reactive state (stage 13b.2)
+
+`State` grew `saveToFile` and `loadFromFile`. JSON format with a
+version field: `{"version":1,"entries":{"key":"value", ...}}`.
+Atomic write (tmp + rename within the same directory) so a crash
+leaves either the old file or the new one. New `persist_dirty`
+flag independent of `dirty` — host throttles disk writes on its
+own cadence without disturbing the renderer's repaint signal.
+
+Lives at `${XDG_STATE_HOME:-$HOME/.local/state}/text_engine/state.json`
+(state is user data, not regenerable cache — XDG conventions put
+them under different roots so `rm -rf ~/.cache` doesn't lose
+slider positions).
+
+Main loads the file between `state_mod.fromSource(demo_md)` and
+`markdown.parseWithState` so persisted values overlay onto
+frontmatter defaults *before* component Bindings subscribe.
+Throttled flush every 60 frames (~1 s at 60 fps) if dirty; final
+flush on graceful exit catches the tail. The slider-drag pattern
+(60 sets/s) coalesces to one disk write per second.
+
+Restart picks up where the user left off. Dragged slider
+positions, button-driven state mutations, input contents all
+survive.
+
+## Shipped — cost-aware parallel-walk classification (stage 14f)
+
+`ElementVTable.parallel_layout_cheap: bool` flag (default false).
+The stage-14b dispatcher counts only *expensive* snapshot-eligible
+walks toward `PARALLEL_MIN_WALKS`; cheap walks still dispatch in
+parallel **when** an expensive sibling pushes us over, but on
+chart-only-dirty frames the dispatcher stays serial — no
+`Counter.wait` spin for work that finishes in microseconds anyway.
+
+Chart, svg-stream, image-stream opt in (their re-walks are O(N)
+memcpy in microseconds — column quads, mesh-slice rebind,
+descriptor-set emit). Paragraph / heading / code_block stay
+default expensive — HarfBuzz shaping is always heavy enough to
+dispatch.
+
+## Parked — finer-grained walk-cost memoisation
+
+The static vtable flag (14f) handles the present problem.
+Future-stage refinement: cache the actual last-walk time on each
+element + gate dispatch on `>N us` measured cost. Worth the
+complexity only if frame-time profiling flags it.
 
 ## Shipped — raster `:::image-stream` (stage 14c)
 

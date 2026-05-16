@@ -456,13 +456,75 @@ TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
   `2`. The two pools coexist on the existing JobSystem shape with
   zero contract changes.
 
+- [x] **Stage 14e — persistent asset cache.** Browser-style
+  content-addressable cache for expensive remote assets (Recraft
+  SVG envelopes, Gemini image envelopes — both ~$0.08/firing).
+  New `src/asset_cache.zig` with `manifest.json` index, sha256
+  keys, 500 MB default budget, LRU eviction on overflow, atomic
+  manifest writes (tmp + rename), `pruneOlderThan` / `pruneAll` /
+  `setBudget` knobs. Lives at
+  `${XDG_CACHE_HOME:-$HOME/.cache}/text_engine/assets`. The two
+  expensive stream components opt in and route cache hits straight
+  into `finalizeResponse` — no `IoChannel` traffic, no spinner,
+  no charge.
+
+- [x] **Stage 10 — headless documents.** `:::embedded-document
+  {headless=true}` parses its child markdown, populates child
+  state, instantiates child components (auto_start streams fire,
+  `:::chart` ingest works, registry routing by id stays intact) —
+  but `layoutAndRender` short-circuits with a zero-size box and
+  emits no draw data. Invisibility propagates behaviourally:
+  nested visual content arbitrarily deep stays hidden regardless
+  of its own flag. Two toggle paths land in the same stage: a
+  reactive-attr path (`headless=${state.x}`) composing with the
+  Binding subsystem, and a `handle_update` arm (`set-headless` /
+  `toggle-headless`) for direct/LLM mutation.
+
+- [x] **Stage 13b.1 — state-target `:::button` dispatch.**
+  `target=state.path` writes `body` straight into the scope-local
+  state via the dispatcher's `on_input` state pointer (matching
+  slider / input scoping). `target=#id` keeps the existing
+  `registry.handleUpdate` path. Closes the reactive-attr loop
+  end-to-end — the headless demo now uses state-target buttons
+  driving `headless=${state.config_hidden}` instead of bouncing
+  through the `handle_update` arm.
+
+- [x] **Stage 13b.2 — persistent reactive state.** `State` grew
+  `saveToFile` / `loadFromFile` (atomic JSON write at
+  `${XDG_STATE_HOME:-$HOME/.local/state}/text_engine/state.json`,
+  version-tagged) and a `persist_dirty` flag independent of
+  `dirty`. Main loads between `fromSource` and `parseWithState`
+  so persisted values overlay onto frontmatter defaults before
+  components subscribe. Throttled flush every 60 frames if dirty;
+  final flush on graceful exit. Slider positions, button-driven
+  state mutations, input contents all survive restarts.
+
+- [x] **Stage 14f — cost-aware parallel-walk classification.**
+  `ElementVTable.parallel_layout_cheap: bool` flag. Chart, svg-
+  stream, image-stream opt in (their re-walks are O(N) memcpy in
+  microseconds — dispatch overhead would dominate). The stage-14b
+  dispatcher counts only *expensive* walks toward
+  `PARALLEL_MIN_WALKS`; cheap walks still dispatch in parallel
+  when expensive siblings push us over, but chart-only-dirty
+  frames stay serial.
+
+## Manifesto
+
+[`docs/manifesto.md`](docs/manifesto.md) — written mid-session-9
+in response to the recent push from some quarters to default LLM
+outputs to HTML. The stance the engine has been building toward
+since session 2 got explicit: **markdown is the universal
+interface; make it live.**
+
 ## What's next
 
-[`docs/roadmap.md`](docs/roadmap.md). Open queue: **persistent
-URL + asset cache** (Recraft + Gemini image preview are both
-~$0.08 per image; content-addressable disk cache keyed on
-model+prompt+params), **stage 10** (headless documents —
-composition-track completion), **more image-class probes**
-(Stability SD-Vector, Bytedance Doubao-Vector, OpenAI gpt-image-1),
-**selection + clipboard for `:::input`**, **crisp zoom**
-(multi-size atlas + re-layout-on-zoom).
+[`docs/roadmap.md`](docs/roadmap.md). Open queue: **more image-
+class probes** (Stability SD-Vector, Bytedance Doubao-Vector,
+OpenAI gpt-image-1 — curl-first reconnaissance per
+[[reference-recraft-wire]]), **selection + clipboard for
+`:::input`** (shift-arrow, double-click word selection, ctrl-A/C/V),
+**stage 5b — markdown ↔ ANSI composability** (~50 LOC, fenced
+` ```ansi ``` ` blocks route into `CodeContent.sub_block`),
+**cache-warming headless demo** (manifesto pattern made concrete),
+**crisp zoom** (multi-size atlas + re-layout-on-zoom),
+**MCP / WASM provenance components**.
