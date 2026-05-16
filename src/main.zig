@@ -35,6 +35,7 @@ const markdown = @import("markdown.zig");
 const ansi = @import("ansi.zig");
 const component = @import("component.zig");
 const box_component = @import("components/box.zig");
+const flex_component = @import("components/flex.zig");
 const button_component = @import("components/button.zig");
 const chart_component = @import("components/chart.zig");
 const embedded_document_component = @import("components/embedded_document.zig");
@@ -1058,6 +1059,8 @@ pub fn main() !void {
 
     try embedded_document_component.install(&registry, &theme, &host_state, &io_channel);
     defer embedded_document_component.deinitGlobals();
+    try flex_component.install(&registry, &theme, &host_state);
+    defer flex_component.deinitGlobals();
     try llm_stream_component.install(&registry, &theme, &host_state, &io_channel, &env);
     defer llm_stream_component.deinitGlobals();
     try input_component.install(&registry, &host_state);

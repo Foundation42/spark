@@ -66,6 +66,21 @@ Block extensions parse into Specs, get resolved through a host-owned registry in
 :::slider {#height_slider target=box_height min=20 max=120 value=${state.box_height} width=320}
 :::
 
+## Flex layout (stage 15c)
+
+The first multi-child constraint-aware provider. `:::flex` walks its children with cumulative-x positioning, dropping `gap` pixels between siblings. Each child still goes through the kiwi solver for its own bounds — the flex parent computes positions, the children constrain their sizes.
+
+:::flex {#three_boxes direction=row gap=20}
+:::box {color=red width=120 height=80 radius=8}
+:::
+
+:::box {color=green width=120 height=80 radius=8}
+:::
+
+:::box {color=blue width=120 height=80 radius=8}
+:::
+:::
+
 ## Composition (stage 9)
 
 The block below is a *whole other document* — `src/widgets/orbit_panel.md` — embedded recursively. Parent attrs (`panel_color=cyan`, `inner_color=magenta`) overlay the child's frontmatter; child components live in the same registry under the scope `orbit/...` so their ids can't collide with the parent's.
