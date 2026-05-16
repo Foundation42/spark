@@ -71,7 +71,14 @@ const ansi_demo =
     "\x1b[38;2;255;127;80mtrue: coral\x1b[0m  " ++
     "\x1b[3mitalic\x1b[0m\n";
 
-const ATLAS_MONO_SIZE: u32 = 768;
+// Mono atlas bumped 768 → 2048 once crisp-zoom landed: each visited
+// zoom bucket adds a fresh rasterisation of every visible glyph, so
+// the steady-state working set scales with `(# distinct zooms × #
+// distinct fonts)`. 768² fit ≈ 4 zoom levels before AtlasFull tripped
+// `runLayout`; 2048² (4 MB R8 — trivial on any modern GPU) holds ≈ 30
+// zoom levels worth, comfortable for any plausible session. Eviction
+// of cold buckets is the long-term answer — captured as a future task.
+const ATLAS_MONO_SIZE: u32 = 2048;
 const ATLAS_COLOR_SIZE: u32 = 1024;
 // Stage 11 bumped MAX_GLYPHS from 2048 → 8192. The original
 // session-1 ceiling was sized for the SDF + ANSI fixtures; once
