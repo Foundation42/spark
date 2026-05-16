@@ -190,6 +190,10 @@ fn handleUpdate(ctx: *anyopaque, action: []const u8, body: []const u8) anyerror!
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .content_version = contentVersion,
+    // Chart re-walks emit a fixed number of column quads from a ring
+    // buffer — O(N samples) memcpy, microseconds. Not worth the
+    // parallel-dispatch overhead even at 60 Hz append rate.
+    .parallel_layout_cheap = true,
 };
 
 fn contentVersion(ctx: *anyopaque) u64 {

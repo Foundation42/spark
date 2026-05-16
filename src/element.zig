@@ -272,6 +272,19 @@ pub const ElementVTable = struct {
     /// (embedded-document). Inner stack_v walks still cache their
     /// own children — only the outer block-grain cache is suppressed.
     disable_cache: bool = false,
+    /// Cost hint for the stage-14b parallel cache-miss dispatcher.
+    /// `false` (default) means a miss on this component is
+    /// "expensive enough to dispatch" — a paragraph's HarfBuzz
+    /// shaping, a freshly-uploaded LLM-stream re-parse, etc. `true`
+    /// marks the miss as a cheap O(N) memcpy that doesn't justify
+    /// the dispatch overhead — `:::chart` re-emitting its column
+    /// quads on every 60 Hz append, `:::svg-stream` re-walking its
+    /// already-tessellated mesh, etc. Cheap walks still dispatch in
+    /// parallel **when** the threshold is met by expensive siblings,
+    /// but on chart-only-dirty frames the dispatcher stays serial
+    /// (no `Counter.wait` cost for work that finishes in
+    /// microseconds anyway).
+    parallel_layout_cheap: bool = false,
 };
 
 /// One input event delivered to a component's `on_input`. Stage 13c

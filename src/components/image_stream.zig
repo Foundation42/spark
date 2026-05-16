@@ -599,6 +599,10 @@ fn finalizeResponse(c: *Component) !void {
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .content_version = contentVersion,
+    // Re-walks emit a single ImageDraw entry (descriptor + rect).
+    // The expensive bit (PNG decode + texture upload) happened in
+    // finalizeResponse; the layout walk itself is microseconds.
+    .parallel_layout_cheap = true,
 };
 
 fn contentVersion(ctx: *anyopaque) u64 {

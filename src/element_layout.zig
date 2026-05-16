@@ -524,6 +524,13 @@ const WalkSpec = struct {
     /// Set if the worker errored. Merge phase falls back to a fresh
     /// serial walk for this child.
     err: ?anyerror = null,
+    /// Cost hint from the element's vtable (custom components only;
+    /// false for paragraph/heading/code_block which always cost
+    /// HarfBuzz shaping). Cheap walks don't count toward the
+    /// dispatch threshold — frames with only `:::chart` /
+    /// `:::*-stream` re-walks stay serial — but they still dispatch
+    /// in parallel when an expensive sibling pushes us over.
+    cheap: bool = false,
 };
 
 const ParallelWalkCtx = struct {
@@ -553,21 +560,31 @@ fn layoutStackVParallel(
     const classifications = try a.alloc(ChildClass, children.len);
     defer a.free(classifications);
 
-    // Count *snapshot-eligible* walks toward the dispatch threshold.
-    // Walks of `disable_cache = true` children (sliders / inputs /
-    // embedded-doc) happen every layout regardless of state change —
-    // counting them would dispatch every frame even when nothing
-    // content-relevant changed, and the worker would lose inner
-    // cache hits (workers run with `cache_blocks = null` to keep the
-    // block cache single-threaded). Only "real" cache misses justify
-    // the dispatch.
-    var snapshot_walks: usize = 0;
+    // Count *expensive snapshot-eligible* walks toward the dispatch
+    // threshold. Two reasons to exclude:
+    //   - `disable_cache = true` children (sliders / inputs /
+    //     embedded-doc) walk every frame regardless of state change.
+    //     Counting them would dispatch every frame, and workers run
+    //     with `cache_blocks = null` so inner cache hits are lost.
+    //   - `parallel_layout_cheap = true` custom components (chart,
+    //     svg-stream, image-stream) are O(N) memcpy on the re-walk.
+    //     Microseconds. Dispatch overhead would dominate. A frame
+    //     dirtied only by chart appends stays serial; once an
+    //     expensive sibling (paragraph re-shape, fresh LLM-stream
+    //     re-parse) pushes us over, the cheap walks ride along in
+    //     parallel for free.
+    var expensive_walks: usize = 0;
     for (children, 0..) |child, i| {
         classifications[i] = classifyChild(child, constraints, ctx, cache);
-        if (classifications[i] == .walk_with_snapshot) snapshot_walks += 1;
+        switch (classifications[i]) {
+            .walk_with_snapshot => |s| if (!s.cheap) {
+                expensive_walks += 1;
+            },
+            else => {},
+        }
     }
 
-    if (snapshot_walks < PARALLEL_MIN_WALKS) return null;
+    if (expensive_walks < PARALLEL_MIN_WALKS) return null;
 
     // Phase 2 — allocate private DrawLists for every walk slot. These
     // are released after the merge, regardless of success/failure.
@@ -694,11 +711,24 @@ fn classifyChild(
             return .{ .walk_with_snapshot = .{
                 .cache_key = key,
                 .version = version,
+                .cheap = isCheap(elem),
             } };
         }
     }
     cache.skipped += 1;
     return .{ .walk_no_cache = .{} };
+}
+
+/// True when an element's per-frame walk cost is small enough that
+/// parallel dispatch overhead would dominate it. Only custom
+/// components can opt in (via `vtable.parallel_layout_cheap`); all
+/// other Element kinds run real layout work (HarfBuzz shape, etc.)
+/// and are always treated as expensive.
+fn isCheap(elem: element.Element) bool {
+    return switch (elem) {
+        .custom => |c| c.vtable.parallel_layout_cheap,
+        else => false,
+    };
 }
 
 /// Worker entry. Walks each child in its batch range into the

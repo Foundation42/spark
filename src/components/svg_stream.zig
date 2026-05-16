@@ -587,6 +587,10 @@ fn finalizeResponse(c: *Component) !void {
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .content_version = contentVersion,
+    // Re-walks just bind the already-tessellated mesh into the
+    // DrawList — O(N triangles) but they're already in c_allocator
+    // memory; we just emit two slice references. Cheap.
+    .parallel_layout_cheap = true,
 };
 
 fn contentVersion(ctx: *anyopaque) u64 {
