@@ -178,6 +178,7 @@ pub const factory: component_mod.Factory = .{
     .create = create,
     .update = update,
     .deinit = deinit_,
+    .handle_update = handleUpdate,
 };
 
 const Phase = enum {
@@ -243,6 +244,14 @@ const Component = struct {
     /// Held when `phase == .loading` so `deinit_` can null its
     /// `.component` field and signal cancel.
     pending: ?*PendingFetch = null,
+    /// Stage 10 — headless documents. When true, `layoutAndRender`
+    /// returns a zero-size box and emits no draw data, but the doc
+    /// is still parsed, frontmatter populates child_state, and any
+    /// child components (LLM/SVG/image streams with `auto_start`,
+    /// `:::chart` ingest, etc.) run normally. Use for config docs,
+    /// cache-warming widgets, or "model" docs whose state other
+    /// (visible) docs observe via the parent pointer.
+    headless: bool = false,
 };
 
 fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
@@ -251,6 +260,7 @@ fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!c
     }
     const id_raw = spec.id orelse return error.EmbeddedDocumentMissingId;
     const src_path = findAttr(spec.attrs, "src") orelse return error.EmbeddedDocumentMissingSrc;
+    const headless = parseBoolAttr(spec.attrs, "headless", false);
 
     // Per-instance allocations common to every phase. Construction
     // order matters for errdefer cleanup — child_state.deinit relies
@@ -280,6 +290,7 @@ fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!c
         .scope = scope,
         .phase = .loading, // optimistic; switch to .ready on every sync path below
         .pending = null,
+        .headless = headless,
     };
 
     // ── Scheme dispatch ─────────────────────────────────────────────
@@ -519,6 +530,18 @@ fn update(ctx: *anyopaque, spec: *const components.Spec) anyerror!void {
     // those new values into child_state — child bindings + chart
     // appends already in flight aren't disturbed.
     try applyParentOverlays(c.child_state, spec);
+
+    // Stage 10 — reactive headless toggle. Re-reading the attr on
+    // every update means `headless=${state.x}` composes with the
+    // existing Binding subsystem: when the referenced state path
+    // mutates, the registry re-resolves attrs and calls us with the
+    // new value. The next layout pass picks up the flipped state.
+    const new_headless = parseBoolAttr(spec.attrs, "headless", false);
+    if (new_headless != c.headless) {
+        c.headless = new_headless;
+        if (parent_state_ref) |ps| ps.dirty = true;
+    }
+
     // src= changes are not honored on update — would invalidate the
     // child Element tree mid-stream. Author changes `#id` to force a
     // destroy + create cycle through the registry's auto-recreation
@@ -529,6 +552,39 @@ fn update(ctx: *anyopaque, spec: *const components.Spec) anyerror!void {
     // *latest* parent values are applied after the frontmatter.
     if (c.pending) |p| {
         try refreshPendingOverlays(p, spec);
+    }
+}
+
+/// Imperative `:::update` arms for visibility toggling. The reactive
+/// path (`update()` reading `headless=${state.x}` each re-resolve) is
+/// the more substrate-coherent way to drive this from data — these
+/// actions are for direct mutation, e.g. a `:::button` or an LLM-
+/// authored update fragment that wants to reveal / hide a previously
+/// configured doc without bouncing through state.
+///
+/// Actions:
+///   - `set-headless` with body `"true"` / `"false"` (or `"0"` / `"no"`).
+///   - `toggle-headless` with empty body — flips the current value.
+fn handleUpdate(ctx: *anyopaque, action: []const u8, body: []const u8) anyerror!void {
+    const c: *Component = @ptrCast(@alignCast(ctx));
+    var new_headless: ?bool = null;
+
+    if (std.mem.eql(u8, action, "set-headless")) {
+        new_headless = if (std.mem.eql(u8, body, "false") or std.mem.eql(u8, body, "0") or std.mem.eql(u8, body, "no"))
+            false
+        else
+            true;
+    } else if (std.mem.eql(u8, action, "toggle-headless")) {
+        new_headless = !c.headless;
+    } else {
+        return; // unknown action — silent no-op
+    }
+
+    if (new_headless) |nh| {
+        if (nh != c.headless) {
+            c.headless = nh;
+            if (parent_state_ref) |ps| ps.dirty = true;
+        }
     }
 }
 
@@ -598,6 +654,17 @@ fn findAttr(attrs: []const components.Attr, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Parse a boolean attribute. Presence-with-no-equals (`headless`)
+/// isn't expressible in the current attr grammar, so callers say
+/// `headless=true` / `headless=false`. `"false"`, `"0"`, and `"no"`
+/// (case-sensitive) read as false; anything else reads as true.
+/// Missing key returns `default`.
+fn parseBoolAttr(attrs: []const components.Attr, key: []const u8, default: bool) bool {
+    const s = findAttr(attrs, key) orelse return default;
+    if (std.mem.eql(u8, s, "false") or std.mem.eql(u8, s, "0") or std.mem.eql(u8, s, "no")) return false;
+    return true;
+}
+
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     // Embedded-doc composes a whole inner tree whose state can mutate
@@ -617,6 +684,13 @@ fn layoutAndRender(
     out: *element.DrawList,
 ) anyerror!element.Box {
     const c: *const Component = @ptrCast(@alignCast(ctx));
+
+    // Stage 10 — headless documents have no visual representation.
+    // The doc was still parsed at create-time (state populated, child
+    // components instantiated, auto_start streams fired); we just
+    // skip the layout walk and emit nothing. Zero-size box keeps
+    // surrounding stack_v layout collapse-friendly.
+    if (c.headless) return .{ .x = origin[0], .y = origin[1], .w = 0, .h = 0 };
 
     switch (c.phase) {
         .ready => {
@@ -822,4 +896,24 @@ test "freePending: releases all owned slices (testing-allocator leak check)" {
     };
     freePending(p);
     // testing.allocator will fail the test on any unfreed allocation.
+}
+
+test "parseBoolAttr: defaults + truthy/falsy parsing" {
+    const a = [_]components.Attr{
+        .{ .key = "on", .value = "true" },
+        .{ .key = "off", .value = "false" },
+        .{ .key = "zero", .value = "0" },
+        .{ .key = "no", .value = "no" },
+        .{ .key = "anything", .value = "yes" },
+        .{ .key = "presence", .value = "" }, // empty value still truthy
+    };
+    try testing.expectEqual(true, parseBoolAttr(&a, "on", false));
+    try testing.expectEqual(false, parseBoolAttr(&a, "off", true));
+    try testing.expectEqual(false, parseBoolAttr(&a, "zero", true));
+    try testing.expectEqual(false, parseBoolAttr(&a, "no", true));
+    try testing.expectEqual(true, parseBoolAttr(&a, "anything", false));
+    try testing.expectEqual(true, parseBoolAttr(&a, "presence", false));
+    // Missing key returns default.
+    try testing.expectEqual(true, parseBoolAttr(&a, "missing", true));
+    try testing.expectEqual(false, parseBoolAttr(&a, "missing", false));
 }

@@ -140,3 +140,24 @@ Same async I/O lane as `:::svg-stream`, but the data URL is a PNG — and the de
 
 :::image-stream {#fresh_image auto_start=false provider=openai endpoint=https://openrouter.ai/api/v1/chat/completions model=google/gemini-3.1-flash-image-preview api_key_env=OPENROUTER_DYNABOOK prompt="A friendly robot sitting at a wooden table, drinking a steaming mug of coffee. Soft natural lighting." max_tokens=4000 width=480}
 :::
+
+## Headless documents (stage 10)
+
+The block below is a `:::embedded-document` with `headless=true`. The
+referenced widget contains a heading, a paragraph, a quote block, and
+a 200px magenta `:::box` — none of which appear on screen. The doc is
+still **parsed**, the frontmatter still populates the child state, the
+`:::box` still gets instantiated and lives in the registry under
+`config/never_visible`, but `layoutAndRender` short-circuits before
+walking it. Use this shape for config docs, cache-warming widgets, or
+"model" docs whose state other (visible) docs observe.
+
+:::embedded-document {#config src="src/widgets/headless_config.md" headless=true}
+:::
+
+Click below to flip the flag at runtime through `handle_update` —
+the doc materialises (its full body + magenta box appear) and the
+surrounding stack-v re-flows to make room. Click again to hide it.
+
+:::button {#toggle_config label="Toggle headless config doc" target=#config action=toggle-headless}
+:::
