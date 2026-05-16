@@ -38,3 +38,5 @@ pub const expr = builder.expr;
 pub const ExprBuilder = builder.ExprBuilder;
 pub const PartialConstraint = builder.PartialConstraint;
 pub const BuilderError = builder.BuilderError;
+
+pub const Solver = @import("solver.zig").Solver;
