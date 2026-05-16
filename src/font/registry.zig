@@ -290,6 +290,32 @@ pub const FontRegistry = struct {
         return self.entries.items[id].actual_px;
     }
 
+    /// Eagerly populate `effectiveFontId(base, base.display_px × zoom)`
+    /// for every currently-loaded base entry. Call from the host's
+    /// runLayout BEFORE dispatching parallel-walker workers — once
+    /// the entries array stops growing, workers can read `scale`,
+    /// `actualPx`, `metrics`, `hbFont` etc. without locks. The
+    /// alternative (workers lazily creating entries themselves) has
+    /// three correctness problems: (1) ArrayList.append on `entries`
+    /// races other workers' slice reads; (2) HashMap.put on
+    /// `sized_lookup` races other workers' lookups; (3) FT_New_Face
+    /// against a shared FT_Library from worker threads — FT isn't
+    /// thread-safe by default. One main-thread prewarm sidesteps all
+    /// three.
+    ///
+    /// Snapshots the entry count up front so we don't iterate over
+    /// entries we lazily create during this very call.
+    pub fn prewarmEffectiveSizesForZoom(self: *FontRegistry, zoom: f32) !void {
+        const snapshot_len = self.entries.items.len;
+        var i: usize = 0;
+        while (i < snapshot_len) : (i += 1) {
+            const base = self.entries.items[i];
+            const target_f: f32 = @max(@as(f32, 1.0), @round(@as(f32, @floatFromInt(base.display_px)) * zoom));
+            const target_px: u32 = @intFromFloat(target_f);
+            _ = try self.effectiveFontId(@intCast(i), target_px);
+        }
+    }
+
     /// Does this font's cmap map `codepoint` to a real glyph? Used by
     /// the markdown parser to decide whether a text leaf needs to be
     /// split into mixed-font runs (typically: body font has Latin and

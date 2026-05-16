@@ -102,20 +102,26 @@ pub fn appendShapedRun(
     // source size (the distance field is zoom-independent); strike-
     // only colour fonts (emoji) also stay at the original strike.
     //
-    // `effectiveFontId` may grow `FontRegistry.entries` and
-    // `sized_lookup` on its lazy-create path, so a parallel-walker
-    // worker calling it concurrently with another worker would race
-    // the same arrays the cache lock already protects. Wrap it in
-    // the cache lock when one is supplied — fast path when it isn't.
+    // `effectiveFontId` can grow `FontRegistry.entries` on its lazy-
+    // create path → ArrayList realloc → the old `items` buffer is
+    // freed. A parallel-walker worker reading `actualPx` immediately
+    // after another worker triggered that realloc would dereference
+    // freed memory → segfault. So we hold the cache lock across BOTH
+    // the resolve and the metadata read (`actualPx`), keeping them
+    // atomic from the perspective of any other worker's grow path.
+    // The lock guards (FT slot + GlyphCache hashmap + Atlas packing
+    // + FontRegistry mutations) — same surface, same lock.
     const base_display_px = fonts.displayPx(font_id);
     const target_px: u32 = @intFromFloat(@max(@as(f32, 1.0), @round(@as(f32, @floatFromInt(base_display_px)) * zoom)));
-    const eff_id: registry_mod.FontId = blk: {
+    const eff_id: registry_mod.FontId, const eff_actual_px: u32 = blk: {
         if (glyph_cache_lock) |m| {
             m.lock();
             defer m.unlock();
-            break :blk try fonts.effectiveFontId(font_id, target_px);
+            const id = try fonts.effectiveFontId(font_id, target_px);
+            break :blk .{ id, fonts.actualPx(id) };
         }
-        break :blk try fonts.effectiveFontId(font_id, target_px);
+        const id = try fonts.effectiveFontId(font_id, target_px);
+        break :blk .{ id, fonts.actualPx(id) };
     };
 
     // World-space scale for everything that comes out of the EFFECTIVE
@@ -144,7 +150,7 @@ pub fn appendShapedRun(
     //     scales it on screen like the rest of the text.
     const eff_world_scale: f32 =
         @as(f32, @floatFromInt(base_display_px)) /
-        @as(f32, @floatFromInt(fonts.actualPx(eff_id)));
+        @as(f32, @floatFromInt(eff_actual_px));
 
     const mono_w: f32 = @floatFromInt(mono_atlas.extent.width);
     const mono_h: f32 = @floatFromInt(mono_atlas.extent.height);

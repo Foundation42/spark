@@ -229,6 +229,14 @@ const FrameCtx = struct {
     fn runLayout(self: *FrameCtx, extent: vk.c.VkExtent2D) !void {
         self.dl.clearRetainingCapacity();
 
+        // Crisp-zoom prewarm. Worker threads can't safely grow the
+        // FontRegistry (ArrayList realloc + HashMap put + shared
+        // FT_Library use all race against other workers' reads). One
+        // main-thread pass eagerly creates whatever effective entries
+        // the upcoming layout will need at this zoom; workers then
+        // only do read-only lookups against a frozen entries array.
+        try self.fonts.prewarmEffectiveSizesForZoom(self.zoom);
+
         var lc = element.LayoutCtx{
             .allocator = self.allocator,
             .fonts = self.fonts,
