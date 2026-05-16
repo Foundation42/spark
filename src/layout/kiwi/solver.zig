@@ -64,7 +64,20 @@ const ConstraintEntry = struct {
 
 const VarRecord = struct {
     name: ?[]const u8 = null,
+    /// Last-known cached value (updated by `updateVariables` /
+    /// `fetchChanges`).
     value: f64 = 0.0,
+    /// Value at the last `fetchChanges` call. Used to compute the
+    /// per-frame change set.
+    last_fetched_value: f64 = 0.0,
+};
+
+/// One entry in the change set returned by `fetchChanges`. The
+/// walker uses this to re-emit draw quads only for elements
+/// whose layout actually moved.
+pub const Change = struct {
+    variable: VariableId,
+    new_value: f64,
 };
 
 pub const Solver = struct {
@@ -96,6 +109,15 @@ pub const Solver = struct {
     /// Phase-1 artificial objective; present only during the
     /// `addWithArtificialVariable` window inside `addConstraint`.
     artificial: ?*Row = null,
+    /// Change set produced by `fetchChanges`. Cleared each call.
+    pub_changes: std.ArrayListUnmanaged(Change) = .{},
+    /// True between `beginEdit` and `commitEdit`. While true,
+    /// `suggestValue` skips its automatic `dualOptimize` so a
+    /// batch of edits can defer the restoration pass to commit.
+    in_edit: bool = false,
+    /// Last `InternalSolverError` reason, as a static string.
+    /// Cleared by `reset`. Surfaces via `lastInternalErrorMessage`.
+    last_internal_error: ?[]const u8 = null,
 
     pub fn init(alloc: std.mem.Allocator) std.mem.Allocator.Error!Solver {
         const obj = try alloc.create(Row);
@@ -136,6 +158,7 @@ pub const Solver = struct {
         self.var_symbols.deinit(self.alloc);
         self.edits.deinit(self.alloc);
         self.infeasible_rows.deinit(self.alloc);
+        self.pub_changes.deinit(self.alloc);
 
         self.objective.deinit(self.alloc);
         self.alloc.destroy(self.objective);
@@ -175,6 +198,7 @@ pub const Solver = struct {
         self.var_symbols.clearRetainingCapacity();
         self.edits.clearRetainingCapacity();
         self.infeasible_rows.clearRetainingCapacity();
+        self.pub_changes.clearRetainingCapacity();
 
         self.objective.deinit(self.alloc);
         self.objective.* = Row.init(0);
@@ -188,6 +212,8 @@ pub const Solver = struct {
         self.next_var_id = 1;
         self.next_constraint_id = 1;
         self.next_symbol_id = 1;
+        self.in_edit = false;
+        self.last_internal_error = null;
     }
 
     // ── Variable management ─────────────────────────────────────────
@@ -549,7 +575,10 @@ pub const Solver = struct {
                 }
             }
 
-            const idx = leaving_idx orelse return error.InternalSolverError;
+            const idx = leaving_idx orelse {
+                self.last_internal_error = "optimize: objective is unbounded — no valid leaving row";
+                return error.InternalSolverError;
+            };
 
             const leaving_sym = self.rows.keys()[idx];
             const kv = self.rows.fetchOrderedRemove(leaving_sym);
@@ -598,8 +627,10 @@ pub const Solver = struct {
             kv.value.deinit(self.alloc);
             self.alloc.destroy(kv.value);
         } else {
-            const idx = self.getMarkerLeavingRow(tag.marker) orelse
+            const idx = self.getMarkerLeavingRow(tag.marker) orelse {
+                self.last_internal_error = "removeConstraint: failed to find marker leaving row";
                 return error.InternalSolverError;
+            };
             const leaving_sym = self.rows.keys()[idx];
             const lkv = self.rows.fetchOrderedRemove(leaving_sym);
             std.debug.assert(lkv != null);
@@ -697,7 +728,10 @@ pub const Solver = struct {
             if (row_ptr.constant >= 0.0) continue; // already feasible
 
             const entering = self.getDualEnteringSymbol(row_ptr.*);
-            if (entering.isInvalid()) return error.InternalSolverError;
+            if (entering.isInvalid()) {
+                self.last_internal_error = "dualOptimize: no valid dual-entering symbol";
+                return error.InternalSolverError;
+            }
 
             const kv = self.rows.fetchOrderedRemove(leaving);
             std.debug.assert(kv != null);
@@ -816,12 +850,15 @@ pub const Solver = struct {
         };
 
         // RAII-style: always run dualOptimize so the tableau ends
-        // in a valid state. If dualOptimize itself fails, surface
-        // its error (the more specific one).
-        self.dualOptimize() catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.InternalSolverError => return error.InternalSolverError,
-        };
+        // in a valid state — except inside a beginEdit/commitEdit
+        // block, where the user is batching edits and commitEdit
+        // will run the restoration pass once at the end.
+        if (!self.in_edit) {
+            self.dualOptimize() catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InternalSolverError => return error.InternalSolverError,
+            };
+        }
 
         if (apply_err) |e| return e;
     }
@@ -874,6 +911,71 @@ pub const Solver = struct {
                 }
             }
         }
+    }
+
+    /// Returns the slice of variables whose value changed since
+    /// the last `fetchChanges` call (or, on the first call, since
+    /// the variable was added). The slice is owned by the solver
+    /// and only valid until the next mutation; copy it if you
+    /// need to hold on.
+    ///
+    /// This is the per-frame fast-read path: the walker re-emits
+    /// draw quads only for elements that moved, instead of
+    /// re-walking the whole document. Allocations are best-effort
+    /// — if the change buffer can't grow, the returned slice is
+    /// truncated. (Matches casuarius's `fetch_changes` no-error
+    /// contract.)
+    pub fn fetchChanges(self: *Solver) []const Change {
+        self.pub_changes.clearRetainingCapacity();
+        var it = self.variables.iterator();
+        while (it.next()) |entry| {
+            const var_id = entry.key_ptr.*;
+            const current: f64 = blk: {
+                if (self.var_symbols.get(var_id)) |sym| {
+                    if (self.rows.get(sym)) |row_ptr| break :blk row_ptr.constant;
+                }
+                break :blk 0.0;
+            };
+            entry.value_ptr.value = current;
+            if (current != entry.value_ptr.last_fetched_value) {
+                self.pub_changes.append(self.alloc, .{
+                    .variable = var_id,
+                    .new_value = current,
+                }) catch break; // best effort
+                entry.value_ptr.last_fetched_value = current;
+            }
+        }
+        return self.pub_changes.items;
+    }
+
+    // ── Edit batching ──────────────────────────────────────────────
+
+    /// Open a batch. Inside the batch, `suggestValue` skips its
+    /// automatic `dualOptimize`, so a sequence of edits costs one
+    /// restoration pass at `commitEdit` instead of N.
+    ///
+    /// Discipline: every `beginEdit` must pair with a
+    /// `commitEdit`. Nesting is undefined.
+    pub fn beginEdit(self: *Solver) void {
+        self.in_edit = true;
+    }
+
+    /// Close a batch — runs `dualOptimize` to restore feasibility
+    /// for all the deferred edits.
+    pub fn commitEdit(self: *Solver) errors.SuggestValueError!void {
+        self.in_edit = false;
+        self.dualOptimize() catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InternalSolverError => return error.InternalSolverError,
+        };
+    }
+
+    /// Diagnostic for the most recent `InternalSolverError`.
+    /// Returns null if no internal error has been raised since
+    /// the solver was created or reset. Static string; do not
+    /// free.
+    pub fn lastInternalErrorMessage(self: *const Solver) ?[]const u8 {
+        return self.last_internal_error;
     }
 };
 
@@ -1249,6 +1351,106 @@ test "repeated suggestValue updates incrementally (the per-frame path)" {
     try s.suggestValue(v, -5.0);
     s.updateVariables();
     try testing.expectApproxEqAbs(@as(f64, -5), s.value(v), 1e-9);
+}
+
+// ── fetchChanges / beginEdit / commitEdit / lastInternalErrorMessage ─
+
+test "fetchChanges: empty on a fresh solver" {
+    var s = try Solver.init(testing.allocator);
+    defer s.deinit();
+    const changes = s.fetchChanges();
+    try testing.expectEqual(@as(usize, 0), changes.len);
+}
+
+test "fetchChanges: returns changed variables after addConstraint" {
+    var s = try Solver.init(testing.allocator);
+    defer s.deinit();
+
+    const v = try s.addVariable("v");
+    const c = try expr(testing.allocator, v).eq(@as(f64, 42)).required();
+    _ = try buildAndAdd(&s, testing.allocator, c);
+
+    const changes = s.fetchChanges();
+    try testing.expectEqual(@as(usize, 1), changes.len);
+    try testing.expectEqual(v, changes[0].variable);
+    try testing.expectApproxEqAbs(@as(f64, 42), changes[0].new_value, 1e-9);
+}
+
+test "fetchChanges: a second call with no mutations returns empty" {
+    var s = try Solver.init(testing.allocator);
+    defer s.deinit();
+
+    const v = try s.addVariable(null);
+    const c = try expr(testing.allocator, v).eq(@as(f64, 7)).required();
+    _ = try buildAndAdd(&s, testing.allocator, c);
+
+    _ = s.fetchChanges(); // drain
+    const changes2 = s.fetchChanges();
+    try testing.expectEqual(@as(usize, 0), changes2.len);
+}
+
+test "fetchChanges: only the moved variables appear" {
+    var s = try Solver.init(testing.allocator);
+    defer s.deinit();
+
+    const a = try s.addVariable("a");
+    const b = try s.addVariable("b");
+
+    // Pin b at 2 (required). Leave a free — the edit will move it.
+    // (Pinning a at required would dominate the strong-strength
+    // edit and leave a unchanged; the edit must be the stronger
+    // force on the variable it targets.)
+    const c_b = try expr(testing.allocator, b).eq(@as(f64, 2)).required();
+    _ = try buildAndAdd(&s, testing.allocator, c_b);
+
+    _ = s.fetchChanges();
+
+    // Edit `a` to 99; `b` stays put.
+    try s.addEditVariable(a, strength_mod.strong);
+    try s.suggestValue(a, 99.0);
+
+    const changes = s.fetchChanges();
+    try testing.expectEqual(@as(usize, 1), changes.len);
+    try testing.expectEqual(a, changes[0].variable);
+    try testing.expectApproxEqAbs(@as(f64, 99), changes[0].new_value, 1e-9);
+}
+
+test "beginEdit/commitEdit: batched suggests apply at commit" {
+    // Inside a batch, dualOptimize is deferred; commitEdit runs
+    // it once. End state is the same as N un-batched calls.
+    var s = try Solver.init(testing.allocator);
+    defer s.deinit();
+
+    const a = try s.addVariable("a");
+    const b = try s.addVariable("b");
+
+    try s.addEditVariable(a, strength_mod.strong);
+    try s.addEditVariable(b, strength_mod.strong);
+
+    s.beginEdit();
+    try s.suggestValue(a, 11.0);
+    try s.suggestValue(b, 22.0);
+    try s.commitEdit();
+
+    s.updateVariables();
+    try testing.expectApproxEqAbs(@as(f64, 11), s.value(a), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 22), s.value(b), 1e-9);
+}
+
+test "lastInternalErrorMessage: null before any internal error" {
+    var s = try Solver.init(testing.allocator);
+    defer s.deinit();
+    try testing.expectEqual(@as(?[]const u8, null), s.lastInternalErrorMessage());
+}
+
+test "reset clears in_edit flag and error message" {
+    var s = try Solver.init(testing.allocator);
+    defer s.deinit();
+    s.beginEdit();
+    s.last_internal_error = "test";
+    s.reset();
+    try testing.expect(!s.in_edit);
+    try testing.expectEqual(@as(?[]const u8, null), s.lastInternalErrorMessage());
 }
 
 test "suggested value reflows dependent variables" {
