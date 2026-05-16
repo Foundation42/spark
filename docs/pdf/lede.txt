@@ -1,0 +1,20 @@
+There's a push right now to make LLMs default their output to HTML: richer presentation, denser information, "free" rendering inside a browser. My honest first reaction was that this is ridiculous.
+
+Markdown is the format humans and AI both read and write easily, that diffs cleanly in Git, that doesn't cost a third of your context window in closing tags. HTML is a specific presentation format that is hard to work with, generates wildly more tokens than the equivalent content needs, and small language models (and even some frontier ones under load) drop closing tags. HTML-as-LLM-output pulls the ladder up behind the only models that can afford the format. It reads as moat-building dressed as forward progress. Less charitably, it reads as the view of someone who's fallen in love with the browser as a viewer and stopped thinking about the rest of the ecosystem the format has to live in. LLMs can already emit HTML if you need it. CommonMark is already extensible enough to layer richer behaviour on top. And it'll be a nightmare for the platforms pushing it, too. Six months from now their own production models will start dropping closing tags under reasoning load.
+
+And here's the bit that actually gets me: just this week we watched Anthropic port nearly a million lines of Bun from Zig to Rust in 6-10 days using Mythos. If we're capable of that, this is exactly the moment to reinvent the stack for the AI era. Not the moment to lock the next generation of models into a legacy presentation format we already know is the wrong shape.
+
+For the last 13 sessions I've been building the bet the other way. A live-document runtime in Zig + Vulkan where markdown isn't a presentation format that gets rendered into something richer. It IS the substrate. The same surface a human authors is the form the runtime executes. It's also the surface LMs are most fluent in, and that's not a 2026 training data accident. Any comprehender useful to humans is going to end up fluent in the human-legible surface. One artifact, three readers, no translation layer between any pair.
+
+What's in: a CommonMark engine extended with `:::name {attrs}` blocks; a Vulkan-native renderer at 7,600 fps Release with three concurrent LLM streams, live SVG generation, raster generation, a 60Hz chart, and 1D/2D constraint-driven layout all in the same document; a pure-Zig port of Cassowary with a mutex-guarded layout context that a work-stealing parallel walker can negotiate against without racing.
+
+What's out: HTML in-band. JavaScript hydration. JSX/XAML/DOM as separate artifacts from their source. Viewer lock-in. ~20k LOC of our own Zig and GLSL, ~300 tests.
+
+What I've always wanted, personally, is the Hitchhiker's Guide to the Galaxy, or Alan Kay's Dynabook writ large, but with a flywheel where anyone is on equal terms to contribute. LLM-output-as-HTML is the opposite bet. It's regressive. And I think it's cowardly.
+
+LISP closed the gap between program text and program data. Markdown-as-runtime closes that gap and one more: the surface is the fixed point where author, runtime, and comprehender meet without translation. The format is the program; the program is the format; the parse is the build.
+
+Full position and roadmap in the attached PDF. Markdown is the universal interface. Make it live.
+
+Christian Beaumont
+Foundation42
