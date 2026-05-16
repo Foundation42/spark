@@ -27,6 +27,9 @@ test {
     _ = @import("jobs.zig");
     _ = @import("layout_cache.zig");
     _ = @import("layout/kiwi/strength.zig");
+    _ = @import("layout/kiwi/term.zig");
+    _ = @import("layout/kiwi/expression.zig");
+    _ = @import("layout/kiwi/constraint.zig");
     _ = @import("state.zig");
     _ = @import("svg.zig");
     _ = @import("svg_tessellate.zig");

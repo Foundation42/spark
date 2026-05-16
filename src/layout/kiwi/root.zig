@@ -28,3 +28,7 @@ pub const SuggestValueError = errors.SuggestValueError;
 
 pub const strength = @import("strength.zig");
 pub const Strength = strength.Strength;
+
+pub const Term = @import("term.zig").Term;
+pub const Expression = @import("expression.zig").Expression;
+pub const Constraint = @import("constraint.zig").Constraint;
