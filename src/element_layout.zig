@@ -384,7 +384,42 @@ fn layoutCodeBlock(
     out: *element.DrawList,
 ) !element.Box {
     switch (content) {
-        .sub_block => return error.CodeBlockSubBlockNotImplemented,
+        .sub_block => |sub| {
+            // Same chrome as `.raw` (background panel + padding +
+            // rounded corners) wrapped around a recursive
+            // `layoutAndRender` call. The embedded tree owns its own
+            // styles — typically produced by `ansi.parse` for ```ansi
+            // fences — so all this arm contributes is the panel and
+            // the constraint shrink.
+            const pad_x = ctx.theme.code_block_pad_x;
+            const pad_y = ctx.theme.code_block_pad_y;
+            const bg_idx = out.quads.items.len;
+            try out.quads.append(.{
+                .dst_pos = .{ origin[0], origin[1] },
+                .dst_size = .{ 0, 0 },
+                .color = ctx.theme.code_block_bg,
+                .radius = ctx.theme.code_block_radius,
+            });
+
+            const inner_origin: [2]f32 = .{ origin[0] + pad_x, origin[1] + pad_y };
+            const inner_constraints = shrinkConstraints(constraints, 2 * pad_x);
+            const inner_box = try layoutAndRender(sub.*, inner_origin, inner_constraints, ctx, out);
+
+            const total_h = inner_box.h + 2 * pad_y;
+            const total_w: f32 = if (std.math.isFinite(constraints.max_w))
+                constraints.max_w
+            else
+                inner_box.w + 2 * pad_x;
+            out.quads.items[bg_idx].dst_size = .{ total_w, total_h };
+
+            return .{
+                .x = origin[0],
+                .y = origin[1],
+                .w = total_w,
+                .h = total_h,
+                .baseline = 0,
+            };
+        },
         .raw => |r| {
             const pad_x = ctx.theme.code_block_pad_x;
             const pad_y = ctx.theme.code_block_pad_y;

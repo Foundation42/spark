@@ -44,6 +44,7 @@ const element = @import("element.zig");
 const components = @import("markdown_components.zig");
 const component_mod = @import("component.zig");
 const state_mod = @import("state.zig");
+const ansi = @import("ansi.zig");
 
 pub const cmark = @cImport({
     @cInclude("cmark.h");
@@ -275,10 +276,32 @@ fn mapBlock(
         },
 
         cmark.CMARK_NODE_CODE_BLOCK => {
-            // CMARK provides the fenced language via
-            // `cmark_node_get_fence_info` — when the ANSI engine
-            // lands (stage 5b) we'll dispatch on that to
-            // `CodeContent.sub_block`.
+            // Fence info is the language tag (```ansi ...). When set
+            // to `ansi`, hand the body to the ANSI parser and embed
+            // the resulting Element tree as `CodeContent.sub_block` —
+            // the layout walker recurses into it so live colours
+            // render inside the same code-block chrome that wraps
+            // raw text. Theme body swapped to `code_block` so SGR
+            // text picks up the mono font for terminal-like spacing.
+            const fence_info_ptr = cmark.cmark_node_get_fence_info(node);
+            const fence_info: []const u8 = if (fence_info_ptr != null)
+                std.mem.span(fence_info_ptr)
+            else
+                "";
+            if (std.mem.eql(u8, fence_info, "ansi")) {
+                const literal_ptr = cmark.cmark_node_get_literal(node);
+                const raw: []const u8 = if (literal_ptr != null)
+                    std.mem.span(literal_ptr)
+                else
+                    "";
+                const trimmed = std.mem.trimRight(u8, raw, "\n");
+                var ansi_theme = mc.theme.*;
+                ansi_theme.body = mc.theme.code_block;
+                const tree = try ansi.parse(mc.arena, trimmed, &ansi_theme);
+                const owned = try mc.arena.create(element.Element);
+                owned.* = tree;
+                return .{ .code_block = .{ .content = .{ .sub_block = owned } } };
+            }
             return try makePreformattedBlock(mc, node);
         },
 
@@ -487,4 +510,93 @@ fn appendInline(
 
         else => return error.UnsupportedNodeKind,
     }
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+test "ansi fence dispatches to ansi.parse and embeds as sub_block" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    // Parse-only test — never reaches the font registry, so stub
+    // font_ids of 0 are fine. Theme defaults fill in chrome fields.
+    const stub_style: element.Style = .{ .font_id = 0, .color = .{ 1, 1, 1, 1 } };
+    const theme: element.Theme = .{
+        .body = stub_style,
+        .heading = .{ stub_style, stub_style, stub_style, stub_style, stub_style, stub_style },
+        .code_block = stub_style,
+        .list_marker = stub_style,
+        .emphasis_font_id = 0,
+        .strong_font_id = 0,
+        .bold_italic_font_id = 0,
+        .code_inline_font_id = 0,
+    };
+
+    const source =
+        "Before fence.\n\n" ++
+        "```ansi\n" ++
+        "plain \x1B[31mred\x1B[0m back\n" ++
+        "```\n\n" ++
+        "After fence.\n";
+
+    const tree = try parse(arena, source, &theme, null);
+
+    try std.testing.expect(tree == .container);
+    const children = tree.container.children;
+    try std.testing.expectEqual(@as(usize, 3), children.len);
+
+    // Proof the ansi info-string was honored: middle child is a
+    // code_block whose content tag is .sub_block, not .raw.
+    try std.testing.expect(children[1] == .code_block);
+    try std.testing.expect(children[1].code_block.content == .sub_block);
+
+    // Embedded tree shape: container.stack_v of paragraphs.
+    const sub = children[1].code_block.content.sub_block.*;
+    try std.testing.expect(sub == .container);
+    const paras = sub.container.children;
+    try std.testing.expect(paras.len >= 1);
+    try std.testing.expect(paras[0] == .paragraph);
+
+    // SGR \x1B[31m sets foreground to palette index 1 — red
+    // (170/255, 0, 0). At least one text leaf must carry it.
+    var saw_red = false;
+    for (paras[0].paragraph) |leaf| {
+        if (leaf != .text) continue;
+        const c = leaf.text.style.color;
+        if (c[0] > 0.5 and c[1] < 0.1 and c[2] < 0.1) saw_red = true;
+    }
+    try std.testing.expect(saw_red);
+}
+
+test "non-ansi code fence stays raw" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const stub_style: element.Style = .{ .font_id = 0, .color = .{ 1, 1, 1, 1 } };
+    const theme: element.Theme = .{
+        .body = stub_style,
+        .heading = .{ stub_style, stub_style, stub_style, stub_style, stub_style, stub_style },
+        .code_block = stub_style,
+        .list_marker = stub_style,
+        .emphasis_font_id = 0,
+        .strong_font_id = 0,
+        .bold_italic_font_id = 0,
+        .code_inline_font_id = 0,
+    };
+
+    // Different language must NOT trigger the ANSI path — falls
+    // through to the existing preformatted handler.
+    const source =
+        "```zig\n" ++
+        "const x = 1;\n" ++
+        "```\n";
+
+    const tree = try parse(arena, source, &theme, null);
+    try std.testing.expect(tree == .container);
+    const children = tree.container.children;
+    try std.testing.expectEqual(@as(usize, 1), children.len);
+    try std.testing.expect(children[0] == .code_block);
+    try std.testing.expect(children[0].code_block.content == .raw);
 }

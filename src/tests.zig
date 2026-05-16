@@ -7,6 +7,7 @@
 //! Add new test-bearing files here as they land.
 
 test {
+    _ = @import("markdown.zig");
     _ = @import("markdown_components.zig");
     _ = @import("component.zig");
     _ = @import("components/box.zig");

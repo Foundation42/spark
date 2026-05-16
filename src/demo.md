@@ -40,6 +40,15 @@ fn render(elem: Element) !void {
 }
 ```
 
+A `​```ansi` fence (stage 5b) hands its body to the ANSI parser and embeds the result back as `CodeContent.sub_block` — the layout walker recurses, so SGR foreground colours render inside the same code-block chrome as raw fences:
+
+```ansi
+[1mtext_engine [32m✓[0m[0m  build [36mok[0m
+[31merror:[0m  out of [33mfuel[0m (recoverable)
+[38;5;141mloaded[0m  [1mglyph_cache[0m + [1matlas[0m + [1mshaper[0m
+[38;2;255;128;200mtruecolor[0m supported via SGR 38;2;R;G;B
+```
+
 ## Live components
 
 Block extensions parse into Specs, get resolved through a host-owned registry into cached instances, and survive across re-parses. Templated `${state.x}` attrs subscribe to state mutations through the reactive layer. The host's frame loop streams `:::update {target=state.box_color}` directives at 1.5s intervals — watch the box recolour through the same fast lane an LLM would use.
