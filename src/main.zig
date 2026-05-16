@@ -265,11 +265,18 @@ const FrameCtx = struct {
         var ansi_lc = lc;
         ansi_lc.theme = self.ansi_theme;
 
-        // 40px gutter on each side; clamp to a sane minimum so an
-        // accidentally-zero-width extent (minimised window) doesn't
-        // wrap every word to its own line forever.
+        // 40px gutter on each side (in WORLD coords — gutters scale
+        // with zoom alongside everything else, like a browser does);
+        // clamp to a sane minimum so an accidentally-zero-width
+        // extent (minimised window) doesn't wrap every word to its
+        // own line forever. The viewport itself is divided by zoom
+        // because layout runs in world coords and the post-pass
+        // `× zoom` then takes world → screen — so at zoom=2 the
+        // available world width is half the screen extent, and at
+        // zoom=0.5 it's double.
         const w: f32 = @floatFromInt(extent.width);
-        const max_w: f32 = @max(w - 80.0, 200.0);
+        const viewport_world_w: f32 = w / self.zoom;
+        const max_w: f32 = @max(viewport_world_w - 80.0, 200.0);
         const c: element.Constraints = .{ .max_w = max_w };
 
         // Layout in WORLD coordinates — no scroll/zoom applied here.
