@@ -3,9 +3,9 @@
 //! Stage 5a: static / batch-mode parser. Walks a UTF-8 + ANSI byte
 //! stream once, emits a `container.stack_v` of paragraphs — one per
 //! source line — with `text` leaves whose Style reflects the current
-//! SGR state (foreground colour + bold + italic). Same shape as
-//! `markdown.parse`, plugs into the engine through the existing
-//! Element contract.
+//! SGR state (foreground colour + bold + italic + underline +
+//! strikethrough + reverse). Same shape as `markdown.parse`, plugs
+//! into the engine through the existing Element contract.
 //!
 //! ### Provenance
 //!
@@ -30,12 +30,13 @@
 //!     irrelevant for batch-rendering static terminal output. The
 //!     parser still passes through these CSI finals silently.
 //!   * Alt-screen toggle / save+restore cursor / scroll region.
-//!   * Underline / strikethrough / reverse / hidden — visual support
-//!     needs theme + chrome work we haven't done. Bytes parse, flags
-//!     update on the state, but the produced Style ignores them for
-//!     now.
-//!   * Background colours — render path needs per-character quad
-//!     emission; defer to stage 5c+.
+//!   * Blink (5/25) and hidden (8/28) — parsed for stream sync but
+//!     not rendered. Blink would need a time channel; hidden is
+//!     rarely useful in static output.
+//!   * Background colours from SGR (40-47, 100-107, 48;5/2;…) —
+//!     parse cleanly but don't populate `Style.bg`. The
+//!     infrastructure is there (reverse uses it) but the SGR-driven
+//!     bg-set codes are deferred until a demand surfaces.
 //!   * OSC sequences — accept + discard.
 //!
 //! ### Stage 5b will add
@@ -138,6 +139,13 @@ const SgrState = struct {
     fg: ?[4]f32 = null,
     bold: bool = false,
     italic: bool = false,
+    underline: bool = false,
+    strikethrough: bool = false,
+    /// SGR 7 — inverse video. Resolved in `toStyle` by swapping the
+    /// run's fg with `theme.background` and emitting a bg quad in the
+    /// pre-swap fg. Independent of `fg`, so `\x1b[31;7m` (red reverse)
+    /// produces a red bg with page-bg text.
+    reverse: bool = false,
 
     /// Resolve the current state into a concrete Style by walking
     /// the same cascade helpers markdown's parser uses. Keeps font
@@ -147,6 +155,15 @@ const SgrState = struct {
         if (self.bold) s = theme.applyStrong(s);
         if (self.italic) s = theme.applyEmphasis(s);
         if (self.fg) |fg| s.color = fg;
+        s.underline = self.underline;
+        s.strikethrough = self.strikethrough;
+        if (self.reverse) {
+            // Swap fg ↔ bg. Pre-swap fg becomes the bg quad colour;
+            // text renders in `theme.background` for contrast.
+            s.bg = s.color;
+            s.color = theme.background;
+            s.reverse = true;
+        }
         return s;
     }
 };
@@ -377,10 +394,10 @@ pub const Parser = struct {
     }
 
     /// SGR (`ESC [ ... m`) — update the Builder's colour + style
-    /// flags. Same set of codes as `~/dev/ac/src/terminal_parser.zig`
-    /// minus the ones whose visual support we haven't built yet
-    /// (underline / strikethrough / reverse / hidden / background).
-    /// Those parse cleanly but don't update the produced Style.
+    /// flags. Bold / italic / underline / strikethrough / reverse all
+    /// produce visible output; blink (5/25), hidden (8/28), and
+    /// background colours (40-47, 100-107, 48;…) parse cleanly but
+    /// don't update the produced Style.
     fn handleSGR(self: *Parser, b: *Builder) !void {
         if (self.param_count == 0) {
             b.sgr = .{};
@@ -395,12 +412,19 @@ pub const Parser = struct {
                 0 => b.sgr = .{}, // reset
                 1 => b.sgr.bold = true,
                 3 => b.sgr.italic = true,
+                4 => b.sgr.underline = true,
+                7 => b.sgr.reverse = true,
+                9 => b.sgr.strikethrough = true,
                 21, 22 => b.sgr.bold = false,
                 23 => b.sgr.italic = false,
-                // Underline / strikethrough / blink / reverse /
-                // hidden — accepted to keep stream sync but no
-                // visual effect yet.
-                4, 5, 7, 8, 9, 24, 25, 27, 28, 29 => {},
+                24 => b.sgr.underline = false,
+                27 => b.sgr.reverse = false,
+                29 => b.sgr.strikethrough = false,
+                // Blink (5/25) and hidden (8/28) — parsed for stream
+                // sync, not rendered. Blink would need a time channel;
+                // hidden is rarely useful and trivially swappable for
+                // bg=fg if a real demand surfaces.
+                5, 8, 25, 28 => {},
 
                 // Standard foreground colours.
                 30...37 => b.sgr.fg = paletteColor(@intCast(code - 30)),
@@ -474,4 +498,132 @@ pub fn parse(
         .children = try b.paragraphs.toOwnedSlice(),
         .gap = 0,
     } };
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+/// Minimal parse-only theme — never reaches the font registry, so
+/// font_ids stay at 0. Same shape as markdown.zig's ansi-fence test.
+fn stubTheme() element.Theme {
+    const stub_style: element.Style = .{ .font_id = 0, .color = .{ 1, 1, 1, 1 } };
+    return .{
+        .body = stub_style,
+        .heading = .{ stub_style, stub_style, stub_style, stub_style, stub_style, stub_style },
+        .code_block = stub_style,
+        .list_marker = stub_style,
+        .emphasis_font_id = 0,
+        .strong_font_id = 0,
+        .bold_italic_font_id = 0,
+        .code_inline_font_id = 0,
+    };
+}
+
+/// Walk the first paragraph and find the first text leaf whose
+/// content equals `needle`. Returns its Style. Asserts existence.
+fn findTextStyle(tree: element.Element, needle: []const u8) !element.Style {
+    try testing.expect(tree == .container);
+    const paras = tree.container.children;
+    try testing.expect(paras.len >= 1);
+    try testing.expect(paras[0] == .paragraph);
+    for (paras[0].paragraph) |leaf| {
+        if (leaf != .text) continue;
+        if (std.mem.eql(u8, leaf.text.content, needle)) return leaf.text.style;
+    }
+    return error.NeedleNotFound;
+}
+
+test "SGR 4 (underline) sets style.underline; 24 clears it" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const theme = stubTheme();
+
+    const tree = try parse(arena, "x\x1B[4mY\x1B[24mZ", &theme);
+
+    const sx = try findTextStyle(tree, "x");
+    const sy = try findTextStyle(tree, "Y");
+    const sz = try findTextStyle(tree, "Z");
+    try testing.expect(!sx.underline);
+    try testing.expect(sy.underline);
+    try testing.expect(!sz.underline);
+}
+
+test "SGR 9 (strikethrough) sets style.strikethrough; 29 clears it" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const theme = stubTheme();
+
+    const tree = try parse(arena, "x\x1B[9mY\x1B[29mZ", &theme);
+
+    const sx = try findTextStyle(tree, "x");
+    const sy = try findTextStyle(tree, "Y");
+    const sz = try findTextStyle(tree, "Z");
+    try testing.expect(!sx.strikethrough);
+    try testing.expect(sy.strikethrough);
+    try testing.expect(!sz.strikethrough);
+}
+
+test "SGR 7 (reverse) swaps fg/bg; 27 clears it" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const theme = stubTheme();
+
+    // Red fg (\x1B[31m) followed by reverse (\x1B[7m): style.bg should
+    // be red, style.color should be theme.background.
+    const tree = try parse(arena, "x\x1B[31mY\x1B[7mZ\x1B[27mW", &theme);
+
+    const sy = try findTextStyle(tree, "Y");
+    const sz = try findTextStyle(tree, "Z");
+    const sw = try findTextStyle(tree, "W");
+
+    // Y: red fg, no reverse, no bg.
+    try testing.expect(!sy.reverse);
+    try testing.expect(sy.bg == null);
+    try testing.expect(sy.color[0] > 0.5 and sy.color[1] < 0.1);
+
+    // Z: reverse on → bg holds the pre-swap (red) fg, color holds
+    // theme.background.
+    try testing.expect(sz.reverse);
+    try testing.expect(sz.bg != null);
+    try testing.expect(sz.bg.?[0] > 0.5 and sz.bg.?[1] < 0.1);
+    try testing.expectEqual(theme.background, sz.color);
+
+    // W: reverse off → bg back to null, fg back to red.
+    try testing.expect(!sw.reverse);
+    try testing.expect(sw.bg == null);
+    try testing.expect(sw.color[0] > 0.5 and sw.color[1] < 0.1);
+}
+
+test "SGR 0 (reset) clears underline + strikethrough + reverse together" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const theme = stubTheme();
+
+    const tree = try parse(arena, "\x1B[4;9;7mX\x1B[0mY", &theme);
+
+    const sx = try findTextStyle(tree, "X");
+    const sy = try findTextStyle(tree, "Y");
+
+    try testing.expect(sx.underline and sx.strikethrough and sx.reverse);
+    try testing.expect(!sy.underline and !sy.strikethrough and !sy.reverse);
+    try testing.expect(sy.bg == null);
+}
+
+test "combined SGR 1;4;31 sets bold + underline + red" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const theme = stubTheme();
+
+    const tree = try parse(arena, "\x1B[1;4;31mhit\x1B[0m", &theme);
+
+    const s = try findTextStyle(tree, "hit");
+    try testing.expect(s.strong);
+    try testing.expect(s.underline);
+    try testing.expect(s.color[0] > 0.5 and s.color[1] < 0.1);
 }

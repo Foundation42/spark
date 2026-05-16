@@ -1185,6 +1185,46 @@ const LineMetrics = struct {
     line_height: f32,
 };
 
+/// Per-line decoration tracker. Walks the line's atoms left-to-right
+/// and accumulates a contiguous span (start_x .. end_x) sharing some
+/// style attribute (underline, strikethrough, run background). The
+/// span closes into a single quad when the attribute switches off;
+/// `max_px` carries the run's dominant `displayPx` so emit
+/// thickness/offset scale to the largest font in the span.
+const DecorationRun = struct {
+    start_x: f32 = 0,
+    active: bool = false,
+    max_px: u32 = 0,
+    color: [4]f32 = .{ 0, 0, 0, 0 },
+
+    /// Advance the tracker for one atom. Returns true when a run
+    /// just closed — the caller reads the still-populated fields and
+    /// emits the quad.
+    fn step(self: *DecorationRun, on: bool, x: f32, px: u32, color: [4]f32) bool {
+        if (on) {
+            if (!self.active) {
+                self.start_x = x;
+                self.active = true;
+                self.max_px = px;
+                self.color = color;
+            } else if (px > self.max_px) {
+                self.max_px = px;
+            }
+            return false;
+        }
+        const was_active = self.active;
+        self.active = false;
+        return was_active;
+    }
+
+    /// Force-close at end of line — a run reaching the trailing edge.
+    fn flush(self: *DecorationRun) bool {
+        const was_active = self.active;
+        self.active = false;
+        return was_active;
+    }
+};
+
 /// Place one line's worth of shaped atoms at the resolved baseline.
 /// First pass: max(ascender) + max(line_height) across the line —
 /// Makepad-style row finish that gives mixed-size content a shared
@@ -1217,36 +1257,66 @@ fn emitLine(
     }
     const baseline_y = y + max_asc;
 
-    // Underline-run tracker. Each link in the source produces atoms
-    // with `style.link == true`; we track contiguous runs on this
-    // line and emit one underline quad per run after we know its
-    // x-extent. A link wrapping across a line break naturally gets
-    // one quad per line because emit_line runs once per line.
+    // Three decoration trackers: underline (markdown link OR ANSI
+    // SGR 4), strikethrough (ANSI SGR 9), and run background (ANSI
+    // SGR 7 reverse; future stage hooks ANSI bg-set codes through
+    // the same field). Each closes into one quad per contiguous run;
+    // a span wrapping across a line break naturally gets one quad
+    // per line because emitLine runs once per line.
     //
-    // `run_max_px` is the dominant displayPx in the current run, so
-    // the underline thickness/offset scale to the largest font in
-    // the link span (mixed-size links are rare but possible — heading
-    // links, link-around-a-strong, etc).
+    // Emit order on close: bg first (broadest, lowest layer), then
+    // underline + strikethrough on top. Glyphs draw last via the
+    // text pipeline, so per-quad submission order only ranks the
+    // chrome relative to itself.
+    var underline_run = DecorationRun{};
+    var strike_run = DecorationRun{};
+    var bg_run = DecorationRun{};
     var x = pen_x;
-    var run_start_x: ?f32 = null;
-    var run_max_px: u32 = 0;
-    var run_color: [4]f32 = .{ 0, 0, 0, 0 };
+    const line_top = baseline_y - max_asc;
 
     for (line_tokens) |tok| {
         const atom = tokenAtom(tok) orelse continue;
+        const px = ctx.fonts.displayPx(atom.style.font_id);
 
-        if (atom.style.link) {
-            if (run_start_x == null) {
-                run_start_x = x;
-                run_max_px = ctx.fonts.displayPx(atom.style.font_id);
-                run_color = atom.style.color;
-            } else {
-                const px = ctx.fonts.displayPx(atom.style.font_id);
-                if (px > run_max_px) run_max_px = px;
-            }
-        } else if (run_start_x) |start_x| {
-            try emitUnderline(out, ctx.theme, start_x, x, baseline_y, run_max_px, run_color);
-            run_start_x = null;
+        if (bg_run.step(
+            atom.style.bg != null,
+            x,
+            px,
+            atom.style.bg orelse .{ 0, 0, 0, 0 },
+        )) {
+            try emitBgQuad(out, bg_run.start_x, x, line_top, max_lh, bg_run.color);
+        }
+        if (underline_run.step(
+            atom.style.link or atom.style.underline,
+            x,
+            px,
+            atom.style.color,
+        )) {
+            try emitUnderline(
+                out,
+                ctx.theme,
+                underline_run.start_x,
+                x,
+                baseline_y,
+                underline_run.max_px,
+                underline_run.color,
+            );
+        }
+        if (strike_run.step(
+            atom.style.strikethrough,
+            x,
+            px,
+            atom.style.color,
+        )) {
+            try emitStrikethrough(
+                out,
+                ctx.theme,
+                strike_run.start_x,
+                x,
+                baseline_y,
+                strike_run.max_px,
+                strike_run.color,
+            );
         }
 
         x = try text_layout.appendShapedRun(
@@ -1267,9 +1337,32 @@ fn emitLine(
         );
     }
 
-    // Trailing run — a link that reaches the end of the line.
-    if (run_start_x) |start_x| {
-        try emitUnderline(out, ctx.theme, start_x, x, baseline_y, run_max_px, run_color);
+    // Trailing flushes — runs reaching the line's trailing edge.
+    // Same order as the in-loop emits: bg first, then decorations.
+    if (bg_run.flush()) {
+        try emitBgQuad(out, bg_run.start_x, x, line_top, max_lh, bg_run.color);
+    }
+    if (underline_run.flush()) {
+        try emitUnderline(
+            out,
+            ctx.theme,
+            underline_run.start_x,
+            x,
+            baseline_y,
+            underline_run.max_px,
+            underline_run.color,
+        );
+    }
+    if (strike_run.flush()) {
+        try emitStrikethrough(
+            out,
+            ctx.theme,
+            strike_run.start_x,
+            x,
+            baseline_y,
+            strike_run.max_px,
+            strike_run.color,
+        );
     }
 
     return .{ .baseline = baseline_y, .line_height = max_lh };
@@ -1296,6 +1389,53 @@ fn emitUnderline(
     try out.quads.append(.{
         .dst_pos = .{ x0, baseline_y + offset },
         .dst_size = .{ x1 - x0, thickness },
+        .color = color,
+        .radius = 0,
+    });
+}
+
+/// Emit one strikethrough quad spanning `[x0, x1]` at the given
+/// baseline. Sits *above* baseline at `theme.strikethrough_offset_em`
+/// (typically ~26% of em → through the middle of x-height); thickness
+/// clamped to >= 1px.
+fn emitStrikethrough(
+    out: *element.DrawList,
+    theme: *const element.Theme,
+    x0: f32,
+    x1: f32,
+    baseline_y: f32,
+    run_px: u32,
+    color: [4]f32,
+) !void {
+    if (x1 <= x0) return;
+    const px_f: f32 = @floatFromInt(run_px);
+    const thickness = @max(1.0, px_f * theme.strikethrough_thickness_em);
+    const offset = px_f * theme.strikethrough_offset_em;
+    try out.quads.append(.{
+        .dst_pos = .{ x0, baseline_y - offset },
+        .dst_size = .{ x1 - x0, thickness },
+        .color = color,
+        .radius = 0,
+    });
+}
+
+/// Emit one background quad spanning `[x0, x1]` × the line's
+/// vertical extent. Used by ANSI reverse-video runs (and future
+/// ANSI bg-set codes) — colour comes from the run's `style.bg`.
+/// Drawn first in submission order so underline + strikethrough +
+/// glyphs layer on top.
+fn emitBgQuad(
+    out: *element.DrawList,
+    x0: f32,
+    x1: f32,
+    line_top: f32,
+    line_height: f32,
+    color: [4]f32,
+) !void {
+    if (x1 <= x0) return;
+    try out.quads.append(.{
+        .dst_pos = .{ x0, line_top },
+        .dst_size = .{ x1 - x0, line_height },
         .color = color,
         .radius = 0,
     });

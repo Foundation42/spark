@@ -42,13 +42,15 @@ fn render(elem: Element) !void {
 }
 ```
 
-A `​```ansi` fence (stage 5b) hands its body to the ANSI parser and embeds the result back as `CodeContent.sub_block` — the layout walker recurses, so SGR foreground colours render inside the same code-block chrome as raw fences:
+A `​```ansi` fence (stage 5b) hands its body to the ANSI parser and embeds the result back as `CodeContent.sub_block` — the layout walker recurses, so SGR foreground colours, **bold**, *italic*, underline (4/24), strikethrough (9/29), and reverse video (7/27) all render inside the same code-block chrome as raw fences:
 
 ```ansi
 [1mtext_engine [32m✓[0m[0m  build [36mok[0m
 [31merror:[0m  out of [33mfuel[0m (recoverable)
 [38;5;141mloaded[0m  [1mglyph_cache[0m + [1matlas[0m + [1mshaper[0m
 [38;2;255;128;200mtruecolor[0m supported via SGR 38;2;R;G;B
+[4munderline[24m + [9mstrikethrough[29m + [7mreverse video[27m
+[1;4;36mbold underline cyan[0m, [31;9mred strike[0m, [7;33myellow reverse[0m
 ```
 
 ## Live components

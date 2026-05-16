@@ -778,6 +778,34 @@ keyed by `(font, glyph, target_px)`. See the "Shipped — crisp zoom
 ~10k fps Release with active scroll/zoom + all of 8a/8b/9/11
 running.
 
+## Shipped — ANSI underline + strikethrough + reverse
+
+The parked SGR visuals from session-10-era backlog. The link
+underline emit path generalised into a `DecorationRun` tracker
+that closes a span on attribute-off and emits one quad per
+contiguous run. Three trackers run side by side in `emitLine` —
+underline (markdown link OR ANSI SGR 4), strikethrough (SGR 9),
+and run background (SGR 7 reverse; future SGR bg-set codes share
+the field).
+
+`Style` gained `underline` / `strikethrough` / `reverse` / `bg`
+fields; `Theme` gained `strikethrough_thickness_em` /
+`strikethrough_offset_em` (matching the `link_underline_*_em`
+shape) and `background` (page-bg colour for reverse-mode contrast
+text, defaulting to the renderer's `clear_color`). SGR 4 / 9 / 7
+set the flags; 24 / 29 / 27 clear them; SGR 0 reset clears all
+three. SgrState's `toStyle` performs the reverse swap: pre-swap
+fg → `Style.bg`, theme background → `Style.color`. Same
+`Style.bg` field will land the parked ANSI bg-set codes when a
+demand surfaces.
+
+Demo: the `​```ansi` fence in `demo.md` gained two lines exercising
+all three plus combined modes (bold + underline + cyan, red +
+strike, yellow + reverse). 5 unit tests in `ansi.zig` covering
+set / clear / SGR-0 reset / combined SGR. ~120 LOC across
+`element.zig`, `ansi.zig`, `element_layout.zig`, `demo.md`,
+`tests.zig`.
+
 ## Next — constraint layout substrate (stage 15)
 
 The next architectural-tier expansion. Brainstormed late session 10,
@@ -868,12 +896,11 @@ land before then.
 Now that stage 4 shipped quad / line primitives, these get
 unblocked:
 
-- **ANSI underline + strikethrough + reverse** — SGR parses them,
-  Style flags exist; needs the quad/line emit path that link
-  underlines pioneered.
-- **ANSI background colours** — per-character quad emission
-  during inline-flow emit. Possible now but moderate
-  engineering.
+- **ANSI background colours (SGR 40-47 / 100-107 / 48;…)** — bg-
+  quad emission infrastructure landed with reverse video; the
+  remaining work is wiring the SGR bg-set codes into
+  `SgrState.bg` (currently parsed-and-discarded). Trivial once a
+  demand surfaces.
 
 ## Parked — naming
 

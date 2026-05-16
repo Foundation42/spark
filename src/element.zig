@@ -73,6 +73,27 @@ pub const Style = struct {
     /// override at apply time; future stage adds underline via
     /// fx_kind and hover state.
     link: bool = false,
+
+    /// ANSI / SGR decoration. Underline draws below baseline using
+    /// `theme.link_underline_*_em`; same emit path as `link` runs.
+    /// Independent so an ANSI run can be underlined without being a
+    /// hyperlink.
+    underline: bool = false,
+    /// Horizontal line through the middle of the x-height, sized via
+    /// `theme.strikethrough_*_em`. Same per-run emit pattern as
+    /// underline.
+    strikethrough: bool = false,
+    /// Inverse video. Triggers a background quad in the run's `color`
+    /// and forces text to render in `theme.background` for contrast.
+    /// `bg` (below) is the canonical place to express the resulting
+    /// background colour; the inline-flow walker emits one bg quad
+    /// per contiguous run.
+    reverse: bool = false,
+    /// Optional run background colour. Drawn as a quad behind the
+    /// glyphs in the inline-flow walker. Used by `reverse` and (later)
+    /// by ANSI background-colour SGR codes (40-47, 100-107, 48;…).
+    /// `null` means no background quad — the default.
+    bg: ?[4]f32 = null,
 };
 
 /// How a `container` element arranges its children. Stage 1 ships
@@ -473,6 +494,21 @@ pub const Theme = struct {
     /// 10% sits comfortably in the descender zone without colliding
     /// with descenders on most Latin fonts.
     link_underline_offset_em: f32 = 0.10,
+
+    /// Strikethrough thickness as a fraction of em. Matches the
+    /// underline default — both are decoration lines and read better
+    /// when they share weight.
+    strikethrough_thickness_em: f32 = 0.06,
+    /// Strikethrough offset *above* baseline (positive value), as a
+    /// fraction of em. ~26% sits through the middle of x-height for
+    /// most Latin fonts.
+    strikethrough_offset_em: f32 = 0.26,
+
+    /// Page background colour the inline-flow walker uses for
+    /// contrast text under `style.reverse`. Defaults match the
+    /// renderer's `clear_color` (`gpu/renderer.zig`) so reverse-mode
+    /// glyphs disappear cleanly into the page when no SGR fg was set.
+    background: [4]f32 = .{ 0.04, 0.04, 0.07, 1.0 },
 
     // ── Layout constants the walker reads ───────────────────────────
     list_marker_indent: f32 = 8,
