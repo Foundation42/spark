@@ -385,10 +385,15 @@ fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) 
     // guarantees an initial layout before the first draw.
     const extent_changed = extent.width != fc.last_extent.width or extent.height != fc.last_extent.height;
     if (extent_changed or fc.state.dirty) {
-        fc.runLayout(extent) catch {
+        fc.runLayout(extent) catch |err| {
             // SsboOverflow / AtlasFull etc. — drop this frame quietly.
-            // A production path would surface this; for the demo we
-            // never approach the caps so it shouldn't fire.
+            // Surface the first occurrence so silent failures aren't
+            // invisible. (Stage 10: shouldn't fire in practice; bump
+            // ATLAS_MONO_SIZE or add eviction if it does.)
+            if (!fc.glyph_overflow_logged) {
+                std.debug.print("WARN: runLayout failed ({s}) at zoom={d:.3}, extent={d}x{d}\n", .{ @errorName(err), fc.zoom, extent.width, extent.height });
+                fc.glyph_overflow_logged = true;
+            }
             return;
         };
         fc.last_extent = extent;

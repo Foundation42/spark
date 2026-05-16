@@ -223,23 +223,32 @@ pub const FontRegistry = struct {
         const key = SizedKey{ .base = base, .target_px = target_px };
         if (self.sized_lookup.get(key)) |id| return id;
 
-        const path = base_entry.file_path orelse return base; // can't reopen without path
-        // Reopen the same TTF as a fresh entry at `target_px`. SDF
-        // entries keep their fixed source size — re-rastering an SDF
-        // at a different texel resolution doesn't make it "crisper",
-        // the distance field already covers any display size. Same
-        // base id maps onto itself at the request.
-        const lane_choice: Lane = if (base_entry.lane == .sdf) .sdf else .mono;
-        const request_px: u32 = if (base_entry.lane == .sdf) SDF_SOURCE_PX else target_px;
-        if (base_entry.lane == .sdf) {
-            // SDF source resolution is fixed; the layout pass already
-            // scales the dst rect to the display size. Memoise the
-            // base id under this key so we don't keep retrying.
-            try self.sized_lookup.put(key, base);
-            return base;
+        // Lanes whose bitmaps are intrinsically zoom-independent return
+        // `base` unchanged — re-opening at a different `display_px`
+        // would produce a duplicate atlas-eating entry with the SAME
+        // rasterised pixels, just keyed differently:
+        //
+        //   * **SDF** — distance field already covers any display size;
+        //     `face.actual_px` is pinned at `SDF_SOURCE_PX`.
+        //   * **Strike-only colour** (CBDT/sbix emoji) — `actual_px` is
+        //     the only available strike (e.g. 136 for NotoColorEmoji);
+        //     `setPixelSize(target_px)` falls back to that strike no
+        //     matter what `target_px` is asked for. A new entry would
+        //     register a duplicate 136² bitmap per glyph per zoom step
+        //     and rapidly fill the colour atlas with redundant data.
+        //
+        // Memoise `base` against the key so we don't repeat the
+        // lane-classification work next time the same target comes in.
+        switch (base_entry.lane) {
+            .sdf, .color => {
+                try self.sized_lookup.put(key, base);
+                return base;
+            },
+            .mono => {},
         }
 
-        const new_id = try self.loadInner(path.ptr, target_px, request_px, lane_choice);
+        const path = base_entry.file_path orelse return base; // can't reopen without path
+        const new_id = try self.loadInner(path.ptr, target_px, target_px, .mono);
         try self.sized_lookup.put(key, new_id);
         return new_id;
     }
