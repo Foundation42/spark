@@ -43,51 +43,32 @@
 //! Both are deferred because the smell is isolated to this one
 //! file. Captured in journey-session-5.md.
 //!
-//! ### Remote sources (stage 11 / 12)
+//! ### Source schemes
 //!
 //! `src=` may be:
 //!
 //!   * A filesystem path (`"src/widgets/foo.md"`, or absolute) — read
 //!     via `std.fs.cwd().readFileAlloc`, no caching (filesystem is
 //!     fast enough that re-reads aren't worth tracking). Synchronous.
-//!   * An HTTP(S) URL (`"http://127.0.0.1:8080/foo.md"`,
-//!     `"https://gist.githubusercontent.com/..."`) — fetched
-//!     **asynchronously** via the host's [`IoChannel`](../io_channel.zig)
-//!     and cached in a module-level `url_cache` keyed by URL string.
-//!     Cache lifetime is program lifetime; `deinitGlobals()` frees
-//!     it at host shutdown. Until the fetch lands, the Component
-//!     renders a small "loading…" placeholder.
 //!   * A `file://` URL — equivalent to the filesystem path of the
 //!     URL's path component. Convenience for authors who want to
 //!     write all `src=`s in URL form for consistency.
+//!   * An HTTP(S) URL (`"http://127.0.0.1:8080/foo.md"`,
+//!     `"https://gist.githubusercontent.com/..."`) — handled by the
+//!     opt-in extras module `src/extras/embedded_document_http.zig`.
+//!     When `spark.embedded_http != null`, core delegates the URL
+//!     branch to it: per-Spark URL→bytes cache, async `IoChannel`
+//!     fetch on cache miss, `.loading` / `.failed` placeholder
+//!     rendering. Without the extras module installed, URL src=
+//!     hits return `error.HttpEmbeddedDocumentRequiresExtras` at
+//!     create-time — loud failure rather than silent truncation.
 //!
-//! HTTPS uses Zig's std.crypto.tls — the system trust store is
-//! loaded on first use. Failures (network, 4xx/5xx, TLS handshake)
-//! flip the Component into `.failed`, which renders a red "fetch
-//! failed" placeholder. Loud but recoverable; recreate the spec
-//! (e.g. by changing the `#id`) to retry.
-//!
-//! ### Async lifecycle (stage 12)
-//!
-//! A URL fetch that misses the cache goes through three phases:
-//!
-//!   1. **create**: build a Component shell (allocator, arena,
-//!      child_state with parent), apply parent overlays, mark
-//!      `phase = .loading`, snapshot overlays + scope into a
-//!      heap-allocated [`PendingFetch`], submit an `IoChannel`
-//!      job with the Pending pointer as `user_data`.
-//!   2. **draining** (main thread, per-frame): once the worker
-//!      posts a Completion, [`handleCompletion`] parses the body,
-//!      caches it, swaps the Component to `.ready`, and bubbles
-//!      `state.dirty` so the renderer re-lays out next frame.
-//!   3. **cancellation**: if the Component is destroyed before the
-//!      fetch lands (e.g. registry GC swept it after the parent
-//!      re-parsed without referencing it), `deinit_` nulls the
-//!      `PendingFetch.component` slot. The completion handler sees
-//!      the null, frees the body + Pending, returns.
-//!
-//! Lifetime of `PendingFetch` is owned by the completion handler;
-//! the Component holds a pointer to it for cancellation only.
+//! `PendingFetch`, `Component`, `OverlayKV`, `fulfillFromBytes*`,
+//! and `applyParentOverlays` are exposed `pub` because the extras
+//! `EmbeddedDocumentHttp.submit` / `handleCompletion` drive the
+//! same shape as the sync path. Data type definitions stay in core
+//! so the `pending: ?*PendingFetch` back-reference on `Component`
+//! doesn't need an opaque-pointer detour.
 //!
 //! ### Interactive components inside embedded docs (not supported)
 //!
@@ -124,37 +105,17 @@ pub const Error = error{
     EmbeddedDocumentMissingSrc,
     EmbeddedDocumentNotInstalled,
     EmbeddedDocumentReadFailed,
+    /// URL src= without the `embedded_document_http` extras module
+    /// installed on this Spark. Install with
+    /// `spark.extras.embedded_document_http.install(&spark)` before
+    /// loading documents that reference http:// or https:// sources.
+    HttpEmbeddedDocumentRequiresExtras,
 };
-
-/// Allocator used for the URL cache; same as the spark's
-/// allocator. Captured at install() time so cache lookups don't
-/// need to thread an allocator everywhere.
-var cache_allocator: ?std.mem.Allocator = null;
-/// URL → fetched bytes cache. Lazily initialised on first remote
-/// fetch. Entries persist for the program lifetime; `deinitGlobals()`
-/// frees them. Keyed by URL string (also duped into the allocator).
-var url_cache: std.StringHashMapUnmanaged([]const u8) = .{};
 
 /// One-time install. Call after registering all the other factories
 /// — keeps the dependency on the rest of the registry explicit.
 pub fn install(spark: *spark_mod.Spark) !void {
-    cache_allocator = spark.allocator;
     try spark.registry.register("embedded-document", factory);
-}
-
-/// Free the URL cache. Host calls this at shutdown after
-/// `registry.deinit()`. Idempotent (safe to call when no remote
-/// loads ever happened).
-pub fn deinitGlobals() void {
-    const a = cache_allocator orelse return;
-    var it = url_cache.iterator();
-    while (it.next()) |entry| {
-        a.free(entry.key_ptr.*);
-        a.free(entry.value_ptr.*);
-    }
-    url_cache.deinit(a);
-    url_cache = .{};
-    cache_allocator = null;
 }
 
 pub const factory: component_mod.Factory = .{
@@ -164,7 +125,7 @@ pub const factory: component_mod.Factory = .{
     .handle_update = handleUpdate,
 };
 
-const Phase = enum {
+pub const Phase = enum {
     /// `root` is a parsed Element tree; layoutAndRender delegates to it.
     ready,
     /// Awaiting an in-flight async fetch; layoutAndRender renders a
@@ -175,27 +136,29 @@ const Phase = enum {
     failed,
 };
 
-const OverlayKV = struct {
+pub const OverlayKV = struct {
     key: []u8,
     value: []u8,
 };
 
-/// Heap-allocated request-side context. The Component holds a
-/// pointer to it (for cancellation). The completion handler owns
-/// its lifetime — frees it after applying or discarding the result.
-const PendingFetch = struct {
-    /// Polymorphic completion header (stage 13d.3). Host's drain
-    /// loop dispatches via `header.handle_completion`. Must be the
-    /// first field; `user_data` is `@intFromPtr(&pending)` and the
-    /// host reads the first usize.
-    header: io.PendingHeader = .{ .handle_completion = handleCompletion },
+/// Heap-allocated request-side context for the async URL branch.
+/// The Component holds a pointer to it (for cancellation). The
+/// extras `EmbeddedDocumentHttp.handleCompletion` owns its lifetime
+/// — frees it after applying or discarding the result. The type is
+/// `pub` because extras allocates + populates it from outside core,
+/// but no HTTP-specific operations live here. `header.handle_completion`
+/// is set by the extras submit path to point at its completion
+/// dispatcher — core never sets this default.
+pub const PendingFetch = struct {
+    /// Polymorphic completion header. Host's drain loop dispatches via
+    /// `header.handle_completion`. Must be the first field; `user_data`
+    /// is `@intFromPtr(&pending)` and the host reads the first usize.
+    header: io.PendingHeader,
     allocator: std.mem.Allocator,
     /// Set to null by `deinit_` if the Component is destroyed while
     /// the fetch is in flight.
     component: ?*Component,
-    /// Borrowed slice into the IoChannel's `next_handle` epoch —
-    /// retained here for diagnostics. Not used for routing (the
-    /// pointer round-trip in user_data does that).
+    /// Retained for diagnostics; not used for routing.
     handle: io.Handle,
     /// Owned by Pending. Duped at submit time so we can cache the
     /// body keyed by URL when it lands.
@@ -205,12 +168,13 @@ const PendingFetch = struct {
     /// frontmatter, preserving the parent-wins rule).
     overlays: []OverlayKV,
     /// Snapshot of the spark pointer so the completion handler can
-    /// release the io-channel-owned body and bump host_state.dirty
-    /// even after the Component itself has been destroyed.
+    /// release the io-channel-owned body, bump host_state.dirty, and
+    /// reach the EmbeddedDocumentHttp's url_cache even after the
+    /// Component itself has been destroyed.
     spark: *spark_mod.Spark,
 };
 
-const Component = struct {
+pub const Component = struct {
     allocator: std.mem.Allocator,
     /// Owns the child Element tree's arena.
     arena: *std.heap.ArenaAllocator,
@@ -283,27 +247,20 @@ fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const co
     };
 
     // ── Scheme dispatch ─────────────────────────────────────────────
-    // Local file or cached URL: synchronous path. Cache-miss URL:
-    // kick off an async fetch, leave the Component in .loading.
+    // file:// + bare paths are core (synchronous). http:// + https://
+    // require the `embedded_document_http` extras module — when
+    // installed, `spark.embedded_http != null` and we delegate the
+    // entire URL lifecycle (cache hit OR async fetch) to it.
     const is_url = std.mem.startsWith(u8, src_path, "http://") or std.mem.startsWith(u8, src_path, "https://");
 
     if (is_url) {
-        if (url_cache.get(src_path)) |cached| {
-            try fulfillFromBytes(c, cached, spec);
-            return .{ .vtable = &vtable, .ctx = @ptrCast(c) };
-        }
-        // Apply parent overlays NOW so an `update()` call that lands
-        // before the completion sees a coherent child_state. Frontmatter
-        // is applied later by the completion handler, then overlays
-        // re-applied (so parent still wins on conflict).
-        try applyParentOverlays(child_state, spec);
-        try submitAsyncFetch(c, src_path, spec);
+        const ext = spark.embedded_http orelse return error.HttpEmbeddedDocumentRequiresExtras;
+        try ext.submit(c, src_path, spec);
         return .{ .vtable = &vtable, .ctx = @ptrCast(c) };
     }
 
-    // Filesystem path (raw or file://): keep the synchronous flow —
-    // local reads are fast and the loading-state machinery isn't
-    // worth the complexity here.
+    // Filesystem path (raw or file://): synchronous — local reads are
+    // fast and the loading-state machinery isn't worth the complexity.
     const source = readLocal(allocator, src_path) catch
         return error.EmbeddedDocumentReadFailed;
     defer allocator.free(source);
@@ -313,9 +270,9 @@ fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const co
 
 /// Shared finalisation: takes a Component shell and a source
 /// buffer, applies frontmatter + overlays, parses, swaps the root
-/// in, marks `.ready`. Used by both the sync paths and the
-/// completion handler.
-fn fulfillFromBytes(c: *Component, source: []const u8, spec: *const components.Spec) !void {
+/// in, marks `.ready`. `pub` so the extras URL-fetch path can
+/// call it for cache hits.
+pub fn fulfillFromBytes(c: *Component, source: []const u8, spec: *const components.Spec) !void {
     var body: []const u8 = source;
     if (state_mod.extractFrontmatter(source)) |fm| {
         body = fm.rest;
@@ -340,10 +297,11 @@ fn fulfillFromBytes(c: *Component, source: []const u8, spec: *const components.S
     c.phase = .ready;
 }
 
-/// Variant of `fulfillFromBytes` for the completion handler, which
-/// doesn't have a live `Spec` anymore — applies the snapshotted
-/// overlay KVs from the PendingFetch instead.
-fn fulfillFromBytesWithOverlays(c: *Component, source: []const u8, overlays: []const OverlayKV) !void {
+/// Variant of `fulfillFromBytes` for the extras completion handler,
+/// which doesn't have a live `Spec` anymore — applies the snapshotted
+/// overlay KVs from the PendingFetch instead. `pub` so the extras
+/// URL-fetch path can call it.
+pub fn fulfillFromBytesWithOverlays(c: *Component, source: []const u8, overlays: []const OverlayKV) !void {
     var body: []const u8 = source;
     if (state_mod.extractFrontmatter(source)) |fm| {
         body = fm.rest;
@@ -370,53 +328,6 @@ fn fulfillFromBytesWithOverlays(c: *Component, source: []const u8, overlays: []c
     c.phase = .ready;
 }
 
-fn submitAsyncFetch(c: *Component, url: []const u8, spec: *const components.Spec) !void {
-    const ch = c.spark.io_channel;
-    const a = c.allocator;
-
-    const pending = try a.create(PendingFetch);
-    errdefer a.destroy(pending);
-
-    const url_copy = try a.dupe(u8, url);
-    errdefer a.free(url_copy);
-
-    // Snapshot non-`src` attrs. We dupe both key and value into
-    // PendingFetch.allocator so the snapshot survives past the
-    // current parse arena.
-    var overlay_list: std.ArrayListUnmanaged(OverlayKV) = .{};
-    errdefer {
-        for (overlay_list.items) |kv| {
-            a.free(kv.key);
-            a.free(kv.value);
-        }
-        overlay_list.deinit(a);
-    }
-    for (spec.attrs) |attr| {
-        if (std.mem.eql(u8, attr.key, "src")) continue;
-        const k = try a.dupe(u8, attr.key);
-        errdefer a.free(k);
-        const v = try a.dupe(u8, attr.value);
-        errdefer a.free(v);
-        try overlay_list.append(a, .{ .key = k, .value = v });
-    }
-    const overlays = try overlay_list.toOwnedSlice(a);
-    errdefer a.free(overlays);
-
-    pending.* = .{
-        .allocator = a,
-        .component = c,
-        .handle = 0,
-        .url = url_copy,
-        .overlays = overlays,
-        .spark = c.spark,
-    };
-
-    const handle = try ch.submitHttpGet(url, @intFromPtr(pending));
-    pending.handle = handle;
-    c.pending = pending;
-    c.phase = .loading;
-}
-
 /// Read a local (non-URL) source. Same path the synchronous flow
 /// used pre-stage-12; broken out so the URL path can stay clean.
 fn readLocal(allocator: std.mem.Allocator, src: []const u8) ![]const u8 {
@@ -425,94 +336,6 @@ fn readLocal(allocator: std.mem.Allocator, src: []const u8) ![]const u8 {
     else
         src;
     return try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
-}
-
-fn freePending(p: *PendingFetch) void {
-    const a = p.allocator;
-    for (p.overlays) |kv| {
-        a.free(kv.key);
-        a.free(kv.value);
-    }
-    a.free(p.overlays);
-    a.free(p.url);
-    a.destroy(p);
-}
-
-/// Drain target. Main thread calls this once per frame via
-/// `IoChannel.drain`. Resolves a completion against the originating
-/// Pending: caches the body, finishes the parse, bubbles dirty.
-/// Owned bodies are released here in all paths (cache transfers
-/// ownership but dupes; cancellation frees outright).
-pub fn handleCompletion(comp: io.Completion) void {
-    const p: *PendingFetch = @ptrFromInt(comp.user_data);
-    defer freePending(p);
-
-    const c_opt = p.component;
-    // Decouple the Pending↔Component link regardless of outcome so
-    // deinit_ doesn't try to follow a freed pointer later.
-    if (c_opt) |c| c.pending = null;
-
-    const ch = p.spark.io_channel;
-    const host_state = p.spark.host_state;
-    switch (comp.result) {
-        // Stream variants don't apply to embedded-document — it only
-        // issues http_get. Defensive: never hits the wire.
-        .chunk, .end, .end_err => {
-            switch (comp.result) {
-                .chunk => |bytes| ch.releaseOk(bytes),
-                else => {},
-            }
-            return;
-        },
-        .err => {
-            if (c_opt) |c| {
-                c.phase = .failed;
-                host_state.dirty = true;
-            }
-            // No body to free on the error path.
-        },
-        .ok => |body_owned| {
-            // Always cache the bytes (the next mount of the same URL
-            // gets the fast sync path), even if THIS Component was
-            // cancelled. Cache ownership: body is duped into the
-            // cache_allocator; the io-channel-owned slice is freed
-            // immediately after.
-            const a = cache_allocator orelse {
-                ch.releaseOk(body_owned);
-                return;
-            };
-            const cached_copy = a.dupe(u8, body_owned) catch {
-                ch.releaseOk(body_owned);
-                return;
-            };
-            ch.releaseOk(body_owned);
-
-            // Only insert into the cache if we don't have a copy
-            // already (a concurrent second fetch racing the first
-            // would otherwise leak the older copy).
-            if (url_cache.get(p.url) == null) {
-                const key = a.dupe(u8, p.url) catch {
-                    a.free(cached_copy);
-                    return;
-                };
-                url_cache.put(a, key, cached_copy) catch {
-                    a.free(key);
-                    a.free(cached_copy);
-                    return;
-                };
-            } else {
-                a.free(cached_copy);
-            }
-
-            if (c_opt) |c| {
-                const bytes = url_cache.get(p.url) orelse return;
-                fulfillFromBytesWithOverlays(c, bytes, p.overlays) catch {
-                    c.phase = .failed;
-                };
-                host_state.dirty = true;
-            }
-        },
-    }
 }
 
 fn update(ctx: *anyopaque, spec: *const components.Spec) anyerror!void {
@@ -634,7 +457,7 @@ fn refreshPendingOverlays(p: *PendingFetch, spec: *const components.Spec) !void 
     p.overlays = new_slice;
 }
 
-fn applyParentOverlays(child_state: *state_mod.State, spec: *const components.Spec) !void {
+pub fn applyParentOverlays(child_state: *state_mod.State, spec: *const components.Spec) !void {
     for (spec.attrs) |a| {
         if (std.mem.eql(u8, a.key, "src")) continue;
         try child_state.set(a.key, a.value);
@@ -800,6 +623,12 @@ fn renderPlaceholder(
 
 const testing = std.testing;
 
+/// No-op completion handler used by the `refreshPendingOverlays` test
+/// fixture — exercises overlay rewrite without involving IoChannel.
+fn noopCompletion(comp: io.Completion) void {
+    _ = comp;
+}
+
 test "applyParentOverlays: copies non-src attrs to child state" {
     var s = state_mod.State.init(testing.allocator);
     defer s.deinit();
@@ -840,6 +669,7 @@ test "refreshPendingOverlays: replaces snapshot atomically, no leaks" {
     const url = try a.dupe(u8, "http://x/y");
     var test_spark = spark_mod.Spark.testStub(a);
     var p = PendingFetch{
+        .header = .{ .handle_completion = noopCompletion },
         .allocator = a,
         .component = null,
         .handle = 0,
@@ -873,27 +703,8 @@ test "refreshPendingOverlays: replaces snapshot atomically, no leaks" {
     try testing.expectEqualStrings("fresh", p.overlays[1].value);
 }
 
-test "freePending: releases all owned slices (testing-allocator leak check)" {
-    const a = testing.allocator;
-    const k = try a.dupe(u8, "k");
-    const v = try a.dupe(u8, "v");
-    var overlays = try a.alloc(OverlayKV, 1);
-    overlays[0] = .{ .key = k, .value = v };
-
-    const url = try a.dupe(u8, "http://example/");
-    var test_spark = spark_mod.Spark.testStub(a);
-    const p = try a.create(PendingFetch);
-    p.* = .{
-        .allocator = a,
-        .component = null,
-        .handle = 0,
-        .url = url,
-        .overlays = overlays,
-        .spark = &test_spark,
-    };
-    freePending(p);
-    // testing.allocator will fail the test on any unfreed allocation.
-}
+// `freePending` test lives in `src/extras/embedded_document_http.zig`
+// alongside the function itself.
 
 test "parseBoolAttr: defaults + truthy/falsy parsing" {
     const a = [_]components.Attr{

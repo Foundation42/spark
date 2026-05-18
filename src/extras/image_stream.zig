@@ -1,71 +1,44 @@
-//! `:::svg-stream` — async vector graphics from an image-class
-//! model (stage 13d.3). Sibling of [`:::llm-stream`](llm_stream.zig);
-//! shares the IoChannel + JobSystem plumbing, but the wire format
-//! is different from chat completions.
+//! `:::image-stream` — async raster image from an image-class model
+//! (stage 14c). Sibling of [`:::svg-stream`](svg_stream.zig);
+//! identical wire format (OpenAI-shaped /chat/completions returning
+//! a base64 data URL) but the data URL contents are PNG/JPG instead
+//! of SVG, and we decode + upload to a GPU texture instead of
+//! tessellating to triangles.
 //!
-//! ### Wire format
-//!
-//! Recraft V4.1 on OpenRouter is an image-generation model served
-//! behind the `POST /chat/completions` endpoint. Despite the chat
-//! framing it does **not** stream tokens — it returns a single
-//! JSON response after several seconds of upstream work:
-//!
-//!     {
-//!       "choices": [{
-//!         "message": {
-//!           "content": null,
-//!           "images": [{
-//!             "type": "image_url",
-//!             "image_url": {
-//!               "url": "data:image/svg+xml;base64,PHN2ZyB4bWxu…"
-//!             }
-//!           }]
-//!         }
-//!       }]
-//!     }
-//!
-//! We send `stream:false`, accumulate the raw response into one
-//! buffer, then on `.end`: parse the JSON, base64-decode the data
-//! URL, run the bytes through `svg.parse` + parallel tessellate,
-//! and swap the mesh in. The "stream" in `:::svg-stream` is about
-//! "fetched asynchronously off the render thread" — the renderer
-//! never blocks on Recraft's queue — not about token-by-token
-//! progressive paint. If a future SVG model actually streams its
-//! output, that's a separate code path.
-//!
-//! Default provider is OpenRouter (`provider=openai`,
-//! `model=recraft-ai/recraft-v3-svg` or whatever Recraft handle is
-//! current); any OpenAI-compatible endpoint that returns text
-//! works. The component sets `max_tokens` higher than llm-stream
-//! by default (SVG strings dwarf prose strings).
+//! Default target: google/gemini-3.1-flash-image-preview on
+//! OpenRouter. The model returns `data:image/png;base64,...` in
+//! `message.images[0].image_url.url`. We strip the prefix, base64-
+//! decode, hand the bytes to stb_image, and upload the RGBA8 result
+//! to a per-component GPU texture.
 //!
 //! Author writes:
 //!
-//!     :::svg-stream {#bowl
-//!       provider=openai
+//!     :::image-stream {#fresh_image
+//!       model=google/gemini-3.1-flash-image-preview
 //!       endpoint=https://openrouter.ai/api/v1/chat/completions
-//!       model=recraft-ai/recraft-v3-svg
 //!       api_key_env=OPENROUTER_DYNABOOK
-//!       prompt="A bowl of petunias, vector art"
+//!       prompt="A robot holding a steaming mug of coffee."
 //!       width=480
-//!       max_tokens=8000
 //!       auto_start=false }
 //!     :::
 //!
-//! ### Re-tessellation cadence
+//! ### Texture lifecycle
 //!
-//! For v0 we re-tessellate on every chunk. Recraft's chunks tend
-//! to be small (per-line of SVG) so this is bounded — and 13d.2's
-//! parallel tessellation makes the per-chunk cost negligible. If
-//! profiling shows otherwise, debounce to (say) every 50 ms via
-//! the existing IoChannel timer plumbing.
+//! Each Component owns one `ImageTexture` + one descriptor set from
+//! the host's `ImagePipeline` pool. The texture is created on the
+//! first successful response (sized to the decoded image's
+//! dimensions) and reused for re-fires only if the new image has
+//! the same dimensions — otherwise the texture is destroyed and a
+//! new one allocated, and the descriptor is rewritten in place
+//! (allocation churn is bounded by re-fire rate). Component destroy
+//! frees the descriptor + texture in that order so the pool slot
+//! returns to the pipeline cleanly.
 //!
 //! ### Cancellation invariant
 //!
-//! Identical to embedded-document + llm-stream: a `PendingSvgStream`
-//! is heap-allocated at submit time; Component holds a back-pointer
-//! for the cancel signal only; the completion handler owns its
-//! lifetime. See [[project-io-channel-cancellation]].
+//! Same as [[project-io-channel-cancellation]] — Pending lifetime
+//! owned by completion handler; Component holds back-pointer for
+//! cancel signal only.
 
 const std = @import("std");
 const element = @import("../element.zig");
@@ -74,38 +47,50 @@ const component_mod = @import("../component.zig");
 const spark_mod = @import("../spark.zig");
 const state_mod = @import("../state.zig");
 const io = @import("../io_channel.zig");
-const dotenv = @import("../dotenv.zig");
-const svg = @import("../svg.zig");
-const tess = @import("../svg_tessellate.zig");
-const jobs_mod = @import("../jobs.zig");
-const asset_cache_mod = @import("../asset_cache.zig");
+const dotenv = @import("dotenv.zig");
+const vk = @import("../gpu/vk.zig");
+const image_texture_mod = @import("../gpu/image_texture.zig");
+const image_pipeline_mod = @import("../gpu/image_pipeline.zig");
+const asset_cache_mod = @import("asset_cache.zig");
 const text_layout = @import("../text/layout.zig");
 const shape = @import("../font/shape.zig");
-const box_helpers = @import("box.zig");
+const box_helpers = @import("../components/box.zig");
+
+const c_stb = @cImport({
+    @cInclude("stb_image.h");
+});
 
 pub const Error = error{
-    SvgStreamMissingId,
-    SvgStreamMissingModel,
-    SvgStreamMissingPrompt,
-    SvgStreamMissingApiKeyEnv,
-    SvgStreamApiKeyNotFound,
-    SvgStreamUnknownProvider,
-    SvgStreamNotInstalled,
+    ImageStreamMissingId,
+    ImageStreamMissingModel,
+    ImageStreamMissingPrompt,
+    ImageStreamMissingApiKeyEnv,
+    ImageStreamApiKeyNotFound,
+    ImageStreamUnknownProvider,
+    ImageStreamNotInstalled,
+    ImageStreamDecodeFailed,
+    /// image-stream factories need DotEnv (api_key_env) and AssetCache
+    /// (PNG dedup so a hot reload skips the LM call). Returned from
+    /// `install` when either is null. Install both before this module.
+    RequiresDotEnv,
+    RequiresAssetCache,
 };
 
 pub fn install(spark: *spark_mod.Spark) !void {
-    try spark.registry.register("svg-stream", factory);
+    if (spark.dotenv == null) return error.RequiresDotEnv;
+    if (spark.asset_cache == null) return error.RequiresAssetCache;
+    try spark.registry.register("image-stream", factory);
 }
 
-const DEFAULT_OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
 const DEFAULT_MAX_TOKENS: u32 = 8000;
 
 pub const Provider = enum {
-    /// Only one for now — Recraft is served via OpenRouter, whose
-    /// /chat/completions endpoint is OpenAI-shaped. Direct OpenAI
-    /// doesn't host an SVG model, so there's no "vanilla openai"
-    /// path here that isn't really OpenRouter.
+    /// Gemini image preview is served via OpenRouter's /chat/completions
+    /// — same shape as Recraft. Direct Gemini API uses a different
+    /// route (generativelanguage.googleapis.com) which we don't
+    /// support here; if needed, add a `.gemini` provider variant
+    /// with its own body builder.
     openai,
 
     pub fn parse(s: []const u8) ?Provider {
@@ -118,7 +103,7 @@ const Phase = enum { idle, loading, done, failed };
 
 /// Cache-key shape version. Bump if the key inputs ever change so old
 /// entries are silently bypassed (they remain on disk until evicted).
-const CACHE_KEY_PREFIX = "svg-stream:v1";
+const CACHE_KEY_PREFIX = "image-stream:v1";
 
 fn computeCacheKey(c: *const Component) asset_cache_mod.Key {
     var mt_buf: [16]u8 = undefined;
@@ -134,7 +119,7 @@ fn computeCacheKey(c: *const Component) asset_cache_mod.Key {
     });
 }
 
-const PendingSvgStream = struct {
+const PendingImageStream = struct {
     /// Polymorphic dispatch header — drainHandler reads this to
     /// route the completion. Must be first field.
     header: io.PendingHeader = .{ .handle_completion = handleCompletion },
@@ -143,44 +128,40 @@ const PendingSvgStream = struct {
     /// and return.
     component: ?*Component,
     /// Snapshotted at submit time so a successful `.end` writes to
-    /// the same key the request was issued under — even if the
-    /// component's prompt or model has been mutated mid-flight.
+    /// the same key the request was issued under.
     cache_key: asset_cache_mod.Key,
-    /// Snapshot of the spark pointer so the completion handler can
-    /// access io_channel + host_state + asset_cache even after the
-    /// Component pointer has been nulled by deinit.
+    /// Snapshot of the spark pointer — completion handler accesses
+    /// io_channel + host_state + asset_cache through it even if
+    /// the Component has been destroyed.
     spark: *spark_mod.Spark,
 };
 
 const Component = struct {
     allocator: std.mem.Allocator,
-    /// Captured at create time. Every cross-cutting concern
-    /// (registry, parent state, io_channel, dotenv, compute jobs,
+    /// Captured at create time. Every cross-cutting concern (registry,
+    /// parent state, io_channel, dotenv, vk_ctx, image_pipeline,
     /// asset_cache) is one hop through here.
     spark: *spark_mod.Spark,
-    scope: []u8, // component id, owned
+    scope: []u8,
 
-    /// Raw HTTP response bytes accumulated from every chunk. Not
-    /// SSE-parsed — Recraft returns a single non-streaming JSON
-    /// document. Parsed once on `.end`.
+    /// Raw HTTP response bytes accumulated from every chunk. Gemini
+    /// image preview returns a single JSON document.
     response: std.ArrayListUnmanaged(u8) = .{},
 
     phase: Phase = .loading,
-    pending: ?*PendingSvgStream = null,
+    pending: ?*PendingImageStream = null,
     handle: io.Handle = 0,
 
-    // Cached mesh — c_allocator-owned, replaced each chunk.
-    vertices: []tess.Vertex = &.{},
-    indices: []u32 = &.{},
-    view_x: f32 = 0,
-    view_y: f32 = 0,
-    view_w: f32 = 1,
-    view_h: f32 = 1,
+    /// GPU texture + descriptor. Both null until the first successful
+    /// decode lands; populated lazily by `finalizeResponse`.
+    texture: ?image_texture_mod.ImageTexture = null,
+    descriptor_set: ?*anyopaque = null, // VkDescriptorSet
 
-    // Display config
+    // Display config — width is honoured; height defaults to the
+    // decoded image's aspect ratio if not supplied.
     width: box_helpers.Length,
     height: ?box_helpers.Length,
-    model_label: []u8, // owned dupe — for the loading placeholder
+    model_label: []u8,
     provider: Provider = .openai,
 
     // Request params — owned dupes, freed at deinit.
@@ -193,9 +174,8 @@ const Component = struct {
 
     err_name: ?[]u8 = null,
 
-    /// Bumped on phase transitions, mesh swap, handle_update — every
-    /// path that changes the visible output. Drives retained
-    /// layout-cache invalidation.
+    /// Bumped on every visible-state mutation — drives layout cache
+    /// invalidation in [[stage 14a]].
     version: u64 = 0,
 };
 
@@ -207,25 +187,23 @@ pub const factory: component_mod.Factory = .{
 };
 
 fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
-    const id_raw = spec.id orelse return Error.SvgStreamMissingId;
-    const model = findAttr(spec.attrs, "model") orelse return Error.SvgStreamMissingModel;
-    const prompt = findAttr(spec.attrs, "prompt") orelse return Error.SvgStreamMissingPrompt;
+    const id_raw = spec.id orelse return Error.ImageStreamMissingId;
+    const model = findAttr(spec.attrs, "model") orelse return Error.ImageStreamMissingModel;
+    const prompt = findAttr(spec.attrs, "prompt") orelse return Error.ImageStreamMissingPrompt;
     const system = findAttr(spec.attrs, "system");
     const api_key_env = findAttr(spec.attrs, "api_key_env");
     const auto_start: bool = blk: {
         if (findAttr(spec.attrs, "auto_start")) |s| break :blk !std.mem.eql(u8, s, "false");
-        break :blk false; // SVG generation is slow + costs tokens — default off
+        break :blk false; // image gen is slow + costs tokens
     };
     const max_tokens: u32 = blk: {
         if (findAttr(spec.attrs, "max_tokens")) |s| break :blk std.fmt.parseInt(u32, s, 10) catch DEFAULT_MAX_TOKENS;
         break :blk DEFAULT_MAX_TOKENS;
     };
-
     const provider: Provider = if (findAttr(spec.attrs, "provider")) |p|
-        Provider.parse(p) orelse return Error.SvgStreamUnknownProvider
+        Provider.parse(p) orelse return Error.ImageStreamUnknownProvider
     else
         .openai;
-
     const endpoint = findAttr(spec.attrs, "endpoint") orelse DEFAULT_OPENROUTER_ENDPOINT;
 
     const c = try allocator.create(Component);
@@ -235,7 +213,6 @@ fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const co
     errdefer allocator.free(scope);
     const model_label = try allocator.dupe(u8, model);
     errdefer allocator.free(model_label);
-
     const model_dup = try allocator.dupe(u8, model);
     errdefer allocator.free(model_dup);
     const prompt_dup = try allocator.dupe(u8, prompt);
@@ -275,8 +252,6 @@ fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const co
     return .{ .vtable = &vtable, .ctx = @ptrCast(c) };
 }
 
-/// Submit a fresh stream. Cancels any in-flight fetch, clears the
-/// content + mesh, resubmits. Mirrors `llm_stream.kickStream`.
 fn kickStream(c: *Component) !void {
     const ch = c.spark.io_channel;
 
@@ -289,22 +264,24 @@ fn kickStream(c: *Component) !void {
         c.allocator.free(e);
         c.err_name = null;
     }
-    freeMesh(c);
+    // Texture stays — we'll resize+reupload in finalizeResponse if the
+    // new image's dimensions differ. Cheaper than tearing down GPU
+    // resources unconditionally per re-fire.
     c.phase = .loading;
 
     const cache_key = computeCacheKey(c);
 
-    // Cache fast path. A hit skips the network entirely — read bytes,
-    // run the same finalizeResponse the network path uses. On a
-    // corrupt/incompatible cached entry, drop it and fall through.
+    // Cache fast path. Bypass the network if we already have this
+    // request's envelope on disk; on parse/finalize failure, fall
+    // through to a fresh fetch.
     if (c.spark.asset_cache) |cache| {
         if (cache.get(cache_key) catch |e| blk: {
-            std.log.warn("svg-stream: cache get failed: {s}", .{@errorName(e)});
+            std.log.warn("image-stream: cache get failed: {s}", .{@errorName(e)});
             break :blk null;
         }) |cached_bytes| {
             defer c.allocator.free(cached_bytes);
             c.response.appendSlice(c.allocator, cached_bytes) catch |e| {
-                std.log.warn("svg-stream: cache append failed: {s}; refetching", .{@errorName(e)});
+                std.log.warn("image-stream: cache append failed: {s}; refetching", .{@errorName(e)});
                 c.response.clearRetainingCapacity();
             };
             if (c.response.items.len > 0) {
@@ -313,7 +290,7 @@ fn kickStream(c: *Component) !void {
                     c.spark.host_state.dirty = true;
                     return;
                 } else |e| {
-                    std.log.warn("svg-stream: cache finalize failed: {s}; refetching", .{@errorName(e)});
+                    std.log.warn("image-stream: cache finalize failed: {s}; refetching", .{@errorName(e)});
                     c.response.clearRetainingCapacity();
                     c.phase = .loading;
                 }
@@ -326,16 +303,16 @@ fn kickStream(c: *Component) !void {
     const sa = scratch.allocator();
 
     var body_buf = std.ArrayList(u8).init(sa);
-    try buildRecraftBody(body_buf.writer(), c.model, c.prompt, c.system, c.max_tokens);
+    try buildRequestBody(body_buf.writer(), c.model, c.prompt, c.system, c.max_tokens);
 
     var headers_buf: std.ArrayListUnmanaged(io.Header) = .{};
-    const key_env = c.api_key_env orelse return Error.SvgStreamMissingApiKeyEnv;
-    const env = c.spark.dotenv orelse return Error.SvgStreamApiKeyNotFound;
-    const key = env.get(key_env) orelse return Error.SvgStreamApiKeyNotFound;
+    const key_env = c.api_key_env orelse return Error.ImageStreamMissingApiKeyEnv;
+    const env = c.spark.dotenv orelse return Error.ImageStreamApiKeyNotFound;
+    const key = env.get(key_env) orelse return Error.ImageStreamApiKeyNotFound;
     const auth_value = try std.fmt.allocPrint(sa, "Bearer {s}", .{key});
     try headers_buf.append(sa, .{ .name = "Authorization", .value = auth_value });
 
-    const pending = try c.allocator.create(PendingSvgStream);
+    const pending = try c.allocator.create(PendingImageStream);
     errdefer c.allocator.destroy(pending);
     pending.* = .{ .allocator = c.allocator, .component = c, .cache_key = cache_key, .spark = c.spark };
 
@@ -356,7 +333,7 @@ fn handleUpdate(ctx: *anyopaque, action: []const u8, body: []const u8) anyerror!
 
     if (body.len > 0) {
         const new_prompt = c.allocator.dupe(u8, body) catch |e| {
-            std.log.err("svg-stream: prompt dupe failed: {s}", .{@errorName(e)});
+            std.log.err("image-stream: prompt dupe failed: {s}", .{@errorName(e)});
             return;
         };
         c.allocator.free(c.prompt);
@@ -364,7 +341,7 @@ fn handleUpdate(ctx: *anyopaque, action: []const u8, body: []const u8) anyerror!
     }
 
     kickStream(c) catch |e| {
-        std.log.err("svg-stream: kickStream failed: {s}", .{@errorName(e)});
+        std.log.err("image-stream: kickStream failed: {s}", .{@errorName(e)});
         c.phase = .failed;
         const a = c.allocator;
         if (c.err_name) |old| a.free(old);
@@ -375,8 +352,8 @@ fn handleUpdate(ctx: *anyopaque, action: []const u8, body: []const u8) anyerror!
 }
 
 fn update(_: *anyopaque, _: *const components.Spec) anyerror!void {
-    // Same policy as llm-stream — mid-stream attribute changes
-    // don't re-prompt. Re-id (change `#id`) to force a recreate.
+    // Same policy as svg-stream / llm-stream: mid-flight attribute
+    // changes don't re-prompt. Re-id to force a recreate.
 }
 
 fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
@@ -385,7 +362,7 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
         p.component = null;
         c.pending = null;
     }
-    freeMesh(c);
+    freeGpuResources(c);
     c.response.deinit(allocator);
     allocator.free(c.scope);
     allocator.free(c.model_label);
@@ -398,23 +375,22 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     allocator.destroy(c);
 }
 
-fn freeMesh(c: *Component) void {
-    if (c.vertices.len > 0) std.heap.c_allocator.free(c.vertices);
-    if (c.indices.len > 0) std.heap.c_allocator.free(c.indices);
-    c.vertices = &.{};
-    c.indices = &.{};
+fn freeGpuResources(c: *Component) void {
+    if (c.descriptor_set) |ds| {
+        c.spark.image_pipeline.freeDescriptor(@ptrCast(@alignCast(ds)));
+        c.descriptor_set = null;
+    }
+    if (c.texture) |*t| {
+        t.deinit();
+        c.texture = null;
+    }
 }
 
-/// Build the Recraft request body. Key differences from a
-/// chat-completion body:
-///
-///   * `stream: false` — Recraft is one-shot, not token-streamed.
-///     Even when you ask for streaming, OpenRouter forwards just
-///     heartbeat comments while the upstream renders, then returns
-///     the whole image at once. Skip the SSE charade.
-///   * `max_tokens` still useful as a cost cap (Recraft bills per
-///     image_token, ~4000 tokens for a typical figure).
-fn buildRecraftBody(
+/// Build the chat-completion request body. Same shape as Recraft —
+/// `stream:false`, single user message. Gemini image preview also
+/// expects a single user message; the response shape is the same
+/// (`message.images[0].image_url.url` as a `data:image/png;base64,…`).
+fn buildRequestBody(
     writer: anytype,
     model: []const u8,
     prompt: []const u8,
@@ -439,40 +415,36 @@ fn buildRecraftBody(
 // ── Completion drain target ──────────────────────────────────────────
 
 fn handleCompletion(comp: io.Completion) void {
-    const p: *PendingSvgStream = @ptrFromInt(comp.user_data);
+    const p: *PendingImageStream = @ptrFromInt(comp.user_data);
 
     const host_state = p.spark.host_state;
     switch (comp.result) {
         .chunk => |bytes| {
             defer p.spark.io_channel.releaseOk(bytes);
             const c = p.component orelse return;
-            // Just accumulate. Recraft's response isn't SSE — it's
-            // a single JSON document delivered in HTTP chunks.
             c.response.appendSlice(c.allocator, bytes) catch |e| {
-                std.log.err("svg-stream: append failed: {s}", .{@errorName(e)});
+                std.log.err("image-stream: append failed: {s}", .{@errorName(e)});
             };
         },
         .end => {
             if (p.component) |c| {
                 c.pending = null;
                 finalizeResponse(c) catch |e| {
-                    std.log.warn("svg-stream: finalize failed: {s}", .{@errorName(e)});
+                    std.log.warn("image-stream: finalize failed: {s}", .{@errorName(e)});
                     c.phase = .failed;
                     const a = c.allocator;
                     if (c.err_name) |old| a.free(old);
                     c.err_name = a.dupe(u8, @errorName(e)) catch null;
                 };
-                // Persist successful responses to the asset cache so the
-                // next run replays without burning another $0.08.
                 if (c.phase == .done) {
                     if (p.spark.asset_cache) |cache| {
                         var source_buf: [256]u8 = undefined;
-                        const source = std.fmt.bufPrint(&source_buf, "svg-stream:{s}:{s}", .{ @tagName(c.provider), c.model }) catch null;
+                        const source = std.fmt.bufPrint(&source_buf, "image-stream:{s}:{s}", .{ @tagName(c.provider), c.model }) catch null;
                         cache.put(p.cache_key, c.response.items, .{
                             .source = source,
                             .content_type = "application/json",
                         }) catch |e| {
-                            std.log.warn("svg-stream: cache put failed: {s}", .{@errorName(e)});
+                            std.log.warn("image-stream: cache put failed: {s}", .{@errorName(e)});
                         };
                     }
                 }
@@ -493,29 +465,28 @@ fn handleCompletion(comp: io.Completion) void {
             }
             freePending(p);
         },
-        .ok, .err => {
-            // Not us — defensive arm; the polymorphic header
-            // routes correctly so this is unreachable in practice.
-        },
+        .ok, .err => {},
     }
 }
 
-fn freePending(p: *PendingSvgStream) void {
+fn freePending(p: *PendingImageStream) void {
     p.allocator.destroy(p);
 }
 
-/// One-shot completion handler. Parses the accumulated JSON,
-/// extracts the SVG data URL, base64-decodes it, runs the SVG
-/// through `svg.parse` + parallel tessellate, swaps the mesh.
+/// Parse the chat-completion envelope, extract the data URL,
+/// base64-decode the image bytes, hand them to stb_image to decode
+/// into RGBA8 pixels, then resize the GPU texture if needed and
+/// upload.
+///
+/// Accepts `data:image/png;base64,...` and `data:image/jpeg;base64,...`
+/// (stb_image handles both); rejects unknown MIMEs.
 fn finalizeResponse(c: *Component) !void {
-    if (c.response.items.len == 0) return Error.SvgStreamApiKeyNotFound;
+    if (c.response.items.len == 0) return error.EmptyResponse;
 
     var scratch = std.heap.ArenaAllocator.init(c.allocator);
     defer scratch.deinit();
     const sa = scratch.allocator();
 
-    // Parse the chat-completion envelope, ignoring fields we don't
-    // care about. `images[0].image_url.url` is the data URL.
     const Url = struct { url: []const u8 };
     const Image = struct { image_url: Url };
     const Message = struct { images: ?[]const Image = null };
@@ -532,30 +503,74 @@ fn finalizeResponse(c: *Component) !void {
     if (images.len == 0) return error.MissingImages;
     const data_url = images[0].image_url.url;
 
-    // Strip "data:image/svg+xml;base64," prefix, base64-decode.
-    const prefix = "data:image/svg+xml;base64,";
-    if (!std.mem.startsWith(u8, data_url, prefix)) return error.UnexpectedImageFormat;
-    const b64 = data_url[prefix.len..];
+    // Strip "data:image/<mime>;base64," prefix. We accept any image
+    // MIME — stb_image autodetects format from the byte stream.
+    const prefix_marker = ";base64,";
+    const sep_idx = std.mem.indexOf(u8, data_url, prefix_marker) orelse return error.UnexpectedImageFormat;
+    if (!std.mem.startsWith(u8, data_url, "data:image/")) return error.UnexpectedImageFormat;
+    const b64 = data_url[sep_idx + prefix_marker.len ..];
 
     const decoder = std.base64.standard.Decoder;
     const decoded_len = try decoder.calcSizeForSlice(b64);
-    const svg_bytes = try sa.alloc(u8, decoded_len);
-    try decoder.decode(svg_bytes, b64);
+    const encoded_bytes = try sa.alloc(u8, decoded_len);
+    try decoder.decode(encoded_bytes, b64);
 
-    // Parse + tessellate.
-    const doc = try svg.parse(sa, svg_bytes);
-    var mesh = tess.Mesh.init(std.heap.c_allocator);
-    defer mesh.deinit();
-    try tess.tessellateParallel(c.allocator, doc.paths, &mesh, c.spark.compute_jobs, .{});
+    // stb_image decode → RGBA8.
+    var iw: c_int = 0;
+    var ih: c_int = 0;
+    var ch_count: c_int = 0;
+    const pixels_ptr = c_stb.stbi_load_from_memory(
+        @ptrCast(encoded_bytes.ptr),
+        @intCast(encoded_bytes.len),
+        &iw,
+        &ih,
+        &ch_count,
+        4, // force RGBA
+    );
+    if (pixels_ptr == null) return Error.ImageStreamDecodeFailed;
+    defer c_stb.stbi_image_free(pixels_ptr);
 
-    // Swap into the cached fields.
-    freeMesh(c);
-    c.vertices = try mesh.vertices.toOwnedSlice();
-    c.indices = try mesh.indices.toOwnedSlice();
-    c.view_x = doc.view_x;
-    c.view_y = doc.view_y;
-    c.view_w = doc.view_w;
-    c.view_h = doc.view_h;
+    const w: u32 = @intCast(iw);
+    const h: u32 = @intCast(ih);
+    const pixels = pixels_ptr[0 .. @as(usize, w) * @as(usize, h) * 4];
+
+    // Allocate or resize the GPU texture. If the new image's
+    // dimensions match the existing texture, reuse it (one upload).
+    // Otherwise free and recreate; the descriptor needs to be
+    // rewritten in either case because vkUpdateDescriptorSets is the
+    // sanctioned way to repoint a slot at a new view.
+    const need_new_texture: bool = blk: {
+        if (c.texture) |t| {
+            if (t.extent.width == w and t.extent.height == h) break :blk false;
+            break :blk true;
+        }
+        break :blk true;
+    };
+
+    const vk_ctx = c.spark.vk_ctx;
+    const ip = c.spark.image_pipeline;
+
+    if (need_new_texture) {
+        if (c.texture) |*t| {
+            t.deinit();
+            c.texture = null;
+        }
+        c.texture = try image_texture_mod.ImageTexture.init(vk_ctx, w, h);
+        // First-time descriptor allocation, or after a release-then-
+        // realloc cycle.
+        if (c.descriptor_set == null) {
+            const ds = try ip.allocDescriptor();
+            c.descriptor_set = @ptrCast(@alignCast(ds));
+        }
+    }
+
+    try c.texture.?.upload(pixels);
+
+    // (Re-)point the descriptor at the (possibly new) view + sampler.
+    // Cheap even when nothing changed; vkUpdateDescriptorSets is
+    // idempotent for the same handle pair.
+    ip.writeDescriptor(@ptrCast(@alignCast(c.descriptor_set.?)), c.texture.?.view, c.texture.?.sampler);
+
     c.phase = .done;
 }
 
@@ -564,9 +579,9 @@ fn finalizeResponse(c: *Component) !void {
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .content_version = contentVersion,
-    // Re-walks just bind the already-tessellated mesh into the
-    // DrawList — O(N triangles) but they're already in c_allocator
-    // memory; we just emit two slice references. Cheap.
+    // Re-walks emit a single ImageDraw entry (descriptor + rect).
+    // The expensive bit (PNG decode + texture upload) happened in
+    // finalizeResponse; the layout walk itself is microseconds.
     .parallel_layout_cheap = true,
 };
 
@@ -589,55 +604,38 @@ fn layoutAndRender(
     const w: f32 = c.width.resolve(max_w, fallback_w);
     const h: f32 = blk: {
         if (c.height) |hl| break :blk hl.resolve(max_w, fallback_w);
-        if (c.view_w > 0 and c.view_h > 0) break :blk w * c.view_h / c.view_w;
-        break :blk w; // pre-first-parse: square fallback
+        if (c.texture) |t| {
+            if (t.extent.width > 0 and t.extent.height > 0) {
+                const aspect = @as(f32, @floatFromInt(t.extent.height)) / @as(f32, @floatFromInt(t.extent.width));
+                break :blk w * aspect;
+            }
+        }
+        break :blk w;
     };
 
-    // If we have a mesh, draw it regardless of phase — the
-    // streaming case wants visible progress alongside a "still
-    // generating…" placeholder above/below. Phase placeholders
-    // only render when there's no mesh yet.
-    if (c.vertices.len > 0 and c.indices.len > 0) {
-        return try renderMesh(c, origin, w, h, out);
+    // If we have a texture + descriptor, draw it regardless of phase.
+    // Lets a re-fire continue showing the prior image while the new
+    // one renders, which feels much better than a placeholder flash.
+    if (c.texture != null and c.descriptor_set != null) {
+        try out.images.append(.{
+            .descriptor_set = c.descriptor_set.?,
+            .dst_pos = origin,
+            .dst_size = .{ w, h },
+        });
+        return .{ .x = origin[0], .y = origin[1], .w = w, .h = h };
     }
 
     return switch (c.phase) {
-        .idle => try renderPlaceholder(c, "ready (click button to start)", .idle, origin, w, lc, out),
-        .loading => try renderPlaceholder(c, "generating SVG…", .loading, origin, w, lc, out),
-        .done => try renderPlaceholder(c, "stream ended without SVG", .failed, origin, w, lc, out),
+        .idle => try renderPlaceholder("ready (click button to start)", .idle, origin, w, lc, out),
+        .loading => try renderPlaceholder("generating image…", .loading, origin, w, lc, out),
+        .done => try renderPlaceholder("stream ended without image", .failed, origin, w, lc, out),
         .failed => blk: {
             var buf: [256]u8 = undefined;
             const detail: []const u8 = c.err_name orelse "unknown";
-            const msg = std.fmt.bufPrint(&buf, "SVG stream failed: {s}", .{detail}) catch "SVG stream failed";
-            break :blk try renderPlaceholder(c, msg, .failed, origin, w, lc, out);
+            const msg = std.fmt.bufPrint(&buf, "image stream failed: {s}", .{detail}) catch "image stream failed";
+            break :blk try renderPlaceholder(msg, .failed, origin, w, lc, out);
         },
     };
-}
-
-fn renderMesh(
-    c: *Component,
-    origin: [2]f32,
-    w: f32,
-    h: f32,
-    out: *element.DrawList,
-) !element.Box {
-    const sx = w / c.view_w;
-    const sy = h / c.view_h;
-    const tx = origin[0] - c.view_x * sx;
-    const ty = origin[1] - c.view_y * sy;
-
-    const base_idx: u32 = @intCast(out.tris.items.len);
-    try out.tris.ensureUnusedCapacity(c.vertices.len);
-    for (c.vertices) |v| {
-        out.tris.appendAssumeCapacity(.{
-            .pos = .{ v.pos[0] * sx + tx, v.pos[1] * sy + ty },
-            .color = v.color,
-        });
-    }
-    try out.tri_indices.ensureUnusedCapacity(c.indices.len);
-    for (c.indices) |i| out.tri_indices.appendAssumeCapacity(base_idx + i);
-
-    return .{ .x = origin[0], .y = origin[1], .w = w, .h = h };
 }
 
 const PlaceholderScheme = enum { idle, loading, failed };
@@ -649,13 +647,12 @@ const PLACEHOLDER_PAD_Y: f32 = 8;
 
 const IDLE_BORDER: [4]f32 = .{ 0.40, 0.46, 0.54, 0.75 };
 const IDLE_BG: [4]f32 = .{ 0.10, 0.12, 0.16, 0.55 };
-const LOADING_BORDER: [4]f32 = .{ 0.45, 0.55, 0.85, 0.85 };
-const LOADING_BG: [4]f32 = .{ 0.08, 0.12, 0.20, 0.55 };
+const LOADING_BORDER: [4]f32 = .{ 0.85, 0.60, 0.40, 0.90 };
+const LOADING_BG: [4]f32 = .{ 0.18, 0.13, 0.08, 0.55 };
 const FAILED_BORDER: [4]f32 = .{ 0.85, 0.30, 0.30, 0.95 };
 const FAILED_BG: [4]f32 = .{ 0.30, 0.08, 0.08, 0.60 };
 
 fn renderPlaceholder(
-    _: *Component,
     msg: []const u8,
     scheme: PlaceholderScheme,
     origin: [2]f32,
@@ -728,68 +725,33 @@ fn findAttr(attrs: []const components.Attr, key: []const u8) ?[]const u8 {
 
 const testing = std.testing;
 
-test "svg-stream: Provider.parse round-trip + unknown" {
-    try testing.expectEqual(Provider.openai, Provider.parse("openai").?);
-    try testing.expect(Provider.parse("ollama") == null); // openai-only — Recraft has no local equivalent
-    try testing.expect(Provider.parse("") == null);
+test "image-stream: Provider.parse" {
+    try testing.expect(Provider.parse("openai") == .openai);
+    try testing.expect(Provider.parse("anthropic") == null);
 }
 
-test "svg-stream: buildRecraftBody emits stream:false + max_tokens" {
+test "image-stream: data URL prefix detection accepts png + jpeg" {
+    // The actual decode path needs Vulkan + a real model response; here we
+    // just smoke-check the URL-prefix scan against the two MIMEs we expect
+    // from OpenRouter image-class models.
+    const urls = [_][]const u8{
+        "data:image/png;base64,iVBORw0KGgo=",
+        "data:image/jpeg;base64,/9j/4AAQ=",
+    };
+    for (urls) |url| {
+        try testing.expect(std.mem.startsWith(u8, url, "data:image/"));
+        try testing.expect(std.mem.indexOf(u8, url, ";base64,") != null);
+    }
+    try testing.expect(std.mem.indexOf(u8, "data:audio/wav;base64,xxx", ";base64,") != null);
+    try testing.expect(!std.mem.startsWith(u8, "data:audio/wav;base64,xxx", "data:image/"));
+}
+
+test "image-stream: buildRequestBody shape" {
     var buf = std.ArrayList(u8).init(testing.allocator);
     defer buf.deinit();
-    try buildRecraftBody(buf.writer(), "recraft/recraft-v4.1-vector", "A bowl of petunias", null, 8000);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, buf.items, .{});
-    defer parsed.deinit();
-    const obj = parsed.value.object;
-    try testing.expectEqualStrings("recraft/recraft-v4.1-vector", obj.get("model").?.string);
-    // Recraft is one-shot — explicitly stream:false despite the
-    // OpenAI-shaped wrapper, because the model itself doesn't
-    // stream and OpenRouter only forwards heartbeats while waiting.
-    try testing.expect(obj.get("stream").?.bool == false);
-    try testing.expectEqual(@as(i64, 8000), obj.get("max_tokens").?.integer);
-}
-
-test "svg-stream: parses Recraft envelope shape end-to-end (smoke)" {
-    // A minimal-shape stand-in for Recraft's real response. The
-    // SVG is two tiny paths; base64-encoded inside a data URL.
-    // Confirms our envelope parsing + base64 decode + downstream
-    // svg.parse all line up.
-    const tiny_svg =
-        "<svg viewBox=\"0 0 10 10\">" ++
-        "<path d=\"M 0 0 L 10 0 L 10 10 L 0 10 z\" fill=\"rgb(255,0,0)\"/>" ++
-        "</svg>";
-    var b64_buf: [200]u8 = undefined;
-    const b64 = std.base64.standard.Encoder.encode(&b64_buf, tiny_svg);
-    var env_buf = std.ArrayList(u8).init(testing.allocator);
-    defer env_buf.deinit();
-    try env_buf.writer().print(
-        "{{\"choices\":[{{\"message\":{{\"content\":null,\"images\":[{{\"image_url\":{{\"url\":\"data:image/svg+xml;base64,{s}\"}}}}]}}}}]}}",
-        .{b64},
-    );
-
-    // Standalone envelope parse — mirror the inline parse in
-    // finalizeResponse so the test catches shape drift even when
-    // there's no IoChannel wired.
-    const Url = struct { url: []const u8 };
-    const Image = struct { image_url: Url };
-    const Message = struct { images: ?[]const Image = null };
-    const Choice = struct { message: ?Message = null };
-    const Envelope = struct { choices: ?[]const Choice = null };
-    var parsed = try std.json.parseFromSlice(Envelope, testing.allocator, env_buf.items, .{ .ignore_unknown_fields = true });
-    defer parsed.deinit();
-    const data_url = parsed.value.choices.?[0].message.?.images.?[0].image_url.url;
-    try testing.expect(std.mem.startsWith(u8, data_url, "data:image/svg+xml;base64,"));
-    const stripped = data_url["data:image/svg+xml;base64,".len..];
-    const decoder = std.base64.standard.Decoder;
-    const out_len = try decoder.calcSizeForSlice(stripped);
-    const decoded = try testing.allocator.alloc(u8, out_len);
-    defer testing.allocator.free(decoded);
-    try decoder.decode(decoded, stripped);
-    try testing.expectEqualStrings(tiny_svg, decoded);
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const doc = try svg.parse(arena.allocator(), decoded);
-    try testing.expectEqual(@as(usize, 1), doc.paths.len);
+    try buildRequestBody(buf.writer(), "google/gemini-3.1-flash-image-preview", "draw a duck", null, 4000);
+    // Sanity: model field present, stream:false, prompt embedded.
+    try testing.expect(std.mem.indexOf(u8, buf.items, "\"model\":\"google/gemini-3.1-flash-image-preview\"") != null);
+    try testing.expect(std.mem.indexOf(u8, buf.items, "\"stream\":false") != null);
+    try testing.expect(std.mem.indexOf(u8, buf.items, "\"draw a duck\"") != null);
 }

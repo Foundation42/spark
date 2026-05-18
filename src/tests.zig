@@ -22,10 +22,10 @@ test {
     _ = @import("components/input.zig");
     _ = @import("components/kbd.zig");
     _ = @import("components/progress.zig");
-    _ = @import("components/llm_stream.zig");
+    _ = @import("extras/llm_stream.zig");
     _ = @import("components/svg.zig");
-    _ = @import("components/svg_stream.zig");
-    _ = @import("components/image_stream.zig");
+    _ = @import("extras/svg_stream.zig");
+    _ = @import("extras/image_stream.zig");
     _ = @import("components/slider.zig");
     _ = @import("components/sparkline.zig");
     _ = @import("components/status.zig");
@@ -38,8 +38,9 @@ test {
     _ = @import("components/diff.zig");
     _ = @import("components/gh_ref.zig");
     _ = @import("components/ago.zig");
-    _ = @import("asset_cache.zig");
-    _ = @import("dotenv.zig");
+    _ = @import("extras/asset_cache.zig");
+    _ = @import("extras/dotenv.zig");
+    _ = @import("extras/embedded_document_http.zig");
     _ = @import("io_channel.zig");
     _ = @import("jobs.zig");
     _ = @import("layout_cache.zig");

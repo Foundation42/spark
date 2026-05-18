@@ -59,7 +59,7 @@ const state_mod = @import("../state.zig");
 const io = @import("../io_channel.zig");
 const text_layout = @import("../text/layout.zig");
 const shape = @import("../font/shape.zig");
-const dotenv = @import("../dotenv.zig");
+const dotenv = @import("dotenv.zig");
 
 pub const Error = error{
     LlmStreamMissingId,
@@ -69,9 +69,14 @@ pub const Error = error{
     LlmStreamApiKeyNotFound,
     LlmStreamUnknownProvider,
     LlmStreamNotInstalled,
+    /// llm-stream factories need DotEnv to resolve `api_key_env=` attrs.
+    /// Returned from `install` when `spark.dotenv == null`. Host calls
+    /// `spark.installDotEnv(...)` before installing this extras module.
+    RequiresDotEnv,
 };
 
 pub fn install(spark: *spark_mod.Spark) !void {
+    if (spark.dotenv == null) return error.RequiresDotEnv;
     try spark.registry.register("llm-stream", factory);
 }
 

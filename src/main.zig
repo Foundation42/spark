@@ -51,7 +51,8 @@ const button_component = @import("components/button.zig");
 const chart_component = @import("components/chart.zig");
 const embedded_document_component = @import("components/embedded_document.zig");
 const input_component = @import("components/input.zig");
-const llm_stream_component = @import("components/llm_stream.zig");
+const llm_stream_component = @import("extras/llm_stream.zig");
+const embedded_document_http_extras = @import("extras/embedded_document_http.zig");
 const price_component = @import("components/price.zig");
 const rating_component = @import("components/rating.zig");
 const slider_component = @import("components/slider.zig");
@@ -60,15 +61,15 @@ const status_component = @import("components/status.zig");
 const svg_component = @import("components/svg.zig");
 const tag_component = @import("components/tag.zig");
 const trend_component = @import("components/trend.zig");
-const svg_stream_component = @import("components/svg_stream.zig");
-const image_stream_component = @import("components/image_stream.zig");
+const svg_stream_component = @import("extras/svg_stream.zig");
+const image_stream_component = @import("extras/image_stream.zig");
 const state_mod = @import("state.zig");
 const update = @import("update.zig");
 const demo_server_mod = @import("demo_server.zig");
 const jobs_mod = @import("jobs.zig");
 const io_channel_mod = @import("io_channel.zig");
-const dotenv_mod = @import("dotenv.zig");
-const asset_cache_mod = @import("asset_cache.zig");
+const dotenv_mod = @import("extras/dotenv.zig");
+const asset_cache_mod = @import("extras/asset_cache.zig");
 const svg_mod = @import("svg.zig");
 const svg_tess = @import("svg_tessellate.zig");
 
@@ -842,26 +843,45 @@ pub fn main() !void {
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
 
-    // CLI arg → load that markdown file. Falls back to the embedded
-    // `demo.md` when no arg is supplied. The single-arg shape is the
-    // smallest "spark this doc" interface we can ship pre-library-rename;
-    // matches the future `spark hello.md` UX (decision #11 — rename
-    // lands separately).
-    const doc_source: []const u8 = doc_blk: {
+    // CLI args:
+    //   spark_demo [--core-only] [doc_path]
+    //
+    // `--core-only` is the library-spec Phase 2 toggle: skip every
+    // extras install (llm-stream, svg-stream, image-stream,
+    // embedded_document_http) and don't mount DotEnv / AssetCache.
+    // The demo runs against the core component set only — proves the
+    // extras boundary is real. Position is unimportant; first non-flag
+    // arg is the doc path. The single-arg shape matches the future
+    // `spark hello.md` UX (decision #11 — rename lands separately).
+    var core_only: bool = false;
+    var doc_path_owned: ?[]u8 = null;
+    {
         const args = try std.process.argsAlloc(allocator);
         defer std.process.argsFree(allocator, args);
-        if (args.len < 2) {
-            try stdout.print("  doc (embedded):       {d} bytes (demo.md — pass a path to override)\n", .{demo_md.len});
-            break :doc_blk demo_md;
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--core-only")) {
+                core_only = true;
+            } else if (doc_path_owned == null) {
+                doc_path_owned = try allocator.dupe(u8, args[i]);
+            }
         }
-        const path = args[1];
-        const bytes = std.fs.cwd().readFileAlloc(allocator, path, 4 * 1024 * 1024) catch |e| {
-            try stdout.print("  doc {s} load failed: {s} — falling back to embedded demo.md\n", .{ path, @errorName(e) });
-            break :doc_blk demo_md;
-        };
-        try stdout.print("  doc:                  {d} bytes ({s})\n", .{ bytes.len, path });
-        break :doc_blk bytes;
+    }
+    defer if (doc_path_owned) |p| allocator.free(p);
+
+    const doc_source: []const u8 = doc_blk: {
+        if (doc_path_owned) |path| {
+            const bytes = std.fs.cwd().readFileAlloc(allocator, path, 4 * 1024 * 1024) catch |e| {
+                try stdout.print("  doc {s} load failed: {s} — falling back to embedded demo.md\n", .{ path, @errorName(e) });
+                break :doc_blk demo_md;
+            };
+            try stdout.print("  doc:                  {d} bytes ({s})\n", .{ bytes.len, path });
+            break :doc_blk bytes;
+        }
+        try stdout.print("  doc (embedded):       {d} bytes (demo.md — pass a path to override)\n", .{demo_md.len});
+        break :doc_blk demo_md;
     };
+    if (core_only) try stdout.print("  mode:                 --core-only (extras + DotEnv + AssetCache skipped)\n", .{});
     // doc_source's storage lives until program exit. We don't free it
     // — the parse arena and reactive state both hold long-lived slices
     // into it. Process exit reclaims everything.
@@ -1039,43 +1059,6 @@ pub fn main() !void {
     var io_channel = io_channel_mod.IoChannel.init(allocator, io_pool);
     defer io_channel.deinit();
 
-    // Stage 9 — install the embedded-document factory now that theme
-    // + registry + parent state + io_channel all exist. Has to
-    // happen before any parse runs.
-    // ── Stage 13a.5 — env loader ───────────────────────────────────
-    // `~/.env`'s KEY=VALUE pairs land in `env`, which the llm-stream
-    // factory pulls API keys from at create-time. Missing file is
-    // silent — the factory just rejects an `api_key_env=` attr it
-    // can't resolve.
-    var env = dotenv_mod.DotEnv.init(allocator);
-    defer env.deinit();
-    env.loadDefault() catch |e| {
-        try stdout.print("  ~/.env load:          {s} (continuing)\n", .{@errorName(e)});
-    };
-
-    // ── Stage 14e — persistent asset cache ─────────────────────────
-    // Browser-style content-addressable cache for expensive remote
-    // assets (Recraft SVG envelopes, Gemini image envelopes). Keyed
-    // on sha256(provider | model | prompt) by each consumer; cache
-    // hits skip the network entirely. Default budget 500 MB; LRU
-    // eviction on overflow.
-    const asset_cache_dir = try computeAssetCacheDir(allocator);
-    defer allocator.free(asset_cache_dir);
-    const asset_cache = try asset_cache_mod.AssetCache.init(allocator, asset_cache_dir, 500 * 1024 * 1024);
-    defer asset_cache.deinit();
-    {
-        const s = asset_cache.stats();
-        try stdout.print(
-            "  asset cache:          {d} entries / {d:.1} MB / {d:.0} MB budget @ {s}\n",
-            .{
-                s.entry_count,
-                @as(f64, @floatFromInt(s.total_bytes)) / (1024.0 * 1024.0),
-                @as(f64, @floatFromInt(s.budget_bytes)) / (1024.0 * 1024.0),
-                asset_cache_dir,
-            },
-        );
-    }
-
     // ── Stage 17 (library-spec Phase 1) — `Spark` engine context ───
     // All host resources now live; the Spark struct holds borrowed
     // pointers so every component reaches them through a single
@@ -1103,11 +1086,56 @@ pub fn main() !void {
         .compute_jobs = job_system,
         .io_jobs = io_pool,
         .io_channel = &io_channel,
-        .dotenv = &env,
-        .asset_cache = asset_cache,
+        // dotenv + asset_cache + embedded_http stay null — host
+        // installs them below via the install methods (library-spec
+        // Phase 2, decision #9: explicit opt-in, no auto-loading).
     });
     defer spark.deinit();
     registry.attachSpark(&spark);
+
+    // ── library-spec Phase 2 — extras installs ─────────────────────
+    // Each `installX` allocates the resource from `spark.allocator`,
+    // mounts it on the spark, and Spark.deinit tears it down. The
+    // `--core-only` flag short-circuits this block so the demo can
+    // run against just the core component set (proves the core /
+    // extras boundary is real).
+    if (!core_only) {
+        // `~/.env` — KEY=VALUE store. Missing file is silent (loadFromPath
+        // returns OK on FileNotFound); other errors propagate.
+        const home = try std.process.getEnvVarOwned(allocator, "HOME");
+        defer allocator.free(home);
+        const env_path = try std.fs.path.join(allocator, &.{ home, ".env" });
+        defer allocator.free(env_path);
+        spark.installDotEnv(env_path) catch |e| {
+            try stdout.print("  installDotEnv:        {s} (continuing)\n", .{@errorName(e)});
+        };
+
+        // Asset cache — content-addressable directory under
+        // $XDG_CACHE_HOME/text_engine (or $HOME/.cache/text_engine).
+        // svg-stream + image-stream dedupe expensive remote assets
+        // here so a hot reload skips the LM call entirely.
+        const asset_cache_dir = try computeAssetCacheDir(allocator);
+        defer allocator.free(asset_cache_dir);
+        try spark.installAssetCache(asset_cache_dir, 500 * 1024 * 1024);
+        if (spark.asset_cache) |ac| {
+            const s = ac.stats();
+            try stdout.print(
+                "  asset cache:          {d} entries / {d:.1} MB / {d:.0} MB budget @ {s}\n",
+                .{
+                    s.entry_count,
+                    @as(f64, @floatFromInt(s.total_bytes)) / (1024.0 * 1024.0),
+                    @as(f64, @floatFromInt(s.budget_bytes)) / (1024.0 * 1024.0),
+                    asset_cache_dir,
+                },
+            );
+        }
+
+        // `:::embedded-document` URL source handler. Required for
+        // http:// + https:// src= values; file:// + bare paths work
+        // without it. No precondition beyond `io_channel` (always
+        // present in core).
+        try embedded_document_http_extras.install(&spark);
+    }
 
     // Component installs — every factory takes `*Spark` and plucks
     // what it needs (registry/theme/host_state/io_channel/dotenv/…)
@@ -1134,14 +1162,18 @@ pub fn main() !void {
     try button_component.install(&spark);
     try handle_component.install(&spark);
     try embedded_document_component.install(&spark);
-    defer embedded_document_component.deinitGlobals();
     try flex_component.install(&spark);
     try grid_component.install(&spark);
-    try llm_stream_component.install(&spark);
     try input_component.install(&spark);
     try svg_component.install(&spark);
-    try svg_stream_component.install(&spark);
-    try image_stream_component.install(&spark);
+    // Extras factories — skipped under --core-only. URL embedded-document
+    // sources are gated behind the corresponding extras install above
+    // (`embedded_document_http`), so they also stay dormant in core-only mode.
+    if (!core_only) {
+        try llm_stream_component.install(&spark);
+        try svg_stream_component.install(&spark);
+        try image_stream_component.install(&spark);
+    }
 
     // Stage 13d.2 — micro-benchmark serial vs parallel tessellation
     // on Petunias.svg before the markdown parse begins. Runs once at
