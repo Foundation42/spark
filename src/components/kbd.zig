@@ -17,6 +17,7 @@
 const std = @import("std");
 const element = @import("../element.zig");
 const components = @import("../markdown_components.zig");
+const spark_mod = @import("../spark.zig");
 const component_mod = @import("../component.zig");
 const text_layout = @import("../text/layout.zig");
 const shape = @import("../font/shape.zig");
@@ -26,8 +27,8 @@ pub const Error = error{
     KbdMissingKey,
 };
 
-pub fn install(registry: *component_mod.Registry) !void {
-    try registry.register("kbd", factory);
+pub fn install(spark: *spark_mod.Spark) !void {
+    try spark.registry.register("kbd", factory);
 }
 
 pub const factory: component_mod.Factory = .{
@@ -66,7 +67,8 @@ const Component = struct {
     }
 };
 
-fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
+fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
+    _ = spark;
     const c = try allocator.create(Component);
     errdefer allocator.destroy(c);
     c.* = .{
@@ -273,13 +275,15 @@ fn layoutAndRender(
 
 const testing = std.testing;
 
+var _test_spark = spark_mod.Spark.testStub(testing.allocator);
+
 test "Component.ingest: stores key + accent" {
     const attrs = [_]components.Attr{
         .{ .key = "key", .value = "Ctrl+C" },
         .{ .key = "color", .value = "red" },
     };
     const spec: components.Spec = .{ .name = "kbd", .attrs = &attrs };
-    const inst = try create(testing.allocator, &spec);
+    const inst = try create(&_test_spark, testing.allocator, &spec);
     defer deinit_(inst.ctx, testing.allocator);
 
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
@@ -289,7 +293,7 @@ test "Component.ingest: stores key + accent" {
 
 test "Component: missing key rejected" {
     const spec: components.Spec = .{ .name = "kbd" };
-    try testing.expectError(Error.KbdMissingKey, create(testing.allocator, &spec));
+    try testing.expectError(Error.KbdMissingKey, create(&_test_spark, testing.allocator, &spec));
 }
 
 test "vtable exposes measure_inline" {

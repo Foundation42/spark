@@ -33,6 +33,7 @@ const std = @import("std");
 const element = @import("../element.zig");
 const components = @import("../markdown_components.zig");
 const component_mod = @import("../component.zig");
+const spark_mod = @import("../spark.zig");
 const box_helpers = @import("box.zig"); // reuse parseLength + Length + parseColor
 const layout_context_mod = @import("../layout/context.zig");
 
@@ -43,28 +44,8 @@ pub const Error = error{
 
 pub const Axis = enum { horizontal, vertical };
 
-// ── Module globals ─────────────────────────────────────────────────
-// Set at install time so on_input can reach the host's registry
-// (to resolve target id → ctx) and LayoutContext (to push the
-// suggestion). The slider / flex / grid / embedded-document
-// factories follow the same pattern — see embedded_document.zig's
-// "module-globals smell" note for why we accept this for now.
-
-var registry_ref: ?*component_mod.Registry = null;
-var layout_context_ref: ?*layout_context_mod.LayoutContext = null;
-
-pub fn install(
-    registry: *component_mod.Registry,
-    layout_context: *layout_context_mod.LayoutContext,
-) !void {
-    registry_ref = registry;
-    layout_context_ref = layout_context;
-    try registry.register("handle", factory);
-}
-
-pub fn deinitGlobals() void {
-    registry_ref = null;
-    layout_context_ref = null;
+pub fn install(spark: *spark_mod.Spark) !void {
+    try spark.registry.register("handle", factory);
 }
 
 pub const factory: component_mod.Factory = .{
@@ -103,6 +84,9 @@ const Component = struct {
     // coords back to screen-space.
     last_box: element.Box = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     version: u64 = 0,
+    /// Captured at create time. on_input reaches the layout context
+    /// and registry through it (drag targets, suggestion channel).
+    spark: ?*spark_mod.Spark = null,
 
     fn fromSpec(allocator: std.mem.Allocator, spec: *const components.Spec) !Component {
         var target_raw: ?[]const u8 = null;
@@ -179,11 +163,11 @@ const Component = struct {
     }
 };
 
-fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
-    if (registry_ref == null or layout_context_ref == null) return Error.HandleNotInstalled;
+fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
     const c = try allocator.create(Component);
     errdefer allocator.destroy(c);
     c.* = try Component.fromSpec(allocator, spec);
+    c.spark = spark;
     return .{ .vtable = &vtable, .ctx = @ptrCast(c) };
 }
 
@@ -281,7 +265,7 @@ fn startDrag(c: *Component, local: [2]f32) !void {
     const target = resolveTarget(c) orelse return;
     const target_key = @intFromPtr(target.ctx);
 
-    const lc = layout_context_ref orelse return;
+    const lc = (c.spark orelse return).layout_context;
     const axis: layout_context_mod.Axis = if (c.axis == .horizontal) .width else .height;
 
     // Read the target's current size. Priority order:
@@ -334,7 +318,7 @@ fn applyDrag(c: *Component, local: [2]f32) !void {
     const target = resolveTarget(c) orelse return;
     const target_key = @intFromPtr(target.ctx);
 
-    const lc = layout_context_ref orelse return;
+    const lc = (c.spark orelse return).layout_context;
     const axis: layout_context_mod.Axis = if (c.axis == .horizontal) .width else .height;
 
     // Cursor world reconstruction uses the FROZEN origin captured at
@@ -367,9 +351,9 @@ fn applyDrag(c: *Component, local: [2]f32) !void {
 /// lives at top level. Cheap enough at input frequency to re-resolve
 /// on every event instead of caching across the drag.
 fn resolveTarget(c: *Component) ?component_mod.Resolved {
-    const reg = registry_ref orelse return null;
+    const sp = c.spark orelse return null;
     if (c.target.len == 0) return null;
-    return reg.lookupSibling(@ptrCast(c), c.target);
+    return sp.registry.lookupSibling(@ptrCast(c), c.target);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────

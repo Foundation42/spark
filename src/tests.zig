@@ -57,4 +57,5 @@ test {
     _ = @import("svg.zig");
     _ = @import("svg_tessellate.zig");
     _ = @import("update.zig");
+    _ = @import("spark.zig");
 }

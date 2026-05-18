@@ -60,6 +60,7 @@ const std = @import("std");
 const element = @import("../element.zig");
 const components = @import("../markdown_components.zig");
 const component_mod = @import("../component.zig");
+const spark_mod = @import("../spark.zig");
 const markdown = @import("../markdown.zig");
 const element_layout = @import("../element_layout.zig");
 const layout_cache = @import("../layout_cache.zig");
@@ -99,31 +100,15 @@ const Component = struct {
     /// Component so `deinit` can call `registry.deinitScope`.
     scope: []u8,
     version: u64 = 0,
+    /// Captured at create time. `deinit_` reaches the registry
+    /// through it to tear down child instances in this scope.
+    spark: ?*spark_mod.Spark = null,
 };
-
-// ── Module globals (matches the flex / embedded-document pattern;
-// the factory.create signature doesn't yet thread host context). ──
-var registry_ref: ?*component_mod.Registry = null;
-var theme_ref: ?*const element.Theme = null;
-var state_ref: ?*state_mod.State = null;
 
 /// One-time install. Call after registering the other factories
 /// the grid's children may use (e.g. `:::box`, `:::flex`).
-pub fn install(
-    registry: *component_mod.Registry,
-    theme: *const element.Theme,
-    state: *state_mod.State,
-) !void {
-    registry_ref = registry;
-    theme_ref = theme;
-    state_ref = state;
-    try registry.register("grid", factory);
-}
-
-pub fn deinitGlobals() void {
-    registry_ref = null;
-    theme_ref = null;
-    state_ref = null;
+pub fn install(spark: *spark_mod.Spark) !void {
+    try spark.registry.register("grid", factory);
 }
 
 pub const factory: component_mod.Factory = .{
@@ -133,12 +118,10 @@ pub const factory: component_mod.Factory = .{
 };
 
 fn create(
+    spark: *spark_mod.Spark,
     allocator: std.mem.Allocator,
     spec: *const components.Spec,
 ) anyerror!component_mod.Instance {
-    const reg = registry_ref orelse return error.GridNotInstalled;
-    const theme = theme_ref orelse return error.GridNotInstalled;
-    const state = state_ref orelse return error.GridNotInstalled;
     const id_raw = spec.id orelse return error.GridMissingId;
 
     const c = try allocator.create(Component);
@@ -153,6 +136,7 @@ fn create(
         .root = element.Element{ .paragraph = &[_]element.Element{} },
         .scope = undefined,
         .version = 0,
+        .spark = spark,
     };
     errdefer c.arena.deinit();
 
@@ -164,9 +148,9 @@ fn create(
     c.root = try markdown.parseWithStateAndScope(
         c.arena.allocator(),
         spec.body,
-        theme,
-        reg,
-        state,
+        spark.theme,
+        spark.registry,
+        spark.host_state,
         c.scope,
     );
 
@@ -187,7 +171,7 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     const c: *Component = @ptrCast(@alignCast(ctx));
     // Tear down child instances FIRST (their bindings reference
     // state we're about to free), then the arena, then us.
-    if (registry_ref) |r| r.deinitScope(c.scope);
+    if (c.spark) |sp| sp.registry.deinitScope(c.scope);
     c.arena.deinit();
     allocator.free(c.scope);
     allocator.destroy(c);

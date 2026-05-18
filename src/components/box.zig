@@ -30,6 +30,7 @@ const std = @import("std");
 const element = @import("../element.zig");
 const components = @import("../markdown_components.zig");
 const component_mod = @import("../component.zig");
+const spark_mod = @import("../spark.zig");
 const kiwi = @import("../layout/kiwi/root.zig");
 const layout_context_mod = @import("../layout/context.zig");
 
@@ -72,6 +73,11 @@ const Component = struct {
     /// cache so a state-driven attr change invalidates the cached
     /// block. See `layout_cache.zig`.
     version: u64 = 0,
+    /// Captured at create time; nullable because `Component.fromSpec`
+    /// builds a fresh struct on update and the spark pointer is
+    /// re-stitched right after by the dispatcher. Used by `deinit_`
+    /// to find the LayoutContext for bumper / last_size cleanup.
+    spark: ?*spark_mod.Spark = null,
 
     fn fromSpec(spec: *const components.Spec) Component {
         var c: Component = .{
@@ -132,32 +138,8 @@ const Component = struct {
 
 const MAGENTA: [4]f32 = .{ 1.0, 0.0, 1.0, 1.0 };
 
-// Module-global LayoutContext reference (matches the handle pattern).
-// Used in `deinit_` to unregister the component's bumper + clear its
-// last_size entry so stale `@intFromPtr` keys don't linger past
-// component destruction. Set by `install`; null when the box was
-// registered via `registry.register(...)` directly (pre-15 Phase C.4
-// callers). When null, `deinit_` just frees the component — the
-// stale-bumper window stays open for that path.
-var layout_context_ref: ?*layout_context_mod.LayoutContext = null;
-
-/// Preferred registration path for stage 15 Phase C.4 onwards.
-/// Stashes the LayoutContext so `deinit_` can clean up the bumper
-/// + last_size entry. Use instead of `registry.register("box", factory)`
-/// for hosts that wire a LayoutContext.
-pub fn install(
-    registry: *component_mod.Registry,
-    layout_context: *layout_context_mod.LayoutContext,
-) !void {
-    layout_context_ref = layout_context;
-    try registry.register("box", factory);
-}
-
-/// Test-side helper for tearing down the global reference between
-/// runs. Hosts that own a single LayoutContext for their lifetime
-/// (the typical case) don't need to call this.
-pub fn deinitGlobals() void {
-    layout_context_ref = null;
+pub fn install(spark: *spark_mod.Spark) !void {
+    try spark.registry.register("box", factory);
 }
 
 pub const factory: component_mod.Factory = .{
@@ -168,18 +150,22 @@ pub const factory: component_mod.Factory = .{
 };
 
 fn create(
+    spark: *spark_mod.Spark,
     allocator: std.mem.Allocator,
     spec: *const components.Spec,
 ) anyerror!component_mod.Instance {
     const c = try allocator.create(Component);
     c.* = Component.fromSpec(spec);
+    c.spark = spark;
     return .{ .vtable = &vtable, .ctx = @ptrCast(c) };
 }
 
 fn update(ctx: *anyopaque, spec: *const components.Spec) anyerror!void {
     const c: *Component = @ptrCast(@alignCast(ctx));
     const prev_version = c.version;
+    const prev_spark = c.spark;
     c.* = Component.fromSpec(spec);
+    c.spark = prev_spark;
     c.version = prev_version +% 1;
 }
 
@@ -190,7 +176,8 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     // later, it'll register fresh bumper + size entries; without
     // this, the stale entries would briefly point at freed memory
     // until the new component overwrote them.
-    if (layout_context_ref) |lc| {
+    if (c.spark) |sp| {
+        const lc = sp.layout_context;
         const key = @intFromPtr(c);
         lc.unregisterBumper(key);
         lc.clearSize(key);

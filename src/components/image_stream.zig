@@ -44,6 +44,7 @@ const std = @import("std");
 const element = @import("../element.zig");
 const components = @import("../markdown_components.zig");
 const component_mod = @import("../component.zig");
+const spark_mod = @import("../spark.zig");
 const state_mod = @import("../state.zig");
 const io = @import("../io_channel.zig");
 const dotenv = @import("../dotenv.zig");
@@ -70,43 +71,8 @@ pub const Error = error{
     ImageStreamDecodeFailed,
 };
 
-// Module globals — see `embedded_document.zig` for the discussion of
-// why this pattern exists. install() captures the host context.
-var registry_ref: ?*component_mod.Registry = null;
-var parent_state_ref: ?*state_mod.State = null;
-var io_channel_ref: ?*io.IoChannel = null;
-var env_ref: ?*const dotenv.DotEnv = null;
-var vk_ctx_ref: ?*const vk.Context = null;
-var image_pipeline_ref: ?*image_pipeline_mod.ImagePipeline = null;
-var asset_cache_ref: ?*asset_cache_mod.AssetCache = null;
-
-pub fn install(
-    registry: *component_mod.Registry,
-    parent_state: *state_mod.State,
-    io_channel: *io.IoChannel,
-    env: ?*const dotenv.DotEnv,
-    vk_ctx: *const vk.Context,
-    image_pipeline: *image_pipeline_mod.ImagePipeline,
-    asset_cache: ?*asset_cache_mod.AssetCache,
-) !void {
-    registry_ref = registry;
-    parent_state_ref = parent_state;
-    io_channel_ref = io_channel;
-    env_ref = env;
-    vk_ctx_ref = vk_ctx;
-    image_pipeline_ref = image_pipeline;
-    asset_cache_ref = asset_cache;
-    try registry.register("image-stream", factory);
-}
-
-pub fn deinitGlobals() void {
-    registry_ref = null;
-    parent_state_ref = null;
-    io_channel_ref = null;
-    env_ref = null;
-    vk_ctx_ref = null;
-    image_pipeline_ref = null;
-    asset_cache_ref = null;
+pub fn install(spark: *spark_mod.Spark) !void {
+    try spark.registry.register("image-stream", factory);
 }
 
 const DEFAULT_OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
@@ -157,10 +123,18 @@ const PendingImageStream = struct {
     /// Snapshotted at submit time so a successful `.end` writes to
     /// the same key the request was issued under.
     cache_key: asset_cache_mod.Key,
+    /// Snapshot of the spark pointer — completion handler accesses
+    /// io_channel + host_state + asset_cache through it even if
+    /// the Component has been destroyed.
+    spark: *spark_mod.Spark,
 };
 
 const Component = struct {
     allocator: std.mem.Allocator,
+    /// Captured at create time. Every cross-cutting concern (registry,
+    /// parent state, io_channel, dotenv, vk_ctx, image_pipeline,
+    /// asset_cache) is one hop through here.
+    spark: *spark_mod.Spark,
     scope: []u8,
 
     /// Raw HTTP response bytes accumulated from every chunk. Gemini
@@ -205,10 +179,7 @@ pub const factory: component_mod.Factory = .{
     .handle_update = handleUpdate,
 };
 
-fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
-    if (registry_ref == null or parent_state_ref == null or io_channel_ref == null or vk_ctx_ref == null or image_pipeline_ref == null) {
-        return Error.ImageStreamNotInstalled;
-    }
+fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
     const id_raw = spec.id orelse return Error.ImageStreamMissingId;
     const model = findAttr(spec.attrs, "model") orelse return Error.ImageStreamMissingModel;
     const prompt = findAttr(spec.attrs, "prompt") orelse return Error.ImageStreamMissingPrompt;
@@ -248,6 +219,7 @@ fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!c
 
     c.* = .{
         .allocator = allocator,
+        .spark = spark,
         .scope = scope,
         .width = if (findAttr(spec.attrs, "width")) |s|
             box_helpers.parseLength(s) orelse .{ .pixels = 480 }
@@ -274,7 +246,7 @@ fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!c
 }
 
 fn kickStream(c: *Component) !void {
-    const ch = io_channel_ref orelse return Error.ImageStreamNotInstalled;
+    const ch = c.spark.io_channel;
 
     if (c.pending) |p| {
         p.component = null;
@@ -295,7 +267,7 @@ fn kickStream(c: *Component) !void {
     // Cache fast path. Bypass the network if we already have this
     // request's envelope on disk; on parse/finalize failure, fall
     // through to a fresh fetch.
-    if (asset_cache_ref) |cache| {
+    if (c.spark.asset_cache) |cache| {
         if (cache.get(cache_key) catch |e| blk: {
             std.log.warn("image-stream: cache get failed: {s}", .{@errorName(e)});
             break :blk null;
@@ -308,7 +280,7 @@ fn kickStream(c: *Component) !void {
             if (c.response.items.len > 0) {
                 if (finalizeResponse(c)) |_| {
                     c.version +%= 1;
-                    if (parent_state_ref) |ps| ps.dirty = true;
+                    c.spark.host_state.dirty = true;
                     return;
                 } else |e| {
                     std.log.warn("image-stream: cache finalize failed: {s}; refetching", .{@errorName(e)});
@@ -328,14 +300,14 @@ fn kickStream(c: *Component) !void {
 
     var headers_buf: std.ArrayListUnmanaged(io.Header) = .{};
     const key_env = c.api_key_env orelse return Error.ImageStreamMissingApiKeyEnv;
-    const env = env_ref orelse return Error.ImageStreamApiKeyNotFound;
+    const env = c.spark.dotenv orelse return Error.ImageStreamApiKeyNotFound;
     const key = env.get(key_env) orelse return Error.ImageStreamApiKeyNotFound;
     const auth_value = try std.fmt.allocPrint(sa, "Bearer {s}", .{key});
     try headers_buf.append(sa, .{ .name = "Authorization", .value = auth_value });
 
     const pending = try c.allocator.create(PendingImageStream);
     errdefer c.allocator.destroy(pending);
-    pending.* = .{ .allocator = c.allocator, .component = c, .cache_key = cache_key };
+    pending.* = .{ .allocator = c.allocator, .component = c, .cache_key = cache_key, .spark = c.spark };
 
     const handle = try ch.submitHttpStream(.{
         .url = c.endpoint,
@@ -369,7 +341,7 @@ fn handleUpdate(ctx: *anyopaque, action: []const u8, body: []const u8) anyerror!
         c.err_name = a.dupe(u8, @errorName(e)) catch null;
     };
     c.version +%= 1;
-    if (parent_state_ref) |ps| ps.dirty = true;
+    c.spark.host_state.dirty = true;
 }
 
 fn update(_: *anyopaque, _: *const components.Spec) anyerror!void {
@@ -398,7 +370,7 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
 
 fn freeGpuResources(c: *Component) void {
     if (c.descriptor_set) |ds| {
-        if (image_pipeline_ref) |ip| ip.freeDescriptor(@ptrCast(@alignCast(ds)));
+        c.spark.image_pipeline.freeDescriptor(@ptrCast(@alignCast(ds)));
         c.descriptor_set = null;
     }
     if (c.texture) |*t| {
@@ -438,9 +410,10 @@ fn buildRequestBody(
 fn handleCompletion(comp: io.Completion) void {
     const p: *PendingImageStream = @ptrFromInt(comp.user_data);
 
+    const host_state = p.spark.host_state;
     switch (comp.result) {
         .chunk => |bytes| {
-            defer if (io_channel_ref) |ch| ch.releaseOk(bytes);
+            defer p.spark.io_channel.releaseOk(bytes);
             const c = p.component orelse return;
             c.response.appendSlice(c.allocator, bytes) catch |e| {
                 std.log.err("image-stream: append failed: {s}", .{@errorName(e)});
@@ -457,7 +430,7 @@ fn handleCompletion(comp: io.Completion) void {
                     c.err_name = a.dupe(u8, @errorName(e)) catch null;
                 };
                 if (c.phase == .done) {
-                    if (asset_cache_ref) |cache| {
+                    if (p.spark.asset_cache) |cache| {
                         var source_buf: [256]u8 = undefined;
                         const source = std.fmt.bufPrint(&source_buf, "image-stream:{s}:{s}", .{ @tagName(c.provider), c.model }) catch null;
                         cache.put(p.cache_key, c.response.items, .{
@@ -469,7 +442,7 @@ fn handleCompletion(comp: io.Completion) void {
                     }
                 }
                 c.version +%= 1;
-                if (parent_state_ref) |ps| ps.dirty = true;
+                host_state.dirty = true;
             }
             freePending(p);
         },
@@ -481,7 +454,7 @@ fn handleCompletion(comp: io.Completion) void {
                 if (c.err_name) |old| a.free(old);
                 c.err_name = a.dupe(u8, @errorName(e)) catch null;
                 c.version +%= 1;
-                if (parent_state_ref) |ps| ps.dirty = true;
+                host_state.dirty = true;
             }
             freePending(p);
         },
@@ -567,8 +540,8 @@ fn finalizeResponse(c: *Component) !void {
         break :blk true;
     };
 
-    const vk_ctx = vk_ctx_ref orelse return Error.ImageStreamNotInstalled;
-    const ip = image_pipeline_ref orelse return Error.ImageStreamNotInstalled;
+    const vk_ctx = c.spark.vk_ctx;
+    const ip = c.spark.image_pipeline;
 
     if (need_new_texture) {
         if (c.texture) |*t| {

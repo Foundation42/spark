@@ -45,6 +45,7 @@ const std = @import("std");
 const element = @import("../element.zig");
 const components = @import("../markdown_components.zig");
 const component_mod = @import("../component.zig");
+const spark_mod = @import("../spark.zig");
 const state_mod = @import("../state.zig");
 const text_layout = @import("../text/layout.zig");
 const shape = @import("../font/shape.zig");
@@ -57,16 +58,8 @@ pub const Error = error{
     ButtonNotInstalled,
 };
 
-// Module global — set by install(). Used by onInput to dispatch.
-var registry_ref: ?*component_mod.Registry = null;
-
-pub fn install(registry: *component_mod.Registry) !void {
-    registry_ref = registry;
-    try registry.register("button", factory);
-}
-
-pub fn deinitGlobals() void {
-    registry_ref = null;
+pub fn install(spark: *spark_mod.Spark) !void {
+    try spark.registry.register("button", factory);
 }
 
 pub const factory: component_mod.Factory = .{
@@ -87,6 +80,9 @@ const Component = struct {
     /// Bumped on every spec ingest so the retained layout cache
     /// re-walks the button when its attrs change.
     version: u64 = 0,
+    /// Captured at create time. `onInput` reaches the registry
+    /// through it to dispatch component-target actions.
+    spark: ?*spark_mod.Spark = null,
 
     fn ingest(self: *Component, spec: *const components.Spec) !void {
         const a = self.allocator;
@@ -161,11 +157,12 @@ const Component = struct {
     }
 };
 
-fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
+fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
     const c = try allocator.create(Component);
     errdefer allocator.destroy(c);
     c.* = .{
         .allocator = allocator,
+        .spark = spark,
         .label = try allocator.dupe(u8, ""),
         .target = try allocator.dupe(u8, ""),
         .action = try allocator.dupe(u8, ""),
@@ -320,8 +317,8 @@ fn onInput(
 
             // Component-target.
             if (c.action.len == 0) return;
-            const r = registry_ref orelse return;
-            r.handleUpdate(c.target, c.action, c.body) catch |e| {
+            const sp = c.spark orelse return;
+            sp.registry.handleUpdate(c.target, c.action, c.body) catch |e| {
                 std.log.warn(":::button: dispatch failed: target=#{s} action={s} err={s}", .{
                     c.target, c.action, @errorName(e),
                 });
@@ -335,6 +332,8 @@ fn onInput(
 
 const testing = std.testing;
 
+var _test_spark = spark_mod.Spark.testStub(testing.allocator);
+
 test "button: ingest stores label/target/action/body, strips # from target" {
     const attrs = [_]components.Attr{
         .{ .key = "label", .value = "Run" },
@@ -344,7 +343,7 @@ test "button: ingest stores label/target/action/body, strips # from target" {
     };
     const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
 
-    const inst = try create(testing.allocator, &spec);
+    const inst = try create(&_test_spark, testing.allocator, &spec);
     defer deinit_(inst.ctx, testing.allocator);
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
     try testing.expectEqualStrings("Run", c.label);
@@ -359,7 +358,7 @@ test "button: missing label rejected" {
         .{ .key = "action", .value = "go" },
     };
     const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
-    try testing.expectError(Error.ButtonMissingLabel, create(testing.allocator, &spec));
+    try testing.expectError(Error.ButtonMissingLabel, create(&_test_spark, testing.allocator, &spec));
 }
 
 test "button: missing target rejected" {
@@ -368,7 +367,7 @@ test "button: missing target rejected" {
         .{ .key = "action", .value = "go" },
     };
     const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
-    try testing.expectError(Error.ButtonMissingTarget, create(testing.allocator, &spec));
+    try testing.expectError(Error.ButtonMissingTarget, create(&_test_spark, testing.allocator, &spec));
 }
 
 test "button: missing action rejected" {
@@ -377,7 +376,7 @@ test "button: missing action rejected" {
         .{ .key = "target", .value = "y" },
     };
     const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
-    try testing.expectError(Error.ButtonMissingAction, create(testing.allocator, &spec));
+    try testing.expectError(Error.ButtonMissingAction, create(&_test_spark, testing.allocator, &spec));
 }
 
 test "button: update re-ingests attrs (label change)" {
@@ -387,7 +386,7 @@ test "button: update re-ingests attrs (label change)" {
         .{ .key = "action", .value = "a" },
     };
     const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
-    const inst = try create(testing.allocator, &spec);
+    const inst = try create(&_test_spark, testing.allocator, &spec);
     defer deinit_(inst.ctx, testing.allocator);
 
     const attrs2 = [_]components.Attr{
@@ -410,7 +409,7 @@ test "button: state-target dispatch writes body into state.path" {
     };
     const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
 
-    const inst = try create(testing.allocator, &spec);
+    const inst = try create(&_test_spark, testing.allocator, &spec);
     defer deinit_(inst.ctx, testing.allocator);
 
     var state = state_mod.State.init(testing.allocator);
@@ -430,7 +429,7 @@ test "button: state-target accepts missing action" {
     };
     const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
     // No `action=` attr supplied — must NOT return ButtonMissingAction.
-    const inst = try create(testing.allocator, &spec);
+    const inst = try create(&_test_spark, testing.allocator, &spec);
     defer deinit_(inst.ctx, testing.allocator);
 
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
@@ -446,7 +445,7 @@ test "button: state-target ignores right-mouse and key events" {
     };
     const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
 
-    const inst = try create(testing.allocator, &spec);
+    const inst = try create(&_test_spark, testing.allocator, &spec);
     defer deinit_(inst.ctx, testing.allocator);
 
     var state = state_mod.State.init(testing.allocator);

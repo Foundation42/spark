@@ -375,7 +375,8 @@ Behavior unchanged.
 - No `_ref` module-global pointers remain in any component
   (`grep -r "var .*_ref:" src/components/` returns empty).
 - Demo runs with identical visual output and similar FPS
-  (~7,600 fps Release at idle).
+  (see the FPS canary section below — `src/hello.md` at ~12,800
+  fps Release is the current baseline).
 - All existing tests pass.
 
 ### Phase 2 — core / extras split
@@ -678,14 +679,19 @@ library boundary, not just the internals.
   commit. The spec captures what we believe today; the code is
   what we ship. When the two disagree, the more recent
   understanding wins, and the spec should follow.
-- **FPS canary.** `~7,600 fps Release at idle` is the baseline
-  for an empty/static demo on this hardware. Phase 1 introduces
-  one extra pointer hop (`*Spark` dereference) on every component
-  call, so a small drop is plausible. If the demo regresses by
-  more than ~5% after Phase 1 lands, something's wrong with the
-  indirection — likely a cache-line / pointer-chase issue. Fix is
-  usually inlining the hot `*Spark` fields rather than dereferencing
-  through the struct.
+- **FPS canary.** The Phase-1-era baseline is **~12,800 fps
+  Release** against `src/hello.md` — a tiny doc (heading + 2
+  paragraphs + 1 `:::box` + 1 `::badge`) chosen as a stable
+  rendering hot-path probe. Earlier readings of ~7,600 fps were
+  taken before the demo grew to ~20 KB with embedded docs, LLM
+  streams, and the full inline drawer — apples-to-oranges. To
+  re-measure after a change: `./zig-out/bin/text_engine_demo
+  src/hello.md` (TEXT_ENGINE_EXIT_AFTER=N for a timed run). If
+  the reading drops by more than ~5% against hello.md after a
+  refactor, something on the hot path regressed — likely a
+  cache-line / pointer-chase issue from added indirection. Fix is
+  usually inlining hot fields rather than dereferencing through a
+  struct hop.
 
 ## Locked-in answers to earlier open questions
 

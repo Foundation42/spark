@@ -71,6 +71,7 @@ const std = @import("std");
 const element = @import("../element.zig");
 const components = @import("../markdown_components.zig");
 const component_mod = @import("../component.zig");
+const spark_mod = @import("../spark.zig");
 const state_mod = @import("../state.zig");
 const io = @import("../io_channel.zig");
 const dotenv = @import("../dotenv.zig");
@@ -92,38 +93,8 @@ pub const Error = error{
     SvgStreamNotInstalled,
 };
 
-// Module globals (same pattern as llm-stream).
-var registry_ref: ?*component_mod.Registry = null;
-var parent_state_ref: ?*state_mod.State = null;
-var io_channel_ref: ?*io.IoChannel = null;
-var env_ref: ?*const dotenv.DotEnv = null;
-var job_system_ref: ?*jobs_mod.JobSystem = null;
-var asset_cache_ref: ?*asset_cache_mod.AssetCache = null;
-
-pub fn install(
-    registry: *component_mod.Registry,
-    parent_state: *state_mod.State,
-    io_channel: *io.IoChannel,
-    env: ?*const dotenv.DotEnv,
-    job_system: *jobs_mod.JobSystem,
-    asset_cache: ?*asset_cache_mod.AssetCache,
-) !void {
-    registry_ref = registry;
-    parent_state_ref = parent_state;
-    io_channel_ref = io_channel;
-    env_ref = env;
-    job_system_ref = job_system;
-    asset_cache_ref = asset_cache;
-    try registry.register("svg-stream", factory);
-}
-
-pub fn deinitGlobals() void {
-    registry_ref = null;
-    parent_state_ref = null;
-    io_channel_ref = null;
-    env_ref = null;
-    job_system_ref = null;
-    asset_cache_ref = null;
+pub fn install(spark: *spark_mod.Spark) !void {
+    try spark.registry.register("svg-stream", factory);
 }
 
 const DEFAULT_OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions";
@@ -175,10 +146,18 @@ const PendingSvgStream = struct {
     /// the same key the request was issued under — even if the
     /// component's prompt or model has been mutated mid-flight.
     cache_key: asset_cache_mod.Key,
+    /// Snapshot of the spark pointer so the completion handler can
+    /// access io_channel + host_state + asset_cache even after the
+    /// Component pointer has been nulled by deinit.
+    spark: *spark_mod.Spark,
 };
 
 const Component = struct {
     allocator: std.mem.Allocator,
+    /// Captured at create time. Every cross-cutting concern
+    /// (registry, parent state, io_channel, dotenv, compute jobs,
+    /// asset_cache) is one hop through here.
+    spark: *spark_mod.Spark,
     scope: []u8, // component id, owned
 
     /// Raw HTTP response bytes accumulated from every chunk. Not
@@ -227,10 +206,7 @@ pub const factory: component_mod.Factory = .{
     .handle_update = handleUpdate,
 };
 
-fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
-    if (registry_ref == null or parent_state_ref == null or io_channel_ref == null or job_system_ref == null) {
-        return Error.SvgStreamNotInstalled;
-    }
+fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
     const id_raw = spec.id orelse return Error.SvgStreamMissingId;
     const model = findAttr(spec.attrs, "model") orelse return Error.SvgStreamMissingModel;
     const prompt = findAttr(spec.attrs, "prompt") orelse return Error.SvgStreamMissingPrompt;
@@ -273,6 +249,7 @@ fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!c
 
     c.* = .{
         .allocator = allocator,
+        .spark = spark,
         .scope = scope,
         .width = if (findAttr(spec.attrs, "width")) |s|
             box_helpers.parseLength(s) orelse .{ .pixels = 480 }
@@ -301,7 +278,7 @@ fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!c
 /// Submit a fresh stream. Cancels any in-flight fetch, clears the
 /// content + mesh, resubmits. Mirrors `llm_stream.kickStream`.
 fn kickStream(c: *Component) !void {
-    const ch = io_channel_ref orelse return Error.SvgStreamNotInstalled;
+    const ch = c.spark.io_channel;
 
     if (c.pending) |p| {
         p.component = null;
@@ -320,7 +297,7 @@ fn kickStream(c: *Component) !void {
     // Cache fast path. A hit skips the network entirely — read bytes,
     // run the same finalizeResponse the network path uses. On a
     // corrupt/incompatible cached entry, drop it and fall through.
-    if (asset_cache_ref) |cache| {
+    if (c.spark.asset_cache) |cache| {
         if (cache.get(cache_key) catch |e| blk: {
             std.log.warn("svg-stream: cache get failed: {s}", .{@errorName(e)});
             break :blk null;
@@ -333,7 +310,7 @@ fn kickStream(c: *Component) !void {
             if (c.response.items.len > 0) {
                 if (finalizeResponse(c)) |_| {
                     c.version +%= 1;
-                    if (parent_state_ref) |ps| ps.dirty = true;
+                    c.spark.host_state.dirty = true;
                     return;
                 } else |e| {
                     std.log.warn("svg-stream: cache finalize failed: {s}; refetching", .{@errorName(e)});
@@ -353,14 +330,14 @@ fn kickStream(c: *Component) !void {
 
     var headers_buf: std.ArrayListUnmanaged(io.Header) = .{};
     const key_env = c.api_key_env orelse return Error.SvgStreamMissingApiKeyEnv;
-    const env = env_ref orelse return Error.SvgStreamApiKeyNotFound;
+    const env = c.spark.dotenv orelse return Error.SvgStreamApiKeyNotFound;
     const key = env.get(key_env) orelse return Error.SvgStreamApiKeyNotFound;
     const auth_value = try std.fmt.allocPrint(sa, "Bearer {s}", .{key});
     try headers_buf.append(sa, .{ .name = "Authorization", .value = auth_value });
 
     const pending = try c.allocator.create(PendingSvgStream);
     errdefer c.allocator.destroy(pending);
-    pending.* = .{ .allocator = c.allocator, .component = c, .cache_key = cache_key };
+    pending.* = .{ .allocator = c.allocator, .component = c, .cache_key = cache_key, .spark = c.spark };
 
     const handle = try ch.submitHttpStream(.{
         .url = c.endpoint,
@@ -394,7 +371,7 @@ fn handleUpdate(ctx: *anyopaque, action: []const u8, body: []const u8) anyerror!
         c.err_name = a.dupe(u8, @errorName(e)) catch null;
     };
     c.version +%= 1;
-    if (parent_state_ref) |ps| ps.dirty = true;
+    c.spark.host_state.dirty = true;
 }
 
 fn update(_: *anyopaque, _: *const components.Spec) anyerror!void {
@@ -464,9 +441,10 @@ fn buildRecraftBody(
 fn handleCompletion(comp: io.Completion) void {
     const p: *PendingSvgStream = @ptrFromInt(comp.user_data);
 
+    const host_state = p.spark.host_state;
     switch (comp.result) {
         .chunk => |bytes| {
-            defer if (io_channel_ref) |ch| ch.releaseOk(bytes);
+            defer p.spark.io_channel.releaseOk(bytes);
             const c = p.component orelse return;
             // Just accumulate. Recraft's response isn't SSE — it's
             // a single JSON document delivered in HTTP chunks.
@@ -487,7 +465,7 @@ fn handleCompletion(comp: io.Completion) void {
                 // Persist successful responses to the asset cache so the
                 // next run replays without burning another $0.08.
                 if (c.phase == .done) {
-                    if (asset_cache_ref) |cache| {
+                    if (p.spark.asset_cache) |cache| {
                         var source_buf: [256]u8 = undefined;
                         const source = std.fmt.bufPrint(&source_buf, "svg-stream:{s}:{s}", .{ @tagName(c.provider), c.model }) catch null;
                         cache.put(p.cache_key, c.response.items, .{
@@ -499,7 +477,7 @@ fn handleCompletion(comp: io.Completion) void {
                     }
                 }
                 c.version +%= 1;
-                if (parent_state_ref) |ps| ps.dirty = true;
+                host_state.dirty = true;
             }
             freePending(p);
         },
@@ -511,7 +489,7 @@ fn handleCompletion(comp: io.Completion) void {
                 if (c.err_name) |old| a.free(old);
                 c.err_name = a.dupe(u8, @errorName(e)) catch null;
                 c.version +%= 1;
-                if (parent_state_ref) |ps| ps.dirty = true;
+                host_state.dirty = true;
             }
             freePending(p);
         },
@@ -568,8 +546,7 @@ fn finalizeResponse(c: *Component) !void {
     const doc = try svg.parse(sa, svg_bytes);
     var mesh = tess.Mesh.init(std.heap.c_allocator);
     defer mesh.deinit();
-    const js = job_system_ref orelse return Error.SvgStreamNotInstalled;
-    try tess.tessellateParallel(c.allocator, doc.paths, &mesh, js, .{});
+    try tess.tessellateParallel(c.allocator, doc.paths, &mesh, c.spark.compute_jobs, .{});
 
     // Swap into the cached fields.
     freeMesh(c);

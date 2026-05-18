@@ -22,6 +22,7 @@
 const std = @import("std");
 const element = @import("../element.zig");
 const components = @import("../markdown_components.zig");
+const spark_mod = @import("../spark.zig");
 const component_mod = @import("../component.zig");
 const text_layout = @import("../text/layout.zig");
 const shape = @import("../font/shape.zig");
@@ -31,8 +32,8 @@ pub const Error = error{
     TrendMissingValue,
 };
 
-pub fn install(registry: *component_mod.Registry) !void {
-    try registry.register("trend", factory);
+pub fn install(spark: *spark_mod.Spark) !void {
+    try spark.registry.register("trend", factory);
 }
 
 pub const factory: component_mod.Factory = .{
@@ -115,7 +116,8 @@ fn stripLeadingPlus(v: []const u8) []const u8 {
     return v;
 }
 
-fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
+fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
+    _ = spark;
     const c = try allocator.create(Component);
     errdefer allocator.destroy(c);
     c.* = .{
@@ -252,6 +254,8 @@ fn layoutAndRender(
 
 const testing = std.testing;
 
+var _test_spark = spark_mod.Spark.testStub(testing.allocator);
+
 test "classify: leading + is up" {
     try testing.expectEqual(Direction.up, classify("+12.4%"));
     try testing.expectEqual(Direction.up, classify("+0.1"));
@@ -279,7 +283,7 @@ test "Component: up trend gets green + up arrow" {
         .{ .key = "value", .value = "+12.4%" },
     };
     const spec: components.Spec = .{ .name = "trend", .attrs = &attrs };
-    const inst = try create(testing.allocator, &spec);
+    const inst = try create(&_test_spark, testing.allocator, &spec);
     defer deinit_(inst.ctx, testing.allocator);
 
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
@@ -295,7 +299,7 @@ test "Component: down trend keeps minus sign and gets red" {
         .{ .key = "value", .value = "-2.1%" },
     };
     const spec: components.Spec = .{ .name = "trend", .attrs = &attrs };
-    const inst = try create(testing.allocator, &spec);
+    const inst = try create(&_test_spark, testing.allocator, &spec);
     defer deinit_(inst.ctx, testing.allocator);
 
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
@@ -306,7 +310,7 @@ test "Component: down trend keeps minus sign and gets red" {
 
 test "Component: missing value rejected" {
     const spec: components.Spec = .{ .name = "trend" };
-    try testing.expectError(Error.TrendMissingValue, create(testing.allocator, &spec));
+    try testing.expectError(Error.TrendMissingValue, create(&_test_spark, testing.allocator, &spec));
 }
 
 test "vtable exposes measure_inline" {

@@ -25,6 +25,7 @@
 const std = @import("std");
 const element = @import("../element.zig");
 const components = @import("../markdown_components.zig");
+const spark_mod = @import("../spark.zig");
 const component_mod = @import("../component.zig");
 const text_layout = @import("../text/layout.zig");
 const shape = @import("../font/shape.zig");
@@ -33,8 +34,8 @@ pub const Error = error{
     BadgeMissingLabel,
 };
 
-pub fn install(registry: *component_mod.Registry) !void {
-    try registry.register("badge", factory);
+pub fn install(spark: *spark_mod.Spark) !void {
+    try spark.registry.register("badge", factory);
 }
 
 pub const factory: component_mod.Factory = .{
@@ -80,7 +81,8 @@ const Component = struct {
     }
 };
 
-fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
+fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
+    _ = spark;
     const c = try allocator.create(Component);
     errdefer allocator.destroy(c);
     c.* = .{
@@ -317,6 +319,8 @@ fn parseColor(s: []const u8) ?[4]f32 {
 
 const testing = std.testing;
 
+var _test_spark = spark_mod.Spark.testStub(testing.allocator);
+
 test "badge: parseColor names + hex" {
     try testing.expectEqual(@as(?[4]f32, NAMED_COLORS[0]), parseColor("red"));
     try testing.expectEqual(@as(?[4]f32, NAMED_COLORS[6]), parseColor("gray"));
@@ -333,7 +337,7 @@ test "badge: ingest stores label + parses color" {
     };
     const spec: components.Spec = .{ .name = "badge", .attrs = &attrs };
 
-    const inst = try create(testing.allocator, &spec);
+    const inst = try create(&_test_spark, testing.allocator, &spec);
     defer deinit_(inst.ctx, testing.allocator);
 
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
@@ -346,7 +350,7 @@ test "badge: missing label rejected" {
         .{ .key = "color", .value = "blue" },
     };
     const spec: components.Spec = .{ .name = "badge", .attrs = &attrs };
-    try testing.expectError(Error.BadgeMissingLabel, create(testing.allocator, &spec));
+    try testing.expectError(Error.BadgeMissingLabel, create(&_test_spark, testing.allocator, &spec));
 }
 
 test "badge: vtable exposes measure_inline" {

@@ -112,6 +112,7 @@ const element = @import("../element.zig");
 const element_layout = @import("../element_layout.zig");
 const components = @import("../markdown_components.zig");
 const component_mod = @import("../component.zig");
+const spark_mod = @import("../spark.zig");
 const markdown = @import("../markdown.zig");
 const state_mod = @import("../state.zig");
 const io = @import("../io_channel.zig");
@@ -125,12 +126,7 @@ pub const Error = error{
     EmbeddedDocumentReadFailed,
 };
 
-// Module globals set by install(). See "module-globals smell" above.
-var registry_ref: ?*component_mod.Registry = null;
-var theme_ref: ?*const element.Theme = null;
-var parent_state_ref: ?*state_mod.State = null;
-var io_channel_ref: ?*io.IoChannel = null;
-/// Allocator used for the URL cache; same as the registry's
+/// Allocator used for the URL cache; same as the spark's
 /// allocator. Captured at install() time so cache lookups don't
 /// need to thread an allocator everywhere.
 var cache_allocator: ?std.mem.Allocator = null;
@@ -141,18 +137,9 @@ var url_cache: std.StringHashMapUnmanaged([]const u8) = .{};
 
 /// One-time install. Call after registering all the other factories
 /// — keeps the dependency on the rest of the registry explicit.
-pub fn install(
-    registry: *component_mod.Registry,
-    theme: *const element.Theme,
-    parent_state: *state_mod.State,
-    io_channel: *io.IoChannel,
-) !void {
-    registry_ref = registry;
-    theme_ref = theme;
-    parent_state_ref = parent_state;
-    io_channel_ref = io_channel;
-    cache_allocator = registry.allocator;
-    try registry.register("embedded-document", factory);
+pub fn install(spark: *spark_mod.Spark) !void {
+    cache_allocator = spark.allocator;
+    try spark.registry.register("embedded-document", factory);
 }
 
 /// Free the URL cache. Host calls this at shutdown after
@@ -168,10 +155,6 @@ pub fn deinitGlobals() void {
     url_cache.deinit(a);
     url_cache = .{};
     cache_allocator = null;
-    registry_ref = null;
-    theme_ref = null;
-    parent_state_ref = null;
-    io_channel_ref = null;
 }
 
 pub const factory: component_mod.Factory = .{
@@ -221,13 +204,21 @@ const PendingFetch = struct {
     /// onto child_state at completion (so parent values land AFTER
     /// frontmatter, preserving the parent-wins rule).
     overlays: []OverlayKV,
+    /// Snapshot of the spark pointer so the completion handler can
+    /// release the io-channel-owned body and bump host_state.dirty
+    /// even after the Component itself has been destroyed.
+    spark: *spark_mod.Spark,
 };
 
 const Component = struct {
     allocator: std.mem.Allocator,
     /// Owns the child Element tree's arena.
     arena: *std.heap.ArenaAllocator,
-    /// Child state. Set up with `parent = parent_state_ref` so
+    /// Captured at create time. Replaces the old `_ref` module
+    /// globals — every cross-cutting concern (registry, theme,
+    /// parent state, io_channel) is one hop through here.
+    spark: *spark_mod.Spark,
+    /// Child state. Set up with `parent = spark.host_state` so
     /// child-side mutations wake the root renderer.
     child_state: *state_mod.State,
     /// Parsed root of the embedded document. Only valid when
@@ -254,10 +245,7 @@ const Component = struct {
     headless: bool = false,
 };
 
-fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
-    if (registry_ref == null or theme_ref == null or parent_state_ref == null) {
-        return error.EmbeddedDocumentNotInstalled;
-    }
+fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
     const id_raw = spec.id orelse return error.EmbeddedDocumentMissingId;
     const src_path = findAttr(spec.attrs, "src") orelse return error.EmbeddedDocumentMissingSrc;
     const headless = parseBoolAttr(spec.attrs, "headless", false);
@@ -277,13 +265,14 @@ fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!c
     errdefer allocator.destroy(child_state);
     child_state.* = state_mod.State.init(allocator);
     errdefer child_state.deinit();
-    child_state.parent = parent_state_ref;
+    child_state.parent = spark.host_state;
 
     const scope = try allocator.dupe(u8, id_raw);
     errdefer allocator.free(scope);
 
     c.* = .{
         .allocator = allocator,
+        .spark = spark,
         .arena = arena,
         .child_state = child_state,
         .root = element.Element{ .paragraph = &[_]element.Element{} }, // overwritten on ready paths; never reached in .loading/.failed
@@ -342,8 +331,8 @@ fn fulfillFromBytes(c: *Component, source: []const u8, spec: *const components.S
     const root = try markdown.parseWithStateAndScope(
         c.arena.allocator(),
         body,
-        theme_ref.?,
-        registry_ref.?,
+        c.spark.theme,
+        c.spark.registry,
         c.child_state,
         c.scope,
     );
@@ -372,8 +361,8 @@ fn fulfillFromBytesWithOverlays(c: *Component, source: []const u8, overlays: []c
     const root = try markdown.parseWithStateAndScope(
         c.arena.allocator(),
         body,
-        theme_ref.?,
-        registry_ref.?,
+        c.spark.theme,
+        c.spark.registry,
         c.child_state,
         c.scope,
     );
@@ -382,7 +371,7 @@ fn fulfillFromBytesWithOverlays(c: *Component, source: []const u8, overlays: []c
 }
 
 fn submitAsyncFetch(c: *Component, url: []const u8, spec: *const components.Spec) !void {
-    const ch = io_channel_ref orelse return error.EmbeddedDocumentNotInstalled;
+    const ch = c.spark.io_channel;
     const a = c.allocator;
 
     const pending = try a.create(PendingFetch);
@@ -419,6 +408,7 @@ fn submitAsyncFetch(c: *Component, url: []const u8, spec: *const components.Spec
         .handle = 0,
         .url = url_copy,
         .overlays = overlays,
+        .spark = c.spark,
     };
 
     const handle = try ch.submitHttpGet(url, @intFromPtr(pending));
@@ -462,20 +452,22 @@ pub fn handleCompletion(comp: io.Completion) void {
     // deinit_ doesn't try to follow a freed pointer later.
     if (c_opt) |c| c.pending = null;
 
+    const ch = p.spark.io_channel;
+    const host_state = p.spark.host_state;
     switch (comp.result) {
         // Stream variants don't apply to embedded-document — it only
         // issues http_get. Defensive: never hits the wire.
         .chunk, .end, .end_err => {
-            if (io_channel_ref) |ch| switch (comp.result) {
+            switch (comp.result) {
                 .chunk => |bytes| ch.releaseOk(bytes),
                 else => {},
-            };
+            }
             return;
         },
         .err => {
             if (c_opt) |c| {
                 c.phase = .failed;
-                if (parent_state_ref) |ps| ps.dirty = true;
+                host_state.dirty = true;
             }
             // No body to free on the error path.
         },
@@ -486,14 +478,14 @@ pub fn handleCompletion(comp: io.Completion) void {
             // cache_allocator; the io-channel-owned slice is freed
             // immediately after.
             const a = cache_allocator orelse {
-                if (io_channel_ref) |ch| ch.releaseOk(body_owned);
+                ch.releaseOk(body_owned);
                 return;
             };
             const cached_copy = a.dupe(u8, body_owned) catch {
-                if (io_channel_ref) |ch| ch.releaseOk(body_owned);
+                ch.releaseOk(body_owned);
                 return;
             };
-            if (io_channel_ref) |ch| ch.releaseOk(body_owned);
+            ch.releaseOk(body_owned);
 
             // Only insert into the cache if we don't have a copy
             // already (a concurrent second fetch racing the first
@@ -517,7 +509,7 @@ pub fn handleCompletion(comp: io.Completion) void {
                 fulfillFromBytesWithOverlays(c, bytes, p.overlays) catch {
                     c.phase = .failed;
                 };
-                if (parent_state_ref) |ps| ps.dirty = true;
+                host_state.dirty = true;
             }
         },
     }
@@ -539,7 +531,7 @@ fn update(ctx: *anyopaque, spec: *const components.Spec) anyerror!void {
     const new_headless = parseBoolAttr(spec.attrs, "headless", false);
     if (new_headless != c.headless) {
         c.headless = new_headless;
-        if (parent_state_ref) |ps| ps.dirty = true;
+        c.spark.host_state.dirty = true;
     }
 
     // src= changes are not honored on update — would invalidate the
@@ -583,7 +575,7 @@ fn handleUpdate(ctx: *anyopaque, action: []const u8, body: []const u8) anyerror!
     if (new_headless) |nh| {
         if (nh != c.headless) {
             c.headless = nh;
-            if (parent_state_ref) |ps| ps.dirty = true;
+            c.spark.host_state.dirty = true;
         }
     }
 }
@@ -602,7 +594,7 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     // child_state cleanly while child_state still exists. Without
     // this ordering, child Binding.destroy would call
     // child_state.unsubscribe AFTER we'd freed child_state.
-    if (registry_ref) |r| r.deinitScope(c.scope);
+    c.spark.registry.deinitScope(c.scope);
     c.child_state.deinit();
     allocator.destroy(c.child_state);
     c.arena.deinit();
@@ -846,12 +838,14 @@ test "refreshPendingOverlays: replaces snapshot atomically, no leaks" {
     initial[0] = .{ .key = k1, .value = v1 };
 
     const url = try a.dupe(u8, "http://x/y");
+    var test_spark = spark_mod.Spark.testStub(a);
     var p = PendingFetch{
         .allocator = a,
         .component = null,
         .handle = 0,
         .url = url,
         .overlays = initial,
+        .spark = &test_spark,
     };
     defer {
         for (p.overlays) |kv| {
@@ -887,6 +881,7 @@ test "freePending: releases all owned slices (testing-allocator leak check)" {
     overlays[0] = .{ .key = k, .value = v };
 
     const url = try a.dupe(u8, "http://example/");
+    var test_spark = spark_mod.Spark.testStub(a);
     const p = try a.create(PendingFetch);
     p.* = .{
         .allocator = a,
@@ -894,6 +889,7 @@ test "freePending: releases all owned slices (testing-allocator leak check)" {
         .handle = 0,
         .url = url,
         .overlays = overlays,
+        .spark = &test_spark,
     };
     freePending(p);
     // testing.allocator will fail the test on any unfreed allocation.

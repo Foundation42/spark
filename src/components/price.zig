@@ -19,6 +19,7 @@
 const std = @import("std");
 const element = @import("../element.zig");
 const components = @import("../markdown_components.zig");
+const spark_mod = @import("../spark.zig");
 const component_mod = @import("../component.zig");
 const text_layout = @import("../text/layout.zig");
 const shape = @import("../font/shape.zig");
@@ -28,8 +29,8 @@ pub const Error = error{
     PriceMissingValue,
 };
 
-pub fn install(registry: *component_mod.Registry) !void {
-    try registry.register("price", factory);
+pub fn install(spark: *spark_mod.Spark) !void {
+    try spark.registry.register("price", factory);
 }
 
 pub const factory: component_mod.Factory = .{
@@ -133,7 +134,8 @@ fn formatAmount(a: std.mem.Allocator, value: f64, fmt: CurrencyFormat) ![]u8 {
     return std.fmt.allocPrint(a, "{d}{c}{s}{s}", .{ integer_part, fmt.decimal, frac_str, fmt.symbol });
 }
 
-fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
+fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
+    _ = spark;
     const c = try allocator.create(Component);
     errdefer allocator.destroy(c);
     c.* = .{
@@ -298,6 +300,8 @@ fn layoutAndRender(
 
 const testing = std.testing;
 
+var _test_spark = spark_mod.Spark.testStub(testing.allocator);
+
 test "format: USD two-decimal" {
     const a = testing.allocator;
     const s = try formatAmount(a, 12.99, pickFormat("USD"));
@@ -346,7 +350,7 @@ test "Component: composes from attrs" {
         .{ .key = "currency", .value = "EUR" },
     };
     const spec: components.Spec = .{ .name = "price", .attrs = &attrs };
-    const inst = try create(testing.allocator, &spec);
+    const inst = try create(&_test_spark, testing.allocator, &spec);
     defer deinit_(inst.ctx, testing.allocator);
 
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
@@ -355,7 +359,7 @@ test "Component: composes from attrs" {
 
 test "Component: missing value rejected" {
     const spec: components.Spec = .{ .name = "price" };
-    try testing.expectError(Error.PriceMissingValue, create(testing.allocator, &spec));
+    try testing.expectError(Error.PriceMissingValue, create(&_test_spark, testing.allocator, &spec));
 }
 
 test "vtable exposes measure_inline" {

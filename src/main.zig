@@ -1,17 +1,17 @@
-//! text_engine_demo — Stage 1 of session 2:
+//! text_engine_demo — host-side scaffolding for the spark library.
 //!
-//! Same visual output as session 1 (heading + subtitle + mixed paragraph
-//! + emoji line + rainbow SDF "ATTENTION"), but composed as an
-//! `Element` tree and rendered through the new `element_layout` walker.
-//! Sole point of the migration this stage: prove the contract holds
-//! against session 1's content before adding markdown / ANSI engines on
-//! top of it.
+//! Owns the GLFW window, the Vulkan instance/device/swapchain, font
+//! loading from env vars, persistent state path resolution, the
+//! IoChannel, the asset cache, and the per-frame loop. Constructs a
+//! `Spark` engine context from these (see `spark.zig`) and routes
+//! every component install through it. By design this file does not
+//! reach into `element_layout`, `markdown`, etc. directly — Phase 3
+//! of the library-ification spec tightens that to `@import("spark")`
+//! only.
 //!
-//! The pulse-span trick from session 1 survives unchanged: layout the
-//! top stack first, capture `glyphs.items.len`, then layout the SDF
-//! paragraph — the new glyphs are the ones to animate. Phase B will
-//! probably replace this with named ranges on the `DrawList`, but
-//! it's not load-bearing for stage 1.
+//! Pass a markdown path as `argv[1]` to load that document; otherwise
+//! the embedded `demo.md` runs as before. `src/hello.md` is the
+//! canonical FPS canary baseline (see docs/library-spec.md).
 
 const std = @import("std");
 const text_engine = @import("text_engine");
@@ -30,6 +30,7 @@ const glyph_cache_mod = @import("text/glyph_cache.zig");
 const element = @import("element.zig");
 const element_layout = @import("element_layout.zig");
 const layout_cache_mod = @import("layout_cache.zig");
+const spark_mod = @import("spark.zig");
 const layout_context_mod = @import("layout/context.zig");
 const markdown = @import("markdown.zig");
 const ansi = @import("ansi.zig");
@@ -126,20 +127,32 @@ const MAX_IMAGES: u32 = 32;
 
 /// Per-frame context owned by main(), borrowed by `drawCb` through
 /// the renderer's `*anyopaque` slot. Carries everything `drawCb`
-/// needs to (a) detect viewport changes and re-run the layout pass,
-/// (b) animate the SDF "ATTENTION" wave each frame.
+/// needs to detect viewport changes and re-run the layout pass.
 ///
 /// **Resize policy.** Layout is event-driven, not per-frame: we
 /// cache `last_extent`, and `drawCb` only re-runs the layout pass
 /// when the swapchain's current extent differs. Steady-state at a
-/// fixed window size is just animate + upload glyphs + record draw —
-/// no HB reshaping, no atlas lookups, no token tree rebuild.
+/// fixed window size is just upload glyphs + record draw — no HB
+/// reshaping, no atlas lookups, no token tree rebuild.
 ///
-/// **Parse tree lifetime.** `top_stack` / `ansi_tree` / `sdf_block`
-/// are constructed once at startup and stay valid for the lifetime
-/// of the frame loop. The slices they reference live in
-/// `doc_arena` which the host's main() owns. layoutAndRender reads
-/// them each layout pass without mutating.
+/// **Parse tree lifetime.** `top_stack` / `ansi_tree` are constructed
+/// once at startup and stay valid for the lifetime of the frame loop.
+/// The slices they reference live in `doc_arena` which the host's
+/// main() owns. layoutAndRender reads them each layout pass without
+/// mutating.
+///
+/// **Per-glyph `.attention` plumbing — preserved, not driven.** The
+/// `Style.attention` field, its journey through the inline-flow walker
+/// onto each `Glyph.attention` SSBO slot, and the text shader's
+/// rainbow-on-attention path all still exist. Earlier versions
+/// hard-coded an SDF "ATTENTION" paragraph here in `main.zig` that
+/// pulsed a rainbow wave each frame as a demo of the substrate. That
+/// demo is gone — the substrate stays, ready to be driven by an
+/// LM-side `attention=` stream (semantic heatmap colouring, predictive
+/// completion glow, etc.) once the LM-overlay layer lands. To bring
+/// the visual back for testing: load an SDF font, build a one-line
+/// `paragraph` with `Style.attention=N`, lay it out into a slice of
+/// the DrawList, and mutate `glyph.attention` per frame in `drawCb`.
 const FrameCtx = struct {
     // GPU
     text_pipeline: *tp.TextPipeline,
@@ -159,7 +172,6 @@ const FrameCtx = struct {
     // Parse trees (constructed once at startup)
     top_stack: element.Element,
     ansi_tree: element.Element,
-    sdf_block: element.Element,
 
     // Mutable scratch — `dl` accumulates this layout pass's draw work
     dl: *element.DrawList,
@@ -192,11 +204,10 @@ const FrameCtx = struct {
     // layout, unifying init and resize paths.
     last_extent: vk.c.VkExtent2D = .{ .width = 0, .height = 0 },
 
-    // Animation state — the SDF wave's index range comes out of
-    // runLayout(); the wave function reads these to animate the
-    // right glyphs each frame.
-    pulse_start: u32 = 0,
-    pulse_count: u32 = 0,
+    // Wall-clock baseline for any host-side animation. Kept around
+    // because a few stdout prints still reference it; the SDF
+    // ATTENTION wave that used to drive per-glyph .attention from
+    // here was removed (see docstring above).
     start_ms: i64,
 
     // 7e: reactive state. The host owns it across the program
@@ -325,15 +336,11 @@ const FrameCtx = struct {
         const top_box = try element_layout.layoutAndRenderCached(self.top_stack, .{ 40, 40 }, c, &lc, self.dl);
         const ansi_box = try element_layout.layoutAndRenderCached(self.ansi_tree, .{ 40, top_box.y + top_box.h + 8 }, c, &ansi_lc, self.dl);
 
-        self.pulse_start = @intCast(self.dl.glyphs.items.len);
-        const sdf_box = try element_layout.layoutAndRenderCached(self.sdf_block, .{ 40, ansi_box.y + ansi_box.h }, c, &lc, self.dl);
-        self.pulse_count = @intCast(self.dl.glyphs.items.len - self.pulse_start);
-
         // Recompute max scrollable distance from world content height
         // vs world-space viewport height (`viewport_h / zoom` because
         // the transform scales positions). Clamp current scroll if
         // it now exceeds the new max (e.g. content shortened).
-        const content_bottom_world = sdf_box.y + sdf_box.h;
+        const content_bottom_world = ansi_box.y + ansi_box.h;
         const viewport_h_world: f32 = @as(f32, @floatFromInt(extent.height)) / self.zoom;
         const bottom_margin: f32 = 40;
         self.max_scroll_y = @max(@as(f32, 0), content_bottom_world + bottom_margin - viewport_h_world);
@@ -480,22 +487,15 @@ fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) 
         fc.state.clearDirty();
     }
 
-    // ── Per-frame SDF wave animation ───────────────────────────────
-    // Runs every frame; mutates the laid-out glyph slice in place
-    // and re-uploads. Cheap — ~9 glyphs writing two fields each.
-    const elapsed: f32 = @floatFromInt(std.time.milliTimestamp() - fc.start_ms);
-    const t_sec: f32 = elapsed * 0.001;
-    var i: u32 = 0;
-    while (i < fc.pulse_count) : (i += 1) {
-        const idx = fc.pulse_start + i;
-        const phase = t_sec * 3.0 - @as(f32, @floatFromInt(i)) * 0.6;
-        const w = (std.math.sin(phase) + 1.0) * 0.5;
-        fc.dl.glyphs.items[idx].attention = w;
+    // Per-glyph `.attention` is no longer driven from main(). The
+    // previous SDF-"ATTENTION" rainbow wave (read `start_ms` + `sin`
+    // + hsv→rgb per glyph each frame) lived here; it has been removed
+    // pending an LM-side driver. The plumbing (Style.attention →
+    // Glyph.attention SSBO → fragment shader rainbow) is still wired,
+    // so re-introducing per-glyph animation is a matter of mutating
+    // `fc.dl.glyphs.items[i].attention` and `.hot_color` from
+    // wherever the next driver lives. See the FrameCtx docstring.
 
-        const hue = @mod(@as(f32, @floatFromInt(i)) * 40.0 + t_sec * 30.0, 360.0);
-        const rgb = hsvToRgb(hue, 0.85, 1.0);
-        fc.dl.glyphs.items[idx].hot_color = .{ rgb[0], rgb[1], rgb[2], 1.0 };
-    }
     // TODO: surface SSBO overflow visibly — currently logged once
     // to stderr and silently dropped. A proper surface (overlay
     // banner, telemetry) beats hunting "why is the screen black"
@@ -799,35 +799,10 @@ fn runTessellationBenchmark(
     );
 }
 
-fn hsvToRgb(h_deg: f32, s: f32, v: f32) [3]f32 {
-    const c = v * s;
-    const h_prime = @mod(h_deg / 60.0, 6.0);
-    const x = c * (1.0 - @abs(@mod(h_prime, 2.0) - 1.0));
-    const m = v - c;
-    var r: f32 = 0;
-    var g: f32 = 0;
-    var b: f32 = 0;
-    if (h_prime < 1.0) {
-        r = c;
-        g = x;
-    } else if (h_prime < 2.0) {
-        r = x;
-        g = c;
-    } else if (h_prime < 3.0) {
-        g = c;
-        b = x;
-    } else if (h_prime < 4.0) {
-        g = x;
-        b = c;
-    } else if (h_prime < 5.0) {
-        r = x;
-        b = c;
-    } else {
-        r = c;
-        b = x;
-    }
-    return .{ r + m, g + m, b + m };
-}
+// hsvToRgb was deleted alongside the SDF "ATTENTION" rainbow wave —
+// its only caller. Re-add a hue-cycling helper here if a future
+// host-side animation needs one; the equivalent shader-side cycle
+// still lives in the text fragment shader's attention branch.
 
 /// XDG-style cache directory for persistent assets. Honours
 /// `$XDG_CACHE_HOME` if set; otherwise falls back to `$HOME/.cache`.
@@ -863,10 +838,33 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 9 / stage 14f (cost-aware parallel-walk classification)\n", .{});
+    try stdout.print("text_engine demo — session 17 (library-spec Phase 1: Spark)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
-    try stdout.print("  demo.md bytes:         {d}\n", .{demo_md.len});
+
+    // CLI arg → load that markdown file. Falls back to the embedded
+    // `demo.md` when no arg is supplied. The single-arg shape is the
+    // smallest "spark this doc" interface we can ship pre-library-rename;
+    // matches the future `spark hello.md` UX (decision #11 — rename
+    // lands separately).
+    const doc_source: []const u8 = doc_blk: {
+        const args = try std.process.argsAlloc(allocator);
+        defer std.process.argsFree(allocator, args);
+        if (args.len < 2) {
+            try stdout.print("  doc (embedded):       {d} bytes (demo.md — pass a path to override)\n", .{demo_md.len});
+            break :doc_blk demo_md;
+        }
+        const path = args[1];
+        const bytes = std.fs.cwd().readFileAlloc(allocator, path, 4 * 1024 * 1024) catch |e| {
+            try stdout.print("  doc {s} load failed: {s} — falling back to embedded demo.md\n", .{ path, @errorName(e) });
+            break :doc_blk demo_md;
+        };
+        try stdout.print("  doc:                  {d} bytes ({s})\n", .{ bytes.len, path });
+        break :doc_blk bytes;
+    };
+    // doc_source's storage lives until program exit. We don't free it
+    // — the parse arena and reactive state both hold long-lived slices
+    // into it. Process exit reclaims everything.
 
     var window = try win.Window.init(1280, 720, "text_engine_demo");
     defer window.deinit();
@@ -936,7 +934,10 @@ pub fn main() !void {
     const code_inline_id = try fonts.load(mono_path.ptr, 20);
     const code_block_id = try fonts.load(mono_path.ptr, 18);
     const emoji_id = try fonts.load(emoji_path.ptr, 28);
-    const sdf_id = try fonts.loadSdf(font_path.ptr, 44);
+    // SDF font load deleted alongside the SDF "ATTENTION" demo block —
+    // re-add `try fonts.loadSdf(font_path.ptr, 44)` if you need an SDF
+    // size again. The MSDF rasterisation path inside FontRegistry is
+    // untouched and still tested.
 
     var cache = glyph_cache_mod.GlyphCache.init(allocator);
     defer cache.deinit();
@@ -992,41 +993,12 @@ pub fn main() !void {
     var layout_context = try layout_context_mod.LayoutContext.init(allocator);
     defer layout_context.deinit();
 
-    try box_component.install(&registry, &layout_context);
-    defer box_component.deinitGlobals();
-    try registry.register("chart", chart_component.factory);
-    try registry.register("slider", slider_component.factory);
-    try badge_component.install(&registry);
-    try sparkline_component.install(&registry);
-    try kbd_component.install(&registry);
-    try progress_component.install(&registry);
-    try status_component.install(&registry);
-    try tag_component.install(&registry);
-    try trend_component.install(&registry);
-    try rating_component.install(&registry);
-    try dot_component.install(&registry);
-    try commit_component.install(&registry);
-    try price_component.install(&registry);
-    try diff_component.install(&registry);
-    try gh_ref_component.install(&registry);
-    try ago_component.install(&registry);
-    try button_component.install(&registry);
-    defer button_component.deinitGlobals();
-    try handle_component.install(&registry, &layout_context);
-    defer handle_component.deinitGlobals();
-    // input_component install needs parent_state — we know
-    // host_state lives long enough (declared just below this block)
-    // so we move the install to after host_state init. See below.
-    // Embedded-document factory needs theme + registry + parent
-    // state captured at install time — see embedded_document.zig's
-    // "module-globals smell" note for why.
-
     // ── Host-owned reactive state (stage 7e) ───────────────────────
     // Frontmatter parses once at startup; the State persists across
     // the program's lifetime. drawCb mutates it on a timer and the
     // registry's subscriber wiring propagates changes into the
     // cached component instances.
-    var host_state = (try state_mod.fromSource(allocator, demo_md)) orelse state_mod.State.init(allocator);
+    var host_state = (try state_mod.fromSource(allocator, doc_source)) orelse state_mod.State.init(allocator);
     defer host_state.deinit();
 
     // ── Stage 13b.2 — persistent state ─────────────────────────────
@@ -1104,22 +1076,72 @@ pub fn main() !void {
         );
     }
 
-    try embedded_document_component.install(&registry, &theme, &host_state, &io_channel);
+    // ── Stage 17 (library-spec Phase 1) — `Spark` engine context ───
+    // All host resources now live; the Spark struct holds borrowed
+    // pointers so every component reaches them through a single
+    // dereference instead of file-scope `_ref` globals. Phase 3 will
+    // invert this — `Spark.init` will own the resources and main.zig
+    // will shrink to GLFW + swapchain + frame pacing.
+    var block_cache = layout_cache_mod.BlockCache.init(allocator);
+    defer block_cache.deinit();
+    var spark = spark_mod.Spark.init(.{
+        .allocator = allocator,
+        .vk_ctx = &ctx,
+        .mono_atlas = &atlas_mono,
+        .color_atlas = &atlas_color,
+        .text_pipeline = &pipeline,
+        .quad_pipeline = &quad_pipeline,
+        .tri_pipeline = &tri_pipeline_inst,
+        .image_pipeline = &image_pipeline_inst,
+        .fonts = &fonts,
+        .glyph_cache = &cache,
+        .theme = &theme,
+        .registry = &registry,
+        .host_state = &host_state,
+        .layout_cache = &block_cache,
+        .layout_context = &layout_context,
+        .compute_jobs = job_system,
+        .io_jobs = io_pool,
+        .io_channel = &io_channel,
+        .dotenv = &env,
+        .asset_cache = asset_cache,
+    });
+    defer spark.deinit();
+    registry.attachSpark(&spark);
+
+    // Component installs — every factory takes `*Spark` and plucks
+    // what it needs (registry/theme/host_state/io_channel/dotenv/…)
+    // from the struct in `create`. Order is unimportant except that
+    // children's factories must be registered before any parser walk
+    // that resolves them.
+    try box_component.install(&spark);
+    try registry.register("chart", chart_component.factory);
+    try registry.register("slider", slider_component.factory);
+    try badge_component.install(&spark);
+    try sparkline_component.install(&spark);
+    try kbd_component.install(&spark);
+    try progress_component.install(&spark);
+    try status_component.install(&spark);
+    try tag_component.install(&spark);
+    try trend_component.install(&spark);
+    try rating_component.install(&spark);
+    try dot_component.install(&spark);
+    try commit_component.install(&spark);
+    try price_component.install(&spark);
+    try diff_component.install(&spark);
+    try gh_ref_component.install(&spark);
+    try ago_component.install(&spark);
+    try button_component.install(&spark);
+    try handle_component.install(&spark);
+    try embedded_document_component.install(&spark);
     defer embedded_document_component.deinitGlobals();
-    try flex_component.install(&registry, &theme, &host_state);
-    defer flex_component.deinitGlobals();
-    try grid_component.install(&registry, &theme, &host_state);
-    defer grid_component.deinitGlobals();
-    try llm_stream_component.install(&registry, &theme, &host_state, &io_channel, &env);
-    defer llm_stream_component.deinitGlobals();
-    try input_component.install(&registry, &host_state);
-    defer input_component.deinitGlobals();
-    try svg_component.install(&registry, job_system);
-    defer svg_component.deinitGlobals();
-    try svg_stream_component.install(&registry, &host_state, &io_channel, &env, job_system, asset_cache);
-    defer svg_stream_component.deinitGlobals();
-    try image_stream_component.install(&registry, &host_state, &io_channel, &env, &ctx, &image_pipeline_inst, asset_cache);
-    defer image_stream_component.deinitGlobals();
+    try flex_component.install(&spark);
+    try grid_component.install(&spark);
+    try llm_stream_component.install(&spark);
+    try input_component.install(&spark);
+    try svg_component.install(&spark);
+    try svg_stream_component.install(&spark);
+    try image_stream_component.install(&spark);
 
     // Stage 13d.2 — micro-benchmark serial vs parallel tessellation
     // on Petunias.svg before the markdown parse begins. Runs once at
@@ -1148,34 +1170,17 @@ pub fn main() !void {
     // memory survives the call.
     var doc_arena = std.heap.ArenaAllocator.init(allocator);
     defer doc_arena.deinit();
-    const top_stack = try markdown.parseWithState(doc_arena.allocator(), demo_md, &theme, &registry, &host_state);
-
-    // SDF "ATTENTION" paragraph — separate from the top stack so we
-    // can capture the glyph index range for per-frame animation.
-    // Default per-span `attention = 0.5`; the frame loop overwrites
-    // each glyph's `.attention` individually for the wave.
-    const sdf_children = [_]element.Element{
-        .{ .text = .{ .content = "ATTENTION", .style = .{
-            .font_id = sdf_id,
-            .color = white,
-            .attention = 0.5,
-        } } },
-    };
-    const sdf_block = element.Element{ .paragraph = &sdf_children };
+    const top_stack = try markdown.parseWithState(doc_arena.allocator(), doc_source, &theme, &registry, &host_state);
 
     // ── Parse-time content (constructed once, re-laid each resize) ─
     var dl = element.DrawList.init(allocator);
     defer dl.deinit();
 
-    // Stage 14a — retained per-block layout cache. Reused across every
-    // re-layout pass; lives for the program lifetime. See
-    // `layout_cache.zig` for the cacheability rules — built-in
-    // paragraph/heading/code_block/thematic_break participate
-    // automatically; custom components opt in via vtable.content_version
-    // and out via vtable.disable_cache.
-    var block_cache = layout_cache_mod.BlockCache.init(allocator);
-    defer block_cache.deinit();
-
+    // Stage 14a / library-spec Phase 1 — retained per-block layout cache.
+    // Now constructed earlier so it can be threaded into `Spark`; the
+    // pointer is borrowed both by the FrameCtx (below) and the
+    // Spark struct (above the install block).
+    //
     // Stage 14b — mutex around the (FreeType glyph slot + GlyphCache
     // hashmap + Atlas packing) write surface. Worker threads doing
     // parallel cache-miss layouts acquire it inside
@@ -1216,7 +1221,6 @@ pub fn main() !void {
         .ansi_theme = &ansi_theme,
         .top_stack = top_stack,
         .ansi_tree = ansi_tree,
-        .sdf_block = sdf_block,
         .dl = &dl,
         .block_cache = &block_cache,
         .job_system = job_system,
@@ -1368,10 +1372,7 @@ pub fn main() !void {
     }
 
     const elapsed_ms = std.time.milliTimestamp() - frame_ctx.start_ms;
-    try stdout.print("  glyphs:                {d} (pulse span: {d} glyphs)\n", .{
-        frame_ctx.dl.glyphs.items.len,
-        frame_ctx.pulse_count,
-    });
+    try stdout.print("  glyphs:                {d}\n", .{frame_ctx.dl.glyphs.items.len});
     try stdout.print("  quads:                 {d}\n", .{frame_ctx.dl.quads.items.len});
     try stdout.print("  glyph cache:           {d} miss / {d} hit ({d:.1}% hit rate)\n", .{
         cache.misses,

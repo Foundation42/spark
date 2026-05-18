@@ -63,11 +63,17 @@ const std = @import("std");
 const element = @import("element.zig");
 const components = @import("markdown_components.zig");
 const state_mod = @import("state.zig");
+const spark_mod = @import("spark.zig");
 
 pub const Error = error{
     DuplicateFactory,
     UnknownComponentId,
     NoUpdateHandler,
+    /// Resolve was called before `Registry.attachSpark` — the
+    /// `*Spark` pointer that factories receive isn't available.
+    /// Library hosts must call `registry.attachSpark(&spark)` after
+    /// constructing both, before any parse runs.
+    SparkNotAttached,
 } || std.mem.Allocator.Error;
 
 /// Component factory — host-supplied per directive name. `create` is
@@ -87,8 +93,15 @@ pub const Error = error{
 /// arena) — instance state lives across many parses, so it must
 /// outlive any single parse arena. `deinit` receives the same
 /// allocator for symmetry.
+///
+/// `create` takes `*Spark` as its first arg (Phase 1 of library-spec).
+/// The component captures the pointer in its instance ctx so
+/// `update`/`deinit`/`handle_update` can reach engine resources
+/// (registry, state, io_channel, dotenv, asset_cache, …) without
+/// needing the registry to pass it again.
 pub const Factory = struct {
     create: *const fn (
+        spark: *spark_mod.Spark,
         allocator: std.mem.Allocator,
         spec: *const components.Spec,
     ) anyerror!Instance,
@@ -211,8 +224,20 @@ pub const Registry = struct {
     /// thrash component state.
     sweep_threshold: u32 = 4,
 
+    /// Host attaches a `*Spark` here after both the Spark instance
+    /// and the Registry exist (chicken-and-egg avoided because Spark
+    /// borrows the Registry, not the other way around). Resolve
+    /// asserts it's non-null when called — every code path leading
+    /// to `factory.create` must have a real Spark to thread through.
+    spark: ?*spark_mod.Spark = null,
+
     pub fn init(allocator: std.mem.Allocator) Registry {
         return .{ .allocator = allocator };
+    }
+
+    /// Attach the Spark pointer. Call once after `Spark.init`.
+    pub fn attachSpark(self: *Registry, spark: *spark_mod.Spark) void {
+        self.spark = spark;
     }
 
     /// Drop all factories + destroy all cached instances. Host
@@ -387,7 +412,8 @@ pub const Registry = struct {
         defer create_arena.deinit();
         const ca = create_arena.allocator();
         const fresh = try buildSubstitutedSpec(ca, spec, state);
-        const inst = try factory.create(self.allocator, &fresh);
+        const sp = self.spark orelse return error.SparkNotAttached;
+        const inst = try factory.create(sp, self.allocator, &fresh);
 
         var entry: Entry = .{
             .instance = inst,
@@ -652,7 +678,8 @@ fn pickColor(spec: *const components.Spec) ?[]const u8 {
     return null;
 }
 
-fn testCreate(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!Instance {
+fn testCreate(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!Instance {
+    _ = spark; // tests don't dereference spark fields
     t_creates += 1;
     const state = try allocator.create(TestState);
     // Real components own their state — copy the value into our own
@@ -711,6 +738,8 @@ test "register + resolve creates instance once" {
     resetCounters();
     var registry = Registry.init(testing.allocator);
     defer registry.deinit();
+    var test_spark = spark_mod.Spark.testStub(testing.allocator);
+    registry.attachSpark(&test_spark);
     try registry.register("box", test_factory);
 
     const spec: components.Spec = .{ .name = "box", .id = "bx" };
@@ -731,6 +760,8 @@ test "resolve returns null for unregistered name" {
     resetCounters();
     var registry = Registry.init(testing.allocator);
     defer registry.deinit();
+    var test_spark = spark_mod.Spark.testStub(testing.allocator);
+    registry.attachSpark(&test_spark);
     const spec: components.Spec = .{ .name = "nothing", .id = "x" };
     const r = try registry.resolve(&spec, 0, null, null);
     try testing.expect(r == null);
@@ -740,6 +771,8 @@ test "auto-id is order-based" {
     resetCounters();
     var registry = Registry.init(testing.allocator);
     defer registry.deinit();
+    var test_spark = spark_mod.Spark.testStub(testing.allocator);
+    registry.attachSpark(&test_spark);
     try registry.register("box", test_factory);
 
     const a: components.Spec = .{ .name = "box" }; // no id → auto:5
@@ -758,6 +791,8 @@ test "gc destroys after sweep_threshold consecutive unused parses" {
     resetCounters();
     var registry = Registry.init(testing.allocator);
     defer registry.deinit();
+    var test_spark = spark_mod.Spark.testStub(testing.allocator);
+    registry.attachSpark(&test_spark);
     registry.sweep_threshold = 2;
     try registry.register("box", test_factory);
 
@@ -784,6 +819,8 @@ test "factory name change destroys old + recreates" {
     resetCounters();
     var registry = Registry.init(testing.allocator);
     defer registry.deinit();
+    var test_spark = spark_mod.Spark.testStub(testing.allocator);
+    registry.attachSpark(&test_spark);
     try registry.register("box", test_factory);
     try registry.register("chart", test_factory);
 
@@ -805,6 +842,8 @@ test "update sees latest spec attrs" {
     resetCounters();
     var registry = Registry.init(testing.allocator);
     defer registry.deinit();
+    var test_spark = spark_mod.Spark.testStub(testing.allocator);
+    registry.attachSpark(&test_spark);
     try registry.register("box", test_factory);
 
     const attrs_red = [_]components.Attr{.{ .key = "color", .value = "red" }};
@@ -833,6 +872,8 @@ test "reactive: state.set fires factory.update on bound component" {
 
     var registry = Registry.init(testing.allocator);
     defer registry.deinit();
+    var test_spark = spark_mod.Spark.testStub(testing.allocator);
+    registry.attachSpark(&test_spark);
     try registry.register("box", test_factory);
 
     const attrs = [_]components.Attr{.{ .key = "color", .value = "${state.box_color}" }};
@@ -865,6 +906,8 @@ test "scoped resolve namespaces cache keys" {
     resetCounters();
     var registry = Registry.init(testing.allocator);
     defer registry.deinit();
+    var test_spark = spark_mod.Spark.testStub(testing.allocator);
+    registry.attachSpark(&test_spark);
     try registry.register("box", test_factory);
 
     const spec: components.Spec = .{ .name = "box", .id = "bx" };
@@ -888,6 +931,8 @@ test "scoped resolve: auto:N + scope" {
     resetCounters();
     var registry = Registry.init(testing.allocator);
     defer registry.deinit();
+    var test_spark = spark_mod.Spark.testStub(testing.allocator);
+    registry.attachSpark(&test_spark);
     try registry.register("box", test_factory);
 
     const spec: components.Spec = .{ .name = "box" }; // no id -> auto:N
@@ -900,6 +945,8 @@ test "deinitScope destroys only matching instances" {
     resetCounters();
     var registry = Registry.init(testing.allocator);
     defer registry.deinit();
+    var test_spark = spark_mod.Spark.testStub(testing.allocator);
+    registry.attachSpark(&test_spark);
     try registry.register("box", test_factory);
 
     const spec_top: components.Spec = .{ .name = "box", .id = "top" };
@@ -923,6 +970,8 @@ test "lookup returns null for unknown id" {
     resetCounters();
     var registry = Registry.init(testing.allocator);
     defer registry.deinit();
+    var test_spark = spark_mod.Spark.testStub(testing.allocator);
+    registry.attachSpark(&test_spark);
     try testing.expect(registry.lookup("nope") == null);
 }
 
@@ -930,6 +979,8 @@ test "lookup returns the resolved instance once it exists" {
     resetCounters();
     var registry = Registry.init(testing.allocator);
     defer registry.deinit();
+    var test_spark = spark_mod.Spark.testStub(testing.allocator);
+    registry.attachSpark(&test_spark);
     try registry.register("box", test_factory);
 
     const spec: components.Spec = .{ .name = "box", .id = "bx" };
@@ -942,6 +993,8 @@ test "handleUpdate dispatches to factory handle_update" {
     resetCounters();
     var registry = Registry.init(testing.allocator);
     defer registry.deinit();
+    var test_spark = spark_mod.Spark.testStub(testing.allocator);
+    registry.attachSpark(&test_spark);
     try registry.register("box", test_factory);
 
     const spec: components.Spec = .{ .name = "box", .id = "bx" };
@@ -958,6 +1011,8 @@ test "handleUpdate: unknown id errors" {
     resetCounters();
     var registry = Registry.init(testing.allocator);
     defer registry.deinit();
+    var test_spark = spark_mod.Spark.testStub(testing.allocator);
+    registry.attachSpark(&test_spark);
     try registry.register("box", test_factory);
     try testing.expectError(error.UnknownComponentId, registry.handleUpdate("missing", "set-color", "red"));
 }
@@ -966,6 +1021,8 @@ test "handleUpdate: factory without handler errors" {
     resetCounters();
     var registry = Registry.init(testing.allocator);
     defer registry.deinit();
+    var test_spark = spark_mod.Spark.testStub(testing.allocator);
+    registry.attachSpark(&test_spark);
     const no_handler: Factory = .{
         .create = testCreate,
         .update = testUpdate,
@@ -987,6 +1044,8 @@ test "reactive: gc unsubscribes the binding" {
 
     var registry = Registry.init(testing.allocator);
     defer registry.deinit();
+    var test_spark = spark_mod.Spark.testStub(testing.allocator);
+    registry.attachSpark(&test_spark);
     registry.sweep_threshold = 0; // die after one unused parse
     try registry.register("box", test_factory);
 

@@ -26,6 +26,7 @@
 const std = @import("std");
 const element = @import("../element.zig");
 const components = @import("../markdown_components.zig");
+const spark_mod = @import("../spark.zig");
 const component_mod = @import("../component.zig");
 const box_helpers = @import("box.zig"); // reuse parseColor + parseLength
 
@@ -33,8 +34,8 @@ pub const Error = error{
     SparklineMissingData,
 };
 
-pub fn install(registry: *component_mod.Registry) !void {
-    try registry.register("sparkline", factory);
+pub fn install(spark: *spark_mod.Spark) !void {
+    try spark.registry.register("sparkline", factory);
 }
 
 pub const factory: component_mod.Factory = .{
@@ -94,7 +95,8 @@ const Component = struct {
     }
 };
 
-fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
+fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
+    _ = spark;
     const c = try allocator.create(Component);
     errdefer allocator.destroy(c);
     c.* = .{
@@ -241,6 +243,8 @@ fn layoutAndRender(
 
 const testing = std.testing;
 
+var _test_spark = spark_mod.Spark.testStub(testing.allocator);
+
 test "parseData: comma-separated numbers" {
     const a = testing.allocator;
     const out = try parseData(a, "3,5,7,4,8");
@@ -272,7 +276,7 @@ test "Component.ingest: stores data + defaults" {
         .{ .key = "data", .value = "1,2,3,4" },
     };
     const spec: components.Spec = .{ .name = "sparkline", .attrs = &attrs };
-    const inst = try create(testing.allocator, &spec);
+    const inst = try create(&_test_spark, testing.allocator, &spec);
     defer deinit_(inst.ctx, testing.allocator);
 
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
@@ -283,7 +287,7 @@ test "Component.ingest: stores data + defaults" {
 
 test "Component: missing data rejected" {
     const spec: components.Spec = .{ .name = "sparkline" };
-    try testing.expectError(Error.SparklineMissingData, create(testing.allocator, &spec));
+    try testing.expectError(Error.SparklineMissingData, create(&_test_spark, testing.allocator, &spec));
 }
 
 test "vtable exposes measure_inline" {

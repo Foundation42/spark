@@ -59,6 +59,7 @@ const std = @import("std");
 const element = @import("../element.zig");
 const components = @import("../markdown_components.zig");
 const component_mod = @import("../component.zig");
+const spark_mod = @import("../spark.zig");
 const box_mod = @import("box.zig");
 
 const DEFAULT_CAPACITY: usize = 128;
@@ -150,7 +151,8 @@ fn parseCapacity(spec: *const components.Spec) usize {
     return DEFAULT_CAPACITY;
 }
 
-fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
+fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
+    _ = spark;
     const capacity = @max(@as(usize, 2), parseCapacity(spec));
     const samples = try allocator.alloc(f32, capacity);
     errdefer allocator.free(samples);

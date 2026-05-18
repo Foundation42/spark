@@ -23,6 +23,7 @@ const std = @import("std");
 const element = @import("../element.zig");
 const components = @import("../markdown_components.zig");
 const component_mod = @import("../component.zig");
+const spark_mod = @import("../spark.zig");
 const text_layout = @import("../text/layout.zig");
 const shape = @import("../font/shape.zig");
 const box_helpers = @import("box.zig");
@@ -33,9 +34,9 @@ pub const Error = error{
 
 const Kind = enum { issue, pr };
 
-pub fn install(registry: *component_mod.Registry) !void {
-    try registry.register("issue", issue_factory);
-    try registry.register("pr", pr_factory);
+pub fn install(spark: *spark_mod.Spark) !void {
+    try spark.registry.register("issue", issue_factory);
+    try spark.registry.register("pr", pr_factory);
 }
 
 pub const issue_factory: component_mod.Factory = .{
@@ -94,11 +95,13 @@ const Component = struct {
     }
 };
 
-fn createIssue(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
+fn createIssue(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
+    _ = spark;
     return createKind(allocator, spec, .issue);
 }
 
-fn createPr(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
+fn createPr(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
+    _ = spark;
     return createKind(allocator, spec, .pr);
 }
 
@@ -287,12 +290,14 @@ fn layoutAndRender(
 
 const testing = std.testing;
 
+var _test_spark = spark_mod.Spark.testStub(testing.allocator);
+
 test "Component: issue with bare n" {
     const attrs = [_]components.Attr{
         .{ .key = "n", .value = "42" },
     };
     const spec: components.Spec = .{ .name = "issue", .attrs = &attrs };
-    const inst = try createIssue(testing.allocator, &spec);
+    const inst = try createIssue(&_test_spark, testing.allocator, &spec);
     defer deinit_(inst.ctx, testing.allocator);
 
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
@@ -306,7 +311,7 @@ test "Component: pr with repo prefix" {
         .{ .key = "repo", .value = "fdn42/text_engine" },
     };
     const spec: components.Spec = .{ .name = "pr", .attrs = &attrs };
-    const inst = try createPr(testing.allocator, &spec);
+    const inst = try createPr(&_test_spark, testing.allocator, &spec);
     defer deinit_(inst.ctx, testing.allocator);
 
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
@@ -316,7 +321,7 @@ test "Component: pr with repo prefix" {
 
 test "Component: missing n rejected" {
     const spec: components.Spec = .{ .name = "issue" };
-    try testing.expectError(Error.GhRefMissingNumber, createIssue(testing.allocator, &spec));
+    try testing.expectError(Error.GhRefMissingNumber, createIssue(&_test_spark, testing.allocator, &spec));
 }
 
 test "palette: issue + pr differ" {

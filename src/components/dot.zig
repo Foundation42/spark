@@ -13,6 +13,7 @@
 const std = @import("std");
 const element = @import("../element.zig");
 const components = @import("../markdown_components.zig");
+const spark_mod = @import("../spark.zig");
 const component_mod = @import("../component.zig");
 const box_helpers = @import("box.zig");
 
@@ -20,8 +21,8 @@ pub const Error = error{
     DotMissingColor,
 };
 
-pub fn install(registry: *component_mod.Registry) !void {
-    try registry.register("dot", factory);
+pub fn install(spark: *spark_mod.Spark) !void {
+    try spark.registry.register("dot", factory);
 }
 
 pub const factory: component_mod.Factory = .{
@@ -46,7 +47,8 @@ const Component = struct {
     }
 };
 
-fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
+fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
+    _ = spark;
     const c = try allocator.create(Component);
     errdefer allocator.destroy(c);
     c.* = .{ .color = .{ 0.5, 0.5, 0.5, 1.0 } };
@@ -149,12 +151,14 @@ fn layoutAndRender(
 
 const testing = std.testing;
 
+var _test_spark = spark_mod.Spark.testStub(testing.allocator);
+
 test "Component: color is parsed" {
     const attrs = [_]components.Attr{
         .{ .key = "color", .value = "green" },
     };
     const spec: components.Spec = .{ .name = "dot", .attrs = &attrs };
-    const inst = try create(testing.allocator, &spec);
+    const inst = try create(&_test_spark, testing.allocator, &spec);
     defer deinit_(inst.ctx, testing.allocator);
 
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
@@ -164,7 +168,7 @@ test "Component: color is parsed" {
 
 test "Component: missing color rejected" {
     const spec: components.Spec = .{ .name = "dot" };
-    try testing.expectError(Error.DotMissingColor, create(testing.allocator, &spec));
+    try testing.expectError(Error.DotMissingColor, create(&_test_spark, testing.allocator, &spec));
 }
 
 test "vtable exposes measure_inline" {

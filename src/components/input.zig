@@ -56,6 +56,7 @@ const std = @import("std");
 const element = @import("../element.zig");
 const components = @import("../markdown_components.zig");
 const component_mod = @import("../component.zig");
+const spark_mod = @import("../spark.zig");
 const state_mod = @import("../state.zig");
 const text_layout = @import("../text/layout.zig");
 const shape = @import("../font/shape.zig");
@@ -67,23 +68,8 @@ pub const Error = error{
     InputNotInstalled,
 };
 
-// Module global — set by install(). Used by onInput to dispatch on
-// Enter and to flag state dirty for caret blink.
-var registry_ref: ?*component_mod.Registry = null;
-var parent_state_ref: ?*state_mod.State = null;
-
-pub fn install(
-    registry: *component_mod.Registry,
-    parent_state: *state_mod.State,
-) !void {
-    registry_ref = registry;
-    parent_state_ref = parent_state;
-    try registry.register("input", factory);
-}
-
-pub fn deinitGlobals() void {
-    registry_ref = null;
-    parent_state_ref = null;
+pub fn install(spark: *spark_mod.Spark) !void {
+    try spark.registry.register("input", factory);
 }
 
 pub const factory: component_mod.Factory = .{
@@ -107,6 +93,9 @@ const Component = struct {
 
     focused: bool = false,
     last_box: element.Box = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    /// Captured at create time. `onInput` reaches the registry +
+    /// host state through it (Enter-fire dispatch + caret-blink dirty).
+    spark: ?*spark_mod.Spark = null,
 
     fn ingest(self: *Component, spec: *const components.Spec) !void {
         const a = self.allocator;
@@ -173,13 +162,12 @@ const Component = struct {
     }
 };
 
-fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
-    if (registry_ref == null) return Error.InputNotInstalled;
-
+fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
     const c = try allocator.create(Component);
     errdefer allocator.destroy(c);
     c.* = .{
         .allocator = allocator,
+        .spark = spark,
         .target = try allocator.dupe(u8, ""),
         .action = try allocator.dupe(u8, ""),
         .placeholder = try allocator.dupe(u8, ""),
@@ -327,7 +315,7 @@ fn layoutAndRender(
                 .radius = 0,
             });
         }
-        if (parent_state_ref) |ps| ps.dirty = true;
+        if (c.spark) |sp| sp.host_state.dirty = true;
     }
 
     const box: element.Box = .{
@@ -368,15 +356,15 @@ fn onInput(
     switch (event) {
         .focus_gained => {
             c.focused = true;
-            if (parent_state_ref) |ps| ps.dirty = true;
+            if (c.spark) |sp| sp.host_state.dirty = true;
         },
         .focus_lost => {
             c.focused = false;
-            if (parent_state_ref) |ps| ps.dirty = true;
+            if (c.spark) |sp| sp.host_state.dirty = true;
         },
         .char_input => |cp| {
             try insertCodepoint(c, cp);
-            if (parent_state_ref) |ps| ps.dirty = true;
+            if (c.spark) |sp| sp.host_state.dirty = true;
         },
         .key_down => |k| {
             try handleKey(c, k);
@@ -416,7 +404,7 @@ fn handleKey(c: *Component, k: element.KeyEvent) !void {
             );
             c.buffer.items.len -= drop;
             c.cursor = start;
-            if (parent_state_ref) |ps| ps.dirty = true;
+            if (c.spark) |sp| sp.host_state.dirty = true;
         },
         KEY_DELETE => {
             if (c.cursor >= c.buffer.items.len) return;
@@ -428,30 +416,30 @@ fn handleKey(c: *Component, k: element.KeyEvent) !void {
                 c.buffer.items[end..],
             );
             c.buffer.items.len -= drop;
-            if (parent_state_ref) |ps| ps.dirty = true;
+            if (c.spark) |sp| sp.host_state.dirty = true;
         },
         KEY_LEFT => {
             if (c.cursor == 0) return;
             c.cursor = prevCodepointStart(c.buffer.items, c.cursor);
-            if (parent_state_ref) |ps| ps.dirty = true;
+            if (c.spark) |sp| sp.host_state.dirty = true;
         },
         KEY_RIGHT => {
             if (c.cursor >= c.buffer.items.len) return;
             c.cursor = nextCodepointEnd(c.buffer.items, c.cursor);
-            if (parent_state_ref) |ps| ps.dirty = true;
+            if (c.spark) |sp| sp.host_state.dirty = true;
         },
         KEY_HOME => {
             c.cursor = 0;
-            if (parent_state_ref) |ps| ps.dirty = true;
+            if (c.spark) |sp| sp.host_state.dirty = true;
         },
         KEY_END => {
             c.cursor = c.buffer.items.len;
-            if (parent_state_ref) |ps| ps.dirty = true;
+            if (c.spark) |sp| sp.host_state.dirty = true;
         },
         KEY_ENTER, KEY_KP_ENTER => {
             if (c.target.len == 0 or c.action.len == 0) return;
-            const r = registry_ref orelse return;
-            r.handleUpdate(c.target, c.action, c.buffer.items) catch |e| {
+            const sp = c.spark orelse return;
+            sp.registry.handleUpdate(c.target, c.action, c.buffer.items) catch |e| {
                 std.log.warn(":::input: dispatch failed: target=#{s} action={s} err={s}", .{
                     c.target, c.action, @errorName(e),
                 });
@@ -484,6 +472,17 @@ fn nextCodepointEnd(bytes: []const u8, pos: usize) usize {
 
 const testing = std.testing;
 
+// Input tests exercise onInput which dirties `spark.host_state` —
+// the default testStub leaves that field undefined, so build a real
+// backing State and patch it onto the stub. Leaks at module exit by
+// design (test-only memory).
+var _test_state = state_mod.State.init(testing.allocator);
+var _test_spark = blk: {
+    var s = spark_mod.Spark.testStub(testing.allocator);
+    s.host_state = &_test_state;
+    break :blk s;
+};
+
 test "input: prevCodepointStart steps over ASCII" {
     try testing.expectEqual(@as(usize, 0), prevCodepointStart("hello", 1));
     try testing.expectEqual(@as(usize, 2), prevCodepointStart("hello", 3));
@@ -507,17 +506,13 @@ test "input: nextCodepointEnd steps forward over multi-byte" {
 }
 
 test "input: ingest requires target + action; strips # prefix" {
-    var reg = component_mod.Registry.init(testing.allocator);
-    defer reg.deinit();
-    registry_ref = &reg;
-    defer registry_ref = null;
 
     const ok_attrs = [_]components.Attr{
         .{ .key = "target", .value = "#chat" },
         .{ .key = "action", .value = "start" },
     };
     const spec: components.Spec = .{ .name = "input", .attrs = &ok_attrs };
-    const inst = try create(testing.allocator, &spec);
+    const inst = try create(&_test_spark, testing.allocator, &spec);
     defer deinit_(inst.ctx, testing.allocator);
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
     try testing.expectEqualStrings("chat", c.target);
@@ -525,43 +520,31 @@ test "input: ingest requires target + action; strips # prefix" {
 }
 
 test "input: missing target rejected" {
-    var reg = component_mod.Registry.init(testing.allocator);
-    defer reg.deinit();
-    registry_ref = &reg;
-    defer registry_ref = null;
 
     const attrs = [_]components.Attr{
         .{ .key = "action", .value = "start" },
     };
     const spec: components.Spec = .{ .name = "input", .attrs = &attrs };
-    try testing.expectError(Error.InputMissingTarget, create(testing.allocator, &spec));
+    try testing.expectError(Error.InputMissingTarget, create(&_test_spark, testing.allocator, &spec));
 }
 
 test "input: missing action rejected" {
-    var reg = component_mod.Registry.init(testing.allocator);
-    defer reg.deinit();
-    registry_ref = &reg;
-    defer registry_ref = null;
 
     const attrs = [_]components.Attr{
         .{ .key = "target", .value = "x" },
     };
     const spec: components.Spec = .{ .name = "input", .attrs = &attrs };
-    try testing.expectError(Error.InputMissingAction, create(testing.allocator, &spec));
+    try testing.expectError(Error.InputMissingAction, create(&_test_spark, testing.allocator, &spec));
 }
 
 test "input: char_input + backspace + cursor moves" {
-    var reg = component_mod.Registry.init(testing.allocator);
-    defer reg.deinit();
-    registry_ref = &reg;
-    defer registry_ref = null;
 
     const attrs = [_]components.Attr{
         .{ .key = "target", .value = "t" },
         .{ .key = "action", .value = "a" },
     };
     const spec: components.Spec = .{ .name = "input", .attrs = &attrs };
-    const inst = try create(testing.allocator, &spec);
+    const inst = try create(&_test_spark, testing.allocator, &spec);
     defer deinit_(inst.ctx, testing.allocator);
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
 
@@ -587,10 +570,6 @@ test "input: char_input + backspace + cursor moves" {
 }
 
 test "input: arrows + home + end move cursor" {
-    var reg = component_mod.Registry.init(testing.allocator);
-    defer reg.deinit();
-    registry_ref = &reg;
-    defer registry_ref = null;
 
     const attrs = [_]components.Attr{
         .{ .key = "target", .value = "t" },
@@ -598,7 +577,7 @@ test "input: arrows + home + end move cursor" {
         .{ .key = "initial", .value = "abc" },
     };
     const spec: components.Spec = .{ .name = "input", .attrs = &attrs };
-    const inst = try create(testing.allocator, &spec);
+    const inst = try create(&_test_spark, testing.allocator, &spec);
     defer deinit_(inst.ctx, testing.allocator);
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
     try testing.expectEqual(@as(usize, 3), c.cursor); // initial seeds cursor at end
@@ -615,17 +594,13 @@ test "input: arrows + home + end move cursor" {
 }
 
 test "input: multi-byte char + backspace removes whole codepoint" {
-    var reg = component_mod.Registry.init(testing.allocator);
-    defer reg.deinit();
-    registry_ref = &reg;
-    defer registry_ref = null;
 
     const attrs = [_]components.Attr{
         .{ .key = "target", .value = "t" },
         .{ .key = "action", .value = "a" },
     };
     const spec: components.Spec = .{ .name = "input", .attrs = &attrs };
-    const inst = try create(testing.allocator, &spec);
+    const inst = try create(&_test_spark, testing.allocator, &spec);
     defer deinit_(inst.ctx, testing.allocator);
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
 
@@ -639,10 +614,6 @@ test "input: multi-byte char + backspace removes whole codepoint" {
 }
 
 test "input: initial attr seeds buffer + cursor" {
-    var reg = component_mod.Registry.init(testing.allocator);
-    defer reg.deinit();
-    registry_ref = &reg;
-    defer registry_ref = null;
 
     const attrs = [_]components.Attr{
         .{ .key = "target", .value = "t" },
@@ -650,7 +621,7 @@ test "input: initial attr seeds buffer + cursor" {
         .{ .key = "initial", .value = "preset" },
     };
     const spec: components.Spec = .{ .name = "input", .attrs = &attrs };
-    const inst = try create(testing.allocator, &spec);
+    const inst = try create(&_test_spark, testing.allocator, &spec);
     defer deinit_(inst.ctx, testing.allocator);
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
     try testing.expectEqualStrings("preset", c.buffer.items);

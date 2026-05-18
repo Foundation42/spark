@@ -53,6 +53,7 @@ const element = @import("../element.zig");
 const element_layout = @import("../element_layout.zig");
 const components = @import("../markdown_components.zig");
 const component_mod = @import("../component.zig");
+const spark_mod = @import("../spark.zig");
 const markdown = @import("../markdown.zig");
 const state_mod = @import("../state.zig");
 const io = @import("../io_channel.zig");
@@ -70,34 +71,8 @@ pub const Error = error{
     LlmStreamNotInstalled,
 };
 
-// Module globals; same pattern as embedded-document.
-var registry_ref: ?*component_mod.Registry = null;
-var theme_ref: ?*const element.Theme = null;
-var parent_state_ref: ?*state_mod.State = null;
-var io_channel_ref: ?*io.IoChannel = null;
-var env_ref: ?*const dotenv.DotEnv = null;
-
-pub fn install(
-    registry: *component_mod.Registry,
-    theme: *const element.Theme,
-    parent_state: *state_mod.State,
-    io_channel: *io.IoChannel,
-    env: ?*const dotenv.DotEnv,
-) !void {
-    registry_ref = registry;
-    theme_ref = theme;
-    parent_state_ref = parent_state;
-    io_channel_ref = io_channel;
-    env_ref = env;
-    try registry.register("llm-stream", factory);
-}
-
-pub fn deinitGlobals() void {
-    registry_ref = null;
-    theme_ref = null;
-    parent_state_ref = null;
-    io_channel_ref = null;
-    env_ref = null;
+pub fn install(spark: *spark_mod.Spark) !void {
+    try spark.registry.register("llm-stream", factory);
 }
 
 const DEFAULT_OLLAMA_ENDPOINT = "http://localhost:11434/api/chat";
@@ -143,10 +118,18 @@ const PendingStream = struct {
     /// Last-seen error name when phase flipped to .failed; held so
     /// the placeholder can show useful detail.
     err_name: ?[]u8 = null,
+    /// Snapshot of the spark pointer so the completion handler can
+    /// release io-channel-owned chunks and dirty host_state even
+    /// after Component is gone.
+    spark: *spark_mod.Spark,
 };
 
 const Component = struct {
     allocator: std.mem.Allocator,
+    /// Captured at create time. Every cross-cutting concern
+    /// (registry, theme, parent state, io_channel, dotenv) is one
+    /// hop through here.
+    spark: *spark_mod.Spark,
     arena: *std.heap.ArenaAllocator,
     child_state: *state_mod.State,
     root: element.Element,
@@ -192,10 +175,7 @@ pub const factory: component_mod.Factory = .{
     .handle_update = handleUpdate,
 };
 
-fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
-    if (registry_ref == null or theme_ref == null or parent_state_ref == null or io_channel_ref == null) {
-        return Error.LlmStreamNotInstalled;
-    }
+fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
     const id_raw = spec.id orelse return Error.LlmStreamMissingId;
     const model = findAttr(spec.attrs, "model") orelse return Error.LlmStreamMissingModel;
     const prompt = findAttr(spec.attrs, "prompt") orelse return Error.LlmStreamMissingPrompt;
@@ -238,7 +218,7 @@ fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!c
     errdefer allocator.destroy(child_state);
     child_state.* = state_mod.State.init(allocator);
     errdefer child_state.deinit();
-    child_state.parent = parent_state_ref;
+    child_state.parent = spark.host_state;
 
     const scope = try allocator.dupe(u8, id_raw);
     errdefer allocator.free(scope);
@@ -259,6 +239,7 @@ fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!c
 
     c.* = .{
         .allocator = allocator,
+        .spark = spark,
         .arena = arena,
         .child_state = child_state,
         .root = element.Element{ .paragraph = &[_]element.Element{} },
@@ -287,7 +268,7 @@ fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!c
 /// is null'd before the new submission). Clears the content buffer
 /// so the re-render is from scratch.
 fn kickStream(c: *Component) !void {
-    const ch = io_channel_ref orelse return Error.LlmStreamNotInstalled;
+    const ch = c.spark.io_channel;
 
     // Cancel any in-flight stream from this component.
     if (c.pending) |p| {
@@ -322,7 +303,7 @@ fn kickStream(c: *Component) !void {
     var headers_buf: std.ArrayListUnmanaged(io.Header) = .{};
     if (c.provider == .openai) {
         const key_env = c.api_key_env orelse return Error.LlmStreamMissingApiKeyEnv;
-        const env = env_ref orelse return Error.LlmStreamApiKeyNotFound;
+        const env = c.spark.dotenv orelse return Error.LlmStreamApiKeyNotFound;
         const key = env.get(key_env) orelse return Error.LlmStreamApiKeyNotFound;
         const auth_value = try std.fmt.allocPrint(sa, "Bearer {s}", .{key});
         try headers_buf.append(sa, .{ .name = "Authorization", .value = auth_value });
@@ -330,7 +311,7 @@ fn kickStream(c: *Component) !void {
 
     const pending = try c.allocator.create(PendingStream);
     errdefer c.allocator.destroy(pending);
-    pending.* = .{ .allocator = c.allocator, .component = c };
+    pending.* = .{ .allocator = c.allocator, .component = c, .spark = c.spark };
 
     const handle = try ch.submitHttpStream(.{
         .url = c.endpoint,
@@ -371,7 +352,7 @@ fn handleUpdate(ctx: *anyopaque, action: []const u8, body: []const u8) anyerror!
         c.err_name = a.dupe(u8, @errorName(e)) catch null;
     };
     c.version +%= 1;
-    if (parent_state_ref) |ps| ps.dirty = true;
+    c.spark.host_state.dirty = true;
 }
 
 fn update(ctx: *anyopaque, _: *const components.Spec) anyerror!void {
@@ -390,7 +371,7 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
         p.component = null;
         c.pending = null;
     }
-    if (registry_ref) |r| r.deinitScope(c.scope);
+    c.spark.registry.deinitScope(c.scope);
     c.content.deinit(allocator);
     c.line_buf.deinit(allocator);
     c.child_state.deinit();
@@ -463,22 +444,23 @@ fn buildOpenAiBody(
 pub fn handleCompletion(comp: io.Completion) void {
     const p: *PendingStream = @ptrFromInt(comp.user_data);
 
+    const host_state = p.spark.host_state;
     switch (comp.result) {
         .chunk => |bytes| {
-            defer if (io_channel_ref) |ch| ch.releaseOk(bytes);
+            defer p.spark.io_channel.releaseOk(bytes);
             const c = p.component orelse return;
             processChunk(c, bytes) catch |e| {
                 std.log.err("llm-stream: chunk processing failed: {s}", .{@errorName(e)});
             };
             c.version +%= 1;
-            if (parent_state_ref) |ps| ps.dirty = true;
+            host_state.dirty = true;
         },
         .end => {
             if (p.component) |c| {
                 c.phase = .done;
                 c.pending = null;
                 c.version +%= 1;
-                if (parent_state_ref) |ps| ps.dirty = true;
+                host_state.dirty = true;
             }
             freePending(p);
         },
@@ -490,7 +472,7 @@ pub fn handleCompletion(comp: io.Completion) void {
                 if (c.err_name) |old| a.free(old);
                 c.err_name = a.dupe(u8, @errorName(e)) catch null;
                 c.version +%= 1;
-                if (parent_state_ref) |ps| ps.dirty = true;
+                host_state.dirty = true;
             }
             freePending(p);
         },
@@ -643,8 +625,8 @@ fn rerenderContent(c: *Component) !void {
     const root = markdown.parseWithStateAndScope(
         c.arena.allocator(),
         c.content.items,
-        theme_ref.?,
-        registry_ref.?,
+        c.spark.theme,
+        c.spark.registry,
         c.child_state,
         c.scope,
     ) catch |e| {

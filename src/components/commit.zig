@@ -19,6 +19,7 @@
 const std = @import("std");
 const element = @import("../element.zig");
 const components = @import("../markdown_components.zig");
+const spark_mod = @import("../spark.zig");
 const component_mod = @import("../component.zig");
 const text_layout = @import("../text/layout.zig");
 const shape = @import("../font/shape.zig");
@@ -27,8 +28,8 @@ pub const Error = error{
     CommitMissingHash,
 };
 
-pub fn install(registry: *component_mod.Registry) !void {
-    try registry.register("commit", factory);
+pub fn install(spark: *spark_mod.Spark) !void {
+    try spark.registry.register("commit", factory);
 }
 
 pub const factory: component_mod.Factory = .{
@@ -79,7 +80,8 @@ const Component = struct {
     }
 };
 
-fn create(allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
+fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!component_mod.Instance {
+    _ = spark;
     const c = try allocator.create(Component);
     errdefer allocator.destroy(c);
     c.* = .{
@@ -248,12 +250,14 @@ fn layoutAndRender(
 
 const testing = std.testing;
 
+var _test_spark = spark_mod.Spark.testStub(testing.allocator);
+
 test "Component: hash-only" {
     const attrs = [_]components.Attr{
         .{ .key = "hash", .value = "acf8e7b" },
     };
     const spec: components.Spec = .{ .name = "commit", .attrs = &attrs };
-    const inst = try create(testing.allocator, &spec);
+    const inst = try create(&_test_spark, testing.allocator, &spec);
     defer deinit_(inst.ctx, testing.allocator);
 
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
@@ -265,7 +269,7 @@ test "Component: long hash truncates to 7" {
         .{ .key = "hash", .value = "8d6e7a3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9" },
     };
     const spec: components.Spec = .{ .name = "commit", .attrs = &attrs };
-    const inst = try create(testing.allocator, &spec);
+    const inst = try create(&_test_spark, testing.allocator, &spec);
     defer deinit_(inst.ctx, testing.allocator);
 
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
@@ -278,7 +282,7 @@ test "Component: repo prefix composes" {
         .{ .key = "repo", .value = "fdn42/text_engine" },
     };
     const spec: components.Spec = .{ .name = "commit", .attrs = &attrs };
-    const inst = try create(testing.allocator, &spec);
+    const inst = try create(&_test_spark, testing.allocator, &spec);
     defer deinit_(inst.ctx, testing.allocator);
 
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
@@ -287,7 +291,7 @@ test "Component: repo prefix composes" {
 
 test "Component: missing hash rejected" {
     const spec: components.Spec = .{ .name = "commit" };
-    try testing.expectError(Error.CommitMissingHash, create(testing.allocator, &spec));
+    try testing.expectError(Error.CommitMissingHash, create(&_test_spark, testing.allocator, &spec));
 }
 
 test "vtable exposes measure_inline" {

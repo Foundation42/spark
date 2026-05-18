@@ -27,6 +27,7 @@ const std = @import("std");
 const element = @import("../element.zig");
 const components = @import("../markdown_components.zig");
 const component_mod = @import("../component.zig");
+const spark_mod = @import("../spark.zig");
 const state_mod = @import("../state.zig");
 const box_helpers = @import("box.zig"); // reuse parseLength + Length
 
@@ -118,9 +119,11 @@ pub const factory: component_mod.Factory = .{
 };
 
 fn create(
+    spark: *spark_mod.Spark,
     allocator: std.mem.Allocator,
     spec: *const components.Spec,
 ) anyerror!component_mod.Instance {
+    _ = spark;
     const c = try allocator.create(Component);
     c.* = try Component.fromSpec(allocator, spec);
     return .{ .vtable = &vtable, .ctx = @ptrCast(c) };
