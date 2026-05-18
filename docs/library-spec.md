@@ -253,7 +253,7 @@ pub const Spark = struct {
     color_format: c.VkFormat,
 
     // Owned by spark
-    fonts: *FontRegistry,           // host-constructed; ownership transferred at init
+    fonts: *FontRegistry,           // borrowed in Phase 1; Spark owns at Phase 3
     glyph_cache: *GlyphCache,
     mono_atlas: *Atlas,
     color_atlas: *Atlas,
@@ -306,7 +306,7 @@ pub const InitOptions = struct {
     color_format: c.VkFormat,
 
     theme: *const Theme,
-    fonts: *FontRegistry,                    // ownership transferred
+    fonts: *FontRegistry,                    // borrowed in Phase 1, owned at Phase 3
 
     // Optional knobs
     mono_atlas_size: u32 = 2048,
@@ -378,6 +378,51 @@ Behavior unchanged.
   (see the FPS canary section below — `src/hello.md` at ~12,800
   fps Release is the current baseline).
 - All existing tests pass.
+
+#### Phase 1 outcome — shipped 2026-05-18 (commit `d6f2f4b`)
+
+Phase 1 landed. Three implementation refinements emerged that
+later phases must preserve:
+
+1. **Ownership stays borrowed in Phase 1, inverts at Phase 3.**
+   The original wording above ("ownership transferred at init") was
+   wrong-by-a-phase. Phase 1 shipped as pure refactor: `main.zig`
+   still owns every Vulkan / font / pipeline / state resource;
+   Spark holds borrowed pointers. Phase 3 (public API) is where
+   Spark grows real `init()` and inverts ownership. This split is
+   intentional — it lets Phase 1 be a behavior-preserving refactor
+   with zero ownership-semantics change, which is much safer to
+   land. Comments throughout this spec referring to "ownership
+   transferred at init" have been updated to "borrowed in Phase 1,
+   owned at Phase 3."
+
+2. **`PendingX` structs carry their own `spark: *Spark` snapshot.**
+   The async completion handlers in `IoChannel`-using components
+   (embedded-document HTTP fetch, llm-stream SSE, svg-stream
+   Recraft envelope, image-stream Gemini envelope) outlive their
+   owning Components. Cancellation nulls the Component back-pointer,
+   but the completion handler still needs to release the
+   io-channel-owned body and bump `host_state.dirty` regardless.
+   The spark pointer is process-stable, so every PendingX struct
+   gets a snapshot field as the safe handle for the completion
+   path. **Don't lose this when relocating these factories to
+   `src/extras/` in Phase 2** — the snapshot field travels with
+   the struct.
+
+3. **`testStub(allocator)` pattern for component tests.** Tests
+   that don't exercise the layout/render path use a stub Spark
+   with most fields `undefined`; tests that touch specific surfaces
+   (`host_state.dirty`, parallel-tessellator `JobSystem`) patch the
+   needed field on the returned struct. Don't try to make a full
+   real Spark for every test — `testStub` + per-test patching is
+   the established pattern.
+
+The full demo Release FPS dropped to ~5,184 fps after Phase 1 — a
+31% drop versus the spec's original 7,600 baseline. **The drop is
+demo-content drift, not Phase 1 regression** (the demo grew
+between the 7,600 measurement and Phase 1). `hello.md` is the new
+regression-detection probe at ~12,965 fps — see the canary section
+below.
 
 ### Phase 2 — core / extras split
 
