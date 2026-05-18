@@ -48,7 +48,9 @@ const input_component = @import("components/input.zig");
 const llm_stream_component = @import("components/llm_stream.zig");
 const slider_component = @import("components/slider.zig");
 const sparkline_component = @import("components/sparkline.zig");
+const status_component = @import("components/status.zig");
 const svg_component = @import("components/svg.zig");
+const tag_component = @import("components/tag.zig");
 const svg_stream_component = @import("components/svg_stream.zig");
 const image_stream_component = @import("components/image_stream.zig");
 const state_mod = @import("state.zig");
@@ -989,6 +991,8 @@ pub fn main() !void {
     try sparkline_component.install(&registry);
     try kbd_component.install(&registry);
     try progress_component.install(&registry);
+    try status_component.install(&registry);
+    try tag_component.install(&registry);
     try button_component.install(&registry);
     defer button_component.deinitGlobals();
     try handle_component.install(&registry, &layout_context);

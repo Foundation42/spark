@@ -28,6 +28,8 @@ test {
     _ = @import("components/image_stream.zig");
     _ = @import("components/slider.zig");
     _ = @import("components/sparkline.zig");
+    _ = @import("components/status.zig");
+    _ = @import("components/tag.zig");
     _ = @import("asset_cache.zig");
     _ = @import("dotenv.zig");
     _ = @import("io_channel.zig");

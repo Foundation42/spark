@@ -22,6 +22,10 @@ Press ::kbd{key="Ctrl+C"} to copy, ::kbd{key="Ctrl+V"} to paste, or ::kbd{key="E
 
 Build is ::progress{value=0.7 color=green} almost done. Disk usage ::progress{value=0.92 color=red} getting tight. And bound to the slider below — `box_radius` is ::progress{value=${state.box_radius} max=40 color=cyan} live.
 
+Services: API ::status{color=green label="online"}, cache ::status{color=yellow label="degraded"}, queue ::status{color=green label="online"}, auth ::status{color=red label="offline"}. Background workers ::status{color=green}.
+
+Tagged ::tag{label="wip"} ::tag{label="deprecated" color=orange} ::tag{label="security" color=red} ::tag{label="docs" color=cyan} ::tag{label="v0.42" color=purple} — five facets, one line of prose.
+
 ## Stage 3 — markdown source becomes the tree
 
 Same renderer as before — only the construction path changed. This document is parsed by *cmark* into an AST, then walked into an `element.Element` tree.
