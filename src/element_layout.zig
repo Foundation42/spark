@@ -223,6 +223,132 @@ pub fn layoutAndRender(
     }
 }
 
+/// Measure-pass dispatcher (stage 15 Phase C.3). Returns the
+/// intrinsic width + height + grow-weight a block-level element
+/// reports when asked by a constraint-aware parent. Mirrors the
+/// shape of `layoutAndRender` — same switch over Element kinds, no
+/// DrawList side effects.
+///
+/// Built-in element kinds report sensible defaults:
+///   * paragraph / heading / list / code_block / thematic_break →
+///     claim `constraints.max_w` (wrap or stretch handles the rest)
+///   * container.stack_v / list_item → recurse, return max child
+///     width and (height-wise) sum of child heights + gaps
+///   * spacer → width 0, height = sp.height
+///   * quote → recurse, indent applied to the reported width
+///
+/// `.custom` dispatches to `vtable.measure_block` when present;
+/// otherwise falls back to running `layout_and_render` into a
+/// throwaway DrawList and translating the returned Box. The
+/// fallback is correct but expensive (shapes glyphs, allocates the
+/// DrawList); flex/grid children should implement `measure_block`
+/// directly.
+///
+/// Inline kinds at block position → `InlineElementOutsideInlineContext`
+/// (the parent constructed the tree incorrectly).
+pub fn measureBlock(
+    elem: element.Element,
+    constraints: element.Constraints,
+    ctx: *element.LayoutCtx,
+) anyerror!element.BlockMetrics {
+    switch (elem) {
+        .text, .line_break, .emphasis, .strong, .code, .link, .inline_object => return error.InlineElementOutsideInlineContext,
+
+        .paragraph, .heading => {
+            const w: f32 = if (std.math.isFinite(constraints.max_w)) constraints.max_w else 0;
+            return .{ .width = w, .height = 0 };
+        },
+
+        .container => |co| switch (co.layout) {
+            .stack_v => {
+                var max_w: f32 = 0;
+                var total_h: f32 = 0;
+                for (co.children, 0..) |child, i| {
+                    if (i != 0) total_h += co.gap;
+                    const m = try measureBlock(child, constraints, ctx);
+                    if (m.width > max_w) max_w = m.width;
+                    total_h += m.height;
+                }
+                return .{ .width = max_w, .height = total_h };
+            },
+        },
+
+        .spacer => |sp| return .{ .width = 0, .height = sp.height },
+
+        .thematic_break => return .{
+            .width = if (std.math.isFinite(constraints.max_w)) constraints.max_w else 320,
+            .height = ctx.theme.thematic_break_height,
+        },
+
+        .list => return .{
+            .width = if (std.math.isFinite(constraints.max_w)) constraints.max_w else 0,
+            .height = 0,
+        },
+
+        .list_item => |it| {
+            var max_w: f32 = 0;
+            var total_h: f32 = 0;
+            for (it.children, 0..) |child, i| {
+                if (i != 0) total_h += ctx.theme.block_child_gap;
+                const m = try measureBlock(child, constraints, ctx);
+                if (m.width > max_w) max_w = m.width;
+                total_h += m.height;
+            }
+            return .{ .width = max_w, .height = total_h };
+        },
+
+        .quote => |q| {
+            const indent = ctx.theme.quote_indent;
+            const inner_constraints = shrinkConstraints(constraints, indent);
+            var max_w: f32 = 0;
+            var total_h: f32 = 0;
+            for (q.children, 0..) |child, i| {
+                if (i != 0) total_h += ctx.theme.block_child_gap;
+                const m = try measureBlock(child, inner_constraints, ctx);
+                if (m.width > max_w) max_w = m.width;
+                total_h += m.height;
+            }
+            return .{ .width = max_w + indent, .height = total_h };
+        },
+
+        .code_block => return .{
+            .width = if (std.math.isFinite(constraints.max_w)) constraints.max_w else 320,
+            .height = 0,
+        },
+
+        .custom => |cu| {
+            if (cu.vtable.measure_block) |m| {
+                return m(cu.ctx, ctx, constraints);
+            }
+            return measureViaLayoutFallback(cu.vtable, cu.ctx, constraints, ctx);
+        },
+    }
+}
+
+/// Fallback measure path for `custom` components that don't expose
+/// `measure_block`. Runs `layout_and_render` into a scratch DrawList
+/// at origin (0,0) and reports the resulting Box dimensions with
+/// grow=0. Correct but expensive (shapes glyphs, allocates DrawList
+/// scratch). Components used as flex/grid children should implement
+/// `measure_block` to skip this.
+fn measureViaLayoutFallback(
+    vtable: *const element.ElementVTable,
+    ctx_anyopaque: *anyopaque,
+    constraints: element.Constraints,
+    lc: *element.LayoutCtx,
+) anyerror!element.BlockMetrics {
+    var scratch = element.DrawList.init(lc.allocator);
+    defer scratch.deinit();
+    const box = try vtable.layout_and_render(
+        ctx_anyopaque,
+        .{ 0, 0 },
+        constraints,
+        lc,
+        &scratch,
+    );
+    return .{ .width = box.w, .height = box.h };
+}
+
 /// Shrink `constraints.max_w` by the given indent. Used by quote /
 /// list to propagate "less width is available" to nested content.
 /// Other constraint fields pass through unchanged.

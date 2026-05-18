@@ -201,13 +201,35 @@ fn layoutAndRender(
         else => &[_]element.Element{},
     };
 
+    // Phase C.3 measure pass — runs only for row direction with a
+    // finite parent width. Asks each child for its intrinsic
+    // BlockMetrics (width + grow weight); computes slack = parent_w
+    // − Σ(fixed widths) − Σ(gaps), then distributes slack to grow>0
+    // children proportionally to their weights. Result is a final
+    // width per child, passed to its `layoutAndRender` as max_w —
+    // boxes at `width=100%` (the default) resolve to the slot; boxes
+    // with explicit width keep their declared size.
+    //
+    // When all children have grow=0, the math reduces to "each child
+    // gets its intrinsic width" — visually identical to pre-C.3
+    // behaviour. Column direction skips the pass entirely (heights
+    // are unbounded under stack_v, so slack is undefined).
+    var final_widths: ?[]f32 = null;
+    if (c.direction == .row and
+        std.math.isFinite(constraints.max_w) and
+        child_slice.len > 0)
+    {
+        final_widths = try computeRowWidths(c, child_slice, constraints.max_w, lc);
+    }
+    defer if (final_widths) |fw| lc.allocator.free(fw);
+
     var cur_x = origin[0];
     var cur_y = origin[1];
     var max_w: f32 = 0;
     var max_h: f32 = 0;
     var first = true;
 
-    for (child_slice) |*child| {
+    for (child_slice, 0..) |*child, i| {
         if (!first) {
             switch (c.direction) {
                 .row => cur_x += c.gap,
@@ -216,7 +238,8 @@ fn layoutAndRender(
         }
         first = false;
 
-        const child_constraints: element.Constraints = .{ .max_w = constraints.max_w };
+        const child_max_w: f32 = if (final_widths) |fw| fw[i] else constraints.max_w;
+        const child_constraints: element.Constraints = .{ .max_w = child_max_w };
         const child_box = try element_layout.layoutAndRender(
             child.*,
             .{ cur_x, cur_y },
@@ -253,6 +276,63 @@ fn layoutAndRender(
             .baseline = 0,
         },
     };
+}
+
+/// Stage 15 Phase C.3 — compute per-child width for a row-direction
+/// flex. Measures each child via `element_layout.measureBlock` to
+/// learn its intrinsic width + grow weight, then:
+///
+///   * Children with `grow == 0` claim their intrinsic width.
+///   * Slack = parent_w − Σ(intrinsic for grow=0) − Σ(gaps).
+///   * Children with `grow > 0` split slack proportionally.
+///
+/// Result allocated against `lc.allocator` (per-frame arena in the
+/// typical host wiring); caller is responsible for freeing.
+fn computeRowWidths(
+    c: *const Component,
+    children: []const element.Element,
+    max_w: f32,
+    lc: *element.LayoutCtx,
+) ![]f32 {
+    const N = children.len;
+    const final = try lc.allocator.alloc(f32, N);
+    errdefer lc.allocator.free(final);
+
+    const metrics = try lc.allocator.alloc(element.BlockMetrics, N);
+    defer lc.allocator.free(metrics);
+
+    var total_fixed: f32 = 0;
+    var total_grow: u32 = 0;
+    for (children, 0..) |child, i| {
+        const m = try element_layout.measureBlock(
+            child,
+            .{ .max_w = max_w },
+            lc,
+        );
+        metrics[i] = m;
+        if (m.grow == 0) {
+            total_fixed += m.width;
+        } else {
+            total_grow += m.grow;
+        }
+    }
+
+    const total_gap: f32 = if (N >= 2)
+        @as(f32, @floatFromInt(N - 1)) * c.gap
+    else
+        0;
+    const slack: f32 = @max(0.0, max_w - total_fixed - total_gap);
+
+    for (children, 0..) |_, i| {
+        if (metrics[i].grow > 0 and total_grow > 0) {
+            const share = (@as(f32, @floatFromInt(metrics[i].grow)) /
+                @as(f32, @floatFromInt(total_grow))) * slack;
+            final[i] = share;
+        } else {
+            final[i] = metrics[i].width;
+        }
+    }
+    return final;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────

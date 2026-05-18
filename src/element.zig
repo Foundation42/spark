@@ -300,6 +300,20 @@ pub const IntrinsicMetrics = struct {
     descender: f32 = 0,
 };
 
+/// Intrinsic size + layout hint a block component reports to a
+/// constraint-aware parent (currently `:::flex`; future `:::grid`
+/// row tracks, future custom layouts). Same coord system as
+/// `Box.w/h`. `grow` is the flex-grow weight — 0 means "I claim
+/// only my intrinsic width"; nonzero means "I claim a proportional
+/// share of any slack my parent has after subtracting fixed-width
+/// siblings." Only `:::flex` honours it today; other parents
+/// (stack_v, list) ignore it.
+pub const BlockMetrics = struct {
+    width: f32,
+    height: f32,
+    grow: u32 = 0,
+};
+
 /// vtable for `custom` elements. Two slots: a required
 /// layout-and-render and an optional input handler.
 ///
@@ -359,6 +373,20 @@ pub const ElementVTable = struct {
         em_px: f32,
         lc: *LayoutCtx,
     ) anyerror!IntrinsicMetrics = null,
+    /// Optional. Called by constraint-aware parents (`:::flex`,
+    /// future `:::grid` row tracks) BEFORE placement to learn the
+    /// child's intrinsic size + grow weight. The parent uses this
+    /// to compute slack distribution: fixed-width children claim
+    /// their intrinsic; grow>0 children share whatever's left.
+    /// Components that don't opt in get measured by the dispatcher
+    /// falling back to running `layout_and_render` into a throwaway
+    /// DrawList — correct but expensive. Components that appear as
+    /// flex/grid children should implement this directly.
+    measure_block: ?*const fn (
+        ctx: *anyopaque,
+        lc: *LayoutCtx,
+        constraints: Constraints,
+    ) anyerror!BlockMetrics = null,
     /// Cost hint for the stage-14b parallel cache-miss dispatcher.
     /// `false` (default) means a miss on this component is
     /// "expensive enough to dispatch" — a paragraph's HarfBuzz

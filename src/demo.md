@@ -95,6 +95,34 @@ The first multi-child constraint-aware provider. `:::flex` walks its children wi
 :::
 :::
 
+## Flex grow (stage 15 Phase C.3)
+
+The measure-pass protocol lets `:::flex` ask each child for its intrinsic width *before* placement, then distribute slack across children with a `grow` weight. Below: two fixed-width caps + a middle box that takes whatever's left. Resize the window — the middle box stretches; the caps stay put.
+
+:::flex {#grow_row direction=row gap=8}
+:::box {color=orange width=80 height=48 radius=6}
+:::
+
+:::box {color=cyan grow=1 height=48 radius=6}
+:::
+
+:::box {color=orange width=80 height=48 radius=6}
+:::
+:::
+
+Multiple grow weights split slack proportionally — `grow=1` + `grow=2` + `grow=1` here means the middle panel claims half the row's slack and the side panels split the rest.
+
+:::flex {#grow_proportional direction=row gap=8}
+:::box {color=purple grow=1 height=40 radius=6}
+:::
+
+:::box {color=green grow=2 height=40 radius=6}
+:::
+
+:::box {color=purple grow=1 height=40 radius=6}
+:::
+:::
+
 ## Drag-to-resize (stage 15D)
 
 Stage 15D wires GPU-side input deltas straight to the kiwi constraint solver via `LayoutContext.setSuggestion`. A `:::handle` between two boxes drags horizontally; the left box reads its own width as a `suggestValue` edit at medium strength, and the right box shifts to follow. No state intermediary, no re-parse — the cursor drives the solver, the solver reshapes the layout, the renderer paints the new geometry on the next frame.

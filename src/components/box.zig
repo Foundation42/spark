@@ -52,6 +52,12 @@ const Component = struct {
     width: Length,
     height: Length,
     radius: f32,
+    /// Flex-grow weight (stage 15 Phase C.3). 0 (the default) means
+    /// "claim my intrinsic width"; nonzero means "claim a proportional
+    /// share of any slack my parent flex has after subtracting
+    /// fixed-width siblings." Honoured by `:::flex`; ignored by
+    /// stack_v / grid / direct render.
+    grow: u32 = 0,
     /// Bumped on every mutation; consulted by the retained layout
     /// cache so a state-driven attr change invalidates the cached
     /// block. See `layout_cache.zig`.
@@ -63,6 +69,7 @@ const Component = struct {
             .width = .{ .percent = 1.0 },
             .height = .{ .pixels = 80 },
             .radius = 0,
+            .grow = 0,
         };
         for (spec.attrs) |a| {
             if (std.mem.eql(u8, a.key, "color")) {
@@ -79,6 +86,8 @@ const Component = struct {
                         .auto => 0,
                     };
                 }
+            } else if (std.mem.eql(u8, a.key, "grow")) {
+                c.grow = std.fmt.parseInt(u32, std.mem.trim(u8, a.value, " \t"), 10) catch 0;
             }
         }
         return c;
@@ -150,7 +159,34 @@ fn handleUpdate(ctx: *anyopaque, action: []const u8, body: []const u8) anyerror!
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .content_version = contentVersion,
+    .measure_block = measureBlock,
 };
+
+/// Block-context measure (stage 15 Phase C.3). Reports the box's
+/// intrinsic size and grow weight to a constraint-aware parent
+/// (`:::flex` currently; future grid row tracks). The reported width
+/// is the attr-driven `width` resolved against `constraints.max_w`
+/// — same math `layoutAndRender` uses. The suggestion channel
+/// (drag-driven overrides) is deliberately NOT consulted here: a box
+/// inside a flex reports its declared size, and the flex's grow
+/// distribution then drives the actual width.
+fn measureBlock(
+    ctx: *anyopaque,
+    lc: *element.LayoutCtx,
+    constraints: element.Constraints,
+) anyerror!element.BlockMetrics {
+    _ = lc;
+    const c: *const Component = @ptrCast(@alignCast(ctx));
+    const max_w = constraints.max_w;
+    const fallback_w: f32 = if (std.math.isFinite(max_w)) max_w else 320.0;
+    const w_target = c.width.resolve(max_w, fallback_w);
+    const h_target = c.height.resolve(max_w, 80.0);
+    return .{
+        .width = w_target,
+        .height = h_target,
+        .grow = c.grow,
+    };
+}
 
 /// Version bumper trampoline registered with LayoutContext.bumpers.
 /// External suggestion mutations (drag handlers etc.) call into here
@@ -527,6 +563,51 @@ test "handleUpdate: set-radius / set-width / set-height" {
     try handleUpdate(@ptrCast(&c), "set-height", "75%");
     try testing.expect(c.height == .percent);
     try testing.expectEqual(@as(f32, 0.75), c.height.percent);
+}
+
+test "Component.fromSpec: grow attr parses to u32" {
+    const attrs_yes = [_]components.Attr{
+        .{ .key = "grow", .value = "3" },
+    };
+    const spec_yes: components.Spec = .{ .name = "box", .attrs = &attrs_yes };
+    try testing.expectEqual(@as(u32, 3), Component.fromSpec(&spec_yes).grow);
+
+    // Missing grow → default 0.
+    const spec_no: components.Spec = .{ .name = "box" };
+    try testing.expectEqual(@as(u32, 0), Component.fromSpec(&spec_no).grow);
+
+    // Garbage grow → default 0.
+    const attrs_bad = [_]components.Attr{
+        .{ .key = "grow", .value = "notanumber" },
+    };
+    const spec_bad: components.Spec = .{ .name = "box", .attrs = &attrs_bad };
+    try testing.expectEqual(@as(u32, 0), Component.fromSpec(&spec_bad).grow);
+}
+
+test "vtable.measure_block reports attr-driven width + grow" {
+    // Build a Component directly (no factory needed — measure_block
+    // doesn't touch the registry).
+    var c: Component = .{
+        .color = MAGENTA,
+        .width = .{ .pixels = 120 },
+        .height = .{ .pixels = 40 },
+        .radius = 0,
+        .grow = 2,
+    };
+
+    // measure_block takes a LayoutCtx pointer but doesn't read it
+    // (current impl). Synthesise a minimal one — we just need the
+    // pointer to be non-null and the function not to crash.
+    var lc: element.LayoutCtx = undefined;
+    const m = try measureBlock(@ptrCast(&c), &lc, .{ .max_w = 400 });
+    try testing.expectEqual(@as(f32, 120), m.width);
+    try testing.expectEqual(@as(f32, 40), m.height);
+    try testing.expectEqual(@as(u32, 2), m.grow);
+
+    // Percent width resolves against constraints.max_w.
+    c.width = .{ .percent = 0.5 };
+    const m2 = try measureBlock(@ptrCast(&c), &lc, .{ .max_w = 400 });
+    try testing.expectEqual(@as(f32, 200), m2.width);
 }
 
 test "handleUpdate: unknown action is silent no-op" {
