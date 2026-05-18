@@ -184,6 +184,48 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run text_engine_demo");
     run_step.dependOn(&run_cmd.step);
 
+    // ── Minimal host (Phase 4 second consumer) ─────────────────────
+    // Smallest possible binary that imports `text_engine` and stands
+    // up a Spark instance against its public surface. Library-spec
+    // §"Phase 4" — proves the boundary against a non-demo consumer
+    // before matryoshka adoption. Same system-library link config
+    // as the demo because it reaches through the same demo-supporting
+    // re-exports (window/swapchain/renderer) for the host-side glue.
+    const minimal_host = b.addExecutable(.{
+        .name = "minimal_host",
+        .root_source_file = b.path("examples/minimal_host.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    minimal_host.root_module.addImport("text_engine", text_engine_mod);
+    if (target.result.os.tag == .windows) {
+        if (std.process.getEnvVarOwned(b.allocator, "VULKAN_SDK")) |sdk| {
+            minimal_host.addIncludePath(.{ .cwd_relative = b.fmt("{s}/Include", .{sdk}) });
+            minimal_host.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/Lib", .{sdk}) });
+        } else |_| {}
+        minimal_host.linkSystemLibrary("vulkan-1");
+    } else {
+        minimal_host.linkSystemLibrary("vulkan");
+    }
+    minimal_host.linkSystemLibrary("glfw");
+    minimal_host.linkSystemLibrary("freetype2");
+    minimal_host.linkSystemLibrary("harfbuzz");
+    minimal_host.linkLibrary(cmark_lib);
+    minimal_host.addIncludePath(b.path("vendor/cmark"));
+    minimal_host.addCSourceFile(.{
+        .file = b.path("vendor/stb/stb_image.c"),
+        .flags = &.{"-std=c99"},
+    });
+    minimal_host.addIncludePath(b.path("vendor/stb"));
+    minimal_host.linkLibC();
+    const minimal_host_step = b.step("minimal-host", "Build the Phase 4 minimal_host example");
+    minimal_host_step.dependOn(&b.addInstallArtifact(minimal_host, .{}).step);
+
+    const run_minimal_host = b.addRunArtifact(minimal_host);
+    run_minimal_host.step.dependOn(&b.addInstallArtifact(minimal_host, .{}).step);
+    const run_minimal_host_step = b.step("run-minimal-host", "Run the Phase 4 minimal_host example");
+    run_minimal_host_step.dependOn(&run_minimal_host.step);
+
     // ── Unit tests ─────────────────────────────────────────────────
     // Single test entry point at `src/tests.zig` so the module root
     // is `src/` — needed because subdirectory test files
