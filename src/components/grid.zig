@@ -62,6 +62,7 @@ const components = @import("../markdown_components.zig");
 const component_mod = @import("../component.zig");
 const markdown = @import("../markdown.zig");
 const element_layout = @import("../element_layout.zig");
+const layout_cache = @import("../layout_cache.zig");
 const state_mod = @import("../state.zig");
 const box_component = @import("box.zig");
 
@@ -307,17 +308,23 @@ pub fn resolveTrackWidths(
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .content_version = contentVersion,
-    // Stage 15 Phase C.4: cells are walked via
-    // `layoutAndRenderCached` — each cell caches individually so
-    // unchanged cells blit. The grid itself stays
-    // disable_cache=true; same rationale as :::flex: aggregating
-    // cell versions into the grid's own key is a follow-on.
-    .disable_cache = true,
+    // Stage 15 Phase C.5: the grid caches as a whole, mirroring
+    // `:::flex`. `contentVersion` aggregates each cell's version so
+    // a descendant bump propagates up. Idle dashboards blit one
+    // entry; cell mutations re-walk affected cells while siblings
+    // hit their per-block cache.
 };
 
 fn contentVersion(ctx: *anyopaque) u64 {
     const c: *const Component = @ptrCast(@alignCast(ctx));
-    return c.version;
+    // Stage 15 Phase C.5 — hierarchical aggregation. Same pattern
+    // as `:::flex`: fold each cell's content_version into our own
+    // so a descendant bump invalidates the grid's cache entry.
+    const cells: []const element.Element = switch (c.root) {
+        .container => |co| co.children,
+        else => &[_]element.Element{},
+    };
+    return c.version ^ layout_cache.aggregateChildVersions(cells);
 }
 
 fn layoutAndRender(

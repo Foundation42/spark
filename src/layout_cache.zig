@@ -269,6 +269,35 @@ pub fn versionFor(elem: element.Element) u64 {
     };
 }
 
+/// Stage 15 Phase C.5 — fold child content-versions into a single
+/// `u64` that changes whenever ANY child's version changes. Container
+/// components (`:::flex`, `:::grid`) call this from their own
+/// `content_version` and XOR the result with their own version. The
+/// cache key then catches both "self mutated" and "a descendant
+/// mutated" without the container needing to know what mutated.
+///
+/// Each child's contribution mixes its `versionFor` value with its
+/// `elementIdentity`. Identity mixing dodges the A XOR A = 0 trap:
+/// two siblings sharing the same version would otherwise cancel and
+/// hide each other's changes. With identity mixed in, the per-child
+/// terms are pointer-keyed and collisions become astronomically
+/// unlikely.
+///
+/// Bumps to grandchildren propagate up automatically because each
+/// container in the chain aggregates its own children — so a `:::box`
+/// inside a `:::grid` inside a `:::flex` rolls all the way up: box's
+/// version bumps → grid's aggregated version changes → flex's
+/// aggregated version changes → flex cache invalidates.
+pub fn aggregateChildVersions(children: []const element.Element) u64 {
+    var v: u64 = 0;
+    for (children) |child| {
+        const cv = versionFor(child);
+        const id: u64 = @intCast(elementIdentity(child));
+        v ^= cv ^ id;
+    }
+    return v;
+}
+
 /// Blit a cached entry into `out`, translating every position by
 /// `origin`. Triangle indices are rebased against the current vertex
 /// count of `out.tris`. Returns the `Box` at `origin`.
@@ -553,4 +582,66 @@ test "cacheableLeaf: classifies kinds" {
     try testing.expect(!cacheableLeaf(.line_break));
     try testing.expect(!cacheableLeaf(element.Element{ .container = .{ .layout = .stack_v, .children = &.{} } }));
     try testing.expect(!cacheableLeaf(element.Element{ .list = .{ .ordered = false, .items = &.{} } }));
+}
+
+test "aggregateChildVersions: child bumps flip the aggregated value" {
+    const State = struct {
+        var ver_a: u64 = 0;
+        var ver_b: u64 = 0;
+        fn vA(_: *anyopaque) u64 {
+            return ver_a;
+        }
+        fn vB(_: *anyopaque) u64 {
+            return ver_b;
+        }
+        fn dummyLar(
+            _: *anyopaque,
+            origin: [2]f32,
+            _: element.Constraints,
+            _: *element.LayoutCtx,
+            _: *element.DrawList,
+        ) anyerror!element.Box {
+            return .{ .x = origin[0], .y = origin[1], .w = 0, .h = 0 };
+        }
+    };
+
+    const vt_a: element.ElementVTable = .{
+        .layout_and_render = State.dummyLar,
+        .content_version = State.vA,
+    };
+    const vt_b: element.ElementVTable = .{
+        .layout_and_render = State.dummyLar,
+        .content_version = State.vB,
+    };
+
+    var ctx_a: u8 = 0;
+    var ctx_b: u8 = 0;
+    State.ver_a = 0;
+    State.ver_b = 0;
+
+    const children: [2]element.Element = .{
+        .{ .custom = .{ .vtable = &vt_a, .ctx = &ctx_a } },
+        .{ .custom = .{ .vtable = &vt_b, .ctx = &ctx_b } },
+    };
+
+    const v0 = aggregateChildVersions(&children);
+
+    // Bump one child — aggregated value should change.
+    State.ver_a = 1;
+    const v1 = aggregateChildVersions(&children);
+    try testing.expect(v0 != v1);
+
+    // Identity-mixing regression: two siblings with the same version
+    // must NOT cancel each other out. Without identity-mix,
+    // (5 XOR 5) = 0 and the aggregate would equal the no-bump
+    // baseline, hiding the change.
+    State.ver_a = 5;
+    State.ver_b = 5;
+    const v_same = aggregateChildVersions(&children);
+    try testing.expect(v_same != 0);
+
+    State.ver_a = 5;
+    State.ver_b = 7;
+    const v_diff = aggregateChildVersions(&children);
+    try testing.expect(v_same != v_diff);
 }

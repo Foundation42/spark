@@ -30,6 +30,7 @@ const components = @import("../markdown_components.zig");
 const component_mod = @import("../component.zig");
 const markdown = @import("../markdown.zig");
 const element_layout = @import("../element_layout.zig");
+const layout_cache = @import("../layout_cache.zig");
 const state_mod = @import("../state.zig");
 const box_component = @import("box.zig");
 
@@ -165,22 +166,26 @@ fn applyAttrs(c: *Component, spec: *const components.Spec) void {
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .content_version = contentVersion,
-    // Stage 15 Phase C.4 (hierarchical cache invalidation):
-    // children are now walked via `layoutAndRenderCached`, so each
-    // child caches individually — unchanged boxes blit on every
-    // frame. The flex itself stays disable_cache=true: if it
-    // cached as a whole, child version bumps wouldn't propagate
-    // into the flex's cache key without explicit aggregation. A
-    // future Phase can opt the flex into caching as a unit by
-    // XOR'ing children's content_versions into its own — the
-    // current cost (one re-walk per frame for the flex's own
-    // measure + dispatch) is small.
-    .disable_cache = true,
+    // Stage 15 Phase C.5: the flex caches as a whole. `contentVersion`
+    // XOR's each child's content_version into its own — so a
+    // descendant bump (drag suggestion, state-driven box attr,
+    // streaming chart…) flips our effective version and the cache
+    // hit becomes a miss. Idle frames blit one entry; partial
+    // changes re-walk children (each of whom may still hit their
+    // own per-block cache via `layoutAndRenderCached`).
 };
 
 fn contentVersion(ctx: *anyopaque) u64 {
     const c: *const Component = @ptrCast(@alignCast(ctx));
-    return c.version;
+    // Stage 15 Phase C.5 — hierarchical aggregation. Combine our own
+    // version with the children's content_versions so a descendant
+    // bump invalidates the flex's cache entry. Without this, the
+    // outer cache would replay stale baked-in child output.
+    const children: []const element.Element = switch (c.root) {
+        .container => |co| co.children,
+        else => &[_]element.Element{},
+    };
+    return c.version ^ layout_cache.aggregateChildVersions(children);
 }
 
 fn layoutAndRender(
