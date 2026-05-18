@@ -245,6 +245,59 @@ pub const Element = union(enum) {
         vtable: *const ElementVTable,
         ctx: *anyopaque,
     },
+
+    /// Inline-context component. Flows alongside text in a
+    /// paragraph/heading at glyph granularity — the inline-flow walker
+    /// reserves space for it, baseline-resolves it against surrounding
+    /// runs, and dispatches to its vtable to paint at the resolved
+    /// `(pen_x, baseline_y)`. The component is responsible for sizing
+    /// itself via `vtable.measure_inline` (called before wrap) and
+    /// painting itself via `vtable.layout_and_render` (called from
+    /// `emitLine` once its line position is settled).
+    ///
+    /// `valign` controls vertical placement against the line's
+    /// resolved baseline. `.baseline` is the default and the right
+    /// choice for any component whose interior has its own text
+    /// baseline (badges, inline mini-charts with axis labels).
+    /// Non-text components (sparkline glyphs, generated SVG icons)
+    /// typically want `.middle` or `.top`.
+    inline_object: struct {
+        vtable: *const ElementVTable,
+        ctx: *anyopaque,
+        valign: InlineAlign = .baseline,
+    },
+};
+
+/// Vertical alignment of an `inline_object` against the line's
+/// resolved baseline. Computed once per object during line build.
+pub const InlineAlign = enum {
+    /// Object's reported `ascender` sits at the line's `max(ascender)`
+    /// — visually, the object's interior baseline aligns with the
+    /// surrounding text baseline. Default; correct for badges and any
+    /// other component with its own text inside.
+    baseline,
+    /// Object's vertical center aligns with the line's x-height
+    /// center. Suits text-less glyphs (sparklines, icons).
+    middle,
+    /// Object's top edge aligns with the line's top. Suits very tall
+    /// objects that should hang from the cap line.
+    top,
+    /// Object's bottom edge aligns with the line's bottom. Symmetric
+    /// to `.top`; rarely the right answer but cheap to support.
+    bottom,
+};
+
+/// Intrinsic size + baseline an inline component reports to the
+/// flow walker before wrap. All three values are in display pixels
+/// (same coord system as `Box.w/h` and font metrics). `ascender +
+/// descender` is the object's full vertical extent; the walker uses
+/// `ascender` to participate in the line's `max(ascender)` resolve
+/// and `descender` to extend the line box below the baseline if
+/// needed.
+pub const IntrinsicMetrics = struct {
+    width: f32,
+    ascender: f32,
+    descender: f32 = 0,
 };
 
 /// vtable for `custom` elements. Two slots: a required
@@ -293,6 +346,19 @@ pub const ElementVTable = struct {
     /// (embedded-document). Inner stack_v walks still cache their
     /// own children — only the outer block-grain cache is suppressed.
     disable_cache: bool = false,
+    /// Optional. Called by the inline-flow walker before wrap to
+    /// learn an `inline_object`'s intrinsic size + baseline so the
+    /// walker can place it correctly within a line. Required for any
+    /// component used as an `inline_object`; ignored when the
+    /// component appears as a block `custom` element. `em_px` is the
+    /// surrounding text's body display size, supplied so components
+    /// that want to scale relative to their context can do so without
+    /// reaching into the font registry.
+    measure_inline: ?*const fn (
+        ctx: *anyopaque,
+        em_px: f32,
+        lc: *LayoutCtx,
+    ) anyerror!IntrinsicMetrics = null,
     /// Cost hint for the stage-14b parallel cache-miss dispatcher.
     /// `false` (default) means a miss on this component is
     /// "expensive enough to dispatch" — a paragraph's HarfBuzz

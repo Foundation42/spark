@@ -210,8 +210,8 @@ pub fn elementIdentity(elem: element.Element) usize {
     return switch (elem) {
         // Inline kinds are never cached at the block level — they
         // belong inside paragraph/heading content and the inline-flow
-        // shaper handles them.
-        .text, .line_break, .emphasis, .strong, .code, .link => 0,
+        // shaper handles them. `inline_object` is in the same family.
+        .text, .line_break, .emphasis, .strong, .code, .link, .inline_object => 0,
 
         .paragraph => |children| @intFromPtr(children.ptr),
         .heading => |h| @intFromPtr(h.content.ptr),

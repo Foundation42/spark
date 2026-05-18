@@ -144,7 +144,11 @@ pub fn layoutAndRender(
     switch (elem) {
         // Inline kinds — leaf and structural — are only valid inside
         // an inline-flow context (paragraph / heading content).
-        .text, .line_break, .emphasis, .strong, .code, .link => return error.InlineElementOutsideInlineContext,
+        // `inline_object` (Stage 15E text intrusion) belongs to the
+        // same family: a component flowing inside a paragraph rather
+        // than as a standalone block. At block level both are tree-
+        // construction errors.
+        .text, .line_break, .emphasis, .strong, .code, .link, .inline_object => return error.InlineElementOutsideInlineContext,
 
         .paragraph => |children| return layoutInlineFlow(
             children,
@@ -1058,15 +1062,36 @@ const ShapedAtom = struct {
     line_height: f32,
 };
 
+/// Wrap-pass atom for an inline component. Carries the vtable + ctx
+/// the emit pass dispatches to, plus the intrinsic metrics the line-
+/// build needs (width drives wrap; ascender + descender drive baseline
+/// resolve and line-box height). `valign` is the alignment policy
+/// declared at the Element layer; emit consults it to position the
+/// component vertically against the resolved baseline.
+const ObjectAtom = struct {
+    vtable: *const element.ElementVTable,
+    ctx: *anyopaque,
+    valign: element.InlineAlign,
+    width: f32,
+    ascender: f32,
+    descender: f32,
+};
+
 const InlineToken = union(enum) {
     word: ShapedAtom,
     gap: ShapedAtom,
+    object: ObjectAtom,
     line_break,
 };
 
 fn isWord(t: InlineToken) bool {
     return switch (t) {
-        .word => true,
+        // Objects wrap like words — they're atomic units the wrap
+        // logic must decide to keep or push to a new line. Treating
+        // them as words makes "would adding this overflow?" use the
+        // right code path; the line-build's leading-gap drop logic
+        // then naturally handles a gap that fell at the wrap point.
+        .word, .object => true,
         else => false,
     };
 }
@@ -1086,6 +1111,7 @@ fn tokenWidth(t: InlineToken) f32 {
     return switch (t) {
         .word => |w| w.width,
         .gap => |g| g.width,
+        .object => |o| o.width,
         .line_break => 0,
     };
 }
@@ -1093,7 +1119,36 @@ fn tokenAtom(t: InlineToken) ?ShapedAtom {
     return switch (t) {
         .word => |w| w,
         .gap => |g| g,
-        .line_break => null,
+        // Objects don't carry a ShapedAtom — emit handles them
+        // separately. Returning null lets the existing decoration /
+        // shaping loop skip the object's slot without touching style
+        // fields that don't exist on it.
+        .object, .line_break => null,
+    };
+}
+
+/// Per-atom ascender contribution to the line's `max(ascender)`
+/// resolve. Text atoms read their font's ascender; objects report
+/// their own.
+fn tokenAscender(t: InlineToken) f32 {
+    return switch (t) {
+        .word => |w| w.ascender,
+        .gap => |g| g.ascender,
+        .object => |o| o.ascender,
+        .line_break => 0,
+    };
+}
+
+/// Per-atom `line_height` contribution to the line box. Text atoms
+/// supply their font's `line_height` (already includes leading);
+/// objects supply `ascender + descender` so the line box grows just
+/// enough to contain them.
+fn tokenLineHeight(t: InlineToken) f32 {
+    return switch (t) {
+        .word => |w| w.line_height,
+        .gap => |g| g.line_height,
+        .object => |o| o.ascender + o.descender,
+        .line_break => 0,
     };
 }
 
@@ -1122,6 +1177,26 @@ fn collectInlineTokens(
             .strong => |inner| try collectInlineTokens(inner, tokens, allocator, ctx),
             .code => |inner| try collectInlineTokens(inner, tokens, allocator, ctx),
             .link => |l| try collectInlineTokens(l.content, tokens, allocator, ctx),
+            .inline_object => |io| {
+                // Pull the component's intrinsic metrics so wrap +
+                // baseline-resolve know where to put it. A component
+                // that surfaces as inline_object MUST set
+                // `measure_inline`; an unmeasured object is a
+                // construction error rather than a silent zero-width
+                // ghost.
+                const measurer = io.vtable.measure_inline orelse
+                    return error.InlineObjectMissingMeasurer;
+                const em_px: f32 = @floatFromInt(ctx.fonts.displayPx(ctx.theme.body.font_id));
+                const m = try measurer(io.ctx, em_px, ctx);
+                try tokens.append(.{ .object = .{
+                    .vtable = io.vtable,
+                    .ctx = io.ctx,
+                    .valign = io.valign,
+                    .width = m.width,
+                    .ascender = m.ascender,
+                    .descender = m.descender,
+                } });
+            },
             else => return error.InlineElementOutsideInlineContext,
         }
     }
@@ -1251,9 +1326,10 @@ fn emitLine(
     var max_asc: f32 = 0;
     var max_lh: f32 = 0;
     for (line_tokens) |tok| {
-        const atom = tokenAtom(tok) orelse continue;
-        if (atom.ascender > max_asc) max_asc = atom.ascender;
-        if (atom.line_height > max_lh) max_lh = atom.line_height;
+        const asc = tokenAscender(tok);
+        const lh = tokenLineHeight(tok);
+        if (asc > max_asc) max_asc = asc;
+        if (lh > max_lh) max_lh = lh;
     }
     const baseline_y = y + max_asc;
 
@@ -1275,6 +1351,29 @@ fn emitLine(
     const line_top = baseline_y - max_asc;
 
     for (line_tokens) |tok| {
+        // ── Inline objects: close decorations + dispatch + advance ──
+        // An inline component is a hard break in any open decoration
+        // run — a link underline doesn't visually extend across a
+        // badge, an ANSI reverse-video span doesn't paint behind it.
+        // Force-close the trackers at the object's start x, paint the
+        // object, and resume after it with empty runs.
+        if (tok == .object) {
+            const obj = tok.object;
+            if (bg_run.flush()) {
+                try emitBgQuad(out, bg_run.start_x, x, line_top, max_lh, bg_run.color);
+            }
+            if (underline_run.flush()) {
+                try emitUnderline(out, ctx.theme, underline_run.start_x, x, baseline_y, underline_run.max_px, underline_run.color);
+            }
+            if (strike_run.flush()) {
+                try emitStrikethrough(out, ctx.theme, strike_run.start_x, x, baseline_y, strike_run.max_px, strike_run.color);
+            }
+
+            try emitInlineObject(obj, x, baseline_y, max_asc, max_lh, line_top, ctx, out);
+            x += obj.width;
+            continue;
+        }
+
         const atom = tokenAtom(tok) orelse continue;
         const px = ctx.fonts.displayPx(atom.style.font_id);
 
@@ -1439,4 +1538,65 @@ fn emitBgQuad(
         .color = color,
         .radius = 0,
     });
+}
+
+/// Paint one inline component at the resolved line position.
+/// Translates the four `InlineAlign` modes into a concrete top-y for
+/// the component's bbox, hands the vtable an origin pinned to that
+/// position, and registers a Hit if the component accepts input.
+/// Width is the caller's responsibility — `emitLine` advances `x` by
+/// the measured `obj.width` after this returns, ignoring the Box the
+/// vtable hands back. (Trust the measure-pass intent; the Box exists
+/// so future block-level retained-mode plumbing has a return slot.)
+fn emitInlineObject(
+    obj: ObjectAtom,
+    pen_x: f32,
+    baseline_y: f32,
+    max_asc: f32,
+    max_lh: f32,
+    line_top: f32,
+    ctx: *element.LayoutCtx,
+    out: *element.DrawList,
+) !void {
+    const obj_h = obj.ascender + obj.descender;
+    const origin_y: f32 = switch (obj.valign) {
+        // Component's ascender lands on the resolved line baseline —
+        // the standard "share a baseline with surrounding text" case.
+        .baseline => baseline_y - obj.ascender,
+        // Component is vertically centred against the line's full
+        // box. Matches CSS `vertical-align: middle` closely enough
+        // for the cases we care about (sparklines, icons).
+        .middle => line_top + (max_lh - obj_h) * 0.5,
+        // Component hangs from the line's cap line.
+        .top => baseline_y - max_asc,
+        // Component sits on the line's bottom edge.
+        .bottom => line_top + max_lh - obj_h,
+    };
+    const origin: [2]f32 = .{ pen_x, origin_y };
+
+    // Tight constraints — the component already declared its intrinsic
+    // size via measure_inline. Passing the same width back as max_w
+    // keeps any defensive max-clamping inside the component honest;
+    // max_h is the component's own height for the same reason.
+    const constraints: element.Constraints = .{
+        .min_w = 0,
+        .max_w = obj.width,
+        .min_h = 0,
+        .max_h = obj_h,
+    };
+
+    const box = try obj.vtable.layout_and_render(obj.ctx, origin, constraints, ctx, out);
+
+    // Register on the hit-test layer if the component accepts input —
+    // mirrors the block-level `.custom` path. Stamped with the current
+    // walker `state` so input dispatch routes to the right scope.
+    if (obj.vtable.on_input != null) {
+        try out.hits.append(.{
+            .box = box,
+            .vtable = obj.vtable,
+            .ctx = obj.ctx,
+            .state = ctx.state,
+            .focusable = obj.vtable.focusable,
+        });
+    }
 }

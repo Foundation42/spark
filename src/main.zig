@@ -34,6 +34,7 @@ const layout_context_mod = @import("layout/context.zig");
 const markdown = @import("markdown.zig");
 const ansi = @import("ansi.zig");
 const component = @import("component.zig");
+const badge_component = @import("components/badge.zig");
 const box_component = @import("components/box.zig");
 const flex_component = @import("components/flex.zig");
 const grid_component = @import("components/grid.zig");
@@ -55,6 +56,7 @@ const dotenv_mod = @import("dotenv.zig");
 const asset_cache_mod = @import("asset_cache.zig");
 const svg_mod = @import("svg.zig");
 const svg_tess = @import("svg_tessellate.zig");
+const markdown_components = @import("markdown_components.zig");
 
 /// Demo document — parsed by the vendored cmark + mapper into an
 /// Element tree at startup. Same render path as the hand-built
@@ -837,6 +839,72 @@ fn computeStateFilePath(allocator: std.mem.Allocator) ![]u8 {
     return try std.fs.path.join(allocator, &.{ home, ".local", "state", "text_engine", "state.json" });
 }
 
+/// Stage 15E text-intrusion demo. Builds a paragraph that interleaves
+/// labeled text with badge instances flowing inline. The host calls
+/// this once after parseWithState; all allocations land in the doc
+/// arena and are freed when the arena is.
+///
+/// Each badge instance is materialised via `badge_component.factory.create`
+/// — same machinery the markdown parser uses for `:::badge` blocks
+/// (block-level for now; inline markdown syntax is 15E.2). The
+/// returned `inline_object` Element points at the instance's
+/// vtable + ctx, identical in shape to what a future inline parser
+/// will emit.
+fn buildInlineBadgeDemo(
+    arena: std.mem.Allocator,
+    theme: *const element.Theme,
+) !element.Element {
+    const BadgeSpec = struct { label: []const u8, color: []const u8 };
+    const badges = [_]BadgeSpec{
+        .{ .label = "200ms", .color = "green" },
+        .{ .label = "stale", .color = "yellow" },
+        .{ .label = "13ms", .color = "green" },
+        .{ .label = "503", .color = "red" },
+        .{ .label = "PR-1234", .color = "blue" },
+        .{ .label = "draft", .color = "purple" },
+    };
+
+    // Materialise instances. Each gets its own allocation; doc_arena
+    // deinit frees the lot. We don't keep ownership of the Instance
+    // struct itself — only its vtable + ctx pointers ride along into
+    // the Element tree.
+    var instances: [badges.len]component.Instance = undefined;
+    inline for (badges, 0..) |b, i| {
+        const attrs = [_]markdown_components.Attr{
+            .{ .key = "label", .value = b.label },
+            .{ .key = "color", .value = b.color },
+        };
+        const spec_local: markdown_components.Spec = .{
+            .name = "badge",
+            .attrs = &attrs,
+        };
+        instances[i] = try badge_component.factory.create(arena, &spec_local);
+    }
+
+    // Interleave text and badges. The trailing "all green except auth
+    // X." brings two badges close together and tests baseline-resolve
+    // across the line's run of mixed-size atoms; the leading copy
+    // gives the line normal text to settle the baseline against.
+    const body_style = theme.body;
+    var children = std.ArrayList(element.Element).init(arena);
+
+    try children.append(.{ .text = .{ .content = "Service health: API ", .style = body_style } });
+    try children.append(.{ .inline_object = .{ .vtable = instances[0].vtable, .ctx = instances[0].ctx } });
+    try children.append(.{ .text = .{ .content = " cache ", .style = body_style } });
+    try children.append(.{ .inline_object = .{ .vtable = instances[1].vtable, .ctx = instances[1].ctx } });
+    try children.append(.{ .text = .{ .content = " queue ", .style = body_style } });
+    try children.append(.{ .inline_object = .{ .vtable = instances[2].vtable, .ctx = instances[2].ctx } });
+    try children.append(.{ .text = .{ .content = ", all green except auth ", .style = body_style } });
+    try children.append(.{ .inline_object = .{ .vtable = instances[3].vtable, .ctx = instances[3].ctx } });
+    try children.append(.{ .text = .{ .content = ". Tracking ", .style = body_style } });
+    try children.append(.{ .inline_object = .{ .vtable = instances[4].vtable, .ctx = instances[4].ctx } });
+    try children.append(.{ .text = .{ .content = " ", .style = body_style } });
+    try children.append(.{ .inline_object = .{ .vtable = instances[5].vtable, .ctx = instances[5].ctx } });
+    try children.append(.{ .text = .{ .content = " for the next release.", .style = body_style } });
+
+    return .{ .paragraph = try children.toOwnedSlice() };
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -966,6 +1034,7 @@ pub fn main() !void {
     try registry.register("box", box_component.factory);
     try registry.register("chart", chart_component.factory);
     try registry.register("slider", slider_component.factory);
+    try badge_component.install(&registry);
     try button_component.install(&registry);
     defer button_component.deinitGlobals();
     // input_component install needs parent_state — we know
@@ -1102,7 +1171,28 @@ pub fn main() !void {
     // memory survives the call.
     var doc_arena = std.heap.ArenaAllocator.init(allocator);
     defer doc_arena.deinit();
-    const top_stack = try markdown.parseWithState(doc_arena.allocator(), demo_md, &theme, &registry, &host_state);
+    const parsed_root = try markdown.parseWithState(doc_arena.allocator(), demo_md, &theme, &registry, &host_state);
+
+    // ── Stage 15E demo: hand-built inline badges ──────────────────
+    // The inline `::name` markdown surface is deferred (15E.2). Until
+    // it lands, the host hand-builds a paragraph that interleaves
+    // text with `inline_object` children pointing at badge instances
+    // created via the factory directly. This exercises the full
+    // inline-flow path — measure_inline, baseline-resolve over mixed
+    // ascenders, wrap with object as a wrap atom, paint.
+    const badge_demo = try buildInlineBadgeDemo(doc_arena.allocator(), &theme);
+
+    // Wrap the parsed tree and the badge demo so both render through
+    // the same draw path. Demo paragraph leads — it's the new thing
+    // we want to see at the top of the viewport.
+    const top_children = try doc_arena.allocator().alloc(element.Element, 2);
+    top_children[0] = badge_demo;
+    top_children[1] = parsed_root;
+    const top_stack = element.Element{ .container = .{
+        .layout = .stack_v,
+        .children = top_children,
+        .gap = theme.block_child_gap,
+    } };
 
     // SDF "ATTENTION" paragraph — separate from the top stack so we
     // can capture the glyph index range for per-frame animation.

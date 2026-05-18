@@ -11,6 +11,7 @@ test {
     _ = @import("markdown.zig");
     _ = @import("markdown_components.zig");
     _ = @import("component.zig");
+    _ = @import("components/badge.zig");
     _ = @import("components/box.zig");
     _ = @import("components/button.zig");
     _ = @import("components/chart.zig");
