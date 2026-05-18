@@ -34,6 +34,10 @@ test {
     _ = @import("components/rating.zig");
     _ = @import("components/dot.zig");
     _ = @import("components/commit.zig");
+    _ = @import("components/price.zig");
+    _ = @import("components/diff.zig");
+    _ = @import("components/gh_ref.zig");
+    _ = @import("components/ago.zig");
     _ = @import("asset_cache.zig");
     _ = @import("dotenv.zig");
     _ = @import("io_channel.zig");

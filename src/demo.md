@@ -34,6 +34,14 @@ Build status: ::dot{color=green} passing on main, ::dot{color=yellow} flaky on P
 
 Fixed in ::commit{hash="acf8e7b"} (part of session 17), shipping alongside ::commit{hash="8d6e7a3c4d5e6f7a8b9c0d1e2f"} and ::commit{hash="d26d67d" repo="fdn42/text_engine"} in the next release.
 
+The Pro plan is ::price{value=29 currency=USD} per month, Enterprise bills annually at ::price{value=499 currency=USD} (~::price{value=499 currency=EUR} for European customers, or ::price{value=399 currency=GBP} sterling). Tokyo office runs ::price{value=4990 currency=JPY} per seat.
+
+Today's PR: ::diff{add=437 remove=17} across six files. Yesterday's churn: ::diff{add=72 remove=68}. The big rebase last month: ::diff{add=2840 remove=1402}. And the no-op cleanup: ::diff{add=0 remove=0}.
+
+Tracked in ::issue{n=247} and ::pr{n=1042} (part of the ::issue{n=89 repo="fdn42/text_engine"} epic). Shipped via ::pr{n=311 repo="fdn42/text_engine"} after a long review thread.
+
+Last deploy ::ago{value="3m"}, last incident ::ago{value="2d"}, last full outage ::ago{value="3w"} (touch wood). Build kicked off ::ago{value="just now"}.
+
 ## Stage 3 — markdown source becomes the tree
 
 Same renderer as before — only the construction path changed. This document is parsed by *cmark* into an AST, then walked into an `element.Element` tree.
