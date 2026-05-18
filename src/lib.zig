@@ -83,7 +83,7 @@ pub const vk = @import("gpu/vk.zig");
 // ── Host-side scaffolding the demo uses ────────────────────────────
 // Real production hosts (matryoshka HUD, terminal app) will write
 // their own window + swapchain + renderer; these are re-exported so
-// the demo can use them via `text_engine.X` without files ending up
+// the demo can use them via `spark.X` without files ending up
 // in multiple modules at build time. Treat as demo-supporting code,
 // not part of the stable public API.
 pub const window = @import("window.zig");

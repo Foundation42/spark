@@ -1,7 +1,7 @@
 .{
-    .name = .text_engine,
+    .name = .spark,
     .version = "0.1.0",
-    .fingerprint = 0xfd24837e0f3a7e77, // Changing this has security and trust implications.
+    .fingerprint = 0x9d13cf2d9d3b2e2c, // Changing this has security and trust implications.
     .minimum_zig_version = "0.14.1",
     .paths = .{
         "build.zig",

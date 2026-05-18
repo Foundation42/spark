@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const testing = std.testing;
-const text_engine = @import("../lib.zig");
+const spark = @import("../lib.zig");
 const fixture = @import("fixture.zig");
 
 const doc_a =
@@ -42,10 +42,10 @@ test "two Spark instances share no state" {
 
     const fonts_a = try fixture.makeFonts(allocator, fx.ft);
     const theme_a = fixture.makeTheme(fonts_a);
-    var state_a = text_engine.State.init(allocator);
+    var state_a = spark.State.init(allocator);
     defer state_a.deinit();
 
-    var spark_a = try text_engine.Spark.init(allocator, .{
+    var spark_a = try spark.Spark.init(allocator, .{
         .vk_ctx = &fx.ctx,
         .color_format = fx.swapchain.format,
         .theme = &theme_a,
@@ -57,14 +57,14 @@ test "two Spark instances share no state" {
         allocator.destroy(fonts_a.registry);
     }
     spark_a.attachToRegistry();
-    try text_engine.installCoreComponents(&spark_a);
+    try spark.installCoreComponents(&spark_a);
 
     const fonts_b = try fixture.makeFonts(allocator, fx.ft);
     const theme_b = fixture.makeTheme(fonts_b);
-    var state_b = text_engine.State.init(allocator);
+    var state_b = spark.State.init(allocator);
     defer state_b.deinit();
 
-    var spark_b = try text_engine.Spark.init(allocator, .{
+    var spark_b = try spark.Spark.init(allocator, .{
         .vk_ctx = &fx.ctx,
         .color_format = fx.swapchain.format,
         .theme = &theme_b,
@@ -76,7 +76,7 @@ test "two Spark instances share no state" {
         allocator.destroy(fonts_b.registry);
     }
     spark_b.attachToRegistry();
-    try text_engine.installCoreComponents(&spark_b);
+    try spark.installCoreComponents(&spark_b);
 
     // ── State isolation ──────────────────────────────────────────
     // Set a key on A's state, assert it's invisible on B's state and
@@ -130,10 +130,10 @@ test "applying an update on A does not see B's state" {
 
     const fonts_a = try fixture.makeFonts(allocator, fx.ft);
     const theme_a = fixture.makeTheme(fonts_a);
-    var state_a = text_engine.State.init(allocator);
+    var state_a = spark.State.init(allocator);
     defer state_a.deinit();
 
-    var spark_a = try text_engine.Spark.init(allocator, .{
+    var spark_a = try spark.Spark.init(allocator, .{
         .vk_ctx = &fx.ctx,
         .color_format = fx.swapchain.format,
         .theme = &theme_a,
@@ -145,14 +145,14 @@ test "applying an update on A does not see B's state" {
         allocator.destroy(fonts_a.registry);
     }
     spark_a.attachToRegistry();
-    try text_engine.installCoreComponents(&spark_a);
+    try spark.installCoreComponents(&spark_a);
 
     const fonts_b = try fixture.makeFonts(allocator, fx.ft);
     const theme_b = fixture.makeTheme(fonts_b);
-    var state_b = text_engine.State.init(allocator);
+    var state_b = spark.State.init(allocator);
     defer state_b.deinit();
 
-    var spark_b = try text_engine.Spark.init(allocator, .{
+    var spark_b = try spark.Spark.init(allocator, .{
         .vk_ctx = &fx.ctx,
         .color_format = fx.swapchain.format,
         .theme = &theme_b,
@@ -164,7 +164,7 @@ test "applying an update on A does not see B's state" {
         allocator.destroy(fonts_b.registry);
     }
     spark_b.attachToRegistry();
-    try text_engine.installCoreComponents(&spark_b);
+    try spark.installCoreComponents(&spark_b);
 
     // applyUpdate is the wire-format path the LM uses; it writes
     // through to host_state. Run an update on A targeting `shared_key`,

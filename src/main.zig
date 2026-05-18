@@ -1,7 +1,7 @@
-//! text_engine_demo — host-side scaffolding for the spark library
+//! spark_demo — host-side scaffolding for the spark library
 //! after the Phase 3 library-ification flip.
 //!
-//! Imports `@import("text_engine")` only for everything the library
+//! Imports `@import("spark")` only for everything the library
 //! owns: Spark, Document, FrameInfo, Theme, Element, State, registry,
 //! per-frame methods, input dispatch. The host still owns the
 //! cooperative-embed surface: GLFW window, Vulkan instance/device/
@@ -17,17 +17,17 @@
 //! baseline; see `docs/library-spec.md`.
 
 const std = @import("std");
-const text_engine = @import("text_engine");
+const spark = @import("spark");
 
 // Host-only modules. Vulkan + GLFW + the demo's per-frame Renderer
 // and the test HTTP server stay outside spark — the spec calls these
 // out as host responsibilities in §"Cooperative Vulkan handshake".
-// Pulled in via the text_engine namespace so Zig doesn't see the
+// Pulled in via the spark namespace so Zig doesn't see the
 // same source files rooted in two modules at once.
-const win = text_engine.window;
-const vk = text_engine.vk;
-const swap = text_engine.swapchain;
-const renderer = text_engine.renderer;
+const win = spark.window;
+const vk = spark.vk;
+const swap = spark.swapchain;
+const renderer = spark.renderer;
 const demo_server_mod = @import("demo_server.zig");
 
 /// Embedded fallback markdown. Used when no `argv[1]` doc path is
@@ -36,7 +36,7 @@ const demo_server_mod = @import("demo_server.zig");
 const demo_md = @embedFile("demo.md");
 
 /// Small ANSI fixture rendered alongside the markdown via the
-/// library's `text_engine.ansi.parse`. The `\x1b` escapes resolve at
+/// library's `spark.ansi.parse`. The `\x1b` escapes resolve at
 /// compile time to real ESC bytes so the parser sees authentic
 /// terminal output.
 const ansi_demo =
@@ -52,10 +52,10 @@ const ansi_demo =
 /// shared State, and pointers to Spark + the two Documents. The
 /// renderer's `draw_fn` receives this through its `*anyopaque` slot.
 const HostCtx = struct {
-    spark: *text_engine.Spark,
-    state: *text_engine.State,
-    top_doc: *text_engine.Document,
-    ansi_doc: *text_engine.Document,
+    spark: *spark.Spark,
+    state: *spark.State,
+    top_doc: *spark.Document,
+    ansi_doc: *spark.Document,
 
     // Scroll + zoom policy lives on the host. spark.frame_info takes
     // a scroll_offset + zoom each beginFrame; host computes them.
@@ -120,7 +120,7 @@ fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) 
         const w: f32 = @floatFromInt(extent.width);
         const viewport_world_w: f32 = w / h.zoom;
         const max_w: f32 = @max(viewport_world_w - 80.0, 200.0);
-        const constraints: text_engine.Constraints = .{ .max_w = max_w };
+        const constraints: spark.Constraints = .{ .max_w = max_w };
 
         const top_box = h.spark.layoutAndRender(h.top_doc, .{ 40, 40 }, constraints) catch |err| switch (err) {
             error.AtlasFull => {
@@ -282,21 +282,21 @@ fn scrollCb(window: ?*win.c.GLFWwindow, _: f64, yoffset: f64) callconv(.C) void 
 fn computeAssetCacheDir(allocator: std.mem.Allocator) ![]u8 {
     if (std.process.getEnvVarOwned(allocator, "XDG_CACHE_HOME")) |xdg| {
         defer allocator.free(xdg);
-        return try std.fs.path.join(allocator, &.{ xdg, "text_engine", "assets" });
+        return try std.fs.path.join(allocator, &.{ xdg, "spark", "assets" });
     } else |_| {}
     const home = try std.process.getEnvVarOwned(allocator, "HOME");
     defer allocator.free(home);
-    return try std.fs.path.join(allocator, &.{ home, ".cache", "text_engine", "assets" });
+    return try std.fs.path.join(allocator, &.{ home, ".cache", "spark", "assets" });
 }
 
 fn computeStateFilePath(allocator: std.mem.Allocator) ![]u8 {
     if (std.process.getEnvVarOwned(allocator, "XDG_STATE_HOME")) |xdg| {
         defer allocator.free(xdg);
-        return try std.fs.path.join(allocator, &.{ xdg, "text_engine", "state.json" });
+        return try std.fs.path.join(allocator, &.{ xdg, "spark", "state.json" });
     } else |_| {}
     const home = try std.process.getEnvVarOwned(allocator, "HOME");
     defer allocator.free(home);
-    return try std.fs.path.join(allocator, &.{ home, ".local", "state", "text_engine", "state.json" });
+    return try std.fs.path.join(allocator, &.{ home, ".local", "state", "spark", "state.json" });
 }
 
 pub fn main() !void {
@@ -305,9 +305,9 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 19 (library-spec Phase 3: public API + ownership)\n", .{});
-    try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
-    try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
+    try stdout.print("spark demo — session 20 (library-spec closed: Phases 1-5 + rename)\n", .{});
+    try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{spark.shaders.text_vert.len});
+    try stdout.print("  fragment SPIR-V bytes: {d}\n", .{spark.shaders.text_frag.len});
 
     // ── CLI parsing ───────────────────────────────────────────────
     var core_only: bool = false;
@@ -352,10 +352,10 @@ pub fn main() !void {
     if (core_only) try stdout.print("  mode:                 --core-only (extras + DotEnv + AssetCache skipped)\n", .{});
 
     // ── Host-owned Vulkan + window ────────────────────────────────
-    var window = try win.Window.init(1280, 720, "text_engine_demo");
+    var window = try win.Window.init(1280, 720, "spark_demo");
     defer window.deinit();
 
-    var ctx = try vk.Context.init(allocator, &window, "text_engine_demo");
+    var ctx = try vk.Context.init(allocator, &window, "spark_demo");
     defer ctx.deinit();
     try stdout.print("  vulkan device:         {s}\n", .{std.mem.sliceTo(ctx.deviceName(), 0)});
 
@@ -365,18 +365,18 @@ pub fn main() !void {
     // ── Host-owned font building ──────────────────────────────────
     // FT + FontRegistry are built here, then handed to Spark by
     // ownership transfer. Theme references the resulting font_ids.
-    const font_path = std.posix.getenv("TEXT_ENGINE_FONT") orelse "/usr/share/fonts/TTF/DejaVuSans.ttf";
-    const italic_path = std.posix.getenv("TEXT_ENGINE_ITALIC_FONT") orelse "/usr/share/fonts/TTF/DejaVuSans-Oblique.ttf";
-    const bold_path = std.posix.getenv("TEXT_ENGINE_BOLD_FONT") orelse "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf";
-    const bold_italic_path = std.posix.getenv("TEXT_ENGINE_BOLD_ITALIC_FONT") orelse "/usr/share/fonts/TTF/DejaVuSans-BoldOblique.ttf";
-    const mono_path = std.posix.getenv("TEXT_ENGINE_MONO_FONT") orelse "/usr/share/fonts/TTF/DejaVuSansMono.ttf";
-    const emoji_path = std.posix.getenv("TEXT_ENGINE_EMOJI_FONT") orelse "/usr/share/fonts/noto/NotoColorEmoji.ttf";
+    const font_path = std.posix.getenv("SPARK_FONT") orelse "/usr/share/fonts/TTF/DejaVuSans.ttf";
+    const italic_path = std.posix.getenv("SPARK_ITALIC_FONT") orelse "/usr/share/fonts/TTF/DejaVuSans-Oblique.ttf";
+    const bold_path = std.posix.getenv("SPARK_BOLD_FONT") orelse "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf";
+    const bold_italic_path = std.posix.getenv("SPARK_BOLD_ITALIC_FONT") orelse "/usr/share/fonts/TTF/DejaVuSans-BoldOblique.ttf";
+    const mono_path = std.posix.getenv("SPARK_MONO_FONT") orelse "/usr/share/fonts/TTF/DejaVuSansMono.ttf";
+    const emoji_path = std.posix.getenv("SPARK_EMOJI_FONT") orelse "/usr/share/fonts/noto/NotoColorEmoji.ttf";
 
-    var ft = try text_engine.font.Library.init();
+    var ft = try spark.font.Library.init();
     defer ft.deinit();
 
-    var fonts = try allocator.create(text_engine.FontRegistry);
-    fonts.* = text_engine.FontRegistry.init(allocator, ft);
+    var fonts = try allocator.create(spark.FontRegistry);
+    fonts.* = spark.FontRegistry.init(allocator, ft);
 
     const h1_id = try fonts.load(font_path.ptr, 48);
     const h2_id = try fonts.load(font_path.ptr, 32);
@@ -395,7 +395,7 @@ pub fn main() !void {
     const heading_dim: [4]f32 = .{ 0.78, 0.83, 0.92, 1.0 };
     const marker_color: [4]f32 = .{ 0.65, 0.72, 0.85, 1.0 };
 
-    const theme: text_engine.Theme = .{
+    const theme: spark.Theme = .{
         .body = .{ .font_id = body_id, .color = white },
         .heading = .{
             .{ .font_id = h1_id, .color = heading_color },
@@ -419,7 +419,7 @@ pub fn main() !void {
     // Built from the doc's frontmatter (best-effort) and seeded with
     // any persisted values from the previous session. Shared with
     // both Documents below via LoadOpts.shared_state.
-    var host_state = (try text_engine.stateFromSource(allocator, doc_source)) orelse text_engine.State.init(allocator);
+    var host_state = (try spark.stateFromSource(allocator, doc_source)) orelse spark.State.init(allocator);
     defer host_state.deinit();
 
     const state_path = try computeStateFilePath(allocator);
@@ -432,7 +432,7 @@ pub fn main() !void {
     // ── Spark.init — owns atlases, pipelines, glyph cache, layout
     //    cache, layout context, registry, io_channel, JobSystems.
     //    Takes ownership of the FontRegistry built above.
-    var spark = try text_engine.Spark.init(allocator, .{
+    var sp = try spark.Spark.init(allocator, .{
         .vk_ctx = &ctx,
         .color_format = swapchain.format,
         .theme = &theme,
@@ -440,27 +440,27 @@ pub fn main() !void {
         .host_state = &host_state,
     });
     defer {
-        spark.deinit();
+        sp.deinit();
         allocator.destroy(fonts);
     }
-    spark.attachToRegistry();
+    sp.attachToRegistry();
 
     // ── Component installs ────────────────────────────────────────
-    try text_engine.installCoreComponents(&spark);
+    try spark.installCoreComponents(&sp);
 
     if (!core_only) {
         const home = try std.process.getEnvVarOwned(allocator, "HOME");
         defer allocator.free(home);
         const env_path = try std.fs.path.join(allocator, &.{ home, ".env" });
         defer allocator.free(env_path);
-        spark.installDotEnv(env_path) catch |e| {
+        sp.installDotEnv(env_path) catch |e| {
             try stdout.print("  installDotEnv:        {s} (continuing)\n", .{@errorName(e)});
         };
 
         const asset_cache_dir = try computeAssetCacheDir(allocator);
         defer allocator.free(asset_cache_dir);
-        try spark.installAssetCache(asset_cache_dir, 500 * 1024 * 1024);
-        if (spark.asset_cache) |ac| {
+        try sp.installAssetCache(asset_cache_dir, 500 * 1024 * 1024);
+        if (sp.asset_cache) |ac| {
             const s = ac.stats();
             try stdout.print(
                 "  asset cache:          {d} entries / {d:.1} MB / {d:.0} MB budget @ {s}\n",
@@ -473,10 +473,10 @@ pub fn main() !void {
             );
         }
 
-        try text_engine.extras.embedded_document_http.install(&spark);
-        try text_engine.extras.llm_stream.install(&spark);
-        try text_engine.extras.svg_stream.install(&spark);
-        try text_engine.extras.image_stream.install(&spark);
+        try spark.extras.embedded_document_http.install(&sp);
+        try spark.extras.llm_stream.install(&sp);
+        try spark.extras.svg_stream.install(&sp);
+        try spark.extras.image_stream.install(&sp);
     }
 
     // ── Demo HTTP server (test fixture for embedded-document URL src=).
@@ -484,7 +484,7 @@ pub fn main() !void {
     defer demo_server.stop();
 
     // ── Load the markdown doc via the library ─────────────────────
-    var top_doc = try spark.loadDocument(doc_source, .{ .shared_state = &host_state });
+    var top_doc = try sp.loadDocument(doc_source, .{ .shared_state = &host_state });
     defer top_doc.deinit();
 
     // ── Build the ANSI tree separately and wrap it as a Document ──
@@ -497,19 +497,19 @@ pub fn main() !void {
 
     const ansi_arena = try allocator.create(std.heap.ArenaAllocator);
     ansi_arena.* = std.heap.ArenaAllocator.init(allocator);
-    const ansi_root = try text_engine.ansi.parse(ansi_arena.allocator(), ansi_demo, &ansi_theme);
-    var ansi_doc = text_engine.wrapElement(allocator, ansi_arena, ansi_root, &host_state, &ansi_theme);
+    const ansi_root = try spark.ansi.parse(ansi_arena.allocator(), ansi_demo, &ansi_theme);
+    var ansi_doc = spark.wrapElement(allocator, ansi_arena, ansi_root, &host_state, &ansi_theme);
     defer ansi_doc.deinit();
 
     // Tree swap complete — GC stale cached component instances.
-    spark.registry.gc();
+    sp.registry.gc();
 
     // ── Renderer (host-owned per-frame loop) ──────────────────────
     var rdr = try renderer.Renderer.init(allocator, &ctx, &swapchain, &window);
     defer rdr.deinit();
 
     var host_ctx = HostCtx{
-        .spark = &spark,
+        .spark = &sp,
         .state = &host_state,
         .top_doc = &top_doc,
         .ansi_doc = &ansi_doc,
@@ -523,7 +523,7 @@ pub fn main() !void {
     _ = win.c.glfwSetKeyCallback(window.handle, keyCb);
     _ = win.c.glfwSetCharCallback(window.handle, charCb);
 
-    const exit_after_ms: ?i64 = if (std.process.getEnvVarOwned(allocator, "TEXT_ENGINE_EXIT_AFTER")) |s| blk: {
+    const exit_after_ms: ?i64 = if (std.process.getEnvVarOwned(allocator, "SPARK_EXIT_AFTER")) |s| blk: {
         defer allocator.free(s);
         const secs = std.fmt.parseFloat(f64, s) catch break :blk null;
         break :blk @intFromFloat(secs * 1000.0);
@@ -547,7 +547,7 @@ pub fn main() !void {
         processInput(&window, &host_ctx) catch {};
 
         // Drain async I/O completions on the main thread.
-        spark.tick();
+        sp.tick();
 
         const now_ms = std.time.milliTimestamp();
         if (now_ms - last_update_ms >= UPDATE_CYCLE_MS) {
@@ -559,7 +559,7 @@ pub fn main() !void {
                 \\:::
                 \\
             , .{cycle_colors[color_idx]}) catch unreachable;
-            const n = spark.applyUpdate(directive) catch 0;
+            const n = sp.applyUpdate(directive) catch 0;
             update_count += n;
             last_update_ms = now_ms;
         }
@@ -579,7 +579,7 @@ pub fn main() !void {
                 \\:::
                 \\
             , .{sample}) catch unreachable;
-            const n = spark.applyUpdate(directive) catch 0;
+            const n = sp.applyUpdate(directive) catch 0;
             update_count += n;
             last_chart_ms = now_ms;
         }

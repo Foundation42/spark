@@ -60,29 +60,29 @@ pub fn build(b: *std.Build) void {
     });
 
     // ── Public Zig module for host-engine embedding ────────────────
-    // `text_engine` exposes the narrow cooperative-embed surface: a
-    // host engine (matryoshka, the future terminal, in-game UI) does
-    // `@import("text_engine")` and reaches the styled-text pipeline +
+    // `spark` exposes the narrow cooperative-embed surface: a host
+    // engine (matryoshka, the future terminal, in-game UI) does
+    // `@import("spark")` and reaches the styled-text pipeline +
     // SPIR-V blobs. Vulkan / FreeType / HarfBuzz / glfw are the
     // host's link responsibility — same policy as `valkyr_gpu` in
     // tripvulkan/build.zig. Keeps link config singular when one host
     // embeds several cooperative libraries.
-    const text_engine_mod = b.addModule("text_engine", .{
+    const spark_mod = b.addModule("spark", .{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
-    text_engine_mod.addImport("shaders", shaders_module);
+    spark_mod.addImport("shaders", shaders_module);
     // The library module's source files `@cImport` freetype +
     // harfbuzz + cmark + stb_image headers (FreeType library handle,
     // HB face/font, cmark parser, image decode). The compiler runs
     // those imports at module-build time, so the include paths need
     // to be on the module itself — the demo exe linking is a
     // separate concern.
-    text_engine_mod.addIncludePath(.{ .cwd_relative = "/usr/include/freetype2" });
-    text_engine_mod.addIncludePath(.{ .cwd_relative = "/usr/include/harfbuzz" });
-    text_engine_mod.addIncludePath(b.path("vendor/cmark"));
-    text_engine_mod.addIncludePath(b.path("vendor/stb"));
+    spark_mod.addIncludePath(.{ .cwd_relative = "/usr/include/freetype2" });
+    spark_mod.addIncludePath(.{ .cwd_relative = "/usr/include/harfbuzz" });
+    spark_mod.addIncludePath(b.path("vendor/cmark"));
+    spark_mod.addIncludePath(b.path("vendor/stb"));
 
     // ── Vendored cmark (CommonMark reference parser) ───────────────
     // Static archive linked into the demo. Vendored at 0.31.2 under
@@ -141,13 +141,13 @@ pub fn build(b: *std.Build) void {
     // hosts (matryoshka HUD, terminal app) come later and use the
     // cooperative attach surface, not this exe.
     const exe = b.addExecutable(.{
-        .name = "text_engine_demo",
+        .name = "spark_demo",
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
     exe.root_module.addImport("shaders", shaders_module);
-    exe.root_module.addImport("text_engine", text_engine_mod);
+    exe.root_module.addImport("spark", spark_mod);
 
     // System libraries the demo links against. The library module
     // itself does *not* link these — host's responsibility.
@@ -181,12 +181,12 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
-    const run_step = b.step("run", "Run text_engine_demo");
+    const run_step = b.step("run", "Run spark_demo");
     run_step.dependOn(&run_cmd.step);
 
     // ── Minimal host (Phase 4 second consumer) ─────────────────────
-    // Smallest possible binary that imports `text_engine` and stands
-    // up a Spark instance against its public surface. Library-spec
+    // Smallest possible binary that imports `spark` and stands up a
+    // Spark instance against its public surface. Library-spec
     // §"Phase 4" — proves the boundary against a non-demo consumer
     // before matryoshka adoption. Same system-library link config
     // as the demo because it reaches through the same demo-supporting
@@ -197,7 +197,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    minimal_host.root_module.addImport("text_engine", text_engine_mod);
+    minimal_host.root_module.addImport("spark", spark_mod);
     if (target.result.os.tag == .windows) {
         if (std.process.getEnvVarOwned(b.allocator, "VULKAN_SDK")) |sdk| {
             minimal_host.addIncludePath(.{ .cwd_relative = b.fmt("{s}/Include", .{sdk}) });

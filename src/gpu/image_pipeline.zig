@@ -138,7 +138,7 @@ pub const ImagePipeline = struct {
 
         // Premultiplied alpha — fragment outputs `c.rgb * c.a` and
         // composites with srcFactor = ONE. Matches the rest of the
-        // text_engine pipelines so layered output is consistent.
+        // spark pipelines so layered output is consistent.
         var cba = std.mem.zeroes(c.VkPipelineColorBlendAttachmentState);
         cba.blendEnable = c.VK_TRUE;
         cba.srcColorBlendFactor = c.VK_BLEND_FACTOR_ONE;

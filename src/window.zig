@@ -2,7 +2,7 @@
 //!
 //! The library itself does not own a window — the cooperative-embed
 //! surface assumes the host engine already has one. This wrapper
-//! exists only so `text_engine_demo` has a place to draw. When/if a
+//! exists only so `spark_demo` has a place to draw. When/if a
 //! second host appears, this file does not move into the library;
 //! the host brings its own.
 

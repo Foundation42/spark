@@ -1,5 +1,5 @@
-//! `LayoutContext` — the integration handshake between text_engine
-//! and the kiwi constraint solver.
+//! `LayoutContext` — the integration handshake between spark and
+//! the kiwi constraint solver.
 //!
 //! Phase B (the first integration) keeps this thin: it owns one
 //! `kiwi.Solver`, exposes `beginPass` to reset it before each

@@ -8,9 +8,9 @@
 //! Attribute grammar:
 //!
 //!     ::issue {n=42}
-//!     ::issue {n=89 repo="fdn42/text_engine"}
+//!     ::issue {n=89 repo="fdn42/spark"}
 //!     ::pr {n=1042}
-//!     ::pr {n=247 repo="fdn42/text_engine"}
+//!     ::pr {n=247 repo="fdn42/spark"}
 //!
 //! - `n` (required) — the issue or PR number. Renders prefixed with
 //!   `#`.
@@ -308,7 +308,7 @@ test "Component: issue with bare n" {
 test "Component: pr with repo prefix" {
     const attrs = [_]components.Attr{
         .{ .key = "n", .value = "1042" },
-        .{ .key = "repo", .value = "fdn42/text_engine" },
+        .{ .key = "repo", .value = "fdn42/spark" },
     };
     const spec: components.Spec = .{ .name = "pr", .attrs = &attrs };
     const inst = try createPr(&_test_spark, testing.allocator, &spec);
@@ -316,7 +316,7 @@ test "Component: pr with repo prefix" {
 
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
     try testing.expectEqual(Kind.pr, c.kind);
-    try testing.expectEqualStrings("fdn42/text_engine#1042", c.text);
+    try testing.expectEqualStrings("fdn42/spark#1042", c.text);
 }
 
 test "Component: missing n rejected" {

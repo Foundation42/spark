@@ -21,7 +21,7 @@
 
 const std = @import("std");
 const testing = std.testing;
-const text_engine = @import("../lib.zig");
+const spark = @import("../lib.zig");
 const fixture = @import("fixture.zig");
 
 const known_doc =
@@ -34,7 +34,7 @@ const known_doc =
     \\
 ;
 
-fn hashDrawList(drawlist: *const text_engine.DrawList) u64 {
+fn hashDrawList(drawlist: *const spark.DrawList) u64 {
     var h = std.hash.Wyhash.init(0);
 
     h.update(std.mem.asBytes(&drawlist.glyphs.items.len));
@@ -64,10 +64,10 @@ test "DrawList is deterministic across runs" {
     inline for (0..2) |i| {
         const fonts = try fixture.makeFonts(allocator, fx.ft);
         const theme = fixture.makeTheme(fonts);
-        var state = text_engine.State.init(allocator);
+        var state = spark.State.init(allocator);
         defer state.deinit();
 
-        var spark = try text_engine.Spark.init(allocator, .{
+        var sp = try spark.Spark.init(allocator, .{
             .vk_ctx = &fx.ctx,
             .color_format = fx.swapchain.format,
             .theme = &theme,
@@ -75,18 +75,18 @@ test "DrawList is deterministic across runs" {
             .host_state = &state,
         });
         defer {
-            spark.deinit();
+            sp.deinit();
             allocator.destroy(fonts.registry);
         }
-        spark.attachToRegistry();
-        try text_engine.installCoreComponents(&spark);
+        sp.attachToRegistry();
+        try spark.installCoreComponents(&sp);
 
-        var doc = try spark.loadDocument(known_doc, .{ .shared_state = &state });
+        var doc = try sp.loadDocument(known_doc, .{ .shared_state = &state });
         defer doc.deinit();
 
         // Skip attachCmd — it just stores the cmd buffer for endFrame
         // to use later, and we never reach endFrame.
-        try spark.beginFrame(
+        try sp.beginFrame(
             .{
                 .extent = .{ .width = 800, .height = 600 },
                 .zoom = 1.0,
@@ -94,13 +94,13 @@ test "DrawList is deterministic across runs" {
             },
             .{ .reset = true },
         );
-        _ = try spark.layoutAndRender(&doc, .{ 40, 40 }, .{ .max_w = 720 });
+        _ = try sp.layoutAndRender(&doc, .{ 40, 40 }, .{ .max_w = 720 });
 
-        hashes[i] = hashDrawList(&spark.drawlist);
+        hashes[i] = hashDrawList(&sp.drawlist);
         counts[i] = .{
-            .glyphs = spark.drawlist.glyphs.items.len,
-            .quads = spark.drawlist.quads.items.len,
-            .tris = spark.drawlist.tris.items.len,
+            .glyphs = sp.drawlist.glyphs.items.len,
+            .quads = sp.drawlist.quads.items.len,
+            .tris = sp.drawlist.tris.items.len,
         };
     }
 

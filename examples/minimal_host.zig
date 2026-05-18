@@ -1,9 +1,9 @@
 //! examples/minimal_host.zig — smallest possible second consumer of
 //! the spark library. Phase 4 of the library-spec.
 //!
-//! Single import: `@import("text_engine")`. The GLFW window, Vulkan
+//! Single import: `@import("spark")`. The GLFW window, Vulkan
 //! instance/device/swapchain, and per-frame Renderer used here are
-//! re-exported from `text_engine.{window, swapchain, renderer}` — they
+//! re-exported from `spark.{window, swapchain, renderer}` — they
 //! are demo-supporting code, not stable public API. Real production
 //! hosts (matryoshka HUD, terminal app) will write their own; this
 //! file copies the cooperative-embed dance they will use against the
@@ -21,12 +21,12 @@
 //!   * ESC closes the window, deinit runs clean.
 
 const std = @import("std");
-const text_engine = @import("text_engine");
+const spark = @import("spark");
 
-const win = text_engine.window;
-const vk = text_engine.vk;
-const swap = text_engine.swapchain;
-const renderer = text_engine.renderer;
+const win = spark.window;
+const vk = spark.vk;
+const swap = spark.swapchain;
+const renderer = spark.renderer;
 
 /// Embedded markdown. Frontmatter seeds `state.radius = 16` so the
 /// slider has a known starting position; the box reads the same key
@@ -55,9 +55,9 @@ const doc_md =
 /// reachable inside the per-frame callback, and tracks the previous
 /// extent so we can detect viewport resize without computing a hash.
 const HostCtx = struct {
-    spark: *text_engine.Spark,
-    state: *text_engine.State,
-    doc: *text_engine.Document,
+    spark: *spark.Spark,
+    state: *spark.State,
+    doc: *spark.Document,
     last_extent: vk.c.VkExtent2D = .{ .width = 0, .height = 0 },
 };
 
@@ -79,7 +79,7 @@ fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) 
 
     if (reset) {
         const w: f32 = @floatFromInt(extent.width);
-        const constraints: text_engine.Constraints = .{ .max_w = @max(w - 80, 200) };
+        const constraints: spark.Constraints = .{ .max_w = @max(w - 80, 200) };
         _ = h.spark.layoutAndRender(h.doc, .{ 40, 40 }, constraints) catch return;
         h.state.clearDirty();
     }
@@ -139,11 +139,11 @@ pub fn main() !void {
     // FreeType library + a single FontRegistry. Five sizes against
     // one font face is enough for h1 + body + code; minimal_host
     // doesn't ship italic / bold / emoji to keep the surface small.
-    var ft = try text_engine.font.Library.init();
+    var ft = try spark.font.Library.init();
     defer ft.deinit();
 
-    const fonts = try allocator.create(text_engine.FontRegistry);
-    fonts.* = text_engine.FontRegistry.init(allocator, ft);
+    const fonts = try allocator.create(spark.FontRegistry);
+    fonts.* = spark.FontRegistry.init(allocator, ft);
 
     const sans_path = "/usr/share/fonts/TTF/DejaVuSans.ttf";
     const mono_path = "/usr/share/fonts/TTF/DejaVuSansMono.ttf";
@@ -154,7 +154,7 @@ pub fn main() !void {
     // ── Theme (host-owned) ────────────────────────────────────────
     const fg: [4]f32 = .{ 0.95, 0.95, 0.98, 1.0 };
     const dim: [4]f32 = .{ 0.78, 0.83, 0.92, 1.0 };
-    const theme: text_engine.Theme = .{
+    const theme: spark.Theme = .{
         .body = .{ .font_id = body_id, .color = fg },
         .heading = .{
             .{ .font_id = h1_id, .color = fg },
@@ -178,14 +178,14 @@ pub fn main() !void {
     // Parsed from the doc's frontmatter (`state.radius = 16`). Shared
     // with the Document below via LoadOpts so the slider's writes
     // and the ${state.radius} reads see the same value.
-    var host_state = (try text_engine.stateFromSource(allocator, doc_md)) orelse text_engine.State.init(allocator);
+    var host_state = (try spark.stateFromSource(allocator, doc_md)) orelse spark.State.init(allocator);
     defer host_state.deinit();
 
     // ── Spark.init ────────────────────────────────────────────────
     // Takes ownership of `fonts`. attachToRegistry wires the
     // registry's back-pointer; installCoreComponents registers
     // box / slider / and the other core factories.
-    var spark = try text_engine.Spark.init(allocator, .{
+    var sp = try spark.Spark.init(allocator, .{
         .vk_ctx = &ctx,
         .color_format = swapchain.format,
         .theme = &theme,
@@ -193,14 +193,14 @@ pub fn main() !void {
         .host_state = &host_state,
     });
     defer {
-        spark.deinit();
+        sp.deinit();
         allocator.destroy(fonts);
     }
-    spark.attachToRegistry();
-    try text_engine.installCoreComponents(&spark);
+    sp.attachToRegistry();
+    try spark.installCoreComponents(&sp);
 
     // ── Document ──────────────────────────────────────────────────
-    var doc = try spark.loadDocument(doc_md, .{ .shared_state = &host_state });
+    var doc = try sp.loadDocument(doc_md, .{ .shared_state = &host_state });
     defer doc.deinit();
 
     // ── Host-owned per-frame renderer (acquire / record / submit
@@ -210,7 +210,7 @@ pub fn main() !void {
     defer rdr.deinit();
 
     var host_ctx = HostCtx{
-        .spark = &spark,
+        .spark = &sp,
         .state = &host_state,
         .doc = &doc,
     };
@@ -221,11 +221,11 @@ pub fn main() !void {
     _ = win.c.glfwSetKeyCallback(window.handle, keyCb);
 
     // ── Optional timed exit (regression-detection hook) ───────────
-    // `TEXT_ENGINE_EXIT_AFTER=N` (seconds, float) sets
+    // `SPARK_EXIT_AFTER=N` (seconds, float) sets
     // glfwSetWindowShouldClose after N seconds — same destructor
     // sequence as a user pressing X. Not part of the cooperative-
     // embed surface; strip when copying this file as a template.
-    const exit_after_ms: ?i64 = if (std.process.getEnvVarOwned(allocator, "TEXT_ENGINE_EXIT_AFTER")) |s| blk: {
+    const exit_after_ms: ?i64 = if (std.process.getEnvVarOwned(allocator, "SPARK_EXIT_AFTER")) |s| blk: {
         defer allocator.free(s);
         const secs = std.fmt.parseFloat(f64, s) catch break :blk null;
         break :blk @intFromFloat(secs * 1000.0);
@@ -236,7 +236,7 @@ pub fn main() !void {
     while (!window.shouldClose()) {
         window.pollEvents();
         processInput(&window, &host_ctx) catch {};
-        spark.tick();
+        sp.tick();
         try rdr.drawFrame();
         if (exit_after_ms) |limit| {
             if (std.time.milliTimestamp() - start_ms >= limit) {
@@ -245,6 +245,6 @@ pub fn main() !void {
         }
     }
 
-    // Drain the GPU before spark.deinit destroys pipelines + atlases.
+    // Drain the GPU before sp.deinit destroys pipelines + atlases.
     _ = vk.c.vkDeviceWaitIdle(ctx.device);
 }

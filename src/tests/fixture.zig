@@ -9,17 +9,17 @@
 //! is fine for the handful of integration tests in this suite.
 
 const std = @import("std");
-const text_engine = @import("../lib.zig");
+const spark = @import("../lib.zig");
 
-const win = text_engine.window;
-const vk = text_engine.vk;
-const swap = text_engine.swapchain;
+const win = spark.window;
+const vk = spark.vk;
+const swap = spark.swapchain;
 
 pub const Fixture = struct {
     window: win.Window,
     ctx: vk.Context,
     swapchain: swap.Swapchain,
-    ft: text_engine.font.Library,
+    ft: spark.font.Library,
 
     pub fn init(allocator: std.mem.Allocator) !Fixture {
         win.c.glfwWindowHint(win.c.GLFW_VISIBLE, win.c.GLFW_FALSE);
@@ -32,7 +32,7 @@ pub const Fixture = struct {
         var swapchain = try swap.Swapchain.init(allocator, &ctx, &window);
         errdefer swapchain.deinit();
 
-        const ft = try text_engine.font.Library.init();
+        const ft = try spark.font.Library.init();
         return .{
             .window = window,
             .ctx = ctx,
@@ -55,20 +55,20 @@ const sans_path = "/usr/share/fonts/TTF/DejaVuSans.ttf";
 const mono_path = "/usr/share/fonts/TTF/DejaVuSansMono.ttf";
 
 pub const Fonts = struct {
-    registry: *text_engine.FontRegistry,
-    heading_id: text_engine.FontId,
-    body_id: text_engine.FontId,
-    code_id: text_engine.FontId,
+    registry: *spark.FontRegistry,
+    heading_id: spark.FontId,
+    body_id: spark.FontId,
+    code_id: spark.FontId,
 };
 
 /// Build a heap-allocated `FontRegistry` populated with three sizes
 /// of DejaVu (heading/body/mono-code), the way `Spark.init` expects.
 /// Caller transfers ownership of `registry` to Spark; on teardown,
 /// call `spark.deinit()` THEN `allocator.destroy(fonts.registry)`.
-pub fn makeFonts(allocator: std.mem.Allocator, ft: text_engine.font.Library) !Fonts {
-    const registry = try allocator.create(text_engine.FontRegistry);
+pub fn makeFonts(allocator: std.mem.Allocator, ft: spark.font.Library) !Fonts {
+    const registry = try allocator.create(spark.FontRegistry);
     errdefer allocator.destroy(registry);
-    registry.* = text_engine.FontRegistry.init(allocator, ft);
+    registry.* = spark.FontRegistry.init(allocator, ft);
     const heading_id = try registry.load(sans_path, 24);
     const body_id = try registry.load(sans_path, 20);
     const code_id = try registry.load(mono_path, 18);
@@ -83,11 +83,11 @@ pub fn makeFonts(allocator: std.mem.Allocator, ft: text_engine.font.Library) !Fo
 /// Build a minimal Theme referencing the three sizes from `makeFonts`.
 /// Returned by value — keep on the stack alongside the Spark it's
 /// passed to (Spark borrows `*const Theme`).
-pub fn makeTheme(fonts: Fonts) text_engine.Theme {
+pub fn makeTheme(fonts: Fonts) spark.Theme {
     const fg: [4]f32 = .{ 0.95, 0.95, 0.98, 1.0 };
-    const heading: text_engine.Style = .{ .font_id = fonts.heading_id, .color = fg };
-    const body: text_engine.Style = .{ .font_id = fonts.body_id, .color = fg };
-    const code: text_engine.Style = .{ .font_id = fonts.code_id, .color = fg };
+    const heading: spark.Style = .{ .font_id = fonts.heading_id, .color = fg };
+    const body: spark.Style = .{ .font_id = fonts.body_id, .color = fg };
+    const code: spark.Style = .{ .font_id = fonts.code_id, .color = fg };
     return .{
         .body = body,
         .heading = .{ heading, heading, body, body, body, body },

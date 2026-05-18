@@ -7,13 +7,13 @@
 //! Attribute grammar:
 //!
 //!     ::commit {hash="acf8e7b"}
-//!     ::commit {hash="acf8e7b" repo="fdn42/text_engine"}
+//!     ::commit {hash="acf8e7b" repo="fdn42/spark"}
 //!     ::commit {hash="8d6e7a3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9"}
 //!
 //! - `hash` (required) — full or short hash. Anything longer than 7
 //!   characters truncates to the conventional `git log --oneline`
 //!   width.
-//! - `repo` (optional) — short repo label (e.g. `fdn42/text_engine`).
+//! - `repo` (optional) — short repo label (e.g. `fdn42/spark`).
 //!   Renders as `repo@hash`; omitted, the chip is just the hash.
 
 const std = @import("std");
@@ -279,14 +279,14 @@ test "Component: long hash truncates to 7" {
 test "Component: repo prefix composes" {
     const attrs = [_]components.Attr{
         .{ .key = "hash", .value = "acf8e7b" },
-        .{ .key = "repo", .value = "fdn42/text_engine" },
+        .{ .key = "repo", .value = "fdn42/spark" },
     };
     const spec: components.Spec = .{ .name = "commit", .attrs = &attrs };
     const inst = try create(&_test_spark, testing.allocator, &spec);
     defer deinit_(inst.ctx, testing.allocator);
 
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
-    try testing.expectEqualStrings("fdn42/text_engine@acf8e7b", c.text);
+    try testing.expectEqualStrings("fdn42/spark@acf8e7b", c.text);
 }
 
 test "Component: missing hash rejected" {

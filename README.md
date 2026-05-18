@@ -1,4 +1,4 @@
-# text_engine
+# spark
 
 A live-document runtime for Zig + Vulkan host engines. One Element
 contract that markdown, ANSI terminals, future native components
@@ -85,7 +85,7 @@ remote embed is
 
 ## Three-tier plan
 
-1. **text_engine (this repo)** — styled-text rendering library with
+1. **spark (this repo)** — styled-text rendering library with
    the Element contract + walker + Theme. ✅ live.
 2. **Layout engines** — markdown ✅, ANSI terminal (next), syntax
    highlighter, valkyr token streams, eventually Dear ImGui-shaped
@@ -109,7 +109,7 @@ glfw are linked by the host exe, not by the library module. cmark
 ships as a vendored static archive built by `build.zig` and linked
 into the host.
 
-The standalone `text_engine_demo` exe in `src/main.zig` is a dogfood
+The standalone `spark_demo` exe in `src/main.zig` is a dogfood
 surface — owns its own window and exercises the library through the
 same module a host engine would.
 
@@ -130,14 +130,14 @@ oblique + mono) and Noto Color Emoji from `/usr/share/fonts/` —
 override with:
 
 ```sh
-TEXT_ENGINE_FONT=/path/to/font.ttf zig build run
-TEXT_ENGINE_BOLD_FONT=/path/to/bold.ttf zig build run
-TEXT_ENGINE_ITALIC_FONT=/path/to/italic.ttf zig build run
-TEXT_ENGINE_BOLD_ITALIC_FONT=/path/to/bold-italic.ttf zig build run
-TEXT_ENGINE_MONO_FONT=/path/to/mono.ttf zig build run
-TEXT_ENGINE_EMOJI_FONT=/path/to/emoji.ttf zig build run
-TEXT_ENGINE_EXIT_AFTER=5 zig build run    # auto-close after N seconds
-TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
+SPARK_FONT=/path/to/font.ttf zig build run
+SPARK_BOLD_FONT=/path/to/bold.ttf zig build run
+SPARK_ITALIC_FONT=/path/to/italic.ttf zig build run
+SPARK_BOLD_ITALIC_FONT=/path/to/bold-italic.ttf zig build run
+SPARK_MONO_FONT=/path/to/mono.ttf zig build run
+SPARK_EMOJI_FONT=/path/to/emoji.ttf zig build run
+SPARK_EXIT_AFTER=5 zig build run    # auto-close after N seconds
+SPARK_VK_VERBOSE=1 zig build run    # device-pick diagnostics
 ```
 
 ## Stage status
@@ -463,7 +463,7 @@ TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
   keys, 500 MB default budget, LRU eviction on overflow, atomic
   manifest writes (tmp + rename), `pruneOlderThan` / `pruneAll` /
   `setBudget` knobs. Lives at
-  `${XDG_CACHE_HOME:-$HOME/.cache}/text_engine/assets`. The two
+  `${XDG_CACHE_HOME:-$HOME/.cache}/spark/assets`. The two
   expensive stream components opt in and route cache hits straight
   into `finalizeResponse` — no `IoChannel` traffic, no spinner,
   no charge.
@@ -491,7 +491,7 @@ TEXT_ENGINE_VK_VERBOSE=1 zig build run    # device-pick diagnostics
 
 - [x] **Stage 13b.2 — persistent reactive state.** `State` grew
   `saveToFile` / `loadFromFile` (atomic JSON write at
-  `${XDG_STATE_HOME:-$HOME/.local/state}/text_engine/state.json`,
+  `${XDG_STATE_HOME:-$HOME/.local/state}/spark/state.json`,
   version-tagged) and a `persist_dirty` flag independent of
   `dirty`. Main loads between `fromSource` and `parseWithState`
   so persisted values overlay onto frontmatter defaults before

@@ -13,7 +13,7 @@ surface, or swapchain. The host hands the library its `VkDevice` +
 per-frame `VkCommandBuffer` and the library records draw work into
 them." In practice, `src/lib.zig` is 34 lines and nothing reaches
 through it. `src/main.zig` (1378 LOC) owns GLFW, the Vulkan stack,
-font init from env vars (`TEXT_ENGINE_FONT=...`), the JobSystem
+font init from env vars (historically `TEXT_ENGINE_FONT=...`, now `SPARK_FONT=...`), the JobSystem
 pair, the IoChannel, the asset cache directory under
 `XDG_CACHE_HOME`, persistence under `XDG_STATE_HOME`, and the
 per-frame loop. The internal modules reach across each other freely.
@@ -86,7 +86,12 @@ No filesystem assumptions.
   the library boundary is real.
 - **Rename `text_engine` → `spark`** — mechanical, can land
   concurrent with any phase or separately. Decided in conversation
-  but not required by this spec.
+  but not required by this spec. **CLOSED in session 20** — landed
+  as a separate commit after Phase 5. Module name, demo exe name
+  (`text_engine_demo` → `spark_demo`), env var prefixes
+  (`TEXT_ENGINE_*` → `SPARK_*`), cache dir
+  (`~/.cache/text_engine/assets` → `~/.cache/spark/assets`),
+  state file path, and all internal references updated together.
 
 ## Related precedent — valkyr in matryoshka
 
@@ -479,7 +484,7 @@ try spark.extras.embedded_document_http.install(&ui);
   directive name with a URL-scheme check at resolve time, **or**
   intercepts via a separate directive name (`:::embedded-doc-url`,
   TBD). Implementer picks whichever is cleaner. Both work.
-- Asset cache (`~/.cache/text_engine/assets`) is extras: only
+- Asset cache (`~/.cache/spark/assets`) is extras: only
   svg-stream and image-stream use it; core never touches the
   filesystem cache path.
 - **DotEnv and AssetCache are host-opt-in, not auto-loaded.** Add
@@ -685,12 +690,12 @@ library boundary, not just the internals.
 | 3 | file:// `embedded-document` in core; http:// in extras | File composition is foundational to the flywheel; network is opt-in |
 | 4 | `IoChannel` stays in core | Reusable for non-HTTP async (file watch, MCP pipes, future LSP) |
 | 5 | `Theme` + `FontRegistry` constructed by host | Same cooperative-embed pattern as Vulkan resources |
-| 6 | No env vars consulted by the library | Library makes no filesystem assumptions; demo's `TEXT_ENGINE_FONT=...` stays in `main.zig` |
+| 6 | No env vars consulted by the library | Library makes no filesystem assumptions; demo's `SPARK_FONT=...` stays in `main.zig` |
 | 7 | `Document` is a handle (arena + Element tree + per-doc DrawList) | Multiple docs per `Spark` is natural for HUD overlays, debug panels |
 | 8 | Each `Document` gets its own `State` by default | Two docs on one Spark shouldn't fight over `state.*` keys; sharing is opt-in via `loadDocument(.{ .shared_state = ... })` |
 | 9 | DotEnv + AssetCache are host-opt-in via explicit `Spark.installDotEnv(path)` / `Spark.installAssetCache(dir, budget)` calls, not auto-loaded by extras | Library makes no filesystem assumptions; host stays in charge of all filesystem paths; no surprise `~/.env` reads when any extras install runs |
 | 10 | Vulkan handles in the public API are raw C types (`c.VkDevice`, `c.VkQueue`, `c.VkCommandBuffer`) | Lowest-common-denominator interop — both spark and matryoshka have their own thin Vulkan wrappers; raw handles let both sides keep their internal bindings without coupling |
-| 11 | The rename (`text_engine` → `spark`) lands separately from this work | Mechanical; can be done first or last. Asset cache dir, env var prefixes, build module name move together. |
+| 11 | The rename (`text_engine` → `spark`) lands separately from this work | ✅ Closed session 20. Module name, demo exe name, env var prefixes, asset cache dir, state path all renamed in one commit. |
 
 ## Risks / things to watch
 
@@ -730,8 +735,8 @@ library boundary, not just the internals.
   rendering hot-path probe. Earlier readings of ~7,600 fps were
   taken before the demo grew to ~20 KB with embedded docs, LLM
   streams, and the full inline drawer — apples-to-oranges. To
-  re-measure after a change: `./zig-out/bin/text_engine_demo
-  src/hello.md` (TEXT_ENGINE_EXIT_AFTER=N for a timed run). If
+  re-measure after a change: `./zig-out/bin/spark_demo
+  src/hello.md` (SPARK_EXIT_AFTER=N for a timed run). If
   the reading drops by more than ~5% against hello.md after a
   refactor, something on the hot path regressed — likely a
   cache-line / pointer-chase issue from added indirection. Fix is

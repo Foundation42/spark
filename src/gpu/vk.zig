@@ -1,4 +1,4 @@
-//! Vulkan 1.3 context for text_engine.
+//! Vulkan 1.3 context for spark.
 //!
 //! Mirrors the shape of `tripvulkan/src/gpu/vk.zig` (init / attach
 //! split with ownership flags) but configured for graphics + present
@@ -143,7 +143,7 @@ pub const Context = struct {
         window: *const win.Window,
         app_name: [*:0]const u8,
     ) !Context {
-        const verbose = std.process.hasEnvVarConstant("TEXT_ENGINE_VK_VERBOSE");
+        const verbose = std.process.hasEnvVarConstant("SPARK_VK_VERBOSE");
 
         // ── Instance ────────────────────────────────────────────────
         // GLFW tells us the platform-specific surface extension chain
@@ -169,7 +169,7 @@ pub const Context = struct {
         app_info.sType = c.VK_STRUCTURE_TYPE_APPLICATION_INFO;
         app_info.pApplicationName = app_name;
         app_info.applicationVersion = makeApiVersion(0, 0, 1, 0);
-        app_info.pEngineName = "text_engine";
+        app_info.pEngineName = "spark";
         app_info.engineVersion = makeApiVersion(0, 0, 1, 0);
         app_info.apiVersion = makeApiVersion(0, 1, 3, 0);
 

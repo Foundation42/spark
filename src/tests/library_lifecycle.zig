@@ -19,7 +19,7 @@
 
 const std = @import("std");
 const testing = std.testing;
-const text_engine = @import("../lib.zig");
+const spark = @import("../lib.zig");
 const fixture = @import("fixture.zig");
 
 const tiny_doc =
@@ -38,10 +38,10 @@ test "Spark.init + deinit leaves no leaks" {
 
     const fonts = try fixture.makeFonts(allocator, fx.ft);
     const theme = fixture.makeTheme(fonts);
-    var state = text_engine.State.init(allocator);
+    var state = spark.State.init(allocator);
     defer state.deinit();
 
-    var spark = try text_engine.Spark.init(allocator, .{
+    var sp = try spark.Spark.init(allocator, .{
         .vk_ctx = &fx.ctx,
         .color_format = fx.swapchain.format,
         .theme = &theme,
@@ -49,10 +49,10 @@ test "Spark.init + deinit leaves no leaks" {
         .host_state = &state,
     });
     defer {
-        spark.deinit();
+        sp.deinit();
         allocator.destroy(fonts.registry);
     }
-    spark.attachToRegistry();
+    sp.attachToRegistry();
 }
 
 test "Spark + installCoreComponents + deinit leaves no leaks" {
@@ -63,10 +63,10 @@ test "Spark + installCoreComponents + deinit leaves no leaks" {
 
     const fonts = try fixture.makeFonts(allocator, fx.ft);
     const theme = fixture.makeTheme(fonts);
-    var state = text_engine.State.init(allocator);
+    var state = spark.State.init(allocator);
     defer state.deinit();
 
-    var spark = try text_engine.Spark.init(allocator, .{
+    var sp = try spark.Spark.init(allocator, .{
         .vk_ctx = &fx.ctx,
         .color_format = fx.swapchain.format,
         .theme = &theme,
@@ -74,11 +74,11 @@ test "Spark + installCoreComponents + deinit leaves no leaks" {
         .host_state = &state,
     });
     defer {
-        spark.deinit();
+        sp.deinit();
         allocator.destroy(fonts.registry);
     }
-    spark.attachToRegistry();
-    try text_engine.installCoreComponents(&spark);
+    sp.attachToRegistry();
+    try spark.installCoreComponents(&sp);
 }
 
 test "Spark + loadDocument + one layout pass leaves no leaks" {
@@ -89,10 +89,10 @@ test "Spark + loadDocument + one layout pass leaves no leaks" {
 
     const fonts = try fixture.makeFonts(allocator, fx.ft);
     const theme = fixture.makeTheme(fonts);
-    var state = text_engine.State.init(allocator);
+    var state = spark.State.init(allocator);
     defer state.deinit();
 
-    var spark = try text_engine.Spark.init(allocator, .{
+    var sp = try spark.Spark.init(allocator, .{
         .vk_ctx = &fx.ctx,
         .color_format = fx.swapchain.format,
         .theme = &theme,
@@ -100,13 +100,13 @@ test "Spark + loadDocument + one layout pass leaves no leaks" {
         .host_state = &state,
     });
     defer {
-        spark.deinit();
+        sp.deinit();
         allocator.destroy(fonts.registry);
     }
-    spark.attachToRegistry();
-    try text_engine.installCoreComponents(&spark);
+    sp.attachToRegistry();
+    try spark.installCoreComponents(&sp);
 
-    var doc = try spark.loadDocument(tiny_doc, .{ .shared_state = &state });
+    var doc = try sp.loadDocument(tiny_doc, .{ .shared_state = &state });
     defer doc.deinit();
 
     // One layout-only pass — we never `beginFrame` so no Vulkan
@@ -125,10 +125,10 @@ test "Spark.installAssetCache mounts + tears down clean" {
 
     const fonts = try fixture.makeFonts(allocator, fx.ft);
     const theme = fixture.makeTheme(fonts);
-    var state = text_engine.State.init(allocator);
+    var state = spark.State.init(allocator);
     defer state.deinit();
 
-    var spark = try text_engine.Spark.init(allocator, .{
+    var sp = try spark.Spark.init(allocator, .{
         .vk_ctx = &fx.ctx,
         .color_format = fx.swapchain.format,
         .theme = &theme,
@@ -136,18 +136,18 @@ test "Spark.installAssetCache mounts + tears down clean" {
         .host_state = &state,
     });
     defer {
-        spark.deinit();
+        sp.deinit();
         allocator.destroy(fonts.registry);
     }
-    spark.attachToRegistry();
+    sp.attachToRegistry();
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const cache_path = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(cache_path);
 
-    try spark.installAssetCache(cache_path, 4 * 1024 * 1024);
-    try testing.expect(spark.asset_cache != null);
+    try sp.installAssetCache(cache_path, 4 * 1024 * 1024);
+    try testing.expect(sp.asset_cache != null);
 }
 
 test "Spark.installDotEnv mounts + tears down clean" {
@@ -158,10 +158,10 @@ test "Spark.installDotEnv mounts + tears down clean" {
 
     const fonts = try fixture.makeFonts(allocator, fx.ft);
     const theme = fixture.makeTheme(fonts);
-    var state = text_engine.State.init(allocator);
+    var state = spark.State.init(allocator);
     defer state.deinit();
 
-    var spark = try text_engine.Spark.init(allocator, .{
+    var sp = try spark.Spark.init(allocator, .{
         .vk_ctx = &fx.ctx,
         .color_format = fx.swapchain.format,
         .theme = &theme,
@@ -169,10 +169,10 @@ test "Spark.installDotEnv mounts + tears down clean" {
         .host_state = &state,
     });
     defer {
-        spark.deinit();
+        sp.deinit();
         allocator.destroy(fonts.registry);
     }
-    spark.attachToRegistry();
+    sp.attachToRegistry();
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -180,6 +180,6 @@ test "Spark.installDotEnv mounts + tears down clean" {
     const env_path = try tmp.dir.realpathAlloc(allocator, ".env");
     defer allocator.free(env_path);
 
-    try spark.installDotEnv(env_path);
-    try testing.expect(spark.dotenv != null);
+    try sp.installDotEnv(env_path);
+    try testing.expect(sp.dotenv != null);
 }

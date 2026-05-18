@@ -1,4 +1,4 @@
-//! Element — the universal contract layout engines hand to text_engine.
+//! Element — the universal contract layout engines hand to spark.
 //!
 //! Markdown blocks are the first concrete implementers; future ANSI
 //! cells, syntax-highlighter spans, and (long-term) ImGui-style
@@ -27,10 +27,9 @@
 //!   * Input handling — every element will expose its laid-out `Box`
 //!     so hit-testing can land on it later; the box is not buried.
 //!
-//! The library is currently named `text_engine`. The destination is
-//! broader (Markdown + terminals + Dear ImGui + game UI). Rename
-//! conversation happens once the contract is concrete enough to
-//! name what the library actually does — not yet.
+//! The library is named `spark`. The destination is broader
+//! (Markdown + terminals + Dear ImGui + game UI); the contract here
+//! is the universal substrate underneath.
 
 const std = @import("std");
 const registry_mod = @import("font/registry.zig");
@@ -705,7 +704,7 @@ pub const Theme = struct {
     }
 };
 
-/// Read-only handle elements use to ask text_engine for shaping +
+/// Read-only handle elements use to ask spark for shaping +
 /// atlas placement. Walker fills it once at the top of a frame and
 /// passes by pointer through the tree. Owns nothing — every field
 /// is a borrow from the host.
