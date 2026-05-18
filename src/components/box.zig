@@ -58,6 +58,16 @@ const Component = struct {
     /// fixed-width siblings." Honoured by `:::flex`; ignored by
     /// stack_v / grid / direct render.
     grow: u32 = 0,
+    /// Float side (stage 15 Phase E text exclusion). `.normal` flows
+    /// in document order. `.float_left` / `.float_right` opt the box
+    /// out of normal flow: stack_v positions the box at the
+    /// container's left or right edge at the current cursor and
+    /// doesn't advance, while the box registers a rect exclusion so
+    /// following text wraps around it. Floats default to `width=120
+    /// height=120` if the author leaves the dimensions unset — a
+    /// `100%`-wide float would consume the whole column and defeat the
+    /// purpose.
+    float: element.FlowKind = .normal,
     /// Bumped on every mutation; consulted by the retained layout
     /// cache so a state-driven attr change invalidates the cached
     /// block. See `layout_cache.zig`.
@@ -70,14 +80,23 @@ const Component = struct {
             .height = .{ .pixels = 80 },
             .radius = 0,
             .grow = 0,
+            .float = .normal,
         };
+        var explicit_width = false;
+        var explicit_height = false;
         for (spec.attrs) |a| {
             if (std.mem.eql(u8, a.key, "color")) {
                 if (parseColor(a.value)) |col| c.color = col;
             } else if (std.mem.eql(u8, a.key, "width")) {
-                if (parseLength(a.value)) |l| c.width = l;
+                if (parseLength(a.value)) |l| {
+                    c.width = l;
+                    explicit_width = true;
+                }
             } else if (std.mem.eql(u8, a.key, "height")) {
-                if (parseLength(a.value)) |l| c.height = l;
+                if (parseLength(a.value)) |l| {
+                    c.height = l;
+                    explicit_height = true;
+                }
             } else if (std.mem.eql(u8, a.key, "radius")) {
                 if (parseLength(a.value)) |l| {
                     c.radius = switch (l) {
@@ -88,7 +107,24 @@ const Component = struct {
                 }
             } else if (std.mem.eql(u8, a.key, "grow")) {
                 c.grow = std.fmt.parseInt(u32, std.mem.trim(u8, a.value, " \t"), 10) catch 0;
+            } else if (std.mem.eql(u8, a.key, "float")) {
+                const v = std.mem.trim(u8, a.value, " \t");
+                if (std.mem.eql(u8, v, "left")) {
+                    c.float = .float_left;
+                } else if (std.mem.eql(u8, v, "right")) {
+                    c.float = .float_right;
+                } else {
+                    c.float = .normal;
+                }
             }
+        }
+        // Floats need finite intrinsic dimensions — the percent default
+        // would devour the whole column and produce no wrap-around
+        // space. Backfill author-friendly pixel defaults when float is
+        // on and dimensions weren't set explicitly.
+        if (c.float != .normal) {
+            if (!explicit_width) c.width = .{ .pixels = 120 };
+            if (!explicit_height) c.height = .{ .pixels = 120 };
         }
         return c;
     }
@@ -199,7 +235,13 @@ const vtable: element.ElementVTable = .{
     .content_version = contentVersion,
     .measure_block = measureBlock,
     .on_layout_complete = onLayoutComplete,
+    .flow_kind = flowKind,
 };
+
+fn flowKind(ctx: *anyopaque) element.FlowKind {
+    const c: *const Component = @ptrCast(@alignCast(ctx));
+    return c.float;
+}
 
 /// Post-layout hook (stage 15 Phase C.4). Fires after every walk —
 /// cache hit OR miss — via `element_layout`. Records the box's
@@ -215,6 +257,31 @@ fn onLayoutComplete(ctx: *anyopaque, box: element.Box, lc: *element.LayoutCtx) v
             // drag fallback degrades gracefully (handler reads null,
             // initial_size defaults to 0). Don't propagate.
         };
+
+        // Stage 15 Phase E text exclusion: a floated box re-registers
+        // its rect exclusion on every walk (cache hit and miss alike).
+        // beginPass cleared the exclusion list at frame start; this
+        // hook repopulates it from the box's resolved box, ensuring
+        // following paragraphs see the up-to-date exclusion regardless
+        // of cache state.
+        if (c.float != .normal) {
+            const side: layout_context_mod.ExclusionSide = switch (c.float) {
+                .float_left => .left,
+                .float_right => .right,
+                .normal => unreachable,
+            };
+            lctx.registerExclusion(.{
+                .x_min = box.x,
+                .y_min = box.y,
+                .x_max = box.x + box.w,
+                .y_max = box.y + box.h,
+                .side = side,
+            }) catch {
+                // OOM on an exclusion append leaves following lines
+                // wrapping the full column for this frame — visually
+                // wrong but recoverable next frame. Don't propagate.
+            };
+        }
     }
 }
 

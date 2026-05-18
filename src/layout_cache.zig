@@ -95,6 +95,16 @@ pub const Key = struct {
     zoom_bits: u32,
     /// Theme pointer. Theme swap → invalidate.
     theme_ptr: usize,
+    /// Per-pass environment seed (stage 15 Phase E). Folds in any
+    /// layout-state that the cached output baked into its positions
+    /// — currently the active exclusion rect set, hashed via
+    /// `LayoutContext.exclusionsHash`. A float landing above a
+    /// paragraph rotates this seed and forces a fresh wrap; the same
+    /// floats across frames produce the same seed so cached entries
+    /// keep hitting once the document settles. 0 when no exclusions
+    /// are active or `layout_context` isn't wired (tests, headless
+    /// preview).
+    pass_seed: u64,
 };
 
 pub const Entry = struct {
@@ -252,12 +262,14 @@ pub fn keyFor(
     constraints: element.Constraints,
     theme: *const element.Theme,
     zoom: f32,
+    pass_seed: u64,
 ) Key {
     return .{
         .elem_id = elementIdentity(elem),
         .max_w_bits = @bitCast(constraints.max_w),
         .zoom_bits = @bitCast(zoom),
         .theme_ptr = @intFromPtr(theme),
+        .pass_seed = pass_seed,
     };
 }
 
@@ -455,6 +467,7 @@ test "BlockCache: insert/lookup roundtrip" {
         .max_w_bits = @bitCast(@as(f32, 800)),
         .zoom_bits = @bitCast(@as(f32, 1.0)),
         .theme_ptr = 0xABCD,
+        .pass_seed = 0,
     };
 
     const glyphs = try testing.allocator.alloc(tp.GlyphInstance, 0);
@@ -495,6 +508,7 @@ test "BlockCache: insert replaces existing entry" {
         .max_w_bits = @bitCast(@as(f32, 800)),
         .zoom_bits = @bitCast(@as(f32, 1.0)),
         .theme_ptr = 0xABCD,
+        .pass_seed = 0,
     };
 
     const a_glyphs = try testing.allocator.alloc(tp.GlyphInstance, 1);
@@ -536,6 +550,7 @@ test "BlockCache: clear frees all entries" {
             .max_w_bits = 0,
             .zoom_bits = 0,
             .theme_ptr = 0,
+            .pass_seed = 0,
         };
         try cache.insert(key, .{
             .version = 0,

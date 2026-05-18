@@ -123,6 +123,26 @@ Multiple grow weights split slack proportionally — `grow=1` + `grow=2` + `grow
 :::
 :::
 
+## Text exclusion (stage 15 Phase E)
+
+Floats opt a block out of normal flow: the parent stack places the floated box at its left or right edge, *doesn't* advance the cursor, and the floated box registers a rect exclusion on `LayoutContext` so following paragraphs wrap around its silhouette. CSS `shape-outside` semantics, layered atop the settled-positions model the constraint solver produced.
+
+:::box {float=left width=140 height=140 color=orange radius=10}
+:::
+
+A floated block is taken out of normal flow. The stack walker positions it at the chosen edge of the column at the current cursor — and crucially does not advance the cursor. Following paragraphs continue at the same y, but their inline-flow wrap loop queries the active exclusion list every line, shrinking the usable x-range so glyphs miss the float's rectangle. Add enough text and the lines eventually escape the float's bottom and resume the full column width.
+
+This second paragraph picks up where the first left off. Notice how the lines hug the float on the left until the y-cursor passes the float's lower edge — at which point the column reopens to its full width and the prose stops indenting. Behind the scenes nothing about the float is special: it's a regular `:::box` whose `flow_kind` vtable slot reports `.float_left`, and whose `on_layout_complete` hook re-registers the exclusion rect on every walk so the cache-hit path doesn't lose track of it.
+
+The right edge plays the same way. Below the orange float is a teal one nudged the other direction — same machinery, opposite side.
+
+:::box {float=right width=160 height=120 color=cyan radius=10}
+:::
+
+Right floats need their measured width up front so the stack walker can place them flush against the column's right edge. The measure-pass protocol shipped in Phase C.3 already provides this: `measure_block` reports the box's intrinsic width, the walker subtracts it from `max_w`, and the float lands at the resolved x. The wrap loop on this paragraph sees a right-side exclusion and shrinks the line from the right, so the prose hugs the float's left silhouette while the column itself stays unchanged. After the float ends, the column reopens — a clean rectangular cut that the solver never had to know about.
+
+The architectural cut for floats keeps coverage problems separate from constraint problems. Cassowary settles boxes; the float pass is a layered consultation atop the settled positions. v1 ships axis-aligned rects only; polygons and per-line spans (real CSS `shape-outside`) are v2 territory, and glyph-driven exclusions are v3 / probably-never. Three lines of demo, one new attribute, one new vtable slot.
+
 ## Drag-to-resize (stage 15D)
 
 Stage 15D wires GPU-side input deltas straight to the kiwi constraint solver via `LayoutContext.setSuggestion`. A `:::handle` between two boxes drags horizontally; the left box reads its own width as a `suggestValue` edit at medium strength, and the right box shifts to follow. No state intermediary, no re-parse — the cursor drives the solver, the solver reshapes the layout, the renderer paints the new geometry on the next frame.

@@ -92,7 +92,14 @@ pub fn layoutAndRenderCached(
         return layoutAndRender(elem, origin, constraints, ctx, out);
     }
 
-    const key = layout_cache.keyFor(elem, constraints, ctx.theme, ctx.zoom);
+    // Pass-seed folds in any layout-state the cached output baked into
+    // its positions but that isn't visible in `(elem, constraints,
+    // theme, zoom)`. Stage 15 Phase E: active exclusion rects shrink
+    // the per-line wrap on the way down. With the seed in the key, a
+    // float entering / leaving the document invalidates dependent
+    // paragraph caches automatically.
+    const pass_seed: u64 = if (ctx.layout_context) |lctx| lctx.exclusionsHash() else 0;
+    const key = layout_cache.keyFor(elem, constraints, ctx.theme, ctx.zoom, pass_seed);
     const version = layout_cache.versionFor(elem);
 
     if (cache.lookup(key, version)) |entry| {
@@ -666,25 +673,100 @@ fn layoutStackV(
 
     var y = origin[1];
     var max_w: f32 = 0;
-    for (children, 0..) |child, i| {
-        if (i != 0) y += gap;
+    // Tracks the furthest-down y any child (floats included) has
+    // reached. Floats don't advance the in-flow cursor, but the stack
+    // still needs to report a height that covers them so a host
+    // container doesn't visually clip the float box.
+    var max_bottom_y = origin[1];
+    // Whether the *previous* in-flow child was a float — used to skip
+    // the gap before a float (a float sitting between two paragraphs
+    // shouldn't push the second paragraph down by `gap`) and to skip
+    // the gap after a float when the next child is also a float.
+    var prev_was_normal = false;
+    for (children) |child| {
+        const fk = flowKindOf(child);
+        if (fk == .normal) {
+            if (prev_was_normal) y += gap;
+            const child_box = try layoutAndRenderCached(
+                child,
+                .{ origin[0], y },
+                constraints,
+                ctx,
+                out,
+            );
+            if (child_box.w > max_w) max_w = child_box.w;
+            y += child_box.h;
+            if (y > max_bottom_y) max_bottom_y = y;
+            prev_was_normal = true;
+            continue;
+        }
+        // Float positioning. The child is laid out at the appropriate
+        // edge; its rendered height is reported back via the returned
+        // Box but the in-flow cursor `y` does NOT advance — following
+        // paragraphs continue at the same y and wrap around the float
+        // via the exclusion the float registers on `on_layout_complete`.
+        const child_x = floatChildX(child, fk, origin[0], constraints, ctx);
         const child_box = try layoutAndRenderCached(
             child,
-            .{ origin[0], y },
+            .{ child_x, y },
             constraints,
             ctx,
             out,
         );
+        const float_bottom = child_box.y + child_box.h;
+        if (float_bottom > max_bottom_y) max_bottom_y = float_bottom;
+        // Float width contributes to the stack's reported width
+        // (matters when a float is the widest piece of content; for
+        // text columns the paragraph usually wins).
         if (child_box.w > max_w) max_w = child_box.w;
-        y += child_box.h;
     }
+    const reported_bottom = if (max_bottom_y > y) max_bottom_y else y;
     return .{
         .x = origin[0],
         .y = origin[1],
         .w = max_w,
-        .h = y - origin[1],
+        .h = reported_bottom - origin[1],
         .baseline = 0,
     };
+}
+
+/// Stage 15 Phase E text exclusion — peek at a child's FlowKind
+/// without laying it out. Built-in element kinds always flow normally;
+/// only custom components can opt into floats (currently `:::box`).
+fn flowKindOf(elem: element.Element) element.FlowKind {
+    return switch (elem) {
+        .custom => |cu| if (cu.vtable.flow_kind) |fk| fk(cu.ctx) else .normal,
+        else => .normal,
+    };
+}
+
+/// Stage 15 Phase E text exclusion — resolve a floated child's
+/// laid-out x against its parent's `origin[0]` + `constraints.max_w`.
+/// Left floats sit flush at the left edge. Right floats need the
+/// child's measured width up-front so we can place them flush-right;
+/// we ask the child via `measure_block` (the same protocol flex grow
+/// uses) and fall back to `max_w` / 3 if the child didn't opt in.
+fn floatChildX(
+    elem: element.Element,
+    fk: element.FlowKind,
+    parent_x: f32,
+    constraints: element.Constraints,
+    ctx: *element.LayoutCtx,
+) f32 {
+    if (fk == .float_left) return parent_x;
+    if (!std.math.isFinite(constraints.max_w)) return parent_x;
+    const cu = switch (elem) {
+        .custom => |c| c,
+        else => return parent_x,
+    };
+    const measure = cu.vtable.measure_block orelse {
+        return parent_x + constraints.max_w / 3;
+    };
+    const m = measure(cu.ctx, ctx, constraints) catch {
+        return parent_x + constraints.max_w / 3;
+    };
+    const x = parent_x + constraints.max_w - m.width;
+    return if (x < parent_x) parent_x else x;
 }
 
 // ── Stage 14b parallel stack_v walk ──────────────────────────────────
@@ -742,6 +824,16 @@ fn layoutStackVParallel(
     ctx: *element.LayoutCtx,
     out: *element.DrawList,
 ) anyerror!?element.Box {
+    // Stage 15 Phase E text exclusion: floats need order-sensitive
+    // placement (left/right edge of the column) and per-child cursor
+    // logic that doesn't fit the parallel walker's "every child gets
+    // origin (0,0)" contract. When the stack contains any float, fall
+    // through to the serial path — floats are rare enough that
+    // forfeiting parallelism for a section that has one is the right
+    // tradeoff for now.
+    for (children) |c| {
+        if (flowKindOf(c) != .normal) return null;
+    }
     const cache = ctx.cache_blocks.?;
     const js = ctx.job_system.?;
     const a = ctx.allocator;
@@ -894,7 +986,8 @@ fn classifyChild(
     if (layout_cache.cacheableLeaf(elem)) {
         const id = layout_cache.elementIdentity(elem);
         if (id != 0) {
-            const key = layout_cache.keyFor(elem, constraints, ctx.theme, ctx.zoom);
+            const pass_seed: u64 = if (ctx.layout_context) |lctx| lctx.exclusionsHash() else 0;
+            const key = layout_cache.keyFor(elem, constraints, ctx.theme, ctx.zoom, pass_seed);
             const version = layout_cache.versionFor(elem);
             if (cache.lookup(key, version)) |entry| {
                 return .{ .cache_hit = entry };
@@ -1120,13 +1213,43 @@ fn layoutInlineFlow(
     }
 
     // ── 3: greedy wrap-aware line build ────────────────────────────
-    const max_x = origin[0] + constraints.max_w;
+    // The column's hard left + right edges. Exclusions (stage 15 Phase
+    // E text exclusion) shrink the per-line usable range from these
+    // edges; the wrap loop queries `lc.lineBounds` at the start of
+    // each new line and again whenever `y` advances. With no
+    // exclusions registered the query returns `[column_left,
+    // column_right]` unchanged, so the no-float fast path costs only
+    // the (usually empty) for-loop in `lineBounds`.
+    const column_left = origin[0];
+    const column_right = origin[0] + constraints.max_w;
+    // Conservative per-line query height — exclusion lookups assume
+    // each line occupies roughly the body line_height. Mixed-size
+    // content can exceed this; the float boundary is generous enough
+    // (rect spans the whole floated element's height) that off-by-a-
+    // few-pixels in the query height doesn't move the wrap decision.
+    const query_line_h: f32 = if (ctx.fonts.entries.items.len > 0)
+        ctx.fonts.metrics(ctx.theme.body.font_id).line_height
+    else
+        16;
+
     var y = origin[1];
+
+    // Resolve the current line's left + right against any active
+    // exclusion. When `layout_context` isn't wired (built-in tests,
+    // headless preview), exclusions are unreachable and the line spans
+    // the full column.
+    var line_left = column_left;
+    var line_right = column_right;
+    if (ctx.layout_context) |lctx| {
+        const lb = lctx.lineBounds(y, query_line_h, column_left, column_right);
+        line_left = lb[0];
+        line_right = lb[1];
+    }
 
     // `line_start` is the first token index of the current line;
     // `pen_x` is the running pixel cursor on it.
     var line_start: usize = 0;
-    var pen_x: f32 = origin[0];
+    var pen_x: f32 = line_left;
     var last_baseline: f32 = 0;
     var i: usize = 0;
 
@@ -1136,11 +1259,16 @@ fn layoutInlineFlow(
         // Forced break — flush current line (without including the
         // break itself), advance past it.
         if (isLineBreak(tok)) {
-            const lm = try emitLine(tokens.items[line_start..i], origin[0], y, ctx, out);
+            const lm = try emitLine(tokens.items[line_start..i], line_left, y, ctx, out);
             y += lm.line_height;
             last_baseline = lm.baseline;
             line_start = i + 1;
-            pen_x = origin[0];
+            if (ctx.layout_context) |lctx| {
+                const lb = lctx.lineBounds(y, query_line_h, column_left, column_right);
+                line_left = lb[0];
+                line_right = lb[1];
+            }
+            pen_x = line_left;
             continue;
         }
 
@@ -1150,13 +1278,13 @@ fn layoutInlineFlow(
         // gaps are clean break points themselves and shouldn't push
         // wrap decisions. Don't wrap if the line has no content yet
         // (otherwise an oversized first word would loop forever).
-        if (isWord(tok) and line_start < i and pen_x + width > max_x) {
+        if (isWord(tok) and line_start < i and pen_x + width > line_right) {
             // Find the line's emit end: strip any trailing gaps so
             // wrapped lines don't render a hanging space character.
             var emit_end = i;
             while (emit_end > line_start and isGap(tokens.items[emit_end - 1])) : (emit_end -= 1) {}
 
-            const lm = try emitLine(tokens.items[line_start..emit_end], origin[0], y, ctx, out);
+            const lm = try emitLine(tokens.items[line_start..emit_end], line_left, y, ctx, out);
             y += lm.line_height;
             last_baseline = lm.baseline;
 
@@ -1164,7 +1292,12 @@ fn layoutInlineFlow(
             // are the whitespace that "lived in" the wrap point and
             // shouldn't render on either side of the break.
             line_start = i;
-            pen_x = origin[0];
+            if (ctx.layout_context) |lctx| {
+                const lb = lctx.lineBounds(y, query_line_h, column_left, column_right);
+                line_left = lb[0];
+                line_right = lb[1];
+            }
+            pen_x = line_left;
         }
 
         // Drop a leading gap at the start of a fresh line. We do
@@ -1185,7 +1318,7 @@ fn layoutInlineFlow(
         var emit_end = tokens.items.len;
         while (emit_end > line_start and isGap(tokens.items[emit_end - 1])) : (emit_end -= 1) {}
         if (emit_end > line_start) {
-            const lm = try emitLine(tokens.items[line_start..emit_end], origin[0], y, ctx, out);
+            const lm = try emitLine(tokens.items[line_start..emit_end], line_left, y, ctx, out);
             y += lm.line_height;
             last_baseline = lm.baseline;
         }

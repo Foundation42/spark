@@ -29,6 +29,22 @@ pub const ElementBounds = struct {
     y_max: kiwi.VariableId,
 };
 
+/// Axis-aligned rectangle excluded from inline flow (stage 15 Phase E
+/// text exclusion / shape-outside). Pixel coords in the document's
+/// display space — the same frame the inline-flow walker thinks in.
+/// `side` records which edge the rect hugs; the inline-flow wrap
+/// query uses it to decide whether the rect shrinks the line from the
+/// left or the right.
+pub const ExclusionSide = enum { left, right };
+
+pub const ExclusionRect = struct {
+    x_min: f32,
+    y_min: f32,
+    x_max: f32,
+    y_max: f32,
+    side: ExclusionSide,
+};
+
 /// Which dimension of a participating element a suggestion targets.
 /// Phase D ships `width` + `height` (the two channels a drag handle
 /// drives); `x` / `y` are anchor-position suggestions that future
@@ -120,6 +136,18 @@ pub const LayoutContext = struct {
     /// when a component overwrites its entry.
     last_sizes: std.AutoHashMapUnmanaged(u64, [2]f32) = .{},
 
+    /// Active rect exclusions for the current pass (stage 15 Phase E —
+    /// text exclusion / shape-outside, v1). Cleared on `beginPass`;
+    /// repopulated as floated components are walked. The inline-flow
+    /// wrap loop queries `lineBounds` per line to shrink usable
+    /// x-range; the cache-key seed (`exclusionsHash`) folds into
+    /// paragraph cache keys so a float arriving above a paragraph
+    /// invalidates the paragraph's cached wrap.
+    ///
+    /// V1 is rect-only and assumes floats hug the column's left/right
+    /// edge. Polygons + per-line spans are v2/v3 territory.
+    exclusions: std.ArrayListUnmanaged(ExclusionRect) = .{},
+
     pub fn init(alloc: std.mem.Allocator) std.mem.Allocator.Error!LayoutContext {
         return .{
             .alloc = alloc,
@@ -132,6 +160,7 @@ pub const LayoutContext = struct {
         self.suggestions.deinit(self.alloc);
         self.bumpers.deinit(self.alloc);
         self.last_sizes.deinit(self.alloc);
+        self.exclusions.deinit(self.alloc);
         self.solver.deinit();
         self.* = undefined;
     }
@@ -149,6 +178,12 @@ pub const LayoutContext = struct {
     pub fn beginPass(self: *LayoutContext) void {
         self.solver.reset();
         self.bounds_map.clearRetainingCapacity();
+        // Exclusions are per-pass *outputs* — floated components
+        // re-register their rect every walk (cache hit and miss alike,
+        // via `on_layout_complete`). The list is rebuilt fresh each
+        // pass so a float that disappeared from the document doesn't
+        // leave a phantom hole in following paragraphs.
+        self.exclusions.clearRetainingCapacity();
         // Bumpers and last_sizes are persistent — they survive across
         // beginPass. Bumpers get unregistered explicitly on component
         // deinit; last_sizes are overwritten on each walk that records
@@ -248,6 +283,77 @@ pub const LayoutContext = struct {
     /// deinit so stale sizes don't linger across re-creations.
     pub fn clearSize(self: *LayoutContext, key: u64) void {
         _ = self.last_sizes.remove(key);
+    }
+
+    /// Register a rectangular exclusion for the current pass (stage 15
+    /// Phase E text exclusion). Floated components call this from their
+    /// `on_layout_complete` hook so the exclusion survives cache hits.
+    /// The inline-flow wrap loop consults `lineBounds` per candidate
+    /// line and shrinks the usable x-range when an exclusion overlaps.
+    pub fn registerExclusion(self: *LayoutContext, rect: ExclusionRect) std.mem.Allocator.Error!void {
+        try self.exclusions.append(self.alloc, rect);
+    }
+
+    /// Resolve the usable inline-flow x-range for a line at `y` of
+    /// height `line_height`. `(x_min, x_max)` is the paragraph's
+    /// declared column. Each active exclusion (one whose y-range
+    /// overlaps `[y, y + line_height]`) shrinks the column from its
+    /// declared side. Returns `[line_left, line_right]` ready for the
+    /// wrap loop.
+    ///
+    /// V1 only handles left + right edge floats (the common case);
+    /// stacked floats on the same side compose by taking the
+    /// rightmost / leftmost edge.
+    pub fn lineBounds(
+        self: *const LayoutContext,
+        y: f32,
+        line_height: f32,
+        x_min: f32,
+        x_max: f32,
+    ) [2]f32 {
+        var left = x_min;
+        var right = x_max;
+        const line_bottom = y + line_height;
+        for (self.exclusions.items) |r| {
+            const overlap_y = (r.y_min < line_bottom) and (r.y_max > y);
+            if (!overlap_y) continue;
+            switch (r.side) {
+                .left => if (r.x_max > left) {
+                    left = r.x_max;
+                },
+                .right => if (r.x_min < right) {
+                    right = r.x_min;
+                },
+            }
+        }
+        if (left > right) left = right;
+        return .{ left, right };
+    }
+
+    /// One-shot hash of the active exclusion list — folded into
+    /// paragraph cache keys so a float entering / leaving the document
+    /// invalidates dependent paragraph wraps. Cheap (one pass over
+    /// usually <10 rects); same exclusions across frames produce the
+    /// same hash so cached paragraphs keep hitting once the float
+    /// settles.
+    pub fn exclusionsHash(self: *const LayoutContext) u64 {
+        var h: u64 = 0x517CC1B727220A95;
+        for (self.exclusions.items) |r| {
+            const x0: u32 = @bitCast(r.x_min);
+            const y0: u32 = @bitCast(r.y_min);
+            const x1: u32 = @bitCast(r.x_max);
+            const y1: u32 = @bitCast(r.y_max);
+            h ^= @as(u64, x0);
+            h *%= 0x9E3779B97F4A7C15;
+            h ^= @as(u64, y0);
+            h *%= 0xBF58476D1CE4E5B9;
+            h ^= @as(u64, x1);
+            h *%= 0x94D049BB133111EB;
+            h ^= @as(u64, y1);
+            h *%= 0xD6E8FEB86659FD93;
+            h ^= @intFromEnum(r.side);
+        }
+        return h;
     }
 
     /// Mint (or return) the four bounds variables for an
@@ -484,6 +590,60 @@ test "recordSize / lastSize roundtrip" {
     // clearSize removes the entry.
     ctx.clearSize(7);
     try testing.expect(ctx.lastSize(7) == null);
+}
+
+test "exclusion: register + lineBounds shrinks from left and right (stage 15 Phase E)" {
+    var ctx = try LayoutContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.registerExclusion(.{ .x_min = 0, .y_min = 0, .x_max = 100, .y_max = 200, .side = .left });
+    try ctx.registerExclusion(.{ .x_min = 500, .y_min = 50, .x_max = 600, .y_max = 150, .side = .right });
+
+    // Line at y=80 height=20: both exclusions active.
+    const a = ctx.lineBounds(80, 20, 0, 600);
+    try testing.expectEqual(@as(f32, 100), a[0]);
+    try testing.expectEqual(@as(f32, 500), a[1]);
+
+    // Line at y=160 height=20: only the left exclusion is active.
+    const b = ctx.lineBounds(160, 20, 0, 600);
+    try testing.expectEqual(@as(f32, 100), b[0]);
+    try testing.expectEqual(@as(f32, 600), b[1]);
+
+    // Line at y=210 height=20: no exclusion active; full column.
+    const c = ctx.lineBounds(210, 20, 0, 600);
+    try testing.expectEqual(@as(f32, 0), c[0]);
+    try testing.expectEqual(@as(f32, 600), c[1]);
+}
+
+test "exclusion: beginPass clears exclusions" {
+    var ctx = try LayoutContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.registerExclusion(.{ .x_min = 0, .y_min = 0, .x_max = 50, .y_max = 50, .side = .left });
+    try testing.expectEqual(@as(usize, 1), ctx.exclusions.items.len);
+
+    ctx.beginPass();
+    try testing.expectEqual(@as(usize, 0), ctx.exclusions.items.len);
+}
+
+test "exclusion: hash changes when list changes, stable when identical" {
+    var a = try LayoutContext.init(testing.allocator);
+    defer a.deinit();
+    var b = try LayoutContext.init(testing.allocator);
+    defer b.deinit();
+
+    try testing.expectEqual(a.exclusionsHash(), b.exclusionsHash());
+
+    try a.registerExclusion(.{ .x_min = 10, .y_min = 20, .x_max = 110, .y_max = 220, .side = .left });
+    try testing.expect(a.exclusionsHash() != b.exclusionsHash());
+
+    try b.registerExclusion(.{ .x_min = 10, .y_min = 20, .x_max = 110, .y_max = 220, .side = .left });
+    try testing.expectEqual(a.exclusionsHash(), b.exclusionsHash());
+
+    // Differing side bumps the hash.
+    try a.registerExclusion(.{ .x_min = 300, .y_min = 0, .x_max = 400, .y_max = 100, .side = .right });
+    try b.registerExclusion(.{ .x_min = 300, .y_min = 0, .x_max = 400, .y_max = 100, .side = .left });
+    try testing.expect(a.exclusionsHash() != b.exclusionsHash());
 }
 
 test "last_sizes survives beginPass" {

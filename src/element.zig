@@ -314,6 +314,20 @@ pub const BlockMetrics = struct {
     grow: u32 = 0,
 };
 
+/// How a block participates in its parent stack's flow (stage 15 Phase
+/// E text exclusion / shape-outside, v1).
+///
+/// `.normal` — the default. Stack_v lays the child out at its current
+/// cursor and advances vertically by `Box.h`.
+///
+/// `.float_left` / `.float_right` — the child is positioned at the
+/// container's left or right edge at the current cursor, and the
+/// cursor does NOT advance. The child registers a rect exclusion via
+/// `LayoutContext.registerExclusion` so following inline content wraps
+/// around its silhouette. The stack tracks the float's bottom in its
+/// reported height so containers don't visually clip.
+pub const FlowKind = enum { normal, float_left, float_right };
+
 /// vtable for `custom` elements. Two slots: a required
 /// layout-and-render and an optional input handler.
 ///
@@ -402,6 +416,17 @@ pub const ElementVTable = struct {
         box: Box,
         lc: *LayoutCtx,
     ) void = null,
+    /// Optional. Reports how this component participates in its
+    /// parent stack's flow (stage 15 Phase E text exclusion). `null`
+    /// (the default) means `.normal` — the component flows in
+    /// document order, advancing the stack cursor by its height.
+    /// Returning `.float_left` / `.float_right` opts the component
+    /// into the float positioning path: stack_v places the child at
+    /// the appropriate edge without advancing y, and the component is
+    /// expected to register a rect exclusion via
+    /// `LayoutContext.registerExclusion` during its
+    /// `on_layout_complete` hook so following text wraps around it.
+    flow_kind: ?*const fn (ctx: *anyopaque) FlowKind = null,
     /// Cost hint for the stage-14b parallel cache-miss dispatcher.
     /// `false` (default) means a miss on this component is
     /// "expensive enough to dispatch" — a paragraph's HarfBuzz
