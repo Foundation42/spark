@@ -984,7 +984,8 @@ pub fn main() !void {
     var layout_context = try layout_context_mod.LayoutContext.init(allocator);
     defer layout_context.deinit();
 
-    try registry.register("box", box_component.factory);
+    try box_component.install(&registry, &layout_context);
+    defer box_component.deinitGlobals();
     try registry.register("chart", chart_component.factory);
     try registry.register("slider", slider_component.factory);
     try badge_component.install(&registry);

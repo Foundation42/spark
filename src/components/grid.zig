@@ -307,10 +307,11 @@ pub fn resolveTrackWidths(
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .content_version = contentVersion,
-    // Stage 15D: same rationale as :::flex — caching the whole
-    // grid into one block-cache entry hides per-child version
-    // bumps from the suggestion-driven invalidation chain. Until
-    // hierarchical invalidation lands, grids re-walk every frame.
+    // Stage 15 Phase C.4: cells are walked via
+    // `layoutAndRenderCached` — each cell caches individually so
+    // unchanged cells blit. The grid itself stays
+    // disable_cache=true; same rationale as :::flex: aggregating
+    // cell versions into the grid's own key is a follow-on.
     .disable_cache = true,
 };
 
@@ -380,7 +381,11 @@ fn layoutAndRender(
         const cell_x = origin[0] + track_offsets[col];
         const cell_constraints: element.Constraints = .{ .max_w = track_widths[col] };
 
-        const cell_box = try element_layout.layoutAndRender(
+        // Stage 15 Phase C.4: cached cell walks. Static cells (most
+        // grid cells) hit the block-layout cache. The grid itself
+        // stays disable_cache=true; aggregation up the tree is a
+        // separate follow-on.
+        const cell_box = try element_layout.layoutAndRenderCached(
             cell.*,
             .{ cell_x, row_y },
             cell_constraints,

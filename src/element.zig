@@ -387,6 +387,21 @@ pub const ElementVTable = struct {
         lc: *LayoutCtx,
         constraints: Constraints,
     ) anyerror!BlockMetrics = null,
+    /// Optional. Called by the cache-aware layout dispatcher
+    /// (`layoutAndRenderCached`) after each walk — on cache hit
+    /// (after blit) and on cache miss (after the fresh
+    /// `layout_and_render` call). Components that participate in
+    /// suggestion-channel-driven layout (`:::box` reading drag
+    /// suggestions; future widget cousins) implement this to record
+    /// their resolved size into `LayoutCtx.layout_context.last_sizes`
+    /// so drag handlers can read their dimensions even when they
+    /// were cache-hit and therefore didn't re-add themselves to the
+    /// solver this frame. The reported `box` is in world coordinates.
+    on_layout_complete: ?*const fn (
+        ctx: *anyopaque,
+        box: Box,
+        lc: *LayoutCtx,
+    ) void = null,
     /// Cost hint for the stage-14b parallel cache-miss dispatcher.
     /// `false` (default) means a miss on this component is
     /// "expensive enough to dispatch" — a paragraph's HarfBuzz

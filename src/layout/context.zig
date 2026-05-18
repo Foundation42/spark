@@ -97,14 +97,28 @@ pub const LayoutContext = struct {
     /// calls at medium strength.
     suggestions: std.AutoHashMapUnmanaged(SuggestionKey, f64) = .{},
 
-    /// Per-pass version-bumper registrations. Cleared by
-    /// `beginPass` and re-registered by participating components on
-    /// each walk. `setSuggestion` invokes the registered bumper for
-    /// the suggestion's component key so the block-layout cache
-    /// invalidates and the next walk picks up the change. Cleared
-    /// per-pass (rather than persisting like `suggestions`) so
-    /// stale entries from deinit'd components can't be dispatched.
+    /// Persistent version-bumper registrations. `setSuggestion`
+    /// invokes the registered bumper for the suggestion's component
+    /// key so the block-layout cache invalidates and the next walk
+    /// picks up the change. Stage 15 Phase C.4 (hierarchical cache
+    /// invalidation): bumpers persist across `beginPass` so that
+    /// components which were cache-hit (and therefore didn't
+    /// re-register during the walk) still get their version bumped
+    /// when a suggestion lands. Lifecycle is now register-once on
+    /// first walk, unregister at component deinit via
+    /// `unregisterBumper`.
     bumpers: std.AutoHashMapUnmanaged(u64, VersionBumper) = .{},
+
+    /// Persistent post-layout size cache (stage 15 Phase C.4). Each
+    /// constraint-participating component writes its resolved `(w, h)`
+    /// here after every walk (cache hit or miss) via the
+    /// `ElementVTable.on_layout_complete` hook. Drag handlers read
+    /// from here when the per-pass `bounds_map` is empty — which
+    /// happens whenever the target was cache-hit and therefore
+    /// didn't re-add itself to the solver this frame. Survives
+    /// `beginPass`; cleared on explicit `clearAllSizes` or implicitly
+    /// when a component overwrites its entry.
+    last_sizes: std.AutoHashMapUnmanaged(u64, [2]f32) = .{},
 
     pub fn init(alloc: std.mem.Allocator) std.mem.Allocator.Error!LayoutContext {
         return .{
@@ -117,6 +131,7 @@ pub const LayoutContext = struct {
         self.bounds_map.deinit(self.alloc);
         self.suggestions.deinit(self.alloc);
         self.bumpers.deinit(self.alloc);
+        self.last_sizes.deinit(self.alloc);
         self.solver.deinit();
         self.* = undefined;
     }
@@ -134,11 +149,12 @@ pub const LayoutContext = struct {
     pub fn beginPass(self: *LayoutContext) void {
         self.solver.reset();
         self.bounds_map.clearRetainingCapacity();
-        // Bumpers are per-walk — drop them all so a component that
-        // disappeared between frames can't get re-dispatched.
-        // Participating components re-register during their layout
-        // pass via `registerBumper`.
-        self.bumpers.clearRetainingCapacity();
+        // Bumpers and last_sizes are persistent — they survive across
+        // beginPass. Bumpers get unregistered explicitly on component
+        // deinit; last_sizes are overwritten on each walk that records
+        // a new size. Persistence is what lets cache-hit components
+        // still respond to suggestion changes and lets drag handlers
+        // read sizes without forcing a re-walk.
     }
 
     /// Store a suggestion for `(key, axis)` at the given value.
@@ -189,15 +205,49 @@ pub const LayoutContext = struct {
     }
 
     /// Register a version bumper for `key`. Called by each
-    /// participating component during its layout pass — the
-    /// registration is cleared on the next `beginPass`. `bump` is
-    /// invoked synchronously inside `setSuggestion` /
-    /// `clearSuggestion` when the stored value for `key` actually
-    /// changes; the typical implementation bumps the component's
-    /// `version` counter so the retained layout cache treats the
-    /// next walk as a fresh miss.
+    /// participating component on first walk. `bump` is invoked
+    /// synchronously inside `setSuggestion` / `clearSuggestion` when
+    /// the stored value for `key` actually changes; the typical
+    /// implementation bumps the component's `version` counter so the
+    /// retained layout cache treats the next walk as a fresh miss.
+    ///
+    /// Persistent across `beginPass` — `put` overwrites the same key
+    /// on every re-registration, so idempotent re-calls during
+    /// subsequent walks are cheap. Components MUST call
+    /// `unregisterBumper` in their deinit so the stored function
+    /// pointer + ctx don't outlive the component.
     pub fn registerBumper(self: *LayoutContext, key: u64, bumper: VersionBumper) std.mem.Allocator.Error!void {
         try self.bumpers.put(self.alloc, key, bumper);
+    }
+
+    /// Remove a previously-registered bumper. Components call this in
+    /// their deinit so the bumper's stored ctx pointer doesn't dangle
+    /// past the component's lifetime. No-op when nothing's registered.
+    pub fn unregisterBumper(self: *LayoutContext, key: u64) void {
+        _ = self.bumpers.remove(key);
+    }
+
+    /// Record a component's resolved size for the persistent
+    /// post-layout size cache. Called from the
+    /// `ElementVTable.on_layout_complete` hook on every walk (cache
+    /// hit or miss). Drag handlers and other size-sensitive consumers
+    /// read this via `lastSize` when the per-pass `bounds_map` is
+    /// empty (which happens whenever the target was cache-hit).
+    pub fn recordSize(self: *LayoutContext, key: u64, w: f32, h: f32) std.mem.Allocator.Error!void {
+        try self.last_sizes.put(self.alloc, key, .{ w, h });
+    }
+
+    /// Read back the last-recorded size for `key`, or null when
+    /// nothing's been recorded. Cheap (one hash lookup); drag
+    /// handlers consult this in their fallback chain.
+    pub fn lastSize(self: *const LayoutContext, key: u64) ?[2]f32 {
+        return self.last_sizes.get(key);
+    }
+
+    /// Drop a component's size entry. Called by components in their
+    /// deinit so stale sizes don't linger across re-creations.
+    pub fn clearSize(self: *LayoutContext, key: u64) void {
+        _ = self.last_sizes.remove(key);
     }
 
     /// Mint (or return) the four bounds variables for an
@@ -377,7 +427,7 @@ test "suggestion: changed value fires the registered bumper" {
     try testing.expectEqual(@as(u32, 3), Counter.hits);
 }
 
-test "beginPass clears bumpers but not suggestions" {
+test "beginPass preserves bumpers + suggestions (stage 15 Phase C.4)" {
     var ctx = try LayoutContext.init(testing.allocator);
     defer ctx.deinit();
 
@@ -390,8 +440,61 @@ test "beginPass clears bumpers but not suggestions" {
 
     ctx.beginPass();
 
-    try testing.expect(!ctx.bumpers.contains(1));
+    // Both bumpers AND suggestions survive beginPass now — bumpers
+    // need to fire for cache-hit components, suggestions need to
+    // outlive frames so drags resume correctly.
+    try testing.expect(ctx.bumpers.contains(1));
     try testing.expectEqual(@as(?f64, 100.0), ctx.getSuggestion(1, .width));
+}
+
+test "unregisterBumper removes the entry" {
+    var ctx = try LayoutContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const Stub = struct {
+        fn bump(_: *anyopaque) void {}
+    };
+    var d: u8 = 0;
+    try ctx.registerBumper(5, .{ .bump = Stub.bump, .ctx = &d });
+    try testing.expect(ctx.bumpers.contains(5));
+
+    ctx.unregisterBumper(5);
+    try testing.expect(!ctx.bumpers.contains(5));
+
+    // Idempotent — unregister of a missing key is a no-op.
+    ctx.unregisterBumper(5);
+}
+
+test "recordSize / lastSize roundtrip" {
+    var ctx = try LayoutContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try testing.expect(ctx.lastSize(7) == null);
+
+    try ctx.recordSize(7, 200, 80);
+    const s = ctx.lastSize(7) orelse unreachable;
+    try testing.expectEqual(@as(f32, 200), s[0]);
+    try testing.expectEqual(@as(f32, 80), s[1]);
+
+    // Overwrite.
+    try ctx.recordSize(7, 320, 120);
+    const s2 = ctx.lastSize(7) orelse unreachable;
+    try testing.expectEqual(@as(f32, 320), s2[0]);
+
+    // clearSize removes the entry.
+    ctx.clearSize(7);
+    try testing.expect(ctx.lastSize(7) == null);
+}
+
+test "last_sizes survives beginPass" {
+    var ctx = try LayoutContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.recordSize(42, 100, 50);
+    ctx.beginPass();
+    const s = ctx.lastSize(42) orelse unreachable;
+    try testing.expectEqual(@as(f32, 100), s[0]);
+    try testing.expectEqual(@as(f32, 50), s[1]);
 }
 
 test "the box-style four-var pattern settles to anchor + size" {

@@ -165,16 +165,16 @@ fn applyAttrs(c: *Component, spec: *const components.Spec) void {
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .content_version = contentVersion,
-    // Stage 15D: flex caches its children's draws into a single
-    // block-cache entry. When a child opts into the suggestion
-    // channel (drag-driven resizing via `:::handle`), bumping the
-    // child's version doesn't invalidate THIS entry — the flex
-    // would hit cache and replay the stale baked-in child output.
-    // Disabling block-grain caching here ensures every frame
-    // re-walks the children so their layoutViaConstraints sees
-    // any new suggestion. Cost is small (flex walks a handful of
-    // children imperatively); hierarchical cache invalidation can
-    // earn this back in a future stage.
+    // Stage 15 Phase C.4 (hierarchical cache invalidation):
+    // children are now walked via `layoutAndRenderCached`, so each
+    // child caches individually — unchanged boxes blit on every
+    // frame. The flex itself stays disable_cache=true: if it
+    // cached as a whole, child version bumps wouldn't propagate
+    // into the flex's cache key without explicit aggregation. A
+    // future Phase can opt the flex into caching as a unit by
+    // XOR'ing children's content_versions into its own — the
+    // current cost (one re-walk per frame for the flex's own
+    // measure + dispatch) is small.
     .disable_cache = true,
 };
 
@@ -240,7 +240,11 @@ fn layoutAndRender(
 
         const child_max_w: f32 = if (final_widths) |fw| fw[i] else constraints.max_w;
         const child_constraints: element.Constraints = .{ .max_w = child_max_w };
-        const child_box = try element_layout.layoutAndRender(
+        // Stage 15 Phase C.4: cached child walks. Unchanged children
+        // hit the block-layout cache and blit. The flex itself still
+        // disables its outer cache (children would otherwise need
+        // version aggregation up the tree).
+        const child_box = try element_layout.layoutAndRenderCached(
             child.*,
             .{ cur_x, cur_y },
             child_constraints,

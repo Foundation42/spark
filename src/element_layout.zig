@@ -96,7 +96,14 @@ pub fn layoutAndRenderCached(
     const version = layout_cache.versionFor(elem);
 
     if (cache.lookup(key, version)) |entry| {
-        return try layout_cache.blitEntry(out, entry, origin);
+        const box = try layout_cache.blitEntry(out, entry, origin);
+        // The component's `on_layout_complete` hook needs to fire on
+        // cache hit too — `layoutAndRender` didn't run, so without
+        // this the persistent `last_sizes` cache would never see the
+        // hit's resolved size (and drag handlers reading it would
+        // miss). Mirror the call layoutAndRender makes on cache miss.
+        notifyLayoutComplete(elem, box, ctx);
+        return box;
     }
 
     // Miss: walk into the live DrawList at `origin`, then snapshot the
@@ -128,6 +135,19 @@ pub fn layoutAndRenderCached(
         box,
     );
     return box;
+}
+
+/// Dispatch the `on_layout_complete` vtable hook for a custom
+/// element. Called on cache-hit paths in `layoutAndRenderCached`
+/// AND on every cache-miss path through `layoutAndRender`'s .custom
+/// branch, so participating components get exactly one notification
+/// per walk regardless of cache outcome. No-op for built-in element
+/// kinds (only `.custom` has a vtable).
+inline fn notifyLayoutComplete(elem: element.Element, box: element.Box, ctx: *element.LayoutCtx) void {
+    switch (elem) {
+        .custom => |cu| if (cu.vtable.on_layout_complete) |hook| hook(cu.ctx, box, ctx),
+        else => {},
+    }
 }
 
 /// Lay out + render `elem` with its top-left at `origin`. Returns the
@@ -218,6 +238,11 @@ pub fn layoutAndRender(
                     .focusable = cu.vtable.focusable,
                 });
             }
+            // Notify post-layout. Symmetric with the cache-hit branch
+            // in `layoutAndRenderCached` — every custom walk fires
+            // the hook exactly once, regardless of whether the cache
+            // was consulted.
+            if (cu.vtable.on_layout_complete) |hook| hook(cu.ctx, box, ctx);
             return box;
         },
     }

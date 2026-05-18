@@ -287,8 +287,12 @@ fn startDrag(c: *Component, local: [2]f32) !void {
     // Read the target's current size. Priority order:
     //   1. A live suggestion — the user has dragged before; resume
     //      from where they left off.
-    //   2. The target's last solver-resolved size — first drag.
-    //   3. Zero — fallback if we can't read either.
+    //   2. The target's last solver-resolved size — first drag,
+    //      target re-walked this frame.
+    //   3. The persistent last_sizes cache (stage 15 Phase C.4) —
+    //      first drag, target was cache-hit so the solver doesn't
+    //      know about it. Populated by `on_layout_complete`.
+    //   4. Zero — fallback if none of the above hits.
     const initial_size: f64 = blk: {
         if (lc.getSuggestion(target_key, axis)) |s| break :blk s;
         if (lc.bounds_map.get(target_key)) |b| {
@@ -297,6 +301,13 @@ fn startDrag(c: *Component, local: [2]f32) !void {
                 .height => break :blk lc.solver.value(b.y_max) - lc.solver.value(b.y_min),
                 else => break :blk 0,
             }
+        }
+        if (lc.lastSize(target_key)) |sz| {
+            break :blk @as(f64, switch (axis) {
+                .width => sz[0],
+                .height => sz[1],
+                else => 0,
+            });
         }
         break :blk 0;
     };

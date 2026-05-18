@@ -96,6 +96,34 @@ const Component = struct {
 
 const MAGENTA: [4]f32 = .{ 1.0, 0.0, 1.0, 1.0 };
 
+// Module-global LayoutContext reference (matches the handle pattern).
+// Used in `deinit_` to unregister the component's bumper + clear its
+// last_size entry so stale `@intFromPtr` keys don't linger past
+// component destruction. Set by `install`; null when the box was
+// registered via `registry.register(...)` directly (pre-15 Phase C.4
+// callers). When null, `deinit_` just frees the component — the
+// stale-bumper window stays open for that path.
+var layout_context_ref: ?*layout_context_mod.LayoutContext = null;
+
+/// Preferred registration path for stage 15 Phase C.4 onwards.
+/// Stashes the LayoutContext so `deinit_` can clean up the bumper
+/// + last_size entry. Use instead of `registry.register("box", factory)`
+/// for hosts that wire a LayoutContext.
+pub fn install(
+    registry: *component_mod.Registry,
+    layout_context: *layout_context_mod.LayoutContext,
+) !void {
+    layout_context_ref = layout_context;
+    try registry.register("box", factory);
+}
+
+/// Test-side helper for tearing down the global reference between
+/// runs. Hosts that own a single LayoutContext for their lifetime
+/// (the typical case) don't need to call this.
+pub fn deinitGlobals() void {
+    layout_context_ref = null;
+}
+
 pub const factory: component_mod.Factory = .{
     .create = create,
     .update = update,
@@ -121,6 +149,16 @@ fn update(ctx: *anyopaque, spec: *const components.Spec) anyerror!void {
 
 fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     const c: *Component = @ptrCast(@alignCast(ctx));
+    // Clean up persistent state keyed by our pointer before we
+    // free it. If a new box gets allocated at the same address
+    // later, it'll register fresh bumper + size entries; without
+    // this, the stale entries would briefly point at freed memory
+    // until the new component overwrote them.
+    if (layout_context_ref) |lc| {
+        const key = @intFromPtr(c);
+        lc.unregisterBumper(key);
+        lc.clearSize(key);
+    }
     allocator.destroy(c);
 }
 
@@ -160,7 +198,25 @@ const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .content_version = contentVersion,
     .measure_block = measureBlock,
+    .on_layout_complete = onLayoutComplete,
 };
+
+/// Post-layout hook (stage 15 Phase C.4). Fires after every walk —
+/// cache hit OR miss — via `element_layout`. Records the box's
+/// resolved size into `LayoutContext.last_sizes` so that drag
+/// handlers reading the target's size via `lc.lastSize(key)` get a
+/// fresh value even when the box was cache-hit and therefore didn't
+/// re-add itself to the solver this frame.
+fn onLayoutComplete(ctx: *anyopaque, box: element.Box, lc: *element.LayoutCtx) void {
+    const c: *Component = @ptrCast(@alignCast(ctx));
+    if (lc.layout_context) |lctx| {
+        lctx.recordSize(@intFromPtr(c), box.w, box.h) catch {
+            // Out of memory on a size cache write isn't fatal — the
+            // drag fallback degrades gracefully (handler reads null,
+            // initial_size defaults to 0). Don't propagate.
+        };
+    }
+}
 
 /// Block-context measure (stage 15 Phase C.3). Reports the box's
 /// intrinsic size and grow weight to a constraint-aware parent
