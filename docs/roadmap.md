@@ -984,16 +984,89 @@ Inline vocabulary now: `text`, `line_break`, `emphasis`, `strong`,
 `kbd`, `progress`, `status`, `tag`. Each new component is 30-80
 lines on top of the substrate.
 
-## Next — measure-pass protocol + text exclusion + hierarchical invalidation
+## Shipped — measure-pass protocol + `:::flex` grow (stage 15 Phase C.3)
 
-The remaining stage 15 / 15E work that didn't land in session 15.
+Session 16. The constraint substrate gains a measure pass:
+`ElementVTable.measure_block` returns `BlockMetrics { width, height,
+grow }`; `element_layout.measureBlock(elem, constraints, lc)`
+dispatches the same shape as `layoutAndRender` over Element kinds
+with no DrawList side effects. Built-in kinds report sensible
+defaults (paragraph/heading claim `max_w`; container.stack_v
+recurses; spacer takes its height); `.custom` dispatches to the
+vtable slot with a scratch-DrawList fallback when none is
+implemented.
 
-- **Measure-pass protocol (Phase C.3).** Two-phase
-  measure→layout contract so flex/grid children can advertise
-  intrinsic sizes and providers can place them without guessing.
-  Sets up full constraint-aware flex (flex-grow / shrink /
-  justify=space-between) and richer grid (auto-sized rows /
-  columns).
+`:::box` implements `measure_block` and parses a new `grow=N`
+attribute. `:::flex` runs the slack-distribution algorithm for
+row-direction layouts with a finite parent width — fixed-width
+children claim their intrinsic, grow children share what's left
+proportionally. The resolved width flows through `constraints.max_w`
+to each child's `layoutAndRender`; boxes at the default `width=100%`
+resolve to the slot naturally. Same mechanism `:::grid` already used
+for `1fr` track distribution.
+
+Demo proof: `:::flex` row with `grow=1` on the middle child stretches
+to fill the window; resize plays back live. Second row demonstrates
+proportional 1:2:1 splits across three grow children.
+
+## Shipped — child caching for `:::flex` + `:::grid` (stage 15 Phase C.4)
+
+Session 16. Flex/grid children walk via `layoutAndRenderCached`
+instead of `layoutAndRender` — unchanged children blit out of the
+block-layout cache instead of running the constraint-solver
+round-trip + emit cycle every frame.
+
+Two infrastructure pieces made this drag-safe:
+
+- **`LayoutContext.last_sizes`** — persistent map (across
+  `beginPass`) keyed by component pointer, populated by the new
+  `ElementVTable.on_layout_complete` hook. The hook fires on
+  every walk — `layoutAndRenderCached` calls it after `blitEntry`
+  on hit, `layoutAndRender`'s `.custom` branch calls it on miss.
+  Drag handlers read from this map when the per-pass `bounds_map`
+  is empty (which happens whenever the target was cache-hit and
+  didn't re-add itself to the solver).
+- **Bumper persistence.** Bumpers no longer clear on `beginPass`
+  — they're a static fact about the component, not per-frame
+  state, and cache-hit components don't get a chance to re-register
+  them mid-walk. `:::box.install(registry, layout_context)` now
+  stashes the layout context so `deinit_` can call
+  `unregisterBumper(key)` + `clearSize(key)` when the component is
+  destroyed, keeping the persistent maps from holding pointers
+  into freed memory.
+
+`handle.startDrag` gains a third fallback in its size-lookup chain:
+`suggestion → bounds_map → last_sizes → 0`.
+
+## Shipped — hierarchical cache invalidation (stage 15 Phase C.5)
+
+Session 16, completing Phase C. Flex/grid now cache as a whole —
+`disable_cache=true` comes off both. Their `content_version` is
+their own version XOR'd with each child's
+`versionFor(child) ^ elementIdentity(child)`; the identity-mixing
+dodges the A XOR A = 0 trap where two siblings with the same
+version would otherwise cancel each other.
+
+Recursion is implicit. Each container aggregates its immediate
+children; nested containers already encapsulate their descendants
+in their own `content_version`. A `:::box` inside a `:::grid` inside
+a `:::flex` rolls bumps all the way up: box's bump → grid's
+aggregated version changes → flex's aggregated version changes →
+flex cache invalidates.
+
+`layout_cache.aggregateChildVersions(children)` is the shared
+helper. The combined approach (parent-cached AND children-cached
+via Phase C.4) stores both the container's full output and each
+child's output — ~2x cache memory for those elements. Idle
+dashboards blit one entry per flex/grid; single-cell mutations
+re-walk just the affected cell while siblings hit their per-block
+caches.
+
+## Next — text exclusion, more components, GPU channels
+
+The remaining session-15 / session-16 spillover, plus the deeper
+graphics integration.
+
 - **Text exclusion / shape-outside (original Phase E).**
   `:::image {flow=around}` — markdown wraps around an SVG / raster
   figure via an `ExclusionShape` layered over the settled solver
@@ -1001,17 +1074,21 @@ The remaining stage 15 / 15E work that didn't land in session 15.
   decisions consult the exclusion shapes. Magazine-grade layout
   from a markdown file. **Different from inline_object** (which
   flows components *with* text runs); this routes text *around*
-  block-level visuals.
-- **Hierarchical cache invalidation.** Pay back the techdebt from
-  disabling flex/grid block-cache during stage 15D. Parent
-  containers' content_version should aggregate children's so a
-  child bump propagates up. Restores cache hit-rate on the
-  drag-to-resize path.
+  block-level visuals. The substrate's natural next sitting —
+  intrusion + exclusion is the visually-completing pair.
+- **More inline components.** The substrate makes them cheap
+  (~50 LOC each). Candidates that came up: `::spinner`, `::link`
+  (semantic, hover-able), `::math`, `::code` (different from
+  monospace span — actual chrome).
 - **Compute-shader → suggestion channel.** The GPU-readback
   variant of Phase D that the original roadmap framed. Mouse input
   was the load-bearing demo case; compute-shader feedback (fluid
   sim warps the document) is the next frontier when a real demo
   needs it.
+- **Cache eviction policy.** Phase C.5 doubles cache footprint for
+  flex/grid (parent + children both cached). Orphaned entries from
+  re-parses already accumulate slowly. LRU or TTL eviction is
+  overdue generally; lands when memory pressure surfaces.
 
 Full design position in [`layout.md`](layout.md).
 
