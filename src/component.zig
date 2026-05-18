@@ -242,15 +242,37 @@ pub const Registry = struct {
 
     /// Drop all factories + destroy all cached instances. Host
     /// calls this at shutdown.
+    ///
+    /// Iteration discipline: an embedded-document component's
+    /// `deinit_` calls `self.deinitScope(c.scope)` which mutates
+    /// `self.instances` via `fetchRemove`. Iterating the map and
+    /// invoking `deinit_` in the same pass would corrupt the
+    /// iterator (Debug catches the mutation panic; ReleaseFast just
+    /// loses entries and crashes later). Collect every key up-front,
+    /// then walk the collected list and `fetchRemove` each entry
+    /// before invoking its `deinit_` — same two-phase pattern
+    /// `deinitScope` itself uses.
     pub fn deinit(self: *Registry) void {
+        // Phase 1: snapshot every live instance key (duped so the
+        // map's storage is safe to free).
+        var keys = std.ArrayList([]const u8).init(self.allocator);
+        defer keys.deinit();
         var it = self.instances.iterator();
         while (it.next()) |entry| {
-            const e = entry.value_ptr.*;
-            if (e.binding) |b| b.destroy();
-            if (self.factories.get(e.factory_name)) |f| {
-                if (f.deinit) |d| d(e.instance.ctx, self.allocator);
+            keys.append(entry.key_ptr.*) catch continue;
+        }
+
+        // Phase 2: for each key, fetchRemove + destroy. Embedded
+        // documents' `deinit_` may call `deinitScope` which removes
+        // *more* keys; an already-removed key just returns null
+        // here, harmless.
+        for (keys.items) |key| {
+            const entry = self.instances.fetchRemove(key) orelse continue;
+            if (entry.value.binding) |b| b.destroy();
+            if (self.factories.get(entry.value.factory_name)) |f| {
+                if (f.deinit) |d| d(entry.value.instance.ctx, self.allocator);
             }
-            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.key);
         }
         self.instances.deinit(self.allocator);
 

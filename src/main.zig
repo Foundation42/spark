@@ -1,87 +1,44 @@
-//! text_engine_demo — host-side scaffolding for the spark library.
+//! text_engine_demo — host-side scaffolding for the spark library
+//! after the Phase 3 library-ification flip.
 //!
-//! Owns the GLFW window, the Vulkan instance/device/swapchain, font
-//! loading from env vars, persistent state path resolution, the
-//! IoChannel, the asset cache, and the per-frame loop. Constructs a
-//! `Spark` engine context from these (see `spark.zig`) and routes
-//! every component install through it. By design this file does not
-//! reach into `element_layout`, `markdown`, etc. directly — Phase 3
-//! of the library-ification spec tightens that to `@import("spark")`
-//! only.
+//! Imports `@import("text_engine")` only for everything the library
+//! owns: Spark, Document, FrameInfo, Theme, Element, State, registry,
+//! per-frame methods, input dispatch. The host still owns the
+//! cooperative-embed surface: GLFW window, Vulkan instance/device/
+//! swapchain, the per-frame Renderer (cmd buffer + acquire/submit/
+//! present), font building from env vars, persistent state path
+//! resolution, demo HTTP server, the timer-driven update + chart
+//! feed, scroll-tween + zoom policy.
 //!
 //! Pass a markdown path as `argv[1]` to load that document; otherwise
-//! the embedded `demo.md` runs as before. `src/hello.md` is the
-//! canonical FPS canary baseline (see docs/library-spec.md).
+//! the embedded `demo.md` runs. `--core-only` skips DotEnv + AssetCache
+//! + every extras factory so the demo runs on just the core component
+//! set (proves the boundary). `src/hello.md` is the FPS canary
+//! baseline; see `docs/library-spec.md`.
 
 const std = @import("std");
 const text_engine = @import("text_engine");
-const win = @import("window.zig");
-const vk = @import("gpu/vk.zig");
-const swap = @import("gpu/swapchain.zig");
-const renderer = @import("gpu/renderer.zig");
-const atlas_mod = @import("gpu/atlas.zig");
-const tp = @import("gpu/text_pipeline.zig");
-const qp = @import("gpu/quad_pipeline.zig");
-const tri_pipeline_mod = @import("gpu/tri_pipeline.zig");
-const image_pipeline_mod = @import("gpu/image_pipeline.zig");
-const face_mod = @import("font/face.zig");
-const registry_mod = @import("font/registry.zig");
-const glyph_cache_mod = @import("text/glyph_cache.zig");
-const element = @import("element.zig");
-const element_layout = @import("element_layout.zig");
-const layout_cache_mod = @import("layout_cache.zig");
-const spark_mod = @import("spark.zig");
-const layout_context_mod = @import("layout/context.zig");
-const markdown = @import("markdown.zig");
-const ansi = @import("ansi.zig");
-const component = @import("component.zig");
-const ago_component = @import("components/ago.zig");
-const badge_component = @import("components/badge.zig");
-const box_component = @import("components/box.zig");
-const commit_component = @import("components/commit.zig");
-const diff_component = @import("components/diff.zig");
-const dot_component = @import("components/dot.zig");
-const flex_component = @import("components/flex.zig");
-const gh_ref_component = @import("components/gh_ref.zig");
-const grid_component = @import("components/grid.zig");
-const handle_component = @import("components/handle.zig");
-const kbd_component = @import("components/kbd.zig");
-const progress_component = @import("components/progress.zig");
-const button_component = @import("components/button.zig");
-const chart_component = @import("components/chart.zig");
-const embedded_document_component = @import("components/embedded_document.zig");
-const input_component = @import("components/input.zig");
-const llm_stream_component = @import("extras/llm_stream.zig");
-const embedded_document_http_extras = @import("extras/embedded_document_http.zig");
-const price_component = @import("components/price.zig");
-const rating_component = @import("components/rating.zig");
-const slider_component = @import("components/slider.zig");
-const sparkline_component = @import("components/sparkline.zig");
-const status_component = @import("components/status.zig");
-const svg_component = @import("components/svg.zig");
-const tag_component = @import("components/tag.zig");
-const trend_component = @import("components/trend.zig");
-const svg_stream_component = @import("extras/svg_stream.zig");
-const image_stream_component = @import("extras/image_stream.zig");
-const state_mod = @import("state.zig");
-const update = @import("update.zig");
-const demo_server_mod = @import("demo_server.zig");
-const jobs_mod = @import("jobs.zig");
-const io_channel_mod = @import("io_channel.zig");
-const dotenv_mod = @import("extras/dotenv.zig");
-const asset_cache_mod = @import("extras/asset_cache.zig");
-const svg_mod = @import("svg.zig");
-const svg_tess = @import("svg_tessellate.zig");
 
-/// Demo document — parsed by the vendored cmark + mapper into an
-/// Element tree at startup. Same render path as the hand-built
-/// torture trees of earlier stages; only the construction changed.
+// Host-only modules. Vulkan + GLFW + the demo's per-frame Renderer
+// and the test HTTP server stay outside spark — the spec calls these
+// out as host responsibilities in §"Cooperative Vulkan handshake".
+// Pulled in via the text_engine namespace so Zig doesn't see the
+// same source files rooted in two modules at once.
+const win = text_engine.window;
+const vk = text_engine.vk;
+const swap = text_engine.swapchain;
+const renderer = text_engine.renderer;
+const demo_server_mod = @import("demo_server.zig");
+
+/// Embedded fallback markdown. Used when no `argv[1]` doc path is
+/// passed. `src/hello.md` is the FPS canary baseline; pass it
+/// explicitly for stable measurements.
 const demo_md = @embedFile("demo.md");
 
-/// Small ANSI fixture rendered by `src/ansi.zig` after the markdown.
-/// The `\x1b` escapes resolve at compile time to real ESC bytes
-/// (0x1B), so the parser sees authentic terminal output. Exercises
-/// 8-colour, 256-colour, truecolor, bold + italic, multi-line.
+/// Small ANSI fixture rendered alongside the markdown via the
+/// library's `text_engine.ansi.parse`. The `\x1b` escapes resolve at
+/// compile time to real ESC bytes so the parser sees authentic
+/// terminal output.
 const ansi_demo =
     "\x1b[1;31m\xE2\x97\x8F\x1b[0m bold red    " ++
     "\x1b[1;32m\xE2\x97\x8F\x1b[0m bold green    " ++
@@ -91,638 +48,217 @@ const ansi_demo =
     "\x1b[38;2;255;127;80mtrue: coral\x1b[0m  " ++
     "\x1b[3mitalic\x1b[0m\n";
 
-// Mono atlas bumped 768 → 2048 once crisp-zoom landed: each visited
-// zoom bucket adds a fresh rasterisation of every visible glyph, so
-// the steady-state working set scales with `(# distinct zooms × #
-// distinct fonts)`. 768² fit ≈ 4 zoom levels before AtlasFull tripped
-// `runLayout`; 2048² (4 MB R8 — trivial on any modern GPU) holds ≈ 30
-// zoom levels worth, comfortable for any plausible session. Eviction
-// of cold buckets is the long-term answer — captured as a future task.
-const ATLAS_MONO_SIZE: u32 = 2048;
-const ATLAS_COLOR_SIZE: u32 = 1024;
-// Stage 11 bumped MAX_GLYPHS from 2048 → 8192. The original
-// session-1 ceiling was sized for the SDF + ANSI fixtures; once
-// docs started embedding other docs (and the chart's column-strip
-// chrome started co-existing with multi-paragraph prose) we tripped
-// the cap, writeGlyphs silently failed, and drawCb early-returned
-// every frame — visible as a black window. 8192 is comfortable
-// headroom; bump again if/when doc density justifies.
-//
-// Stage 15 bumped → 16384: the manifesto-density demo + stage-15
-// inline badges + stage-15D drag-to-resize section pushed past
-// 8192; the next density jump (15E.3 sparkline / icon, future
-// embedded docs) gets headroom too.
-const MAX_GLYPHS: u32 = 16384;
-const MAX_QUADS: u32 = 2048;
-// Stage 13d.1 caps. Petunias.svg flattens to ~5–10k triangles
-// (verts + indices each ≈3× tri count for triangle lists).
-// 65k / 196k is comfortable headroom for a few SVGs co-existing on
-// screen; bump when document density justifies.
-const MAX_TRI_VERTICES: u32 = 65536;
-const MAX_TRI_INDICES: u32 = 196608;
-/// Stage 14c — cap on concurrent `:::image-stream` components. Each
-/// owns one descriptor slot from the ImagePipeline's pool. Bump if
-/// the demo grows past this; the cost per slot is one VkDescriptorSet
-/// (~16 bytes of GPU state + tracking).
-const MAX_IMAGES: u32 = 32;
+/// Per-host frame context. Holds scroll/zoom tween bookkeeping, the
+/// shared State, and pointers to Spark + the two Documents. The
+/// renderer's `draw_fn` receives this through its `*anyopaque` slot.
+const HostCtx = struct {
+    spark: *text_engine.Spark,
+    state: *text_engine.State,
+    top_doc: *text_engine.Document,
+    ansi_doc: *text_engine.Document,
 
-/// Per-frame context owned by main(), borrowed by `drawCb` through
-/// the renderer's `*anyopaque` slot. Carries everything `drawCb`
-/// needs to detect viewport changes and re-run the layout pass.
-///
-/// **Resize policy.** Layout is event-driven, not per-frame: we
-/// cache `last_extent`, and `drawCb` only re-runs the layout pass
-/// when the swapchain's current extent differs. Steady-state at a
-/// fixed window size is just upload glyphs + record draw — no HB
-/// reshaping, no atlas lookups, no token tree rebuild.
-///
-/// **Parse tree lifetime.** `top_stack` / `ansi_tree` are constructed
-/// once at startup and stay valid for the lifetime of the frame loop.
-/// The slices they reference live in `doc_arena` which the host's
-/// main() owns. layoutAndRender reads them each layout pass without
-/// mutating.
-///
-/// **Per-glyph `.attention` plumbing — preserved, not driven.** The
-/// `Style.attention` field, its journey through the inline-flow walker
-/// onto each `Glyph.attention` SSBO slot, and the text shader's
-/// rainbow-on-attention path all still exist. Earlier versions
-/// hard-coded an SDF "ATTENTION" paragraph here in `main.zig` that
-/// pulsed a rainbow wave each frame as a demo of the substrate. That
-/// demo is gone — the substrate stays, ready to be driven by an
-/// LM-side `attention=` stream (semantic heatmap colouring, predictive
-/// completion glow, etc.) once the LM-overlay layer lands. To bring
-/// the visual back for testing: load an SDF font, build a one-line
-/// `paragraph` with `Style.attention=N`, lay it out into a slice of
-/// the DrawList, and mutate `glyph.attention` per frame in `drawCb`.
-const FrameCtx = struct {
-    // GPU
-    text_pipeline: *tp.TextPipeline,
-    quad_pipeline: *qp.QuadPipeline,
-    tri_pipeline: *tri_pipeline_mod.TrianglePipeline,
-    image_pipeline: *image_pipeline_mod.ImagePipeline,
-
-    // Layout prerequisites (borrowed from main)
-    allocator: std.mem.Allocator,
-    fonts: *registry_mod.FontRegistry,
-    cache: *glyph_cache_mod.GlyphCache,
-    mono_atlas: *atlas_mod.Atlas,
-    color_atlas: *atlas_mod.Atlas,
-    theme: *const element.Theme,
-    ansi_theme: *const element.Theme,
-
-    // Parse trees (constructed once at startup)
-    top_stack: element.Element,
-    ansi_tree: element.Element,
-
-    // Mutable scratch — `dl` accumulates this layout pass's draw work
-    dl: *element.DrawList,
-
-    // Stage 14a — retained per-block layout cache. Owned by main;
-    // cleared on theme swap / full re-parse (neither happens in the
-    // current demo after startup). The walker consults this through
-    // `LayoutCtx.cache_blocks` for every cacheable child of a stack_v
-    // container — hits blit cached glyph/quad/tri/hit ranges with an
-    // origin offset, misses fall through to a full walk and snapshot
-    // the result back into the cache.
-    block_cache: *layout_cache_mod.BlockCache,
-
-    // Stage 14b — parallel cache-miss layout dispatch. JobSystem
-    // fan-out plus a single mutex around the glyph cache + atlas
-    // staging. Workers walk independent cache-miss blocks at origin
-    // (0,0) into private DrawLists; main thread merges in order.
-    job_system: *jobs_mod.JobSystem,
-    glyph_cache_lock: *std.Thread.Mutex,
-
-    // Stage 15 Phase B — constraint layout. Owned by main; reset at
-    // the top of every runLayout. Components that participate in
-    // constraint-based layout (currently :::box only) read this via
-    // LayoutCtx.layout_context and mint variables / add constraints
-    // against the embedded kiwi solver.
-    layout_context: *layout_context_mod.LayoutContext,
-
-    // Cached viewport for resize detection. Starts at {0,0} so the
-    // first `drawCb` call sees a mismatch and triggers the initial
-    // layout, unifying init and resize paths.
-    last_extent: vk.c.VkExtent2D = .{ .width = 0, .height = 0 },
-
-    // Wall-clock baseline for any host-side animation. Kept around
-    // because a few stdout prints still reference it; the SDF
-    // ATTENTION wave that used to drive per-glyph .attention from
-    // here was removed (see docstring above).
-    start_ms: i64,
-
-    // 7e: reactive state. The host owns it across the program
-    // lifetime (extracted from demo.md's frontmatter at startup).
-    // Mutations propagate through the registry's subscribers to
-    // the cached component instances; the `dirty` flag triggers
-    // re-layout.
-    state: *state_mod.State,
-
-    // 7f: input. Polled once per frame to detect button / position
-    // transitions. `captured` holds the hit the most recent
-    // mouse_down landed on — subsequent mouse_move + mouse_up go to
-    // the same target regardless of containment (standard
-    // pointer-capture pattern; otherwise drags break the moment the
-    // cursor exits the thumb's box).
-    mouse_x: f32 = 0,
-    mouse_y: f32 = 0,
-    mouse_down: bool = false,
-    captured: ?element.Hit = null,
-
-    // Stage 13c — keyboard focus. Set when a mouse_down lands on a
-    // hit whose `focusable=true`; cleared on click-outside or Esc.
-    // While non-null, GLFW key + char callbacks route here instead
-    // of the scroll/zoom nav handler. Compared by `ctx` pointer
-    // identity across re-layouts (component instances persist).
-    focused: ?element.Hit = null,
-
-    // Stage 11 lesson: SSBO overflow used to swallow itself via the
-    // `catch return` in drawCb / runLayout, turning a 2048-glyph
-    // ceiling into a silent black-screen. These flags log the first
-    // failure of each kind to stderr so the next overflow can't
-    // hide. A real surface (on-screen banner, telemetry) is the
-    // proper long-term fix — TODO captured at the SSBO-emit sites.
-    glyph_overflow_logged: bool = false,
-    quad_overflow_logged: bool = false,
-    tri_overflow_logged: bool = false,
-
-    // Scroll + zoom (stage post-11, ad-hoc — the demo's full doc
-    // height now exceeds typical viewport once embedded docs are
-    // in). Plain scroll wheel → scroll_y; Ctrl+scroll → zoom.
-    // Applied as a post-layout transform on DrawList glyphs + quads
-    // (one O(N) pass per re-layout). World-space layout stays
-    // unchanged; mouse coords un-transform for hit-test.
-    //
-    // Trade-off: pre-rasterized text becomes fuzzy at non-1.0 zoom
-    // because we stretch bitmap glyphs. SDF text (ATTENTION) stays
-    // crisp. Documented as v0 limitation — proper crisp-zoom is a
-    // multi-size atlas + re-layout-on-zoom rebuild.
-    /// Rendered scroll position — what the transform pass uses.
-    /// Eased toward `target_scroll_y` each frame so wheel input
-    /// floats to its destination instead of snapping.
+    // Scroll + zoom policy lives on the host. spark.frame_info takes
+    // a scroll_offset + zoom each beginFrame; host computes them.
     scroll_y: f32 = 0,
-    /// Destination the scroll callback writes to. The tween in
-    /// drawCb closes the gap toward it.
     target_scroll_y: f32 = 0,
     zoom: f32 = 1.0,
     max_scroll_y: f32 = 0,
-    /// Wall-clock of the previous drawCb invocation, for time-
-    /// based tween easing.
     last_frame_ms: i64 = 0,
+    last_extent: vk.c.VkExtent2D = .{ .width = 0, .height = 0 },
 
-    /// Re-run the layout pass for the current viewport. Clears the
-    /// DrawList, lays out all three sub-trees at the new `max_w`,
-    /// uploads the quads (static for the lifetime of a layout —
-    /// they don't animate so we only push them when the layout
-    /// changes), and caches the new pulse range.
-    fn runLayout(self: *FrameCtx, extent: vk.c.VkExtent2D) !void {
-        self.dl.clearRetainingCapacity();
-
-        // Crisp-zoom prewarm. Worker threads can't safely grow the
-        // FontRegistry (ArrayList realloc + HashMap put + shared
-        // FT_Library use all race against other workers' reads). One
-        // main-thread pass eagerly creates whatever effective entries
-        // the upcoming layout will need at this zoom; workers then
-        // only do read-only lookups against a frozen entries array.
-        try self.fonts.prewarmEffectiveSizesForZoom(self.zoom);
-
-        // Phase B: each layout pass starts with a fresh constraint
-        // solver. Components mint their variables and add their
-        // constraints during the walk; the solver settles per
-        // addConstraint.
-        self.layout_context.beginPass();
-
-        var lc = element.LayoutCtx{
-            .allocator = self.allocator,
-            .fonts = self.fonts,
-            .cache = self.cache,
-            .mono_atlas = self.mono_atlas,
-            .color_atlas = self.color_atlas,
-            .theme = self.theme,
-            // Top-level walks stamp the host state onto every Hit
-            // they emit. Embedded-doc layoutAndRender save+swap+
-            // restores around its child subtree.
-            .state = @ptrCast(self.state),
-            .cache_blocks = self.block_cache,
-            .job_system = self.job_system,
-            .glyph_cache_lock = self.glyph_cache_lock,
-            // Crisp-zoom: rasterise glyphs at zoom-scaled sizes so the
-            // post-layout `× zoom` multiply samples each bitmap at 1:1.
-            .zoom = self.zoom,
-            // Phase B: constraint solver, reset above. Components
-            // that opt in (currently `:::box`) read positions from
-            // here after declaring constraints.
-            .layout_context = self.layout_context,
-        };
-        var ansi_lc = lc;
-        ansi_lc.theme = self.ansi_theme;
-
-        // 40px gutter on each side (in WORLD coords — gutters scale
-        // with zoom alongside everything else, like a browser does);
-        // clamp to a sane minimum so an accidentally-zero-width
-        // extent (minimised window) doesn't wrap every word to its
-        // own line forever. The viewport itself is divided by zoom
-        // because layout runs in world coords and the post-pass
-        // `× zoom` then takes world → screen — so at zoom=2 the
-        // available world width is half the screen extent, and at
-        // zoom=0.5 it's double.
-        const w: f32 = @floatFromInt(extent.width);
-        const viewport_world_w: f32 = w / self.zoom;
-        const max_w: f32 = @max(viewport_world_w - 80.0, 200.0);
-        const c: element.Constraints = .{ .max_w = max_w };
-
-        // Layout in WORLD coordinates — no scroll/zoom applied here.
-        // The transform pass at the bottom of this function maps
-        // world → screen.
-        const top_box = try element_layout.layoutAndRenderCached(self.top_stack, .{ 40, 40 }, c, &lc, self.dl);
-        const ansi_box = try element_layout.layoutAndRenderCached(self.ansi_tree, .{ 40, top_box.y + top_box.h + 8 }, c, &ansi_lc, self.dl);
-
-        // Recompute max scrollable distance from world content height
-        // vs world-space viewport height (`viewport_h / zoom` because
-        // the transform scales positions). Clamp current scroll if
-        // it now exceeds the new max (e.g. content shortened).
-        const content_bottom_world = ansi_box.y + ansi_box.h;
-        const viewport_h_world: f32 = @as(f32, @floatFromInt(extent.height)) / self.zoom;
-        const bottom_margin: f32 = 40;
-        self.max_scroll_y = @max(@as(f32, 0), content_bottom_world + bottom_margin - viewport_h_world);
-        if (self.scroll_y > self.max_scroll_y) self.scroll_y = self.max_scroll_y;
-        if (self.scroll_y < 0) self.scroll_y = 0;
-
-        // World → screen transform on DrawList. screen = (world - scroll) * zoom.
-        // Single O(N) pass per layout — chart at 60Hz survives this comfortably.
-        const sy = self.scroll_y;
-        const z = self.zoom;
-        for (self.dl.glyphs.items) |*g| {
-            g.dst_pos[1] -= sy;
-            g.dst_pos[0] *= z;
-            g.dst_pos[1] *= z;
-            g.dst_size[0] *= z;
-            g.dst_size[1] *= z;
-        }
-        for (self.dl.quads.items) |*q| {
-            q.dst_pos[1] -= sy;
-            q.dst_pos[0] *= z;
-            q.dst_pos[1] *= z;
-            q.dst_size[0] *= z;
-            q.dst_size[1] *= z;
-            q.radius *= z;
-        }
-        // Same transform on triangle vertices — they live in world
-        // space alongside quads + glyphs, and the tri shader expects
-        // screen-space pixels just like the others.
-        for (self.dl.tris.items) |*v| {
-            v.pos[1] -= sy;
-            v.pos[0] *= z;
-            v.pos[1] *= z;
-        }
-        // Same transform on image draws — dst_pos/dst_size land at
-        // the image pipeline as push constants in display pixels, so
-        // we apply the scroll/zoom here for symmetry with quads.
-        for (self.dl.images.items) |*im| {
-            im.dst_pos[1] -= sy;
-            im.dst_pos[0] *= z;
-            im.dst_pos[1] *= z;
-            im.dst_size[0] *= z;
-            im.dst_size[1] *= z;
-        }
-
-        // Quads stay frozen between layouts (no animation on them);
-        // upload once per layout instead of per frame.
-        // TODO: surface SSBO overflow visibly — currently logged
-        // once to stderr (in drawCb's writeGlyphs path) and silently
-        // dropped here. A proper surface (overlay banner, telemetry)
-        // beats hunting "why is the screen black".
-        self.quad_pipeline.writeQuads(self.dl.quads.items) catch |err| {
-            if (!self.quad_overflow_logged) {
-                std.debug.print(
-                    "WARN: quad write failed ({s}) — {d} quads (cap {d}). Bump MAX_QUADS or split passes. Logging suppressed for further frames.\n",
-                    .{ @errorName(err), self.dl.quads.items.len, MAX_QUADS },
-                );
-                self.quad_overflow_logged = true;
-            }
-            return err;
-        };
-
-        // Stage 13d.1 — upload triangle mesh once per layout.
-        // SVGs are static post-tessellation, so per-layout upload
-        // is appropriate; if streamed re-tessellation lands (13d.3)
-        // we'll reconsider.
-        self.tri_pipeline.writeMesh(self.dl.tris.items, self.dl.tri_indices.items) catch |err| {
-            if (!self.tri_overflow_logged) {
-                std.debug.print(
-                    "WARN: triangle write failed ({s}) — {d} verts / {d} indices (cap {d}/{d}). Bump MAX_TRI_*. Logging suppressed for further frames.\n",
-                    .{ @errorName(err), self.dl.tris.items.len, self.dl.tri_indices.items.len, MAX_TRI_VERTICES, MAX_TRI_INDICES },
-                );
-                self.tri_overflow_logged = true;
-            }
-            return err;
-        };
-    }
+    start_ms: i64 = 0,
+    overflow_logged: bool = false,
 };
 
+/// Renderer draw_fn. Called per frame WITH the active cmd buffer
+/// already inside `vkCmdBeginRendering` (the renderer.zig wraps with
+/// loadOp=CLEAR + the demo's clear colour). Spark records draws into
+/// the open scope via `endFrame`.
 fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) void {
-    const fc: *FrameCtx = @ptrCast(@alignCast(ctx.?));
+    const h: *HostCtx = @ptrCast(@alignCast(ctx.?));
 
     // ── Scroll tween ───────────────────────────────────────────────
-    // Ease `scroll_y` toward `target_scroll_y` so wheel input floats
-    // instead of snapping. Frame-rate-independent (uses wall-clock
-    // dt). While the gap is open, mark state dirty so runLayout
-    // re-applies the transform with the new offset; snap + stop
-    // dirtying once within sub-pixel range.
     const now_ms = std.time.milliTimestamp();
-    if (fc.last_frame_ms == 0) fc.last_frame_ms = now_ms;
-    const dt_ms: f32 = @floatFromInt(@max(now_ms - fc.last_frame_ms, 0));
-    fc.last_frame_ms = now_ms;
-    if (@abs(fc.target_scroll_y - fc.scroll_y) > 0.25) {
-        // tau = 60ms — about 100ms to converge visually. Decay
-        // formula: alpha = 1 - exp(-dt/tau). Clamp dt at one frame
-        // worth of decay so a hitched frame doesn't overshoot the
-        // visual budget.
+    if (h.last_frame_ms == 0) h.last_frame_ms = now_ms;
+    const dt_ms: f32 = @floatFromInt(@max(now_ms - h.last_frame_ms, 0));
+    h.last_frame_ms = now_ms;
+    if (@abs(h.target_scroll_y - h.scroll_y) > 0.25) {
         const tau_ms: f32 = 60.0;
         const clamped_dt = @min(dt_ms, 50.0);
         const alpha = 1.0 - std.math.exp(-clamped_dt / tau_ms);
-        fc.scroll_y += (fc.target_scroll_y - fc.scroll_y) * alpha;
-        fc.state.dirty = true;
-    } else if (fc.scroll_y != fc.target_scroll_y) {
-        fc.scroll_y = fc.target_scroll_y;
-        fc.state.dirty = true;
+        h.scroll_y += (h.target_scroll_y - h.scroll_y) * alpha;
+        h.state.dirty = true;
+    } else if (h.scroll_y != h.target_scroll_y) {
+        h.scroll_y = h.target_scroll_y;
+        h.state.dirty = true;
     }
 
-    // ── Event-driven relayout ──────────────────────────────────────
-    // Two triggers: viewport changed (resize), or state mutated
-    // (input-driven via the slider component, stage 7f, or by the
-    // scroll tween above). First call's last_extent={0,0}
-    // guarantees an initial layout before the first draw.
-    const extent_changed = extent.width != fc.last_extent.width or extent.height != fc.last_extent.height;
-    if (extent_changed or fc.state.dirty) {
-        fc.runLayout(extent) catch |err| switch (err) {
-            error.AtlasFull => {
-                // Coarse LRU: drop every cached glyph + reset both
-                // atlases + clear the block-layout cache (its cached
-                // GlyphInstance UVs point into the now-stale atlas
-                // rects). Next layout re-rasterises only what the
-                // current viewport actually needs — the working set
-                // shrinks back to "visible glyphs at the current
-                // zoom" instead of "every glyph at every zoom bucket
-                // ever visited this session". One retry, then give up
-                // gracefully if the single frame really doesn't fit.
-                std.debug.print("INFO: AtlasFull at zoom={d:.3} — resetting glyph caches and retrying\n", .{fc.zoom});
-                fc.cache.clear();
-                fc.mono_atlas.reset() catch return;
-                fc.color_atlas.reset() catch return;
-                fc.block_cache.clear();
-                fc.runLayout(extent) catch {
-                    std.debug.print("WARN: runLayout still failing after atlas reset — dropping frame\n", .{});
-                    return;
-                };
-            },
-            else => {
-                if (!fc.glyph_overflow_logged) {
-                    std.debug.print("WARN: runLayout failed ({s}) at zoom={d:.3}, extent={d}x{d}\n", .{ @errorName(err), fc.zoom, extent.width, extent.height });
-                    fc.glyph_overflow_logged = true;
-                }
-                return;
-            },
-        };
-        fc.last_extent = extent;
-        fc.state.clearDirty();
-    }
+    // ── Event-driven re-layout ─────────────────────────────────────
+    // Skip the walk when nothing changed — block_cache hits do most
+    // of the work but the prewarm + solver-reset + transform pass
+    // are still per-frame fixed costs we'd rather not pay 13 K
+    // times a second. Triggers: viewport resize, state mutation
+    // (slider drag, scroll tween, chart append, color cycle), or
+    // first frame (last_extent={0,0} forces an initial layout).
+    const extent_changed = extent.width != h.last_extent.width or extent.height != h.last_extent.height;
+    const re_layout = extent_changed or h.state.dirty;
+    h.last_extent = extent;
 
-    // Per-glyph `.attention` is no longer driven from main(). The
-    // previous SDF-"ATTENTION" rainbow wave (read `start_ms` + `sin`
-    // + hsv→rgb per glyph each frame) lived here; it has been removed
-    // pending an LM-side driver. The plumbing (Style.attention →
-    // Glyph.attention SSBO → fragment shader rainbow) is still wired,
-    // so re-introducing per-glyph animation is a matter of mutating
-    // `fc.dl.glyphs.items[i].attention` and `.hot_color` from
-    // wherever the next driver lives. See the FrameCtx docstring.
-
-    // TODO: surface SSBO overflow visibly — currently logged once
-    // to stderr and silently dropped. A proper surface (overlay
-    // banner, telemetry) beats hunting "why is the screen black"
-    // again. See stage-11 journey writeup.
-    fc.text_pipeline.writeGlyphs(fc.dl.glyphs.items) catch |err| {
-        if (!fc.glyph_overflow_logged) {
-            std.debug.print(
-                "WARN: glyph write failed ({s}) — {d} glyphs (cap {d}). Bump MAX_GLYPHS. Logging suppressed for further frames.\n",
-                .{ @errorName(err), fc.dl.glyphs.items.len, MAX_GLYPHS },
-            );
-            fc.glyph_overflow_logged = true;
+    h.spark.attachCmd(cmd, 0, 0);
+    h.spark.beginFrame(
+        .{ .extent = extent, .zoom = h.zoom, .scroll_offset = .{ 0, h.scroll_y } },
+        .{ .reset = re_layout },
+    ) catch |err| {
+        if (!h.overflow_logged) {
+            std.debug.print("WARN: beginFrame failed: {s}\n", .{@errorName(err)});
+            h.overflow_logged = true;
         }
         return;
     };
 
-    // ── Record draws — quads first, glyphs on top ──────────────────
-    // Triangles → images → quads → text. SVG fills + raster images
-    // sit under quad chrome (panels, underlines) and below glyphs so
-    // the document chrome reads on top of generated visuals.
-    fc.tri_pipeline.recordDraw(cmd, extent, @intCast(fc.dl.tri_indices.items.len));
-    if (fc.dl.images.items.len > 0) {
-        fc.image_pipeline.bind(cmd, extent);
-        for (fc.dl.images.items) |im| {
-            fc.image_pipeline.recordOne(cmd, extent, @ptrCast(@alignCast(im.descriptor_set)), im.dst_pos, im.dst_size);
-        }
+    if (re_layout) {
+        const w: f32 = @floatFromInt(extent.width);
+        const viewport_world_w: f32 = w / h.zoom;
+        const max_w: f32 = @max(viewport_world_w - 80.0, 200.0);
+        const constraints: text_engine.Constraints = .{ .max_w = max_w };
+
+        const top_box = h.spark.layoutAndRender(h.top_doc, .{ 40, 40 }, constraints) catch |err| switch (err) {
+            error.AtlasFull => {
+                std.debug.print("INFO: AtlasFull at zoom={d:.3} — resetting caches\n", .{h.zoom});
+                h.spark.invalidateCaches() catch {};
+                return;
+            },
+            else => {
+                if (!h.overflow_logged) {
+                    std.debug.print(
+                        "WARN: layoutAndRender(top) failed ({s}) at zoom={d:.3}, extent={d}x{d}\n",
+                        .{ @errorName(err), h.zoom, extent.width, extent.height },
+                    );
+                    h.overflow_logged = true;
+                }
+                return;
+            },
+        };
+
+        const ansi_box = h.spark.layoutAndRender(
+            h.ansi_doc,
+            .{ 40, top_box.y + top_box.h + 8 },
+            constraints,
+        ) catch |err| {
+            if (!h.overflow_logged) {
+                std.debug.print("WARN: layoutAndRender(ansi) failed ({s})\n", .{@errorName(err)});
+                h.overflow_logged = true;
+            }
+            return;
+        };
+
+        const content_bottom_world = ansi_box.y + ansi_box.h;
+        const viewport_h_world: f32 = @as(f32, @floatFromInt(extent.height)) / h.zoom;
+        const bottom_margin: f32 = 40;
+        h.max_scroll_y = @max(@as(f32, 0), content_bottom_world + bottom_margin - viewport_h_world);
+        if (h.scroll_y > h.max_scroll_y) h.scroll_y = h.max_scroll_y;
+        if (h.scroll_y < 0) h.scroll_y = 0;
+
+        h.state.clearDirty();
     }
-    fc.quad_pipeline.recordDraw(cmd, extent, @intCast(fc.dl.quads.items.len));
-    fc.text_pipeline.recordDraw(cmd, extent, @intCast(fc.dl.glyphs.items.len));
+
+    h.spark.endFrame() catch |err| {
+        if (!h.overflow_logged) {
+            std.debug.print("WARN: endFrame failed: {s}\n", .{@errorName(err)});
+            h.overflow_logged = true;
+        }
+        return;
+    };
 }
 
-// ── Input plumbing (stage 7f) ──────────────────────────────────────
-//
-// Poll-based: once per frame, ask glfw for the current cursor
-// position + primary button state, diff against the previous frame,
-// and synthesize InputEvents. Pointer-capture semantics: whichever
-// hit the most recent mouse_down landed on receives every
-// subsequent mouse_move + mouse_up until release, regardless of
-// whether the cursor stays inside its box. Without this drags break
-// at the boundary.
+// ── Input plumbing ────────────────────────────────────────────────
 
-fn processInput(window: *win.Window, fc: *FrameCtx) !void {
+fn processInput(window: *win.Window, h: *HostCtx) !void {
     var x_raw: f64 = 0;
     var y_raw: f64 = 0;
     win.c.glfwGetCursorPos(window.handle, &x_raw, &y_raw);
-    // Un-transform: screen mouse → world coords so hit-test compares
-    // against the un-transformed Hit.box stored on the DrawList.
-    // Inverse of `screen = (world - scroll) * zoom`:
-    //   world = screen / zoom + scroll
-    const x: f32 = @as(f32, @floatCast(x_raw)) / fc.zoom;
-    const y: f32 = @as(f32, @floatCast(y_raw)) / fc.zoom + fc.scroll_y;
+    // Un-transform: screen → world (inverse of `screen = (world - scroll) * zoom`).
+    const x: f32 = @as(f32, @floatCast(x_raw)) / h.zoom;
+    const y: f32 = @as(f32, @floatCast(y_raw)) / h.zoom + h.scroll_y;
     const button_now = win.c.glfwGetMouseButton(window.handle, win.c.GLFW_MOUSE_BUTTON_LEFT) == win.c.GLFW_PRESS;
 
-    const prev_down = fc.mouse_down;
-    const moved = x != fc.mouse_x or y != fc.mouse_y;
-    fc.mouse_x = x;
-    fc.mouse_y = y;
-    fc.mouse_down = button_now;
-
-    if (button_now and !prev_down) {
-        // Press transition. Hit-test in reverse so the deepest
-        // (last-emitted) element wins; capture for the duration of
-        // the press.
-        const maybe_hit = findHit(fc.dl.hits.items, x, y);
-
-        // Focus management. A click on a focusable hit grabs focus
-        // (firing focus_lost on the prior holder if it changed). A
-        // click anywhere else — non-focusable hit OR empty space —
-        // clears focus. Identity is compared by ctx pointer because
-        // Hit structs are rebuilt every layout but components
-        // persist.
-        const new_focus_ctx: ?*anyopaque = blk: {
-            if (maybe_hit) |h| if (h.focusable) break :blk h.ctx;
-            break :blk null;
-        };
-        const old_focus_ctx: ?*anyopaque = if (fc.focused) |f| f.ctx else null;
-        if (new_focus_ctx != old_focus_ctx) {
-            if (fc.focused) |old| dispatch(old, .focus_lost, fc.state) catch {};
-            fc.focused = if (maybe_hit) |h| if (h.focusable) h else null else null;
-            if (fc.focused) |new| dispatch(new, .focus_gained, fc.state) catch {};
-        }
-
-        if (maybe_hit) |hit| {
-            fc.captured = hit;
-            try dispatch(hit, .{ .mouse_down = .{
-                .local = .{ x - hit.box.x, y - hit.box.y },
-                .button = 0,
-                .button_down = true,
-            } }, fc.state);
-        }
-    } else if (button_now and prev_down and moved) {
-        // Held + cursor moved → drag. Route to captured.
-        if (fc.captured) |hit| {
-            try dispatch(hit, .{ .mouse_move = .{
-                .local = .{ x - hit.box.x, y - hit.box.y },
-                .button = 0,
-                .button_down = true,
-            } }, fc.state);
-        }
-    } else if (!button_now and prev_down) {
-        // Release transition.
-        if (fc.captured) |hit| {
-            try dispatch(hit, .{ .mouse_up = .{
-                .local = .{ x - hit.box.x, y - hit.box.y },
-                .button = 0,
-                .button_down = false,
-            } }, fc.state);
-            fc.captured = null;
-        }
+    if (button_now != h.spark.mouse_down) {
+        try h.spark.dispatchMouseButton(x, y, button_now);
+    } else if (button_now) {
+        // Held + position update → drag move.
+        try h.spark.dispatchMouseMove(x, y);
+    } else {
+        // No press, just update the position cache (used by future hover).
+        h.spark.mouse_x = x;
+        h.spark.mouse_y = y;
     }
 }
 
-fn findHit(hits: []const element.Hit, x: f32, y: f32) ?element.Hit {
-    var i = hits.len;
-    while (i > 0) {
-        i -= 1;
-        const h = hits[i];
-        if (x >= h.box.x and x < h.box.x + h.box.w and
-            y >= h.box.y and y < h.box.y + h.box.h)
-        {
-            return h;
-        }
-    }
-    return null;
-}
-
-fn dispatch(hit: element.Hit, event: element.InputEvent, state: *state_mod.State) !void {
-    const on_input = hit.vtable.on_input orelse return;
-    // If the layout walk stamped a state pointer onto this Hit
-    // (top-level → host state; embedded-doc → child state), use it.
-    // Otherwise fall back to the dispatcher's default.
-    const eff: *anyopaque = hit.state orelse @ptrCast(state);
-    try on_input(hit.ctx, event, eff);
-}
-
-// GLFW key callback — keyboard equivalents of the mouse-wheel
-// scroll / zoom inputs. PgUp/PgDn/Home/End drive scroll; Ctrl+= /
-// Ctrl+- / Ctrl+0 drive zoom. Discrete steps, so they tween to the
-// new target same as wheel input (drawCb's scroll easing handles
-// both paths uniformly).
+// GLFW key callback — keyboard navigation + zoom + focused-component
+// routing. Esc clears focus globally.
 fn keyCb(window: ?*win.c.GLFWwindow, key: c_int, _: c_int, action: c_int, mods: c_int) callconv(.C) void {
     if (action != win.c.GLFW_PRESS and action != win.c.GLFW_REPEAT) return;
     const ud = win.c.glfwGetWindowUserPointer(window);
     if (ud == null) return;
-    const fc: *FrameCtx = @ptrCast(@alignCast(ud));
+    const h: *HostCtx = @ptrCast(@alignCast(ud));
 
-    // Esc always clears focus, regardless of who holds it.
-    if (key == win.c.GLFW_KEY_ESCAPE and fc.focused != null) {
-        const old = fc.focused.?;
-        fc.focused = null;
-        dispatch(old, .focus_lost, fc.state) catch {};
-        fc.state.dirty = true;
+    if (key == win.c.GLFW_KEY_ESCAPE and h.spark.focused != null) {
+        h.spark.clearFocus();
+        h.state.dirty = true;
         return;
     }
 
-    // While a component holds focus (input field, etc.), keys go to
-    // it. The nav handler (PgUp/PgDn/zoom) is suppressed so typing
-    // into a field doesn't also scroll the page.
-    if (fc.focused) |hit| {
-        dispatch(hit, .{ .key_down = .{
-            .key = @intCast(key),
-            .mods = @intCast(mods),
-        } }, fc.state) catch {};
-        fc.state.dirty = true;
+    // Focused component eats keys.
+    if (h.spark.focused != null) {
+        h.spark.dispatchKey(.{ .key = @intCast(key), .mods = @intCast(mods) }) catch {};
+        h.state.dirty = true;
         return;
     }
 
     const ctrl = (mods & win.c.GLFW_MOD_CONTROL) != 0;
-
     if (ctrl) {
         switch (key) {
-            // GLFW_KEY_EQUAL is the unshifted `=` key, which is
-            // where `+` sits on US/UK keyboards — accept both forms
-            // so Ctrl+= and Ctrl++ feel like the same gesture.
             win.c.GLFW_KEY_EQUAL, win.c.GLFW_KEY_KP_ADD => {
-                fc.zoom = std.math.clamp(fc.zoom * 1.10, 0.25, 4.0);
-                fc.state.dirty = true;
+                h.zoom = std.math.clamp(h.zoom * 1.10, 0.25, 4.0);
+                h.state.dirty = true;
             },
             win.c.GLFW_KEY_MINUS, win.c.GLFW_KEY_KP_SUBTRACT => {
-                fc.zoom = std.math.clamp(fc.zoom / 1.10, 0.25, 4.0);
-                fc.state.dirty = true;
+                h.zoom = std.math.clamp(h.zoom / 1.10, 0.25, 4.0);
+                h.state.dirty = true;
             },
             win.c.GLFW_KEY_0, win.c.GLFW_KEY_KP_0 => {
-                fc.zoom = 1.0;
-                fc.state.dirty = true;
+                h.zoom = 1.0;
+                h.state.dirty = true;
             },
             else => {},
         }
         return;
     }
 
-    // Non-Ctrl navigation: page / home / end. Page step ≈ viewport
-    // height (less a slim overlap so the eye keeps continuity).
-    const viewport_h: f32 = @as(f32, @floatFromInt(fc.last_extent.height)) / fc.zoom;
+    const viewport_h: f32 = @as(f32, @floatFromInt(h.last_extent.height)) / h.zoom;
     const page: f32 = @max(viewport_h - 80, 100);
     switch (key) {
-        win.c.GLFW_KEY_PAGE_DOWN => fc.target_scroll_y = std.math.clamp(fc.target_scroll_y + page, 0, fc.max_scroll_y),
-        win.c.GLFW_KEY_PAGE_UP => fc.target_scroll_y = std.math.clamp(fc.target_scroll_y - page, 0, fc.max_scroll_y),
-        win.c.GLFW_KEY_HOME => fc.target_scroll_y = 0,
-        win.c.GLFW_KEY_END => fc.target_scroll_y = fc.max_scroll_y,
+        win.c.GLFW_KEY_PAGE_DOWN => h.target_scroll_y = std.math.clamp(h.target_scroll_y + page, 0, h.max_scroll_y),
+        win.c.GLFW_KEY_PAGE_UP => h.target_scroll_y = std.math.clamp(h.target_scroll_y - page, 0, h.max_scroll_y),
+        win.c.GLFW_KEY_HOME => h.target_scroll_y = 0,
+        win.c.GLFW_KEY_END => h.target_scroll_y = h.max_scroll_y,
         else => return,
     }
 }
 
-// GLFW char callback — fires once per printable character (post-IME,
-// post-shift composition). Routes to the focused component as a
-// `char_input` event. Non-printable keys (arrows, enter, backspace)
-// never reach here; they come through `keyCb` as `.key_down`.
 fn charCb(window: ?*win.c.GLFWwindow, codepoint: c_uint) callconv(.C) void {
     const ud = win.c.glfwGetWindowUserPointer(window);
     if (ud == null) return;
-    const fc: *FrameCtx = @ptrCast(@alignCast(ud));
-    const hit = fc.focused orelse return;
-    dispatch(hit, .{ .char_input = @intCast(codepoint) }, fc.state) catch {};
-    fc.state.dirty = true;
+    const h: *HostCtx = @ptrCast(@alignCast(ud));
+    if (h.spark.focused == null) return;
+    h.spark.dispatchChar(@intCast(codepoint)) catch {};
+    h.state.dirty = true;
 }
 
-// GLFW scroll callback. Ctrl-held → zoom; plain → vertical scroll.
-// Reads FrameCtx from the window user pointer (set in main()).
-//
-// Sets `state.dirty` so drawCb's next frame triggers runLayout
-// (which redoes the world→screen transform pass). Bounds clamped
-// here so user input can't push them outside the legal range.
 fn scrollCb(window: ?*win.c.GLFWwindow, _: f64, yoffset: f64) callconv(.C) void {
     const ud = win.c.glfwGetWindowUserPointer(window);
     if (ud == null) return;
-    const fc: *FrameCtx = @ptrCast(@alignCast(ud));
+    const h: *HostCtx = @ptrCast(@alignCast(ud));
 
     const ctrl = win.c.glfwGetKey(window, win.c.GLFW_KEY_LEFT_CONTROL) == win.c.GLFW_PRESS or
         win.c.glfwGetKey(window, win.c.GLFW_KEY_RIGHT_CONTROL) == win.c.GLFW_PRESS;
@@ -730,84 +266,19 @@ fn scrollCb(window: ?*win.c.GLFWwindow, _: f64, yoffset: f64) callconv(.C) void 
     if (ctrl) {
         const step: f32 = 1.10;
         const dy: f32 = @floatCast(yoffset);
-        if (dy > 0) fc.zoom *= std.math.pow(f32, step, dy);
-        if (dy < 0) fc.zoom /= std.math.pow(f32, step, -dy);
-        fc.zoom = std.math.clamp(fc.zoom, 0.25, 4.0);
+        if (dy > 0) h.zoom *= std.math.pow(f32, step, dy);
+        if (dy < 0) h.zoom /= std.math.pow(f32, step, -dy);
+        h.zoom = std.math.clamp(h.zoom, 0.25, 4.0);
     } else {
         const px_per_notch: f32 = 60.0;
-        fc.target_scroll_y -= @as(f32, @floatCast(yoffset)) * px_per_notch;
-        // Clamp against the most recent layout's known max; runLayout
-        // will clamp again once it has the new content height. The
-        // tween in drawCb closes the gap toward target_scroll_y.
-        fc.target_scroll_y = std.math.clamp(fc.target_scroll_y, 0, fc.max_scroll_y);
+        h.target_scroll_y -= @as(f32, @floatCast(yoffset)) * px_per_notch;
+        h.target_scroll_y = std.math.clamp(h.target_scroll_y, 0, h.max_scroll_y);
     }
-
-    fc.state.dirty = true;
+    h.state.dirty = true;
 }
 
-/// `IoChannel.drain` handler. Polymorphic dispatch through the
-/// `PendingHeader` that every consumer puts as the first field of
-/// its Pending struct (stage 13d.3). `user_data` is
-/// `@intFromPtr(&pending)`; we read the first usize there and call
-/// it. Adding a new consumer (svg-stream, future audio-stream)
-/// doesn't touch this file.
-fn drainHandler(_: *io_channel_mod.IoChannel, comp: io_channel_mod.Completion) void {
-    const header: *const io_channel_mod.PendingHeader = @ptrFromInt(comp.user_data);
-    header.handle_completion(comp);
-}
+// ── Paths (XDG conventions) ───────────────────────────────────────
 
-/// HSV → RGB conversion using the standard six-sextant formula. `h`
-/// is degrees [0, 360); `s` and `v` are [0, 1]. Used by the demo to
-/// paint each animated SDF glyph with its own rainbow hue.
-/// Stage 13d.2 — measure tessellation cost serial vs parallel.
-/// Runs once at startup on the Petunias.svg fixture so we have a
-/// concrete speedup number for the journey doc and a regression
-/// signal if the JobSystem ever stops scaling. ~10 ms total; pure
-/// startup-time cost, no impact on the render loop.
-fn runTessellationBenchmark(
-    allocator: std.mem.Allocator,
-    source: []const u8,
-    job_system: *jobs_mod.JobSystem,
-    stdout: anytype,
-) !void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const doc = try svg_mod.parse(arena.allocator(), source);
-
-    const t0 = std.time.nanoTimestamp();
-    var serial_mesh = svg_tess.Mesh.init(allocator);
-    defer serial_mesh.deinit();
-    try svg_tess.tessellateSerial(allocator, doc.paths, &serial_mesh, .{});
-    const t1 = std.time.nanoTimestamp();
-
-    var parallel_mesh = svg_tess.Mesh.init(allocator);
-    defer parallel_mesh.deinit();
-    try svg_tess.tessellateParallel(allocator, doc.paths, &parallel_mesh, job_system, .{});
-    const t2 = std.time.nanoTimestamp();
-
-    const serial_us: f64 = @as(f64, @floatFromInt(t1 - t0)) / 1000.0;
-    const parallel_us: f64 = @as(f64, @floatFromInt(t2 - t1)) / 1000.0;
-    const speedup: f64 = if (parallel_us > 0) serial_us / parallel_us else 0;
-    try stdout.print(
-        "  svg tessellate ({d} paths, {d} tris): serial {d:.1} us, parallel {d:.1} us → {d:.2}x\n",
-        .{
-            doc.paths.len,
-            serial_mesh.indices.items.len / 3,
-            serial_us,
-            parallel_us,
-            speedup,
-        },
-    );
-}
-
-// hsvToRgb was deleted alongside the SDF "ATTENTION" rainbow wave —
-// its only caller. Re-add a hue-cycling helper here if a future
-// host-side animation needs one; the equivalent shader-side cycle
-// still lives in the text fragment shader's attention branch.
-
-/// XDG-style cache directory for persistent assets. Honours
-/// `$XDG_CACHE_HOME` if set; otherwise falls back to `$HOME/.cache`.
-/// Returns an owned path; caller frees via `allocator.free`.
 fn computeAssetCacheDir(allocator: std.mem.Allocator) ![]u8 {
     if (std.process.getEnvVarOwned(allocator, "XDG_CACHE_HOME")) |xdg| {
         defer allocator.free(xdg);
@@ -818,11 +289,6 @@ fn computeAssetCacheDir(allocator: std.mem.Allocator) ![]u8 {
     return try std.fs.path.join(allocator, &.{ home, ".cache", "text_engine", "assets" });
 }
 
-/// XDG-style state file for persistent reactive-state values. Honours
-/// `$XDG_STATE_HOME` if set; otherwise falls back to
-/// `$HOME/.local/state`. State (slider positions, input contents) is
-/// user data, not regenerable cache — XDG conventions put it under a
-/// different root so `rm -rf ~/.cache` doesn't lose it.
 fn computeStateFilePath(allocator: std.mem.Allocator) ![]u8 {
     if (std.process.getEnvVarOwned(allocator, "XDG_STATE_HOME")) |xdg| {
         defer allocator.free(xdg);
@@ -839,20 +305,11 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("text_engine demo — session 17 (library-spec Phase 1: Spark)\n", .{});
+    try stdout.print("text_engine demo — session 19 (library-spec Phase 3: public API + ownership)\n", .{});
     try stdout.print("  vertex SPIR-V bytes:   {d}\n", .{text_engine.shaders.text_vert.len});
     try stdout.print("  fragment SPIR-V bytes: {d}\n", .{text_engine.shaders.text_frag.len});
 
-    // CLI args:
-    //   spark_demo [--core-only] [doc_path]
-    //
-    // `--core-only` is the library-spec Phase 2 toggle: skip every
-    // extras install (llm-stream, svg-stream, image-stream,
-    // embedded_document_http) and don't mount DotEnv / AssetCache.
-    // The demo runs against the core component set only — proves the
-    // extras boundary is real. Position is unimportant; first non-flag
-    // arg is the doc path. The single-arg shape matches the future
-    // `spark hello.md` UX (decision #11 — rename lands separately).
+    // ── CLI parsing ───────────────────────────────────────────────
     var core_only: bool = false;
     var doc_path_owned: ?[]u8 = null;
     {
@@ -869,12 +326,23 @@ pub fn main() !void {
     }
     defer if (doc_path_owned) |p| allocator.free(p);
 
+    // `doc_bytes_owned`: when a CLI path was given, the read bytes
+    // are owned by the host and must outlive every consumer that
+    // holds a slice into them (top_doc.arena holds parsed-Element
+    // string slices; host_state retains frontmatter slices). Freed
+    // by the defer below, ORDERED so it runs AFTER top_doc.deinit()
+    // + host_state.deinit() (Zig fires defers LIFO — declare this
+    // one first).
+    var doc_bytes_owned: ?[]u8 = null;
+    defer if (doc_bytes_owned) |b| allocator.free(b);
+
     const doc_source: []const u8 = doc_blk: {
         if (doc_path_owned) |path| {
             const bytes = std.fs.cwd().readFileAlloc(allocator, path, 4 * 1024 * 1024) catch |e| {
                 try stdout.print("  doc {s} load failed: {s} — falling back to embedded demo.md\n", .{ path, @errorName(e) });
                 break :doc_blk demo_md;
             };
+            doc_bytes_owned = bytes;
             try stdout.print("  doc:                  {d} bytes ({s})\n", .{ bytes.len, path });
             break :doc_blk bytes;
         }
@@ -882,10 +350,8 @@ pub fn main() !void {
         break :doc_blk demo_md;
     };
     if (core_only) try stdout.print("  mode:                 --core-only (extras + DotEnv + AssetCache skipped)\n", .{});
-    // doc_source's storage lives until program exit. We don't free it
-    // — the parse arena and reactive state both hold long-lived slices
-    // into it. Process exit reclaims everything.
 
+    // ── Host-owned Vulkan + window ────────────────────────────────
     var window = try win.Window.init(1280, 720, "text_engine_demo");
     defer window.deinit();
 
@@ -896,53 +362,21 @@ pub fn main() !void {
     var swapchain = try swap.Swapchain.init(allocator, &ctx, &window);
     defer swapchain.deinit();
 
-    var atlas_mono = try atlas_mod.Atlas.init(&ctx, ATLAS_MONO_SIZE, ATLAS_MONO_SIZE, .mono_r8);
-    defer atlas_mono.deinit();
-    var atlas_color = try atlas_mod.Atlas.init(&ctx, ATLAS_COLOR_SIZE, ATLAS_COLOR_SIZE, .color_rgba8);
-    defer atlas_color.deinit();
+    // ── Host-owned font building ──────────────────────────────────
+    // FT + FontRegistry are built here, then handed to Spark by
+    // ownership transfer. Theme references the resulting font_ids.
+    const font_path = std.posix.getenv("TEXT_ENGINE_FONT") orelse "/usr/share/fonts/TTF/DejaVuSans.ttf";
+    const italic_path = std.posix.getenv("TEXT_ENGINE_ITALIC_FONT") orelse "/usr/share/fonts/TTF/DejaVuSans-Oblique.ttf";
+    const bold_path = std.posix.getenv("TEXT_ENGINE_BOLD_FONT") orelse "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf";
+    const bold_italic_path = std.posix.getenv("TEXT_ENGINE_BOLD_ITALIC_FONT") orelse "/usr/share/fonts/TTF/DejaVuSans-BoldOblique.ttf";
+    const mono_path = std.posix.getenv("TEXT_ENGINE_MONO_FONT") orelse "/usr/share/fonts/TTF/DejaVuSansMono.ttf";
+    const emoji_path = std.posix.getenv("TEXT_ENGINE_EMOJI_FONT") orelse "/usr/share/fonts/noto/NotoColorEmoji.ttf";
 
-    var pipeline = try tp.TextPipeline.init(&ctx, swapchain.format, &atlas_mono, &atlas_color, MAX_GLYPHS);
-    defer pipeline.deinit();
-
-    var quad_pipeline = try qp.QuadPipeline.init(&ctx, swapchain.format, MAX_QUADS);
-    defer quad_pipeline.deinit();
-
-    var tri_pipeline_inst = try tri_pipeline_mod.TrianglePipeline.init(
-        &ctx,
-        swapchain.format,
-        MAX_TRI_VERTICES,
-        MAX_TRI_INDICES,
-    );
-    defer tri_pipeline_inst.deinit();
-
-    // Stage 14c — image pipeline for `:::image-stream`. Owns the
-    // descriptor pool sized to MAX_IMAGES; each component allocates
-    // one slot.
-    var image_pipeline_inst = try image_pipeline_mod.ImagePipeline.init(
-        &ctx,
-        swapchain.format,
-        MAX_IMAGES,
-    );
-    defer image_pipeline_inst.deinit();
-
-    const font_path = std.posix.getenv("TEXT_ENGINE_FONT") orelse
-        "/usr/share/fonts/TTF/DejaVuSans.ttf";
-    const italic_path = std.posix.getenv("TEXT_ENGINE_ITALIC_FONT") orelse
-        "/usr/share/fonts/TTF/DejaVuSans-Oblique.ttf";
-    const bold_path = std.posix.getenv("TEXT_ENGINE_BOLD_FONT") orelse
-        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf";
-    const bold_italic_path = std.posix.getenv("TEXT_ENGINE_BOLD_ITALIC_FONT") orelse
-        "/usr/share/fonts/TTF/DejaVuSans-BoldOblique.ttf";
-    const mono_path = std.posix.getenv("TEXT_ENGINE_MONO_FONT") orelse
-        "/usr/share/fonts/TTF/DejaVuSansMono.ttf";
-    const emoji_path = std.posix.getenv("TEXT_ENGINE_EMOJI_FONT") orelse
-        "/usr/share/fonts/noto/NotoColorEmoji.ttf";
-
-    var ft = try face_mod.Library.init();
+    var ft = try text_engine.font.Library.init();
     defer ft.deinit();
 
-    var fonts = registry_mod.FontRegistry.init(allocator, ft);
-    defer fonts.deinit();
+    var fonts = try allocator.create(text_engine.FontRegistry);
+    fonts.* = text_engine.FontRegistry.init(allocator, ft);
 
     const h1_id = try fonts.load(font_path.ptr, 48);
     const h2_id = try fonts.load(font_path.ptr, 32);
@@ -954,33 +388,22 @@ pub fn main() !void {
     const code_inline_id = try fonts.load(mono_path.ptr, 20);
     const code_block_id = try fonts.load(mono_path.ptr, 18);
     const emoji_id = try fonts.load(emoji_path.ptr, 28);
-    // SDF font load deleted alongside the SDF "ATTENTION" demo block —
-    // re-add `try fonts.loadSdf(font_path.ptr, 44)` if you need an SDF
-    // size again. The MSDF rasterisation path inside FontRegistry is
-    // untouched and still tested.
 
-    var cache = glyph_cache_mod.GlyphCache.init(allocator);
-    defer cache.deinit();
-
-    // ── Build the Theme ────────────────────────────────────────────
-    // Single visual policy the rest of the demo cascades from. Stage
-    // 3's markdown parser will look the same — load fonts, build a
-    // Theme, hand it to LayoutCtx, parser uses `theme.apply*` to
-    // resolve inline cascade onto text leaves.
+    // ── Theme ─────────────────────────────────────────────────────
     const white: [4]f32 = .{ 0.95, 0.95, 0.98, 1.0 };
     const heading_color: [4]f32 = .{ 0.95, 0.96, 0.99, 1.0 };
     const heading_dim: [4]f32 = .{ 0.78, 0.83, 0.92, 1.0 };
     const marker_color: [4]f32 = .{ 0.65, 0.72, 0.85, 1.0 };
 
-    const theme: element.Theme = .{
+    const theme: text_engine.Theme = .{
         .body = .{ .font_id = body_id, .color = white },
         .heading = .{
-            .{ .font_id = h1_id, .color = heading_color }, // h1
-            .{ .font_id = h2_id, .color = heading_color }, // h2
-            .{ .font_id = h3_id, .color = heading_dim }, // h3
-            .{ .font_id = h3_id, .color = heading_dim }, // h4
-            .{ .font_id = h3_id, .color = heading_dim }, // h5
-            .{ .font_id = h3_id, .color = heading_dim }, // h6
+            .{ .font_id = h1_id, .color = heading_color },
+            .{ .font_id = h2_id, .color = heading_color },
+            .{ .font_id = h3_id, .color = heading_dim },
+            .{ .font_id = h3_id, .color = heading_dim },
+            .{ .font_id = h3_id, .color = heading_dim },
+            .{ .font_id = h3_id, .color = heading_dim },
         },
         .code_block = .{ .font_id = code_block_id, .color = .{ 0.72, 0.88, 1.0, 1.0 } },
         .list_marker = .{ .font_id = body_id, .color = marker_color },
@@ -988,120 +411,44 @@ pub fn main() !void {
         .strong_font_id = bold_id,
         .bold_italic_font_id = bold_italic_id,
         .code_inline_font_id = code_inline_id,
-        // Emoji fallback (stage 5c). The markdown parser scans every
-        // text leaf and splits on coverage: Latin + symbols stay with
-        // the primary cascade font; pictographic codepoints route to
-        // this colour-emoji entry. The inline-flow walker treats the
-        // resulting mixed-font runs the same as emphasis / strong.
         .fallback_font_id = emoji_id,
-        .font_registry = &fonts,
+        .font_registry = fonts,
     };
 
-    // ── Component registry (stage 7b) ──────────────────────────────
-    // Owned by the host across the entire program lifetime so cached
-    // component instances persist over re-parses. Box factory
-    // registered at 7c; 3d-scene and chart factories still missing
-    // (their `:::` blocks render as red placeholders).
-    var registry = component.Registry.init(allocator);
-    defer registry.deinit();
-
-    // Stage 15 Phase B — constraint solver context. One per host;
-    // reset at the top of each runLayout. Components that opt in
-    // declare bounds variables and constraints against this during
-    // the walk. Lives up here (before any factory install that
-    // captures it) so the handle's install can grab a stable ref.
-    var layout_context = try layout_context_mod.LayoutContext.init(allocator);
-    defer layout_context.deinit();
-
-    // ── Host-owned reactive state (stage 7e) ───────────────────────
-    // Frontmatter parses once at startup; the State persists across
-    // the program's lifetime. drawCb mutates it on a timer and the
-    // registry's subscriber wiring propagates changes into the
-    // cached component instances.
-    var host_state = (try state_mod.fromSource(allocator, doc_source)) orelse state_mod.State.init(allocator);
+    // ── Host-owned reactive state ─────────────────────────────────
+    // Built from the doc's frontmatter (best-effort) and seeded with
+    // any persisted values from the previous session. Shared with
+    // both Documents below via LoadOpts.shared_state.
+    var host_state = (try text_engine.stateFromSource(allocator, doc_source)) orelse text_engine.State.init(allocator);
     defer host_state.deinit();
 
-    // ── Stage 13b.2 — persistent state ─────────────────────────────
-    // Load previous session's state values (slider positions, button
-    // bodies, input contents) on top of the frontmatter defaults so a
-    // restart picks up where the user left off. Throttled save runs
-    // from the main loop every PERSIST_INTERVAL_FRAMES if dirty.
     const state_path = try computeStateFilePath(allocator);
     defer allocator.free(state_path);
     host_state.loadFromFile(state_path) catch |e| switch (e) {
-        error.FileNotFound => {
-            try stdout.print("  state file:           (none yet) — first run\n", .{});
-        },
+        error.FileNotFound => try stdout.print("  state file:           (none yet) — first run\n", .{}),
         else => try stdout.print("  state file:           {s} (load failed: {s})\n", .{ state_path, @errorName(e) }),
     };
 
-    // ── Stage 12 — async I/O channel ───────────────────────────────
-    // Work-stealing thread pool + fire-and-forget IoChannel sit
-    // between the renderer and any blocking I/O (HTTP fetches today;
-    // LLM streams + file watcher + MCP pipes soon). Owned by main
-    // so worker threads outlive the renderer; deinit order is
-    // strictly reverse-of-init to make sure workers join before the
-    // channel's completion queue is freed.
-    //
-    // ── Stage 14d — split compute and I/O pools ────────────────────
-    // The compute `job_system` sizes itself to `cpu_count - 2` and
-    // hosts parallel layout / SVG tessellation / future work. Blocking
-    // HTTP streams (5-15s on the wire each) get their own pool sized
-    // for *concurrency* — workers parked on `req.read` cost nothing,
-    // so we can afford 24 slots without contending with compute. This
-    // unparks stage 14b: with the parallel walker no longer fighting
-    // 5 stream workers for the same 6 deque slots, dispatch becomes
-    // safe again.
-    const job_system = try jobs_mod.JobSystem.init(allocator, 0);
-    defer job_system.deinit();
-    const io_pool = try jobs_mod.JobSystem.init(allocator, 24);
-    defer io_pool.deinit();
-    var io_channel = io_channel_mod.IoChannel.init(allocator, io_pool);
-    defer io_channel.deinit();
-
-    // ── Stage 17 (library-spec Phase 1) — `Spark` engine context ───
-    // All host resources now live; the Spark struct holds borrowed
-    // pointers so every component reaches them through a single
-    // dereference instead of file-scope `_ref` globals. Phase 3 will
-    // invert this — `Spark.init` will own the resources and main.zig
-    // will shrink to GLFW + swapchain + frame pacing.
-    var block_cache = layout_cache_mod.BlockCache.init(allocator);
-    defer block_cache.deinit();
-    var spark = spark_mod.Spark.init(.{
-        .allocator = allocator,
+    // ── Spark.init — owns atlases, pipelines, glyph cache, layout
+    //    cache, layout context, registry, io_channel, JobSystems.
+    //    Takes ownership of the FontRegistry built above.
+    var spark = try text_engine.Spark.init(allocator, .{
         .vk_ctx = &ctx,
-        .mono_atlas = &atlas_mono,
-        .color_atlas = &atlas_color,
-        .text_pipeline = &pipeline,
-        .quad_pipeline = &quad_pipeline,
-        .tri_pipeline = &tri_pipeline_inst,
-        .image_pipeline = &image_pipeline_inst,
-        .fonts = &fonts,
-        .glyph_cache = &cache,
+        .color_format = swapchain.format,
         .theme = &theme,
-        .registry = &registry,
+        .fonts = fonts,
         .host_state = &host_state,
-        .layout_cache = &block_cache,
-        .layout_context = &layout_context,
-        .compute_jobs = job_system,
-        .io_jobs = io_pool,
-        .io_channel = &io_channel,
-        // dotenv + asset_cache + embedded_http stay null — host
-        // installs them below via the install methods (library-spec
-        // Phase 2, decision #9: explicit opt-in, no auto-loading).
     });
-    defer spark.deinit();
-    registry.attachSpark(&spark);
+    defer {
+        spark.deinit();
+        allocator.destroy(fonts);
+    }
+    spark.attachToRegistry();
 
-    // ── library-spec Phase 2 — extras installs ─────────────────────
-    // Each `installX` allocates the resource from `spark.allocator`,
-    // mounts it on the spark, and Spark.deinit tears it down. The
-    // `--core-only` flag short-circuits this block so the demo can
-    // run against just the core component set (proves the core /
-    // extras boundary is real).
+    // ── Component installs ────────────────────────────────────────
+    try text_engine.installCoreComponents(&spark);
+
     if (!core_only) {
-        // `~/.env` — KEY=VALUE store. Missing file is silent (loadFromPath
-        // returns OK on FileNotFound); other errors propagate.
         const home = try std.process.getEnvVarOwned(allocator, "HOME");
         defer allocator.free(home);
         const env_path = try std.fs.path.join(allocator, &.{ home, ".env" });
@@ -1110,10 +457,6 @@ pub fn main() !void {
             try stdout.print("  installDotEnv:        {s} (continuing)\n", .{@errorName(e)});
         };
 
-        // Asset cache — content-addressable directory under
-        // $XDG_CACHE_HOME/text_engine (or $HOME/.cache/text_engine).
-        // svg-stream + image-stream dedupe expensive remote assets
-        // here so a hot reload skips the LM call entirely.
         const asset_cache_dir = try computeAssetCacheDir(allocator);
         defer allocator.free(asset_cache_dir);
         try spark.installAssetCache(asset_cache_dir, 500 * 1024 * 1024);
@@ -1130,144 +473,52 @@ pub fn main() !void {
             );
         }
 
-        // `:::embedded-document` URL source handler. Required for
-        // http:// + https:// src= values; file:// + bare paths work
-        // without it. No precondition beyond `io_channel` (always
-        // present in core).
-        try embedded_document_http_extras.install(&spark);
+        try text_engine.extras.embedded_document_http.install(&spark);
+        try text_engine.extras.llm_stream.install(&spark);
+        try text_engine.extras.svg_stream.install(&spark);
+        try text_engine.extras.image_stream.install(&spark);
     }
 
-    // Component installs — every factory takes `*Spark` and plucks
-    // what it needs (registry/theme/host_state/io_channel/dotenv/…)
-    // from the struct in `create`. Order is unimportant except that
-    // children's factories must be registered before any parser walk
-    // that resolves them.
-    try box_component.install(&spark);
-    try registry.register("chart", chart_component.factory);
-    try registry.register("slider", slider_component.factory);
-    try badge_component.install(&spark);
-    try sparkline_component.install(&spark);
-    try kbd_component.install(&spark);
-    try progress_component.install(&spark);
-    try status_component.install(&spark);
-    try tag_component.install(&spark);
-    try trend_component.install(&spark);
-    try rating_component.install(&spark);
-    try dot_component.install(&spark);
-    try commit_component.install(&spark);
-    try price_component.install(&spark);
-    try diff_component.install(&spark);
-    try gh_ref_component.install(&spark);
-    try ago_component.install(&spark);
-    try button_component.install(&spark);
-    try handle_component.install(&spark);
-    try embedded_document_component.install(&spark);
-    try flex_component.install(&spark);
-    try grid_component.install(&spark);
-    try input_component.install(&spark);
-    try svg_component.install(&spark);
-    // Extras factories — skipped under --core-only. URL embedded-document
-    // sources are gated behind the corresponding extras install above
-    // (`embedded_document_http`), so they also stay dormant in core-only mode.
-    if (!core_only) {
-        try llm_stream_component.install(&spark);
-        try svg_stream_component.install(&spark);
-        try image_stream_component.install(&spark);
-    }
-
-    // Stage 13d.2 — micro-benchmark serial vs parallel tessellation
-    // on Petunias.svg before the markdown parse begins. Runs once at
-    // startup so the journey doc has a concrete speedup number; cost
-    // is ~10 ms total which is invisible in the startup banner.
-    // (Skip if the file isn't there — keeps the demo bootable when
-    // a host strips test_data.)
-    if (std.fs.cwd().readFileAlloc(allocator, "src/test_data/Petunias.svg", 4 * 1024 * 1024)) |source| {
-        defer allocator.free(source);
-        runTessellationBenchmark(allocator, source, job_system, stdout) catch |e| {
-            try stdout.print("  svg bench skipped: {s}\n", .{@errorName(e)});
-        };
-    } else |_| {}
-
-    // Stage 11 — spin up the local demo HTTP server BEFORE the parse
-    // so the remote :::embedded-document fetch succeeds. Listens on
-    // 127.0.0.1:8080 serving src/widgets/. Stopped at scope exit
-    // (which joins the worker thread cleanly via socket close).
+    // ── Demo HTTP server (test fixture for embedded-document URL src=).
     const demo_server = try demo_server_mod.Server.start(allocator, "src/widgets", 8080);
     defer demo_server.stop();
 
-    // ── Parse demo.md into an Element tree ─────────────────────────
-    // All slices + strings the tree references live in `doc_arena`;
-    // freed in one shot at scope exit. The parser also frees the
-    // cmark AST internally before returning — only Zig-managed
-    // memory survives the call.
-    var doc_arena = std.heap.ArenaAllocator.init(allocator);
-    defer doc_arena.deinit();
-    const top_stack = try markdown.parseWithState(doc_arena.allocator(), doc_source, &theme, &registry, &host_state);
+    // ── Load the markdown doc via the library ─────────────────────
+    var top_doc = try spark.loadDocument(doc_source, .{ .shared_state = &host_state });
+    defer top_doc.deinit();
 
-    // ── Parse-time content (constructed once, re-laid each resize) ─
-    var dl = element.DrawList.init(allocator);
-    defer dl.deinit();
-
-    // Stage 14a / library-spec Phase 1 — retained per-block layout cache.
-    // Now constructed earlier so it can be threaded into `Spark`; the
-    // pointer is borrowed both by the FrameCtx (below) and the
-    // Spark struct (above the install block).
-    //
-    // Stage 14b — mutex around the (FreeType glyph slot + GlyphCache
-    // hashmap + Atlas packing) write surface. Worker threads doing
-    // parallel cache-miss layouts acquire it inside
-    // `text_layout.appendShapedRun` around each `getOrRasterize` call.
-    // Lives next to block_cache so its lifetime matches the layout
-    // pipeline; uncontested cost is a single atomic compare-exchange.
-    var glyph_cache_lock = std.Thread.Mutex{};
-
-    // ANSI uses a mono-bodied derivation of the theme so spacing is
-    // terminal-like. Bold + italic still fall back to the proportional
-    // variants of the main theme — mono bold / italic font loads are
-    // a future refinement.
+    // ── Build the ANSI tree separately and wrap it as a Document ──
+    // ansi.parse produces an Element tree from terminal escape
+    // sequences — not markdown — so we use wrapElement instead of
+    // loadDocument. The arena hands ownership to the Document so
+    // its deinit cleans up.
     var ansi_theme = theme;
     ansi_theme.body = .{ .font_id = code_inline_id, .color = .{ 0.92, 0.94, 0.98, 1.0 } };
-    const ansi_tree = try ansi.parse(doc_arena.allocator(), ansi_demo, &ansi_theme);
 
-    // Tree swap is complete — no live Element references the old
-    // (non-existent, this is the first parse) cached instances. Any
-    // future re-parse would do the same gc() right after replacing
-    // the tree pointer.
-    registry.gc();
+    const ansi_arena = try allocator.create(std.heap.ArenaAllocator);
+    ansi_arena.* = std.heap.ArenaAllocator.init(allocator);
+    const ansi_root = try text_engine.ansi.parse(ansi_arena.allocator(), ansi_demo, &ansi_theme);
+    var ansi_doc = text_engine.wrapElement(allocator, ansi_arena, ansi_root, &host_state, &ansi_theme);
+    defer ansi_doc.deinit();
 
+    // Tree swap complete — GC stale cached component instances.
+    spark.registry.gc();
+
+    // ── Renderer (host-owned per-frame loop) ──────────────────────
     var rdr = try renderer.Renderer.init(allocator, &ctx, &swapchain, &window);
     defer rdr.deinit();
 
-    const start_ms = std.time.milliTimestamp();
-    var frame_ctx = FrameCtx{
-        .text_pipeline = &pipeline,
-        .quad_pipeline = &quad_pipeline,
-        .tri_pipeline = &tri_pipeline_inst,
-        .image_pipeline = &image_pipeline_inst,
-        .allocator = allocator,
-        .fonts = &fonts,
-        .cache = &cache,
-        .mono_atlas = &atlas_mono,
-        .color_atlas = &atlas_color,
-        .theme = &theme,
-        .ansi_theme = &ansi_theme,
-        .top_stack = top_stack,
-        .ansi_tree = ansi_tree,
-        .dl = &dl,
-        .block_cache = &block_cache,
-        .job_system = job_system,
-        .glyph_cache_lock = &glyph_cache_lock,
-        .layout_context = &layout_context,
-        .start_ms = start_ms,
+    var host_ctx = HostCtx{
+        .spark = &spark,
         .state = &host_state,
+        .top_doc = &top_doc,
+        .ansi_doc = &ansi_doc,
+        .start_ms = std.time.milliTimestamp(),
     };
     rdr.draw_fn = drawCb;
-    rdr.draw_ctx = @ptrCast(&frame_ctx);
+    rdr.draw_ctx = @ptrCast(&host_ctx);
 
-    // Scroll + ctrl-scroll-zoom + keyboard navigation: register
-    // both glfw callbacks and stash the FrameCtx on the window's
-    // user-pointer so they can find it without a global.
-    win.c.glfwSetWindowUserPointer(window.handle, @ptrCast(&frame_ctx));
+    win.c.glfwSetWindowUserPointer(window.handle, @ptrCast(&host_ctx));
     _ = win.c.glfwSetScrollCallback(window.handle, scrollCb);
     _ = win.c.glfwSetKeyCallback(window.handle, keyCb);
     _ = win.c.glfwSetCharCallback(window.handle, charCb);
@@ -1278,63 +529,25 @@ pub fn main() !void {
         break :blk @intFromFloat(secs * 1000.0);
     } else |_| null;
 
-    // ── Stage 8a — update micro-stream demo ────────────────────────
-    // Every UPDATE_CYCLE_MS, build a synthetic `:::update {...}` byte
-    // stream and pipe it through `update.applyAll`. The directive
-    // targets the box's `state.box_color` (state-target path), which
-    // walks the existing reactive plumbing from 7e: state.set fires
-    // the registry's Binding subscriber, which re-substitutes the
-    // cached :::box instance's templated `${state.box_color}` attr
-    // and calls factory.update with a fresh color.
-    //
-    // Reusing a single arena across cycles + resetting `retain_capacity`
-    // means steady-state allocation is zero after the first cycle —
-    // the parse + dispatch path stays inside the cached pages.
-    //
-    // (Component-target dispatch is covered by unit tests; visible
-    // demo uses state-target because the box's color attr is
-    // templated, so a component-target `set-color` would get stomped
-    // by the next Binding.refire. Non-templated components are the
-    // natural home for direct component-target updates — and the
-    // upcoming `:::chart` will be the showcase.)
-    var update_arena = std.heap.ArenaAllocator.init(allocator);
-    defer update_arena.deinit();
+    // ── Timer-driven update feeds (color cycle + chart) ──────────
     const UPDATE_CYCLE_MS: i64 = 1500;
     const cycle_colors = [_][]const u8{ "blue", "purple", "cyan", "green", "orange" };
     var color_idx: usize = 0;
     var last_update_ms = std.time.milliTimestamp();
 
-    // Stage 8b — :::chart synthetic feed. 60 Hz tick rate (sample
-    // ~every 16ms); each tick emits a `:::update {#telemetry
-    // action=append}` directive through the same `update.applyAll`
-    // hot path the colour cycle uses. The chart's `handle_update`
-    // pushes the sample onto its ring buffer; `state.dirty` flips,
-    // re-layout fires, the new column shows up next frame.
-    //
-    // The data signal layers three sines at different frequencies
-    // plus low-amplitude noise to make the trace visually rich. A
-    // pure constant or a single sine would look like a steady line
-    // — not a useful demo of "live streaming data".
     const CHART_TICK_MS: i64 = 16;
     var last_chart_ms = std.time.milliTimestamp();
     var chart_phase: f32 = 0;
     var chart_rng = std.Random.DefaultPrng.init(0xC04EE);
 
-    // Steady-state loop: poll glfw + present. All layout +
-    // animation + upload + record work lives in `drawCb` now,
-    // keyed off the swapchain's current `extent` so it auto-reflows
-    // when the user resizes the window.
     var frame_count: u64 = 0;
     var update_count: u64 = 0;
     while (!window.shouldClose()) {
         window.pollEvents();
-        processInput(&window, &frame_ctx) catch {};
+        processInput(&window, &host_ctx) catch {};
 
-        // Stage 12 — drain async I/O completions. Each completion is
-        // routed to its originating component (today: only
-        // embedded-document fetches); the handler may mark state
-        // dirty, which the renderer picks up below.
-        _ = io_channel.drain(&io_channel, drainHandler);
+        // Drain async I/O completions on the main thread.
+        spark.tick();
 
         const now_ms = std.time.milliTimestamp();
         if (now_ms - last_update_ms >= UPDATE_CYCLE_MS) {
@@ -1346,9 +559,8 @@ pub fn main() !void {
                 \\:::
                 \\
             , .{cycle_colors[color_idx]}) catch unreachable;
-            const n = update.applyAll(update_arena.allocator(), &host_state, &registry, directive) catch 0;
+            const n = spark.applyUpdate(directive) catch 0;
             update_count += n;
-            _ = update_arena.reset(.retain_capacity);
             last_update_ms = now_ms;
         }
 
@@ -1367,21 +579,14 @@ pub fn main() !void {
                 \\:::
                 \\
             , .{sample}) catch unreachable;
-            const n = update.applyAll(update_arena.allocator(), &host_state, &registry, directive) catch 0;
+            const n = spark.applyUpdate(directive) catch 0;
             update_count += n;
-            _ = update_arena.reset(.retain_capacity);
             last_chart_ms = now_ms;
         }
 
         try rdr.drawFrame();
         frame_count += 1;
 
-        // Stage 13b.2 — throttled state flush. Slider drags fire
-        // state.set at ~60 Hz; we don't want a file write per drag
-        // event. Coalesce by checking every PERSIST_INTERVAL_FRAMES
-        // (~1s at 60 fps; faster at high refresh) and flush if
-        // anything changed since the last write. The final flush at
-        // shutdown catches the tail.
         const PERSIST_INTERVAL_FRAMES: u64 = 60;
         if (frame_count % PERSIST_INTERVAL_FRAMES == 0 and host_state.persist_dirty) {
             host_state.saveToFile(state_path) catch |e| {
@@ -1391,11 +596,17 @@ pub fn main() !void {
         }
 
         if (exit_after_ms) |limit| {
-            if (std.time.milliTimestamp() - frame_ctx.start_ms >= limit) break;
+            // Mirror the user's X-button path: set the GLFW
+            // should-close flag instead of `break`ing the loop. The
+            // loop continues one more iteration, then the next
+            // shouldClose() returns true and the loop exits via the
+            // same path a real close would take.
+            if (std.time.milliTimestamp() - host_ctx.start_ms >= limit) {
+                win.c.glfwSetWindowShouldClose(window.handle, win.c.GLFW_TRUE);
+            }
         }
     }
 
-    // Final flush on graceful exit so the last <1s of mutations land.
     if (host_state.persist_dirty) {
         host_state.saveToFile(state_path) catch |e| {
             std.log.warn("state final flush failed: {s}", .{@errorName(e)});
@@ -1403,25 +614,15 @@ pub fn main() !void {
         host_state.clearPersistDirty();
     }
 
-    const elapsed_ms = std.time.milliTimestamp() - frame_ctx.start_ms;
-    try stdout.print("  glyphs:                {d}\n", .{frame_ctx.dl.glyphs.items.len});
-    try stdout.print("  quads:                 {d}\n", .{frame_ctx.dl.quads.items.len});
-    try stdout.print("  glyph cache:           {d} miss / {d} hit ({d:.1}% hit rate)\n", .{
-        cache.misses,
-        cache.hits,
-        cache.hitRate() * 100.0,
-    });
-    try stdout.print("  layout cache:          {d} hit / {d} miss / {d} skip ({d:.1}% hit rate, {d} entries)\n", .{
-        block_cache.hits,
-        block_cache.misses,
-        block_cache.skipped,
-        block_cache.hitRate() * 100.0,
-        block_cache.entries.count(),
-    });
-    try stdout.print("  frames:                {d} in {d}ms ({d:.1} fps)\n", .{
-        frame_count,
-        elapsed_ms,
-        if (elapsed_ms > 0) @as(f64, @floatFromInt(frame_count)) * 1000.0 / @as(f64, @floatFromInt(elapsed_ms)) else 0,
-    });
+    // Drain the GPU before tearing down (Spark.deinit destroys
+    // pipelines + atlases — the queue must be idle first).
+    _ = vk.c.vkDeviceWaitIdle(ctx.device);
+
+    const elapsed_ms: u64 = @intCast(std.time.milliTimestamp() - host_ctx.start_ms);
+    const fps: f64 = if (elapsed_ms > 0)
+        @as(f64, @floatFromInt(frame_count)) * 1000.0 / @as(f64, @floatFromInt(elapsed_ms))
+    else
+        0;
+    try stdout.print("  frames:                {d} in {d}ms ({d:.1} fps)\n", .{ frame_count, elapsed_ms, fps });
     try stdout.print("  updates applied:       {d} via :::update wire format\n", .{update_count});
 }

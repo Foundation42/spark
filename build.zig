@@ -73,6 +73,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     text_engine_mod.addImport("shaders", shaders_module);
+    // The library module's source files `@cImport` freetype +
+    // harfbuzz + cmark + stb_image headers (FreeType library handle,
+    // HB face/font, cmark parser, image decode). The compiler runs
+    // those imports at module-build time, so the include paths need
+    // to be on the module itself — the demo exe linking is a
+    // separate concern.
+    text_engine_mod.addIncludePath(.{ .cwd_relative = "/usr/include/freetype2" });
+    text_engine_mod.addIncludePath(.{ .cwd_relative = "/usr/include/harfbuzz" });
+    text_engine_mod.addIncludePath(b.path("vendor/cmark"));
+    text_engine_mod.addIncludePath(b.path("vendor/stb"));
 
     // ── Vendored cmark (CommonMark reference parser) ───────────────
     // Static archive linked into the demo. Vendored at 0.31.2 under
