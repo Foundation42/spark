@@ -29,6 +29,41 @@ pub const ElementBounds = struct {
     y_max: kiwi.VariableId,
 };
 
+/// Which dimension of a participating element a suggestion targets.
+/// Phase D ships `width` + `height` (the two channels a drag handle
+/// drives); `x` / `y` are anchor-position suggestions that future
+/// move-handles will use. The axis selects which solver variable
+/// the suggestion translates to: `width` → edit-var on `x_max`
+/// (with `x_min` still anchored); `height` → edit-var on `y_max`;
+/// `x` → edit-var on `x_min` (and `x_max` follows from any width
+/// constraint); `y` → edit-var on `y_min`.
+pub const Axis = enum { width, height, x, y };
+
+/// Stable key for one suggestion. `component_key` is whatever the
+/// component used to mint its bounds (typically
+/// `@intFromPtr(ctx)`); `axis` disambiguates the dimension. The
+/// host's drag handler stores a suggestion against this key; the
+/// target component's layout pass reads it back via
+/// `getSuggestion`. The pair is densely packed into a u96-style
+/// struct hashable directly.
+pub const SuggestionKey = struct {
+    component_key: u64,
+    axis: Axis,
+};
+
+/// Per-key version bumper. Suggestion mutations bump the target
+/// component's content version through this callback so the
+/// retained block-layout cache invalidates and the next walk picks
+/// up the new value. Each participating component registers one
+/// during its first layout pass; the registration is cleared by
+/// `beginPass` and re-established on every walk, keeping stale
+/// entries from outliving their owners. Suggestions, by contrast,
+/// persist across `beginPass` so dragged layouts stay put.
+pub const VersionBumper = struct {
+    bump: *const fn (ctx: *anyopaque) void,
+    ctx: *anyopaque,
+};
+
 pub const LayoutContext = struct {
     alloc: std.mem.Allocator,
     solver: kiwi.Solver,
@@ -53,6 +88,24 @@ pub const LayoutContext = struct {
     /// frame budget even when serialising across N workers.
     mutex: std.Thread.Mutex = .{},
 
+    /// Persistent suggestions from outside the layout pass (drag
+    /// handlers, future scripted layouts, etc.). Survives every
+    /// `beginPass` — only explicit `clearSuggestion` or
+    /// `clearAllSuggestions` removes entries. Components consult
+    /// this during their layout pass and translate present
+    /// suggestions into kiwi `addEditVariable` + `suggestValue`
+    /// calls at medium strength.
+    suggestions: std.AutoHashMapUnmanaged(SuggestionKey, f64) = .{},
+
+    /// Per-pass version-bumper registrations. Cleared by
+    /// `beginPass` and re-registered by participating components on
+    /// each walk. `setSuggestion` invokes the registered bumper for
+    /// the suggestion's component key so the block-layout cache
+    /// invalidates and the next walk picks up the change. Cleared
+    /// per-pass (rather than persisting like `suggestions`) so
+    /// stale entries from deinit'd components can't be dispatched.
+    bumpers: std.AutoHashMapUnmanaged(u64, VersionBumper) = .{},
+
     pub fn init(alloc: std.mem.Allocator) std.mem.Allocator.Error!LayoutContext {
         return .{
             .alloc = alloc,
@@ -62,6 +115,8 @@ pub const LayoutContext = struct {
 
     pub fn deinit(self: *LayoutContext) void {
         self.bounds_map.deinit(self.alloc);
+        self.suggestions.deinit(self.alloc);
+        self.bumpers.deinit(self.alloc);
         self.solver.deinit();
         self.* = undefined;
     }
@@ -79,6 +134,70 @@ pub const LayoutContext = struct {
     pub fn beginPass(self: *LayoutContext) void {
         self.solver.reset();
         self.bounds_map.clearRetainingCapacity();
+        // Bumpers are per-walk — drop them all so a component that
+        // disappeared between frames can't get re-dispatched.
+        // Participating components re-register during their layout
+        // pass via `registerBumper`.
+        self.bumpers.clearRetainingCapacity();
+    }
+
+    /// Store a suggestion for `(key, axis)` at the given value.
+    /// Participating components consult `getSuggestion` during their
+    /// next layout pass and translate present suggestions into
+    /// `addEditVariable + suggestValue` against their bounds. If a
+    /// version bumper is registered for `key`, it fires immediately
+    /// so the block-layout cache invalidates and the next walk
+    /// actually picks up the change.
+    ///
+    /// Idempotent: re-suggesting the same value is a no-op (no bump
+    /// fires) so drag handlers can call this on every mouse_move
+    /// without paying re-layout cost when the cursor hasn't moved.
+    pub fn setSuggestion(self: *LayoutContext, key: u64, axis: Axis, value: f64) std.mem.Allocator.Error!void {
+        const sk: SuggestionKey = .{ .component_key = key, .axis = axis };
+        const gop = try self.suggestions.getOrPut(self.alloc, sk);
+        const changed = !gop.found_existing or gop.value_ptr.* != value;
+        gop.value_ptr.* = value;
+        if (changed) {
+            if (self.bumpers.get(key)) |b| b.bump(b.ctx);
+        }
+    }
+
+    /// Drop the suggestion for `(key, axis)`. If a suggestion was
+    /// present, fires the registered bumper so the target re-walks
+    /// without it. No-op when there's nothing to clear.
+    pub fn clearSuggestion(self: *LayoutContext, key: u64, axis: Axis) void {
+        const sk: SuggestionKey = .{ .component_key = key, .axis = axis };
+        if (self.suggestions.remove(sk)) {
+            if (self.bumpers.get(key)) |b| b.bump(b.ctx);
+        }
+    }
+
+    /// Read back the stored suggestion for `(key, axis)`, or null
+    /// when nothing's been set. Cheap — callers walk the four axes
+    /// of their bounds every pass.
+    pub fn getSuggestion(self: *const LayoutContext, key: u64, axis: Axis) ?f64 {
+        const sk: SuggestionKey = .{ .component_key = key, .axis = axis };
+        return self.suggestions.get(sk);
+    }
+
+    /// Wipe every suggestion. Reserved for explicit "reset layout"
+    /// actions; not called by `beginPass`. No bumpers fire — the
+    /// caller is expected to have already torn down whatever was
+    /// driving the suggestions.
+    pub fn clearAllSuggestions(self: *LayoutContext) void {
+        self.suggestions.clearRetainingCapacity();
+    }
+
+    /// Register a version bumper for `key`. Called by each
+    /// participating component during its layout pass — the
+    /// registration is cleared on the next `beginPass`. `bump` is
+    /// invoked synchronously inside `setSuggestion` /
+    /// `clearSuggestion` when the stored value for `key` actually
+    /// changes; the typical implementation bumps the component's
+    /// `version` counter so the retained layout cache treats the
+    /// next walk as a fresh miss.
+    pub fn registerBumper(self: *LayoutContext, key: u64, bumper: VersionBumper) std.mem.Allocator.Error!void {
+        try self.bumpers.put(self.alloc, key, bumper);
     }
 
     /// Mint (or return) the four bounds variables for an
@@ -200,6 +319,79 @@ test "two sibling boxes share a flex-style gap constraint" {
     try testing.expectApproxEqAbs(@as(f64, 100), ctx.solver.value(a.x_max), 1e-9);
     try testing.expectApproxEqAbs(@as(f64, 120), ctx.solver.value(b.x_min), 1e-9);
     try testing.expectApproxEqAbs(@as(f64, 220), ctx.solver.value(b.x_max), 1e-9);
+}
+
+test "suggestion: set / get / clear roundtrip" {
+    var ctx = try LayoutContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try testing.expect(ctx.getSuggestion(42, .width) == null);
+
+    try ctx.setSuggestion(42, .width, 250.0);
+    try testing.expectEqual(@as(?f64, 250.0), ctx.getSuggestion(42, .width));
+    try testing.expect(ctx.getSuggestion(42, .height) == null);
+    try testing.expect(ctx.getSuggestion(43, .width) == null);
+
+    ctx.clearSuggestion(42, .width);
+    try testing.expect(ctx.getSuggestion(42, .width) == null);
+}
+
+test "suggestion: survives beginPass" {
+    var ctx = try LayoutContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.setSuggestion(99, .width, 180.0);
+    ctx.beginPass();
+    try testing.expectEqual(@as(?f64, 180.0), ctx.getSuggestion(99, .width));
+}
+
+test "suggestion: changed value fires the registered bumper" {
+    var ctx = try LayoutContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const Counter = struct {
+        var hits: u32 = 0;
+        fn bump(_: *anyopaque) void {
+            hits += 1;
+        }
+    };
+    Counter.hits = 0;
+
+    var dummy: u8 = 0;
+    try ctx.registerBumper(7, .{ .bump = Counter.bump, .ctx = &dummy });
+
+    // First set — bumper fires (new entry).
+    try ctx.setSuggestion(7, .width, 100.0);
+    try testing.expectEqual(@as(u32, 1), Counter.hits);
+
+    // Re-set same value — bumper does NOT fire (idempotent).
+    try ctx.setSuggestion(7, .width, 100.0);
+    try testing.expectEqual(@as(u32, 1), Counter.hits);
+
+    // Change value — bumper fires.
+    try ctx.setSuggestion(7, .width, 200.0);
+    try testing.expectEqual(@as(u32, 2), Counter.hits);
+
+    // Clear — bumper fires.
+    ctx.clearSuggestion(7, .width);
+    try testing.expectEqual(@as(u32, 3), Counter.hits);
+}
+
+test "beginPass clears bumpers but not suggestions" {
+    var ctx = try LayoutContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const Stub = struct {
+        fn bump(_: *anyopaque) void {}
+    };
+    var d: u8 = 0;
+    try ctx.registerBumper(1, .{ .bump = Stub.bump, .ctx = &d });
+    try ctx.setSuggestion(1, .width, 100.0);
+
+    ctx.beginPass();
+
+    try testing.expect(!ctx.bumpers.contains(1));
+    try testing.expectEqual(@as(?f64, 100.0), ctx.getSuggestion(1, .width));
 }
 
 test "the box-style four-var pattern settles to anchor + size" {

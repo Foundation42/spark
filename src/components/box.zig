@@ -152,6 +152,15 @@ const vtable: element.ElementVTable = .{
     .content_version = contentVersion,
 };
 
+/// Version bumper trampoline registered with LayoutContext.bumpers.
+/// External suggestion mutations (drag handlers etc.) call into here
+/// via the type-erased VersionBumper so the block-layout cache
+/// invalidates and the next walk picks up the new geometry.
+fn bumpVersion(ctx: *anyopaque) void {
+    const c: *Component = @ptrCast(@alignCast(ctx));
+    c.version +%= 1;
+}
+
 fn contentVersion(ctx: *anyopaque) u64 {
     const c: *const Component = @ptrCast(@alignCast(ctx));
     return c.version;
@@ -164,7 +173,7 @@ fn layoutAndRender(
     lc: *element.LayoutCtx,
     out: *element.DrawList,
 ) anyerror!element.Box {
-    const c: *const Component = @ptrCast(@alignCast(ctx));
+    const c: *Component = @ptrCast(@alignCast(ctx));
 
     const max_w = constraints.max_w;
     const fallback_w: f32 = if (std.math.isFinite(max_w)) max_w else 320.0;
@@ -214,7 +223,7 @@ fn layoutAndRender(
 /// constrain `box[i+1].x_min == box[i].x_max + gap` without the
 /// box having to expose its variable handles.
 fn layoutViaConstraints(
-    c: *const Component,
+    c: *Component,
     layout_ctx: *layout_context_mod.LayoutContext,
     alloc: std.mem.Allocator,
     origin: [2]f32,
@@ -228,7 +237,14 @@ fn layoutViaConstraints(
     layout_ctx.mutex.lock();
     defer layout_ctx.mutex.unlock();
 
-    const bounds = try layout_ctx.getBounds(@intFromPtr(c));
+    const key = @intFromPtr(c);
+    const bounds = try layout_ctx.getBounds(key);
+
+    // Register a version bumper so external suggestion mutations
+    // (drag handlers, future scripted layouts) invalidate this box
+    // in the retained block-layout cache. Cleared each `beginPass`;
+    // re-registered here on every walk.
+    try layout_ctx.registerBumper(key, .{ .bump = bumpVersion, .ctx = @ptrCast(c) });
 
     var c1 = try kiwi.expr(alloc, bounds.x_min).eq(@as(f64, origin[0])).required();
     defer c1.deinit(alloc);
@@ -238,13 +254,34 @@ fn layoutViaConstraints(
     defer c2.deinit(alloc);
     _ = try layout_ctx.solver.addConstraint(c2);
 
-    var c3 = try kiwi.expr(alloc, bounds.x_max).minus(bounds.x_min).eq(@as(f64, w_target)).required();
-    defer c3.deinit(alloc);
-    _ = try layout_ctx.solver.addConstraint(c3);
+    // Width: solve to the attr-driven `w_target` unless a width
+    // suggestion exists for this box, in which case the suggested
+    // value drives via an edit variable at medium strength.
+    // Required `x_max - x_min >= 0` keeps the box from inverting
+    // even if a negative drag delta crosses the floor.
+    if (layout_ctx.getSuggestion(key, .width)) |sw| {
+        try layout_ctx.solver.addEditVariable(bounds.x_max, kiwi.strength.medium);
+        try layout_ctx.solver.suggestValue(bounds.x_max, @as(f64, origin[0]) + sw);
+        var c_floor = try kiwi.expr(alloc, bounds.x_max).minus(bounds.x_min).geq(@as(f64, 0)).required();
+        defer c_floor.deinit(alloc);
+        _ = try layout_ctx.solver.addConstraint(c_floor);
+    } else {
+        var c3 = try kiwi.expr(alloc, bounds.x_max).minus(bounds.x_min).eq(@as(f64, w_target)).required();
+        defer c3.deinit(alloc);
+        _ = try layout_ctx.solver.addConstraint(c3);
+    }
 
-    var c4 = try kiwi.expr(alloc, bounds.y_max).minus(bounds.y_min).eq(@as(f64, h_target)).required();
-    defer c4.deinit(alloc);
-    _ = try layout_ctx.solver.addConstraint(c4);
+    if (layout_ctx.getSuggestion(key, .height)) |sh| {
+        try layout_ctx.solver.addEditVariable(bounds.y_max, kiwi.strength.medium);
+        try layout_ctx.solver.suggestValue(bounds.y_max, @as(f64, origin[1]) + sh);
+        var c_floor = try kiwi.expr(alloc, bounds.y_max).minus(bounds.y_min).geq(@as(f64, 0)).required();
+        defer c_floor.deinit(alloc);
+        _ = try layout_ctx.solver.addConstraint(c_floor);
+    } else {
+        var c4 = try kiwi.expr(alloc, bounds.y_max).minus(bounds.y_min).eq(@as(f64, h_target)).required();
+        defer c4.deinit(alloc);
+        _ = try layout_ctx.solver.addConstraint(c4);
+    }
 
     layout_ctx.solver.updateVariables();
 

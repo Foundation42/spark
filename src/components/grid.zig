@@ -307,6 +307,11 @@ pub fn resolveTrackWidths(
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .content_version = contentVersion,
+    // Stage 15D: same rationale as :::flex — caching the whole
+    // grid into one block-cache entry hides per-child version
+    // bumps from the suggestion-driven invalidation chain. Until
+    // hierarchical invalidation lands, grids re-walk every frame.
+    .disable_cache = true,
 };
 
 fn contentVersion(ctx: *anyopaque) u64 {

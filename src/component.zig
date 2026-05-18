@@ -456,6 +456,48 @@ pub const Registry = struct {
         return .{ .vtable = entry.instance.vtable, .ctx = entry.instance.ctx };
     }
 
+    /// Resolve a sibling reference inside the caller's own scope.
+    /// `our_ctx` is the calling component's ctx pointer; the
+    /// registry uses it to recover the caller's scope prefix (the
+    /// part of its cache key before the final `/`) and then
+    /// qualifies `target_id` against that scope. Falls back to a
+    /// scope-less lookup when the caller can't be located or when
+    /// the qualified key isn't found — covers top-level components
+    /// addressing other top-level components.
+    ///
+    /// Used by the stage-15D `:::handle` to find its target box
+    /// when both live inside the same `:::flex {#scope}`; the
+    /// author writes `target=#sibling_id` instead of having to
+    /// know the implicit `{scope}/sibling_id` registry path.
+    ///
+    /// O(n) over registry entries on a miss — fine at input
+    /// frequency, callers should cache the result if they need
+    /// per-frame lookups.
+    pub fn lookupSibling(self: *Registry, our_ctx: *anyopaque, target_id: []const u8) ?Resolved {
+        var our_scope: ?[]const u8 = null;
+        var it = self.instances.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.instance.ctx == our_ctx) {
+                const key = entry.key_ptr.*;
+                if (std.mem.lastIndexOfScalar(u8, key, '/')) |slash| {
+                    our_scope = key[0..slash];
+                }
+                break;
+            }
+        }
+
+        if (our_scope) |scope| {
+            var buf: [512]u8 = undefined;
+            if (std.fmt.bufPrint(&buf, "{s}/{s}", .{ scope, target_id })) |full| {
+                if (self.instances.get(full)) |entry| {
+                    return .{ .vtable = entry.instance.vtable, .ctx = entry.instance.ctx };
+                }
+            } else |_| {}
+        }
+
+        return self.lookup(target_id);
+    }
+
     /// Dispatch one `:::update {#id action=NAME}` directive to the
     /// cached instance's `handle_update` handler. The `body` slice is
     /// passed through verbatim (caller has already trimmed surrounding

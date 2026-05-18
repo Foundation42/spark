@@ -38,6 +38,7 @@ const badge_component = @import("components/badge.zig");
 const box_component = @import("components/box.zig");
 const flex_component = @import("components/flex.zig");
 const grid_component = @import("components/grid.zig");
+const handle_component = @import("components/handle.zig");
 const button_component = @import("components/button.zig");
 const chart_component = @import("components/chart.zig");
 const embedded_document_component = @import("components/embedded_document.zig");
@@ -91,7 +92,12 @@ const ATLAS_COLOR_SIZE: u32 = 1024;
 // the cap, writeGlyphs silently failed, and drawCb early-returned
 // every frame — visible as a black window. 8192 is comfortable
 // headroom; bump again if/when doc density justifies.
-const MAX_GLYPHS: u32 = 8192;
+//
+// Stage 15 bumped → 16384: the manifesto-density demo + stage-15
+// inline badges + stage-15D drag-to-resize section pushed past
+// 8192; the next density jump (15E.3 sparkline / icon, future
+// embedded docs) gets headroom too.
+const MAX_GLYPHS: u32 = 16384;
 const MAX_QUADS: u32 = 2048;
 // Stage 13d.1 caps. Petunias.svg flattens to ~5–10k triangles
 // (verts + indices each ≈3× tri count for triangle lists).
@@ -964,12 +970,23 @@ pub fn main() !void {
     // (their `:::` blocks render as red placeholders).
     var registry = component.Registry.init(allocator);
     defer registry.deinit();
+
+    // Stage 15 Phase B — constraint solver context. One per host;
+    // reset at the top of each runLayout. Components that opt in
+    // declare bounds variables and constraints against this during
+    // the walk. Lives up here (before any factory install that
+    // captures it) so the handle's install can grab a stable ref.
+    var layout_context = try layout_context_mod.LayoutContext.init(allocator);
+    defer layout_context.deinit();
+
     try registry.register("box", box_component.factory);
     try registry.register("chart", chart_component.factory);
     try registry.register("slider", slider_component.factory);
     try badge_component.install(&registry);
     try button_component.install(&registry);
     defer button_component.deinitGlobals();
+    try handle_component.install(&registry, &layout_context);
+    defer handle_component.deinitGlobals();
     // input_component install needs parent_state — we know
     // host_state lives long enough (declared just below this block)
     // so we move the install to after host_state init. See below.
@@ -1139,13 +1156,6 @@ pub fn main() !void {
     // Lives next to block_cache so its lifetime matches the layout
     // pipeline; uncontested cost is a single atomic compare-exchange.
     var glyph_cache_lock = std.Thread.Mutex{};
-
-    // Stage 15 Phase B — constraint solver context. One per host;
-    // reset at the top of each runLayout. Components that opt in
-    // (currently :::box only) declare bounds variables and
-    // constraints against this during the walk.
-    var layout_context = try layout_context_mod.LayoutContext.init(allocator);
-    defer layout_context.deinit();
 
     // ANSI uses a mono-bodied derivation of the theme so spacing is
     // terminal-like. Bold + italic still fall back to the proportional

@@ -85,6 +85,21 @@ The first multi-child constraint-aware provider. `:::flex` walks its children wi
 :::
 :::
 
+## Drag-to-resize (stage 15D)
+
+Stage 15D wires GPU-side input deltas straight to the kiwi constraint solver via `LayoutContext.setSuggestion`. A `:::handle` between two boxes drags horizontally; the left box reads its own width as a `suggestValue` edit at medium strength, and the right box shifts to follow. No state intermediary, no re-parse — the cursor drives the solver, the solver reshapes the layout, the renderer paints the new geometry on the next frame.
+
+:::flex {#resizer_row direction=row gap=0}
+:::box {#resizer_left color=cyan width=240 height=80 radius=6}
+:::
+
+:::handle {target=#resizer_left axis=horizontal width=8 height=80}
+:::
+
+:::box {color=magenta width=200 height=80 radius=6}
+:::
+:::
+
 ## Grid layout (stage 15d/e)
 
 The second multi-child constraint-aware provider. `:::grid` lays its body out into tracks (`columns=N` for `N` equal columns, or a CSS-style list like `"100px 1fr 1fr"` mixing fixed and flexible widths), row-major, with independent `row-gap` and `column-gap`. Each cell still goes through the kiwi solver for its own bounds — the grid parent allocates the track, the cell constrains its size inside it. `:::flex` handles 1D; `:::grid` handles 2D; both stack cleanly inside each other.

@@ -165,6 +165,17 @@ fn applyAttrs(c: *Component, spec: *const components.Spec) void {
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .content_version = contentVersion,
+    // Stage 15D: flex caches its children's draws into a single
+    // block-cache entry. When a child opts into the suggestion
+    // channel (drag-driven resizing via `:::handle`), bumping the
+    // child's version doesn't invalidate THIS entry — the flex
+    // would hit cache and replay the stale baked-in child output.
+    // Disabling block-grain caching here ensures every frame
+    // re-walks the children so their layoutViaConstraints sees
+    // any new suggestion. Cost is small (flex walks a handful of
+    // children imperatively); hierarchical cache invalidation can
+    // earn this back in a future stage.
+    .disable_cache = true,
 };
 
 fn contentVersion(ctx: *anyopaque) u64 {

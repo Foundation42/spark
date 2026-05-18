@@ -18,6 +18,7 @@ test {
     _ = @import("components/embedded_document.zig");
     _ = @import("components/flex.zig");
     _ = @import("components/grid.zig");
+    _ = @import("components/handle.zig");
     _ = @import("components/input.zig");
     _ = @import("components/llm_stream.zig");
     _ = @import("components/svg.zig");
