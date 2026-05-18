@@ -874,30 +874,146 @@ fr-track + axis-split gap form. Closes Phase F.1; `:::table` and
 named tracks defer. Manifest of the constraint layer: ~300 tests
 across solver primitives + LayoutContext + flex + grid.
 
-## Next — GPU-input channel + text intrusion (stage 15D, 15E)
+## Shipped — drag-to-suggest channel (stage 15D)
 
-The two remaining phases of the stage 15 substrate plan, both of
-which the kiwi port + LayoutContext + parallel-walk hardening
-were built nominally to host.
+Phase D of the stage 15 plan, delivered in session 15. CPU-side
+input drives the kiwi solver via a persistent suggestion channel —
+no compute-shader readback yet (parked until a fluid-sim-style
+demo actually needs it; mouse input was the load-bearing case).
 
-- **GPU-input → solver channel (Phase D).** Compute shader writes
-  a readback buffer per frame; host wraps the result as
-  `solver.suggestValue(var, x)`; surrounding layout reflows
-  incrementally. Gives the "fluid sim warps the document" demo
-  without putting an LP solver on the GPU. The constraint
-  substrate is the load-bearing piece; the rest is plumbing the
-  GPU readback channel onto solver edit variables.
-- **Text intrusion / exclusion (Phase E).** `:::image {flow=around}`
-  — markdown wraps around an SVG / raster figure via an
-  `ExclusionShape` layered over the settled solver positions. CSS
-  `shape-outside` semantics; per-line break decisions consult the
-  exclusion shapes. Magazine-grade layout from a markdown file.
+`LayoutContext` grew:
+- `Axis` enum (`width` / `height` / `x` / `y`).
+- `suggestions: HashMap(SuggestionKey {component_key, axis}, f64)`
+  that survives `beginPass`. Dragged layouts stay where they were
+  put across frames.
+- `bumpers: HashMap(u64, VersionBumper)` cleared per pass,
+  re-registered each walk by participating components.
+  `setSuggestion` fires the bumper for the target's key so the
+  retained block-layout cache invalidates and the next walk picks
+  up the new value.
+- Public API: `setSuggestion` / `clearSuggestion` / `getSuggestion`
+  / `clearAllSuggestions` / `registerBumper`. Idempotent —
+  re-suggesting the same value is a no-op.
 
-Strength discipline (required / strong / medium / weak) and the
-measure-then-render protocol (lifting per-sibling negotiation —
-`flex-grow`, `justify=space-between` — into the solver itself,
-parked from stage 15C) layer onto either phase when each one
-lands. Full design position in [`layout.md`](layout.md).
+`:::box` opted in: when a width/height suggestion exists for its
+key, skips the required equality and uses `addEditVariable(x_max,
+medium) + suggestValue(x_max, origin + sw)` with a `geq 0` floor
+so drags can't invert. Registers its version-bumper trampoline
+each walk.
+
+`:::handle` is the new drag-aware component. Attrs `target=#id`
+(resolved through new `Registry.lookupSibling` that finds the
+caller's own scope and qualifies the target within it),
+`axis=horizontal|vertical`, `width`, `height`, `color`. Captures
+the cursor's world position and the target's current size at
+mouse_down; each mouse_move computes
+`new_size = drag_start_size + (cursor_world_now - drag_start_cursor_world)`
+and calls `setSuggestion`. Resize and stay resized.
+
+`:::flex` and `:::grid` got `disable_cache = true` — they compose
+children's draws into a single cache entry, so a child's version
+bump alone wouldn't invalidate the container. Hierarchical cache
+invalidation parked.
+
+**The frozen-origin bug** surfaced during shake-out: the dispatcher
+latches `fc.captured` at mouse_down (`hit.box.x` is a value
+snapshot), so every subsequent `local[0]` is relative to the
+*frozen* handle x. The handle's first cut reconstructed cursor world
+as `c.last_box.x + local[0]` — double-counting the handle's own
+motion → positive feedback → bar raced away from the cursor.
+Christian caught it from physical observation when the logged data
+looked superficially right; the fix is a `drag_start_handle_origin`
+snapshot at mouse_down. Rule captured in
+`memory/project_drag_frozen_origin.md` for any future
+drag-aware widget.
+
+Demo: a flex row with cyan box, handle, magenta box. Drag the
+handle, cyan resizes through the solver, magenta shifts. The
+manifesto's flywheel made tangible.
+
+## Shipped — inline component substrate (stage 15E + 15E.2-15E.5)
+
+Six commits in session 15 took inline components from
+hand-built-demo-only to a real markdown surface hosting six
+distinct visual languages flowing through prose. **Distinct from
+"Phase E text exclusion"** in the original stage 15 plan (CSS
+`shape-outside` magazine wrap — still parked, see below); this
+shipped the parallel concept of *components participating in line
+layout* alongside text runs.
+
+**Stage 15E — text intrusion runtime (`05cd2fa`).** New
+`Element.inline_object` variant + `IntrinsicMetrics` +
+`ElementVTable.measure_inline` slot. Inline-flow walker (`element_layout.zig`)
+extended with a fourth `InlineToken.object` variant that
+participates in `max(ascender)` / `max(line_height)` resolve,
+closes decoration runs at object boundaries, dispatches
+`vtable.layout_and_render` at the resolved baseline. `emitInlineObject`
+helper translates four `valign` modes (baseline / middle / top /
+bottom) into concrete origins. First inhabitant: `::badge` pill.
+
+**Stage 15E.2 — markdown surface (`cc74a6d`).** `::name {attrs}`
+inline syntax (single-colon, mirroring triple-colon `:::block`
+form). Preprocess gained per-line character-by-character scanner
+that honours backtick code spans + requires a word boundary before
+`::`. Matches become `<!--ti:N-->` sentinels cmark renders as
+inline HTML; mapper detects + materialises as `inline_object`.
+`parseAttrsBlock` + `parseDirectiveName` extracted as shared helpers
+across block + inline directive parsing.
+
+**Stage 15E.3 — ::sparkline (`bbda045`).** Mini bar chart from
+comma-separated data. Normalises 0..max, renders bars as quads.
+Sits on baseline; line-height grows to accommodate the chart.
+
+**Stage 15E.4 — ::kbd + ::progress (`948f07b`).** `::kbd` =
+keyboard-key chrome (raised-cap shadow + mono label + accent
+border). `::progress` = inline pill bar with `value` + `max` attrs
+so arbitrary state ranges can drive it without manual scaling. The
+demo binds `value=${state.box_radius} max=40` so the slider's
+0..40 drag reactively reshapes the progress bar through the
+existing `Binding` machinery — substrate composition made visible.
+
+**Stage 15E.5 — ::status + ::tag (`5d006d9`).** `::status` =
+coloured dot ± label (dot-only mode for compact rows, dot+label
+for dashboard prose). `::tag` = hashtag-style outlined chip (no
+fill, knockout border, accent text). Brings the inline_object
+roster to six types — enough vocabulary to write a real admin /
+dashboard page in markdown.
+
+Inline vocabulary now: `text`, `line_break`, `emphasis`, `strong`,
+`code`, `link`, plus `inline_object` hosting `badge`, `sparkline`,
+`kbd`, `progress`, `status`, `tag`. Each new component is 30-80
+lines on top of the substrate.
+
+## Next — measure-pass protocol + text exclusion + hierarchical invalidation
+
+The remaining stage 15 / 15E work that didn't land in session 15.
+
+- **Measure-pass protocol (Phase C.3).** Two-phase
+  measure→layout contract so flex/grid children can advertise
+  intrinsic sizes and providers can place them without guessing.
+  Sets up full constraint-aware flex (flex-grow / shrink /
+  justify=space-between) and richer grid (auto-sized rows /
+  columns).
+- **Text exclusion / shape-outside (original Phase E).**
+  `:::image {flow=around}` — markdown wraps around an SVG / raster
+  figure via an `ExclusionShape` layered over the settled solver
+  positions. CSS `shape-outside` semantics; per-line break
+  decisions consult the exclusion shapes. Magazine-grade layout
+  from a markdown file. **Different from inline_object** (which
+  flows components *with* text runs); this routes text *around*
+  block-level visuals.
+- **Hierarchical cache invalidation.** Pay back the techdebt from
+  disabling flex/grid block-cache during stage 15D. Parent
+  containers' content_version should aggregate children's so a
+  child bump propagates up. Restores cache hit-rate on the
+  drag-to-resize path.
+- **Compute-shader → suggestion channel.** The GPU-readback
+  variant of Phase D that the original roadmap framed. Mouse input
+  was the load-bearing demo case; compute-shader feedback (fluid
+  sim warps the document) is the next frontier when a real demo
+  needs it.
+
+Full design position in [`layout.md`](layout.md).
 
 ## Eventually — LM connection (tier 3)
 
