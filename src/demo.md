@@ -16,6 +16,8 @@ Live-document runtime — colour emoji 🎨 flows inline with text 🌸, mathema
 
 Service health: API ::badge{label="200ms" color=green} cache ::badge{label="stale" color=yellow} queue ::badge{label="13ms" color=green}, all green except auth ::badge{label="503" color=red}. Tracking ::badge{label="PR-1234" color=blue} ::badge{label="draft" color=purple} for the next release.
 
+Latency last hour ::sparkline{data="3,5,7,4,8,6,9,5,7,4,6,8,5,3,7,9,6,4,5,8" color=cyan} steady. Errors per minute ::sparkline{data="0,1,0,0,2,1,0,0,1,3,1,0,0,0,1,0,2,0,0,1" color=orange} mostly quiet. Cache hits ::sparkline{data="92,94,93,95,96,94,93,95,97,95,96,94,93,95,97,96,98,95,96,97" color=green} stable.
+
 ## Stage 3 — markdown source becomes the tree
 
 Same renderer as before — only the construction path changed. This document is parsed by *cmark* into an AST, then walked into an `element.Element` tree.

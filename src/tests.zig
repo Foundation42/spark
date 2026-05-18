@@ -25,6 +25,7 @@ test {
     _ = @import("components/svg_stream.zig");
     _ = @import("components/image_stream.zig");
     _ = @import("components/slider.zig");
+    _ = @import("components/sparkline.zig");
     _ = @import("asset_cache.zig");
     _ = @import("dotenv.zig");
     _ = @import("io_channel.zig");

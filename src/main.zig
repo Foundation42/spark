@@ -45,6 +45,7 @@ const embedded_document_component = @import("components/embedded_document.zig");
 const input_component = @import("components/input.zig");
 const llm_stream_component = @import("components/llm_stream.zig");
 const slider_component = @import("components/slider.zig");
+const sparkline_component = @import("components/sparkline.zig");
 const svg_component = @import("components/svg.zig");
 const svg_stream_component = @import("components/svg_stream.zig");
 const image_stream_component = @import("components/image_stream.zig");
@@ -983,6 +984,7 @@ pub fn main() !void {
     try registry.register("chart", chart_component.factory);
     try registry.register("slider", slider_component.factory);
     try badge_component.install(&registry);
+    try sparkline_component.install(&registry);
     try button_component.install(&registry);
     defer button_component.deinitGlobals();
     try handle_component.install(&registry, &layout_context);
