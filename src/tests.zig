@@ -59,4 +59,9 @@ test {
     _ = @import("svg_tessellate.zig");
     _ = @import("update.zig");
     _ = @import("spark.zig");
+
+    // Phase 5 library-boundary tests
+    _ = @import("tests/library_lifecycle.zig");
+    _ = @import("tests/two_instances.zig");
+    _ = @import("tests/integration_render.zig");
 }
