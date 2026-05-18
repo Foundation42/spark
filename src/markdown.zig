@@ -240,7 +240,7 @@ fn mapBlock(
         },
 
         cmark.CMARK_NODE_PARAGRAPH => {
-            const inline_content = try mapInlineChildren(mc.arena, node, cascade, mc.theme);
+            const inline_content = try mapInlineChildren(mc, node, cascade);
             return .{ .paragraph = inline_content };
         },
 
@@ -253,7 +253,7 @@ fn mapBlock(
             // cascade caveat in element.Theme — fix when nested
             // emphasis inside headings becomes a visual concern.)
             const heading_base = mc.theme.heading[level - 1];
-            const inline_content = try mapInlineChildren(mc.arena, node, heading_base, mc.theme);
+            const inline_content = try mapInlineChildren(mc, node, heading_base);
             return .{ .heading = .{ .level = level, .content = inline_content } };
         },
 
@@ -542,15 +542,14 @@ const registry_mod = @import("font/registry.zig");
 /// inline), and recursively by emphasis/strong/code/link container
 /// kinds.
 fn mapInlineChildren(
-    arena: std.mem.Allocator,
+    mc: *const MapCtx,
     parent: *cmark.cmark_node,
     cascade: element.Style,
-    theme: *const element.Theme,
 ) Error![]const element.Element {
-    var list = std.ArrayList(element.Element).init(arena);
+    var list = std.ArrayList(element.Element).init(mc.arena);
     var child: ?*cmark.cmark_node = cmark.cmark_node_first_child(parent);
     while (child) |c| : (child = cmark.cmark_node_next(c)) {
-        try appendInline(arena, c, cascade, theme, &list);
+        try appendInline(mc, c, cascade, &list);
     }
     return try list.toOwnedSlice();
 }
@@ -559,10 +558,9 @@ fn mapInlineChildren(
 /// inline kinds produce exactly one Element; IMAGE produces zero or
 /// more (its alt-text inline children, inlined).
 fn appendInline(
-    arena: std.mem.Allocator,
+    mc: *const MapCtx,
     node: *cmark.cmark_node,
     cascade: element.Style,
-    theme: *const element.Theme,
     out: *std.ArrayList(element.Element),
 ) Error!void {
     const t = cmark.cmark_node_get_type(node);
@@ -574,7 +572,7 @@ fn appendInline(
                 std.mem.span(literal_ptr)
             else
                 "";
-            try appendTextWithFallback(arena, out, literal, cascade, theme);
+            try appendTextWithFallback(mc.arena, out, literal, cascade, mc.theme);
         },
 
         cmark.CMARK_NODE_SOFTBREAK => {
@@ -589,14 +587,14 @@ fn appendInline(
         },
 
         cmark.CMARK_NODE_EMPH => {
-            const inner_cascade = theme.applyEmphasis(cascade);
-            const inner = try mapInlineChildren(arena, node, inner_cascade, theme);
+            const inner_cascade = mc.theme.applyEmphasis(cascade);
+            const inner = try mapInlineChildren(mc, node, inner_cascade);
             try out.append(.{ .emphasis = inner });
         },
 
         cmark.CMARK_NODE_STRONG => {
-            const inner_cascade = theme.applyStrong(cascade);
-            const inner = try mapInlineChildren(arena, node, inner_cascade, theme);
+            const inner_cascade = mc.theme.applyStrong(cascade);
+            const inner = try mapInlineChildren(mc, node, inner_cascade);
             try out.append(.{ .strong = inner });
         },
 
@@ -609,20 +607,20 @@ fn appendInline(
                 std.mem.span(literal_ptr)
             else
                 "";
-            const owned = try arena.dupe(u8, literal);
-            const inner = try arena.alloc(element.Element, 1);
-            inner[0] = .{ .text = .{ .content = owned, .style = theme.applyCodeInline(cascade) } };
+            const owned = try mc.arena.dupe(u8, literal);
+            const inner = try mc.arena.alloc(element.Element, 1);
+            inner[0] = .{ .text = .{ .content = owned, .style = mc.theme.applyCodeInline(cascade) } };
             try out.append(.{ .code = inner });
         },
 
         cmark.CMARK_NODE_LINK => {
             const url_ptr = cmark.cmark_node_get_url(node);
             const target: []const u8 = if (url_ptr != null)
-                try arena.dupe(u8, std.mem.span(url_ptr))
+                try mc.arena.dupe(u8, std.mem.span(url_ptr))
             else
                 "";
-            const inner_cascade = theme.applyLink(cascade);
-            const inner = try mapInlineChildren(arena, node, inner_cascade, theme);
+            const inner_cascade = mc.theme.applyLink(cascade);
+            const inner = try mapInlineChildren(mc, node, inner_cascade);
             try out.append(.{ .link = .{ .target = target, .content = inner } });
         },
 
@@ -631,26 +629,78 @@ fn appendInline(
             // texture pipeline (later). The alt content sits in the
             // image node's inline children; flatten them into the
             // outer flow as if the image weren't there.
-            const alt = try mapInlineChildren(arena, node, cascade, theme);
+            const alt = try mapInlineChildren(mc, node, cascade);
             try out.appendSlice(alt);
         },
 
         cmark.CMARK_NODE_HTML_INLINE => {
-            // Show the raw HTML as inline code so the source is
-            // visible rather than silently dropped.
+            // Stage 15E.2: inline `::name{attrs}` directives survive
+            // preprocess as `<!--ti:N-->` sentinels that cmark hands
+            // back as HTML_INLINE literals. Detect, resolve through
+            // the registry, materialise as Element.inline_object.
+            // Anything else falls through to the original raw-HTML-
+            // as-code rendering so legitimate inline HTML in source
+            // stays visible rather than silently disappearing.
             const literal_ptr = cmark.cmark_node_get_literal(node);
             const literal: []const u8 = if (literal_ptr != null)
                 std.mem.span(literal_ptr)
             else
                 "";
-            const owned = try arena.dupe(u8, literal);
-            const inner = try arena.alloc(element.Element, 1);
-            inner[0] = .{ .text = .{ .content = owned, .style = theme.applyCodeInline(cascade) } };
+
+            if (components.extractInlineSentinelIndex(literal)) |idx| {
+                if (idx < mc.specs.len) {
+                    const spec_ptr = &mc.specs[idx];
+                    if (mc.registry) |reg| {
+                        // Factory errors fall through to the inline
+                        // fallback below — registry surfaces a broader
+                        // error set than this mapper, and a single
+                        // bad directive shouldn't blow up the whole
+                        // parse.
+                        const resolved = reg.resolve(spec_ptr, idx, mc.state, mc.scope) catch null;
+                        if (resolved) |inst| {
+                            try out.append(.{ .inline_object = .{
+                                .vtable = inst.vtable,
+                                .ctx = inst.ctx,
+                            } });
+                            return;
+                        }
+                    }
+                    // Unresolved inline directive — render the original
+                    // `::name` fragment as inert code so the author
+                    // sees their typo or unregistered name. Cleaner
+                    // than the block-level placeholder panel, which
+                    // would blow the line height open mid-paragraph.
+                    try appendInlineFallback(mc, spec_ptr.name, cascade, out);
+                    return;
+                }
+            }
+
+            // Genuine inline HTML — pre-15E.2 behaviour: render the
+            // raw literal as inline code so it stays visible.
+            const owned = try mc.arena.dupe(u8, literal);
+            const inner = try mc.arena.alloc(element.Element, 1);
+            inner[0] = .{ .text = .{ .content = owned, .style = mc.theme.applyCodeInline(cascade) } };
             try out.append(.{ .code = inner });
         },
 
         else => return error.UnsupportedNodeKind,
     }
+}
+
+/// Fallback rendering for an inline directive whose name isn't
+/// registered (or whose factory.create errored). Emits the original
+/// `::name` fragment as inert code-styled text so the author sees
+/// what's wrong without the paragraph layout breaking.
+fn appendInlineFallback(
+    mc: *const MapCtx,
+    name: []const u8,
+    cascade: element.Style,
+    out: *std.ArrayList(element.Element),
+) Error!void {
+    const owned = try std.fmt.allocPrint(mc.arena, "::{s}", .{name});
+    const inner = try mc.arena.alloc(element.Element, 1);
+    inner[0] = .{ .text = .{ .content = owned, .style = mc.theme.applyCodeInline(cascade) } };
+    try out.append(.{ .code = inner });
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

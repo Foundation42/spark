@@ -218,7 +218,14 @@ pub fn preprocess(arena: std.mem.Allocator, source: []const u8, state: ?*const s
             // verbatim — e.g. `:::` at the end of a sentence in prose.
         }
 
-        try out.appendSlice(line);
+        // ── Inline-directive scan (stage 15E.2) ────────────────────
+        // Mid-line `::name{attrs}` becomes an `<!--ti:N-->` sentinel
+        // that the inline mapper later materialises as an
+        // `Element.inline_object`. Honours single-backtick code-span
+        // state so `` `::badge{}` `` round-trips verbatim, and
+        // requires a word-boundary before `::` so C++-style `foo::bar`
+        // doesn't trigger.
+        try scanInlineDirectives(line, arena, &out, &specs, state);
         try out.append('\n');
     }
 
@@ -246,79 +253,17 @@ pub fn preprocess(arena: std.mem.Allocator, source: []const u8, state: ?*const s
 ///   BARE       := [^ \t}]+
 pub fn parseDirectiveLine(arena: std.mem.Allocator, content: []const u8, state: ?*const state_mod.State) Error!Spec {
     var i: usize = 0;
-
-    // Name — allows digit-leading names like "3d-scene". Keys / ids
-    // stay letter-leading via isIdentStart below; the looser rule only
-    // applies here because directive names are tag-like, not
-    // programming identifiers.
-    const name_start = i;
-    if (i >= content.len or !isNameStart(content[i])) return error.InvalidDirective;
-    i += 1;
-    while (i < content.len and isIdentChar(content[i])) : (i += 1) {}
-    const name = try arena.dupe(u8, content[name_start..i]);
+    const name = try parseDirectiveName(arena, content, &i);
 
     skipSpaces(content, &i);
 
     var id: ?[]const u8 = null;
-    var attrs = std.ArrayList(Attr).init(arena);
-
+    var attrs: []const Attr = &.{};
     if (i < content.len and content[i] == '{') {
-        i += 1;
-        while (true) {
-            skipSpaces(content, &i);
-            if (i >= content.len) return error.InvalidAttribute;
-            if (content[i] == '}') {
-                i += 1;
-                break;
-            }
-
-            if (content[i] == '#') {
-                i += 1;
-                const id_start = i;
-                while (i < content.len and isIdentChar(content[i])) : (i += 1) {}
-                if (i == id_start) return error.InvalidAttribute;
-                id = try arena.dupe(u8, content[id_start..i]);
-                continue;
-            }
-
-            const key_start = i;
-            if (!isIdentStart(content[i])) return error.InvalidAttribute;
-            i += 1;
-            while (i < content.len and isIdentChar(content[i])) : (i += 1) {}
-            const key = try arena.dupe(u8, content[key_start..i]);
-
-            var value: []const u8 = "";
-            if (i < content.len and content[i] == '=') {
-                i += 1;
-                if (i < content.len and content[i] == '"') {
-                    i += 1;
-                    const v_start = i;
-                    while (i < content.len and content[i] != '"') : (i += 1) {}
-                    if (i >= content.len) return error.InvalidAttribute;
-                    value = try substituteState(arena, content[v_start..i], state);
-                    i += 1; // consume closing quote
-                } else {
-                    // Bare value scanner — terminates on whitespace
-                    // or the closing `}` of the attribute block, but
-                    // treats `${...}` as a single opaque unit so
-                    // template `}` doesn't truncate the value.
-                    const v_start = i;
-                    var depth: u32 = 0;
-                    while (i < content.len) : (i += 1) {
-                        const ch = content[i];
-                        if (depth == 0 and isAttrTerminator(ch)) break;
-                        if (ch == '$' and i + 1 < content.len and content[i + 1] == '{') {
-                            depth += 1;
-                            i += 1; // consume the `{` too (loop increments past `$`)
-                            continue;
-                        }
-                        if (depth > 0 and ch == '}') depth -= 1;
-                    }
-                    value = try substituteState(arena, content[v_start..i], state);
-                }
-            }
-            try attrs.append(.{ .key = key, .value = value });
-        }
+        const parsed = try parseAttrsBlock(arena, content, i, state);
+        id = parsed.id;
+        attrs = parsed.attrs;
+        i = parsed.end;
     }
 
     // Anything beyond the closing brace should be only whitespace.
@@ -328,8 +273,161 @@ pub fn parseDirectiveLine(arena: std.mem.Allocator, content: []const u8, state: 
     return .{
         .name = name,
         .id = id,
-        .attrs = try attrs.toOwnedSlice(),
+        .attrs = attrs,
         .body = "",
+    };
+}
+
+/// Parse one inline directive — `::name` optionally followed by
+/// `{attrs}` — anchored at `content[start..]`. Returns the resolved
+/// Spec plus the end index just past the directive (where the caller
+/// resumes scanning). Returns `null` if the position doesn't look
+/// like the start of a directive at all (so the caller can decide
+/// to emit the bytes verbatim and advance one char).
+///
+/// Boundary policy: this function assumes the caller has already
+/// checked that `content[start..start+2]` is `::` followed by a
+/// name-start character. The boundary-before-`::` check (excluding
+/// `foo::bar` C++-style colons, `:::` triple, etc.) belongs to the
+/// scanning caller.
+///
+/// Symmetric with `parseDirectiveLine` — same name / attrs grammar.
+/// The two differ only in their termination contract: directive-line
+/// requires the rest to be whitespace; inline-directive leaves
+/// arbitrary trailing content for the caller's stream to continue.
+pub fn parseInlineDirective(
+    arena: std.mem.Allocator,
+    content: []const u8,
+    start: usize,
+    state: ?*const state_mod.State,
+) Error!?struct { spec: Spec, end: usize } {
+    if (start + 2 > content.len) return null;
+    if (content[start] != ':' or content[start + 1] != ':') return null;
+    if (start + 2 >= content.len or !isNameStart(content[start + 2])) return null;
+
+    var i: usize = start + 2;
+    const name = try parseDirectiveName(arena, content, &i);
+
+    // Whitespace between name and `{` is allowed (matches
+    // `:::flex {direction=row}`). The directive ends at the name if
+    // no `{` follows — content-less inline use like `::heart-icon`.
+    skipSpaces(content, &i);
+
+    var id: ?[]const u8 = null;
+    var attrs: []const Attr = &.{};
+    if (i < content.len and content[i] == '{') {
+        const parsed = try parseAttrsBlock(arena, content, i, state);
+        id = parsed.id;
+        attrs = parsed.attrs;
+        i = parsed.end;
+    }
+
+    return .{
+        .spec = .{
+            .name = name,
+            .id = id,
+            .attrs = attrs,
+            .body = "",
+        },
+        .end = i,
+    };
+}
+
+/// Parse the directive name token at `content[i.*..]`. Advances `i`
+/// past the name on success. Returns an arena-owned slice of the
+/// name. Names are tag-like: digit-leading is allowed (so `3d-scene`
+/// works), keys / ids stay letter-leading.
+fn parseDirectiveName(
+    arena: std.mem.Allocator,
+    content: []const u8,
+    i: *usize,
+) Error![]const u8 {
+    const start = i.*;
+    if (start >= content.len or !isNameStart(content[start])) return error.InvalidDirective;
+    var j: usize = start + 1;
+    while (j < content.len and isIdentChar(content[j])) : (j += 1) {}
+    const name = try arena.dupe(u8, content[start..j]);
+    i.* = j;
+    return name;
+}
+
+/// Parse a `{key=value ...}` attrs block starting at `content[start]`
+/// (which MUST be `{`). Returns the parsed id + attrs and the index
+/// past the closing `}`. Shared between block (`:::name {…}`) and
+/// inline (`::name{…}`) directives so they accept the exact same
+/// grammar without drift.
+fn parseAttrsBlock(
+    arena: std.mem.Allocator,
+    content: []const u8,
+    start: usize,
+    state: ?*const state_mod.State,
+) Error!struct { id: ?[]const u8, attrs: []const Attr, end: usize } {
+    std.debug.assert(content[start] == '{');
+
+    var i: usize = start + 1;
+    var id: ?[]const u8 = null;
+    var attrs = std.ArrayList(Attr).init(arena);
+
+    while (true) {
+        skipSpaces(content, &i);
+        if (i >= content.len) return error.InvalidAttribute;
+        if (content[i] == '}') {
+            i += 1;
+            break;
+        }
+
+        if (content[i] == '#') {
+            i += 1;
+            const id_start = i;
+            while (i < content.len and isIdentChar(content[i])) : (i += 1) {}
+            if (i == id_start) return error.InvalidAttribute;
+            id = try arena.dupe(u8, content[id_start..i]);
+            continue;
+        }
+
+        const key_start = i;
+        if (!isIdentStart(content[i])) return error.InvalidAttribute;
+        i += 1;
+        while (i < content.len and isIdentChar(content[i])) : (i += 1) {}
+        const key = try arena.dupe(u8, content[key_start..i]);
+
+        var value: []const u8 = "";
+        if (i < content.len and content[i] == '=') {
+            i += 1;
+            if (i < content.len and content[i] == '"') {
+                i += 1;
+                const v_start = i;
+                while (i < content.len and content[i] != '"') : (i += 1) {}
+                if (i >= content.len) return error.InvalidAttribute;
+                value = try substituteState(arena, content[v_start..i], state);
+                i += 1; // consume closing quote
+            } else {
+                // Bare value scanner — terminates on whitespace or the
+                // closing `}` of the attribute block, but treats
+                // `${...}` as a single opaque unit so template `}`
+                // doesn't truncate the value.
+                const v_start = i;
+                var depth: u32 = 0;
+                while (i < content.len) : (i += 1) {
+                    const ch = content[i];
+                    if (depth == 0 and isAttrTerminator(ch)) break;
+                    if (ch == '$' and i + 1 < content.len and content[i + 1] == '{') {
+                        depth += 1;
+                        i += 1; // consume the `{` too (loop increments past `$`)
+                        continue;
+                    }
+                    if (depth > 0 and ch == '}') depth -= 1;
+                }
+                value = try substituteState(arena, content[v_start..i], state);
+            }
+        }
+        try attrs.append(.{ .key = key, .value = value });
+    }
+
+    return .{
+        .id = id,
+        .attrs = try attrs.toOwnedSlice(),
+        .end = i,
     };
 }
 
@@ -401,6 +499,95 @@ pub fn extractSentinelIndex(literal: []const u8) ?usize {
     if (!std.mem.endsWith(u8, trimmed, suffix)) return null;
     const body = trimmed[prefix.len .. trimmed.len - suffix.len];
     return std.fmt.parseInt(usize, body, 10) catch null;
+}
+
+/// Counterpart of `extractSentinelIndex` for the inline-directive
+/// sentinel emitted by `scanInlineDirectives` — `<!--ti:N-->`. Distinct
+/// prefix from the block path (`te` vs `ti`) so the mapper knows
+/// whether to materialise as `Element.custom` or
+/// `Element.inline_object`. Same spec-index space; the two sentinel
+/// families just disambiguate the materialisation contract.
+pub fn extractInlineSentinelIndex(literal: []const u8) ?usize {
+    const trimmed = std.mem.trim(u8, literal, " \t\r\n");
+    const prefix = "<!--ti:";
+    const suffix = "-->";
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
+    if (!std.mem.endsWith(u8, trimmed, suffix)) return null;
+    const body = trimmed[prefix.len .. trimmed.len - suffix.len];
+    return std.fmt.parseInt(usize, body, 10) catch null;
+}
+
+/// Scan one non-fence, non-block-`:::` source line for inline
+/// `::name{attrs}` directives. Successful matches get replaced with
+/// `<!--ti:N-->` sentinels (a new entry pushed to `specs`); everything
+/// else passes through verbatim. The trailing newline is the caller's
+/// responsibility — this helper writes line content only.
+///
+/// Backtick handling: a single-backtick code span `` `…` `` swallows
+/// its contents wholesale (including any `::name` inside) so authors
+/// can talk about the syntax in prose without triggering it. We do
+/// NOT yet handle multi-backtick spans (`` `` …`text`… `` ``) — that
+/// edge case lands when content actually needs it.
+///
+/// Boundary policy: `::` only opens a directive when preceded by
+/// nothing, by whitespace, or by punctuation other than `:`. This
+/// keeps C++-style `Foo::bar` and our own line-start `:::` from
+/// matching as inline directives.
+fn scanInlineDirectives(
+    line: []const u8,
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    specs: *std.ArrayList(Spec),
+    state: ?*const state_mod.State,
+) Error!void {
+    var i: usize = 0;
+    while (i < line.len) {
+        const c = line[i];
+
+        // Code-span passthrough — find the matching backtick and emit
+        // the whole span untouched. If unmatched, emit the backtick
+        // alone and continue (cmark will treat it as literal too).
+        if (c == '`') {
+            const close = std.mem.indexOfScalarPos(u8, line, i + 1, '`');
+            if (close) |end| {
+                try out.appendSlice(line[i .. end + 1]);
+                i = end + 1;
+                continue;
+            }
+            try out.append(c);
+            i += 1;
+            continue;
+        }
+
+        // Inline-directive opener: `::` + name-start + boundary.
+        if (c == ':' and i + 2 < line.len and line[i + 1] == ':' and isNameStart(line[i + 2]) and isInlineBoundary(line, i)) {
+            if (try parseInlineDirective(arena, line, i, state)) |hit| {
+                const idx = specs.items.len;
+                try specs.append(hit.spec);
+                try out.writer().print("<!--ti:{d}-->", .{idx});
+                i = hit.end;
+                continue;
+            }
+            // Parser declined (malformed attrs reach here as errors;
+            // null returns mean the position didn't actually start a
+            // directive). Fall through and emit the byte verbatim.
+        }
+
+        try out.append(c);
+        i += 1;
+    }
+}
+
+/// Whether the position `i` in `line` qualifies as a left boundary
+/// for an inline directive opener. True at line start; true after
+/// whitespace or non-`:` punctuation; false after an ident-character
+/// (so `foo::bar` doesn't trigger) and false after `:` (so the
+/// second `:` of a `:::` triple doesn't open one either).
+fn isInlineBoundary(line: []const u8, i: usize) bool {
+    if (i == 0) return true;
+    const prev = line[i - 1];
+    if (prev == ':') return false;
+    return !isIdentChar(prev);
 }
 
 // ── Placeholder vtable ─────────────────────────────────────────────
@@ -666,6 +853,141 @@ test "extractSentinelIndex" {
     try std.testing.expectEqual(@as(?usize, 42), extractSentinelIndex("<!--te:42-->\n"));
     try std.testing.expectEqual(@as(?usize, null), extractSentinelIndex("<!-- something else -->"));
     try std.testing.expectEqual(@as(?usize, null), extractSentinelIndex("<!--te:abc-->"));
+}
+
+test "extractInlineSentinelIndex" {
+    try std.testing.expectEqual(@as(?usize, 0), extractInlineSentinelIndex("<!--ti:0-->"));
+    try std.testing.expectEqual(@as(?usize, 7), extractInlineSentinelIndex("<!--ti:7-->"));
+    try std.testing.expectEqual(@as(?usize, null), extractInlineSentinelIndex("<!--te:0-->"));
+    try std.testing.expectEqual(@as(?usize, null), extractInlineSentinelIndex("<!--ti:foo-->"));
+}
+
+test "parseInlineDirective: basic name + attrs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const hit = (try parseInlineDirective(arena.allocator(), "::badge{label=\"13ms\" color=red}", 0, null)).?;
+    try std.testing.expectEqualStrings("badge", hit.spec.name);
+    try std.testing.expectEqual(@as(usize, 2), hit.spec.attrs.len);
+    try std.testing.expectEqualStrings("label", hit.spec.attrs[0].key);
+    try std.testing.expectEqualStrings("13ms", hit.spec.attrs[0].value);
+    try std.testing.expectEqualStrings("color", hit.spec.attrs[1].key);
+    try std.testing.expectEqualStrings("red", hit.spec.attrs[1].value);
+    try std.testing.expectEqual(@as(usize, 31), hit.end);
+}
+
+test "parseInlineDirective: name only (no attrs)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const hit = (try parseInlineDirective(arena.allocator(), "::heart-icon", 0, null)).?;
+    try std.testing.expectEqualStrings("heart-icon", hit.spec.name);
+    try std.testing.expectEqual(@as(usize, 0), hit.spec.attrs.len);
+    try std.testing.expectEqual(@as(usize, 12), hit.end);
+}
+
+test "parseInlineDirective: declines on non-directive position" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // No `::` at start
+    try std.testing.expectEqual(@as(@TypeOf(try parseInlineDirective(arena.allocator(), "no", 0, null)), null), try parseInlineDirective(arena.allocator(), "no", 0, null));
+    // `::` but third char isn't a name-start
+    try std.testing.expectEqual(@as(@TypeOf(try parseInlineDirective(arena.allocator(), "no", 0, null)), null), try parseInlineDirective(arena.allocator(), ":::a", 0, null));
+}
+
+test "preprocess: inline directive becomes ti sentinel" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = try preprocess(arena.allocator(),
+        \\Latency hit ::badge{label="13ms" color=green} this morning.
+        \\
+    , null);
+    try std.testing.expectEqual(@as(usize, 1), p.specs.len);
+    try std.testing.expectEqualStrings("badge", p.specs[0].name);
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "<!--ti:0-->") != null);
+    // The original `::badge{...}` source is gone from the output.
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "::badge") == null);
+    // Surrounding text survives.
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "Latency hit ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.source, " this morning.") != null);
+}
+
+test "preprocess: multiple inline directives per line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = try preprocess(arena.allocator(),
+        \\Statuses: ::badge{label="ok"} ::badge{label="warn" color=yellow} ::badge{label="err" color=red}.
+        \\
+    , null);
+    try std.testing.expectEqual(@as(usize, 3), p.specs.len);
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "<!--ti:0-->") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "<!--ti:1-->") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "<!--ti:2-->") != null);
+}
+
+test "preprocess: inline directive inside backtick code span is untouched" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = try preprocess(arena.allocator(),
+        \\Use `::badge{label="13ms"}` to render an inline pill.
+        \\
+    , null);
+    try std.testing.expectEqual(@as(usize, 0), p.specs.len);
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "`::badge{label=\"13ms\"}`") != null);
+}
+
+test "preprocess: C++-style foo::bar does not match" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = try preprocess(arena.allocator(),
+        \\See `std::vector` for details. Or write Foo::bar in prose.
+        \\
+    , null);
+    try std.testing.expectEqual(@as(usize, 0), p.specs.len);
+}
+
+test "preprocess: inline directive at line start works" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = try preprocess(arena.allocator(),
+        \\::badge{label="open"} after.
+        \\
+    , null);
+    try std.testing.expectEqual(@as(usize, 1), p.specs.len);
+    try std.testing.expectEqualStrings("open", p.specs[0].attrs[0].value);
+}
+
+test "preprocess: inline directives mix with a block directive" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = try preprocess(arena.allocator(),
+        \\Status is ::badge{label="green"}.
+        \\
+        \\:::box {color=red}
+        \\hello
+        \\:::
+        \\
+        \\After ::badge{label="done"}.
+        \\
+    , null);
+    try std.testing.expectEqual(@as(usize, 3), p.specs.len);
+    try std.testing.expectEqualStrings("badge", p.specs[0].name);
+    try std.testing.expectEqualStrings("box", p.specs[1].name);
+    try std.testing.expectEqualStrings("badge", p.specs[2].name);
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "<!--ti:0-->") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "<!--te:1-->") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "<!--ti:2-->") != null);
+}
+
+test "preprocess: inline directive inside fenced code is untouched" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = try preprocess(arena.allocator(),
+        \\```
+        \\::badge{label="inside code"}
+        \\```
+        \\
+    , null);
+    try std.testing.expectEqual(@as(usize, 0), p.specs.len);
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "::badge") != null);
 }
 
 test "parseDirectiveLine: ${state.x} substitution" {

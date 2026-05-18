@@ -12,6 +12,10 @@ state:
 
 Live-document runtime — colour emoji 🎨 flows inline with text 🌸, mathematical signs ✓ ✗ ≈ ≠ ∞ ≤ ≥ pick up the body font, and rich glyphs (rocket 🚀, sparkles ✨, flower 🌸, palette 🎨, party 🎉, star ⭐, fire 🔥, heart ❤️) ride the colour atlas alongside everything else.
 
+## Inline components
+
+Service health: API ::badge{label="200ms" color=green} cache ::badge{label="stale" color=yellow} queue ::badge{label="13ms" color=green}, all green except auth ::badge{label="503" color=red}. Tracking ::badge{label="PR-1234" color=blue} ::badge{label="draft" color=purple} for the next release.
+
 ## Stage 3 — markdown source becomes the tree
 
 Same renderer as before — only the construction path changed. This document is parsed by *cmark* into an AST, then walked into an `element.Element` tree.
