@@ -18,6 +18,10 @@ Service health: API ::badge{label="200ms" color=green} cache ::badge{label="stal
 
 Latency last hour ::sparkline{data="3,5,7,4,8,6,9,5,7,4,6,8,5,3,7,9,6,4,5,8" color=cyan} steady. Errors per minute ::sparkline{data="0,1,0,0,2,1,0,0,1,3,1,0,0,0,1,0,2,0,0,1" color=orange} mostly quiet. Cache hits ::sparkline{data="92,94,93,95,96,94,93,95,97,95,96,94,93,95,97,96,98,95,96,97" color=green} stable.
 
+Press ::kbd{key="Ctrl+C"} to copy, ::kbd{key="Ctrl+V"} to paste, or ::kbd{key="Esc" color=red} to bail out. Vim survivors reach for ::kbd{key="hjkl"} on instinct.
+
+Build is ::progress{value=0.7 color=green} almost done. Disk usage ::progress{value=0.92 color=red} getting tight. And bound to the slider below — `box_radius` is ::progress{value=${state.box_radius} max=40 color=cyan} live.
+
 ## Stage 3 — markdown source becomes the tree
 
 Same renderer as before — only the construction path changed. This document is parsed by *cmark* into an AST, then walked into an `element.Element` tree.

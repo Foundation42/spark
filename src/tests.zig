@@ -20,6 +20,8 @@ test {
     _ = @import("components/grid.zig");
     _ = @import("components/handle.zig");
     _ = @import("components/input.zig");
+    _ = @import("components/kbd.zig");
+    _ = @import("components/progress.zig");
     _ = @import("components/llm_stream.zig");
     _ = @import("components/svg.zig");
     _ = @import("components/svg_stream.zig");

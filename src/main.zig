@@ -39,6 +39,8 @@ const box_component = @import("components/box.zig");
 const flex_component = @import("components/flex.zig");
 const grid_component = @import("components/grid.zig");
 const handle_component = @import("components/handle.zig");
+const kbd_component = @import("components/kbd.zig");
+const progress_component = @import("components/progress.zig");
 const button_component = @import("components/button.zig");
 const chart_component = @import("components/chart.zig");
 const embedded_document_component = @import("components/embedded_document.zig");
@@ -985,6 +987,8 @@ pub fn main() !void {
     try registry.register("slider", slider_component.factory);
     try badge_component.install(&registry);
     try sparkline_component.install(&registry);
+    try kbd_component.install(&registry);
+    try progress_component.install(&registry);
     try button_component.install(&registry);
     defer button_component.deinitGlobals();
     try handle_component.install(&registry, &layout_context);
