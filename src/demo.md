@@ -26,6 +26,14 @@ Services: API ::status{color=green label="online"}, cache ::status{color=yellow 
 
 Tagged ::tag{label="wip"} ::tag{label="deprecated" color=orange} ::tag{label="security" color=red} ::tag{label="docs" color=cyan} ::tag{label="v0.42" color=purple} — five facets, one line of prose.
 
+Revenue ::trend{value="+12.4%"} this quarter, orders ::trend{value="-2.1%"} from last week, NPS holding ::trend{value="0%"}. Latency ::trend{value="-23ms" down_color=green} (lower is better), error rate ::trend{value="+0.4%" up_color=red}.
+
+The book scored ::rating{value=4.5} on Goodreads, the sequel only ::rating{value=2.5}, and the third never quite landed ::rating{value=1}. Five-star reviews dominate at ::rating{value=5 color=orange}.
+
+Build status: ::dot{color=green} passing on main, ::dot{color=yellow} flaky on PR #42, ::dot{color=red} blocked on staging. Workers ::dot{color=green} ::dot{color=green} ::dot{color=yellow} ::dot{color=green} mostly fine.
+
+Fixed in ::commit{hash="acf8e7b"} (part of session 17), shipping alongside ::commit{hash="8d6e7a3c4d5e6f7a8b9c0d1e2f"} and ::commit{hash="d26d67d" repo="fdn42/text_engine"} in the next release.
+
 ## Stage 3 — markdown source becomes the tree
 
 Same renderer as before — only the construction path changed. This document is parsed by *cmark* into an AST, then walked into an `element.Element` tree.

@@ -30,6 +30,10 @@ test {
     _ = @import("components/sparkline.zig");
     _ = @import("components/status.zig");
     _ = @import("components/tag.zig");
+    _ = @import("components/trend.zig");
+    _ = @import("components/rating.zig");
+    _ = @import("components/dot.zig");
+    _ = @import("components/commit.zig");
     _ = @import("asset_cache.zig");
     _ = @import("dotenv.zig");
     _ = @import("io_channel.zig");
