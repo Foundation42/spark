@@ -157,6 +157,7 @@ pub const components = struct {
         pub const pattern = @import("components/effects/pattern.zig");
         pub const noise = @import("components/effects/noise.zig");
         pub const drop_shadow = @import("components/effects/drop_shadow.zig");
+        pub const frosted_glass = @import("components/effects/frosted_glass.zig");
     };
 };
 
@@ -197,6 +198,8 @@ pub fn installCoreComponents(spark: *Spark) !void {
     try components.effects.noise.install(spark);
     // Effects-spec Phase B.5 — first single_source filter.
     try components.effects.drop_shadow.install(spark);
+    // Effects-spec Phase B.6 — second single_source filter.
+    try components.effects.frosted_glass.install(spark);
 }
 
 /// Compiled SPIR-V blobs. Anonymous module wired in by `build.zig`;

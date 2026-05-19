@@ -54,3 +54,35 @@ The first user-facing single_source factory. Wraps any child content, renders it
 :::box {color=#0d9488 width=240 height=80 radius=8}
 :::
 :::
+
+## Frosted glass — single-source filter (Phase B.6)
+
+Second single_source consumer. Renders the wrapped child into an offscreen target, then a single-pass 9-tap box blur smears the contents and a tint colour composites over the result — the modern-OS panel look. No inflation: the effect stays within the child's natural bounds. The pipeline shape (combined-image-sampler + push-constant uniforms) mirrors drop_shadow; the post-B.6.a cache substrate handles both factories without per-factory workaround flags. The blur shows convincingly only when the child has spatial-frequency content to smear — solid-colour children only show edge softening, so the four panels below escalate from flat fill to high-frequency pattern + noise.
+
+Subtle tint over a solid panel — baseline. Edge softening visible; interior is flat by construction.
+
+:::frosted_glass {#glass_subtle blur=10 tint=#ffffff14}
+:::box {color=#1a1a2e width=240 height=80 radius=8}
+:::
+:::
+
+Checker pattern wrapped in frosted glass — maximum-contrast input. The blur averages adjacent black/white squares into mid-grey; the tint overlays on top.
+
+:::frosted_glass {#glass_checker blur=12 tint=#0d948828}
+:::pattern {type=checker seed=0 width=240 height=80}
+:::
+:::
+
+Same wrap, heavier blur — the squares dissolve almost completely; the tint dominates the visible result.
+
+:::frosted_glass {#glass_checker_heavy blur=28 tint=#16213e40}
+:::pattern {type=checker seed=0 width=240 height=80}
+:::
+:::
+
+FBM noise wrapped in frosted glass — the per-pixel jitter blurs into a soft cloudy texture, then the tint washes over. Demonstrates the substrate composes with any pass-emitting child.
+
+:::frosted_glass {#glass_noise blur=16 tint=#ffffff10}
+:::noise {seed=42 scale=8.0 octaves=4 width=240 height=80}
+:::
+:::

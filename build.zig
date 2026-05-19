@@ -47,6 +47,11 @@ pub fn build(b: *std.Build) void {
     // Effects-spec Phase B.5 — first user-facing single_source
     // filter. 9-tap box blur + offset + tint over a sampled target.
     const drop_shadow_frag_spv = compileShaderStage(b, glslc_path, "drop_shadow", "frag", optimize);
+    // Effects-spec Phase B.6 — second user-facing single_source
+    // filter. 9-tap box blur + tint overlay (modern-OS panel look).
+    // First consumer to land cleanly on the post-B.6.a cache substrate
+    // (no disable_cache workaround needed).
+    const frosted_glass_frag_spv = compileShaderStage(b, glslc_path, "frosted_glass", "frag", optimize);
 
     // ── Bundle SPIR-V into a generated Zig module ──────────────────
     // The compiled blobs need `align(4)` because Vulkan's `pCode` field
@@ -68,6 +73,7 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(noise_frag_spv, "noise.frag.spv");
     _ = wf.addCopyFile(copy_frag_spv, "copy.frag.spv");
     _ = wf.addCopyFile(drop_shadow_frag_spv, "drop_shadow.frag.spv");
+    _ = wf.addCopyFile(frosted_glass_frag_spv, "frosted_glass.frag.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const text_vert align(4) = @embedFile("text.vert.spv").*;
         \\pub const text_frag align(4) = @embedFile("text.frag.spv").*;
@@ -83,6 +89,7 @@ pub fn build(b: *std.Build) void {
         \\pub const noise_frag align(4) = @embedFile("noise.frag.spv").*;
         \\pub const copy_frag align(4) = @embedFile("copy.frag.spv").*;
         \\pub const drop_shadow_frag align(4) = @embedFile("drop_shadow.frag.spv").*;
+        \\pub const frosted_glass_frag align(4) = @embedFile("frosted_glass.frag.spv").*;
         \\
     );
 

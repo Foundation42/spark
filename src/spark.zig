@@ -720,18 +720,15 @@ pub const Spark = struct {
         // entry. Same fix mirrored in phase1ProcessSingleSource's
         // nested loop.
         //
-        // TODO(B.6): forward iteration treats patterns inside
-        // single_source subtrees as top-level. The walker emits
-        // patterns BEFORE their single_source parent (post-order),
-        // so a forward walk encounters nested patterns and dispatches
-        // them at the main attachment AND inside the parent's
-        // offscreen pass — double-rendering. Doesn't trigger on
-        // current effect.md because `:::drop_shadow { :::box }`
-        // wraps a content element (`:::box` emits no dispatches).
-        // B.6's `:::frosted_glass { :::gradient … }` (or any
-        // shape wrapping a pass-emitting child) will surface it.
-        // Fix: backward iteration + skip-past-subtree, OR an
-        // `is_top_level` bitmap pre-computed once.
+        // B.6.b — patterns inside a single_source's subtree (walker
+        // emits them BEFORE the parent in post-order) are handled
+        // here by `.pattern => i += 1` skipping them at top-level;
+        // they get rendered into the parent's offscreen target by
+        // the nested subtree loop in `phase1ProcessSingleSource`.
+        // Phase 2's mirror skip uses an `is_nested` bitmap (see
+        // there); the asymmetry is intentional — Phase 1's iteration
+        // only ever processes single_sources, so the natural skip
+        // of `.pattern` is already correct.
         var i: u32 = 0;
         while (i < self.pass_dispatches.items.len) {
             switch (self.pass_dispatches.items[i]) {
@@ -1163,6 +1160,29 @@ pub const Spark = struct {
         // Phase C+ chain effects (bloom mips) make per-bind cost
         // matter.
         if (self.pass_dispatches.items.len > 0) {
+            // B.6.b — pre-compute is_top_level bitmap. The walker emits
+            // patterns BEFORE their parent single_source (post-order),
+            // so a naive forward iteration treats nested patterns as
+            // top-level and dispatches them on MAIN. Mark every
+            // dispatch inside a single_source's subtree_dispatch_range
+            // as nested; Phase 2 skips those (Phase 1 already
+            // rendered them into the parent's offscreen target).
+            const pd_len = self.pass_dispatches.items.len;
+            const is_nested = try self.allocator.alloc(bool, pd_len);
+            defer self.allocator.free(is_nested);
+            @memset(is_nested, false);
+            for (self.pass_dispatches.items) |d| {
+                switch (d) {
+                    .single_source => |ss| {
+                        var k = ss.subtree_dispatch_range[0];
+                        while (k < ss.subtree_dispatch_range[1]) : (k += 1) {
+                            is_nested[k] = true;
+                        }
+                    },
+                    else => {},
+                }
+            }
+
             const sx = self.frame_info.scroll_offset[0];
             const sy = self.frame_info.scroll_offset[1];
             const z = self.frame_info.zoom;
@@ -1170,6 +1190,10 @@ pub const Spark = struct {
             var last_compose: vk.c.VkPipeline = null;
             var i: usize = 0;
             while (i < self.pass_dispatches.items.len) {
+                if (is_nested[i]) {
+                    i += 1;
+                    continue;
+                }
                 switch (self.pass_dispatches.items[i]) {
                     .pattern => |p| {
                         // World-local viewport: (region - scroll) * zoom.
@@ -1561,6 +1585,14 @@ fn registerEmbeddedPassShaders(
     // ensures the pipeline is ready before any doc loads.
     try resolver.register("drop_shadow.frag", &shaders.drop_shadow_frag);
     try single_source.compile(pass_mod.shaderIdFromName("drop_shadow.frag"), &shaders.drop_shadow_frag);
+
+    // Effects-spec Phase B.6 — second user-facing single_source
+    // filter. Frosted-glass factory (`:::frosted_glass`). Ratifies
+    // the B.6.a cache substrate (no disable_cache workaround) and
+    // shares the drop_shadow descriptor-layout shape — same
+    // pipeline cache, same eager-compile discipline.
+    try resolver.register("frosted_glass.frag", &shaders.frosted_glass_frag);
+    try single_source.compile(pass_mod.shaderIdFromName("frosted_glass.frag"), &shaders.frosted_glass_frag);
 }
 
 fn dispatchHit(hit: element.Hit, event: element.InputEvent, default_state: *state_mod.State) !void {
