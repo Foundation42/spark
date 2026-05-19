@@ -181,6 +181,14 @@ pub const Spark = struct {
     /// dispatch-time lookup is constant-time. Holds one shared
     /// `VkPipelineLayout` and one `VkPipeline` per pattern shader.
     pattern_pipelines: pass_mod.PatternPipelineCache,
+    /// Single-source filter pipeline cache (effects-spec Phase
+    /// B.4.b.1). Sibling of `pattern_pipelines`; same lifecycle,
+    /// different pipeline-layout shape (one combined-image-sampler
+    /// descriptor set + push constants — patterns are push-only).
+    /// `registerEmbeddedPassShaders` seeds it with `copy.frag` at
+    /// init time as the substrate smoke shader; B.5+ filters
+    /// (`drop_shadow`, `frosted_glass`) register here too.
+    single_source_pipelines: pass_mod.SingleSourcePipelineCache,
 
     /// Owned via pointer (JobSystem.init returns `*JobSystem`).
     compute_jobs: *jobs_mod.JobSystem,
@@ -304,7 +312,23 @@ pub const Spark = struct {
             &shaders.fullscreen_vert,
         );
         errdefer pattern_pipelines.deinit();
-        try registerEmbeddedPassShaders(&shader_resolver, &pattern_pipelines);
+        // Single-source filter cache stands up before
+        // `registerEmbeddedPassShaders` for the same reason
+        // `pattern_pipelines` does — the seeding pass calls
+        // `compile()` on each substrate/filter shader and needs both
+        // caches live.
+        var single_source_pipelines = try pass_mod.SingleSourcePipelineCache.init(
+            allocator,
+            opts.vk_ctx,
+            opts.color_format,
+            &shaders.fullscreen_vert,
+        );
+        errdefer single_source_pipelines.deinit();
+        try registerEmbeddedPassShaders(
+            &shader_resolver,
+            &pattern_pipelines,
+            &single_source_pipelines,
+        );
 
         return .{
             .allocator = allocator,
@@ -327,6 +351,7 @@ pub const Spark = struct {
             .target_pool = target_pool,
             .shader_resolver = shader_resolver,
             .pattern_pipelines = pattern_pipelines,
+            .single_source_pipelines = single_source_pipelines,
             .compute_jobs = compute_jobs,
             .io_jobs = io_jobs,
             .fonts = opts.fonts,
@@ -403,6 +428,7 @@ pub const Spark = struct {
         self.target_pool.deinit();
         self.shader_resolver.deinit();
         self.pattern_pipelines.deinit();
+        self.single_source_pipelines.deinit();
 
         // 6. Layout state.
         self.layout_context.deinit();
@@ -893,6 +919,7 @@ pub const Spark = struct {
             .target_pool = undefined,
             .shader_resolver = undefined,
             .pattern_pipelines = undefined,
+            .single_source_pipelines = undefined,
             .compute_jobs = undefined,
             .io_jobs = undefined,
             .fonts = undefined,
@@ -905,10 +932,11 @@ pub const Spark = struct {
 // ── Helpers ────────────────────────────────────────────────────────
 
 /// Seed the shader resolver with every built-in pass shader at
-/// Spark init time. Effects-spec Phase A.4 + A.5: registers
-/// `fullscreen.vert` (shared) plus the three Phase A.5 canary
-/// fragments (`gradient`, `pattern`, `noise`). Phase B adds the
-/// single-source effects (`drop_shadow`, `frosted_glass`, `blur`).
+/// Spark init time. Effects-spec Phase A.4 + A.5 + B.4.b.1:
+/// registers `fullscreen.vert` (shared), the three Phase A.5 canary
+/// pattern fragments (`gradient`, `pattern`, `noise`), and the
+/// Phase B.4.b.1 substrate-smoke filter (`copy`). Phase B.5+ adds
+/// real single-source filters (`drop_shadow`, `frosted_glass`).
 /// When the list grows past comfortable inline size, split into
 /// `src/pass/embedded.zig`.
 ///
@@ -939,6 +967,7 @@ pub const Spark = struct {
 fn registerEmbeddedPassShaders(
     resolver: *pass_mod.ShaderResolver,
     pipelines: *pass_mod.PatternPipelineCache,
+    single_source: *pass_mod.SingleSourcePipelineCache,
 ) !void {
     const shaders = @import("shaders");
     // Vertex shader is registered in the resolver for symmetry /
@@ -955,6 +984,14 @@ fn registerEmbeddedPassShaders(
 
     try resolver.register("noise.frag", &shaders.noise_frag);
     try pipelines.compile(pass_mod.shaderIdFromName("noise.frag"), &shaders.noise_frag);
+
+    // Effects-spec Phase B.4.b.1 substrate-smoke filter. Registered
+    // here so the SingleSourcePipelineCache's eager-compile path
+    // gets exercised end-to-end at every Spark.init, not just by
+    // its own unit tests. No factory ships against `copy.frag` —
+    // it's substrate validation, not a user-facing effect.
+    try resolver.register("copy.frag", &shaders.copy_frag);
+    try single_source.compile(pass_mod.shaderIdFromName("copy.frag"), &shaders.copy_frag);
 }
 
 fn dispatchHit(hit: element.Hit, event: element.InputEvent, default_state: *state_mod.State) !void {

@@ -38,6 +38,12 @@ pub fn build(b: *std.Build) void {
     const gradient_frag_spv = compileShaderStage(b, glslc_path, "gradient", "frag", optimize);
     const pattern_frag_spv = compileShaderStage(b, glslc_path, "pattern", "frag", optimize);
     const noise_frag_spv = compileShaderStage(b, glslc_path, "noise", "frag", optimize);
+    // Effects-spec Phase B.4.b.1 — single-source substrate smoke
+    // shader. Passthrough composite paired with the combined-image-
+    // sampler descriptor layout; first non-pattern pipeline shape,
+    // validates the SingleSourcePipelineCache eager-compile path
+    // before B.5 ships the first real filter (`:::drop_shadow`).
+    const copy_frag_spv = compileShaderStage(b, glslc_path, "copy", "frag", optimize);
 
     // ── Bundle SPIR-V into a generated Zig module ──────────────────
     // The compiled blobs need `align(4)` because Vulkan's `pCode` field
@@ -57,6 +63,7 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(gradient_frag_spv, "gradient.frag.spv");
     _ = wf.addCopyFile(pattern_frag_spv, "pattern.frag.spv");
     _ = wf.addCopyFile(noise_frag_spv, "noise.frag.spv");
+    _ = wf.addCopyFile(copy_frag_spv, "copy.frag.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const text_vert align(4) = @embedFile("text.vert.spv").*;
         \\pub const text_frag align(4) = @embedFile("text.frag.spv").*;
@@ -70,6 +77,7 @@ pub fn build(b: *std.Build) void {
         \\pub const gradient_frag align(4) = @embedFile("gradient.frag.spv").*;
         \\pub const pattern_frag align(4) = @embedFile("pattern.frag.spv").*;
         \\pub const noise_frag align(4) = @embedFile("noise.frag.spv").*;
+        \\pub const copy_frag align(4) = @embedFile("copy.frag.spv").*;
         \\
     );
 
