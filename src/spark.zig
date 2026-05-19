@@ -835,15 +835,24 @@ pub const Spark = struct {
 // ── Helpers ────────────────────────────────────────────────────────
 
 /// Seed the shader resolver with every built-in pass shader at
-/// Spark init time. Effects-spec Phase A.4 — today registers
-/// `fullscreen.vert` (shared by every effect from A.5 onward).
-/// Future phases add entries as they ship: A.5 lands the three
-/// canary fragment shaders (`gradient`, `pattern`, `noise`); B
-/// adds `drop_shadow`, `frosted_glass`, `blur`. When the list
-/// grows past comfortable inline size, split into
+/// Spark init time. Effects-spec Phase A.4 + A.5: registers
+/// `fullscreen.vert` (shared) plus the three Phase A.5 canary
+/// fragments (`gradient`, `pattern`, `noise`). Phase B adds the
+/// single-source effects (`drop_shadow`, `frosted_glass`, `blur`).
+/// When the list grows past comfortable inline size, split into
 /// `src/pass/embedded.zig`.
 ///
-/// Borrowing contract: the registered slices point into the
+/// **Eager-registration scaling caveat.** v1 registers every
+/// shader at Spark init — fine while the set is small. Phase C
+/// `bloom` will multiply: bloom needs N downsample mip levels, and
+/// each might want a distinct shader specialization (separable
+/// horizontal/vertical, threshold-aware vs naive). At that point a
+/// lazy variant (`resolver.registerLazy(name, fn() spv)` or pull-
+/// through compilation on first `resolve()`) is the answer. Today
+/// the cost is one HashMap put per shader at startup; Phase C is
+/// where this stops being free.
+///
+/// **Borrowing contract.** The registered slices point into the
 /// `shaders` module's `@embedFile`'d data — process-lifetime, no
 /// free needed. The resolver holds the borrowed pointers and never
 /// owns them. Future asset-cache-loaded shaders (per the resolver's
@@ -851,6 +860,9 @@ pub const Spark = struct {
 fn registerEmbeddedPassShaders(resolver: *pass_mod.ShaderResolver) !void {
     const shaders = @import("shaders");
     try resolver.register("fullscreen.vert", &shaders.fullscreen_vert);
+    try resolver.register("gradient.frag", &shaders.gradient_frag);
+    try resolver.register("pattern.frag", &shaders.pattern_frag);
+    try resolver.register("noise.frag", &shaders.noise_frag);
 }
 
 fn dispatchHit(hit: element.Hit, event: element.InputEvent, default_state: *state_mod.State) !void {

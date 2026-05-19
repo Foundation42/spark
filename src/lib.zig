@@ -149,6 +149,14 @@ pub const components = struct {
     pub const svg = @import("components/svg.zig");
     pub const tag = @import("components/tag.zig");
     pub const trend = @import("components/trend.zig");
+    // Effects-spec Phase A.5 — three canary pattern factories.
+    // Same `installCoreComponents` rung as the rasterizer-shaped
+    // components per Decision #11 ("core vocabulary, not extras").
+    pub const effects = struct {
+        pub const gradient = @import("components/effects/gradient.zig");
+        pub const pattern = @import("components/effects/pattern.zig");
+        pub const noise = @import("components/effects/noise.zig");
+    };
 };
 
 /// Register all core component factories on `spark`. Idempotent at
@@ -182,6 +190,10 @@ pub fn installCoreComponents(spark: *Spark) !void {
     try components.grid.install(spark);
     try components.input.install(spark);
     try components.svg.install(spark);
+    // Effects-spec Phase A.5 — Phase A pattern canaries.
+    try components.effects.gradient.install(spark);
+    try components.effects.pattern.install(spark);
+    try components.effects.noise.install(spark);
 }
 
 /// Compiled SPIR-V blobs. Anonymous module wired in by `build.zig`;

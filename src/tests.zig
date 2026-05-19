@@ -14,6 +14,9 @@ test {
     _ = @import("pass/graph.zig");
     _ = @import("pass/shader_resolver.zig");
     _ = @import("pass/target_pool.zig");
+    _ = @import("components/effects/gradient.zig");
+    _ = @import("components/effects/pattern.zig");
+    _ = @import("components/effects/noise.zig");
     _ = @import("component.zig");
     _ = @import("components/badge.zig");
     _ = @import("components/box.zig");
