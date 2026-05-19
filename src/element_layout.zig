@@ -335,10 +335,33 @@ pub fn layoutAndRender(
                         .subtree_dispatch_range = .{ dispatch_start, seq },
                         .sequence_index = seq,
                     } },
-                    // Reserved arms (chain, host_slot) — no factory
-                    // declares them yet, so this branch is dead. When
-                    // Phase B's :::placeholder_scene lights up pass_kind
-                    // = 4, the host_slot arm gets its own case here.
+                    // Effects-spec B.7 — host_slot. Invocation is
+                    // resolved by the per-instance vtable hook
+                    // (mandatory for host_slot factories — same shape
+                    // as snapshot_uniforms being mandatory for
+                    // pass-kind variants). Walker errors if the hook
+                    // is missing so the dispatch site never sees a
+                    // half-resolved HostSlotStep. host_slot emits NO
+                    // child subtree, so subtree_dispatch_range is
+                    // absent from the type (host owns the rendering
+                    // wholesale — no spark walker recursion below
+                    // this dispatch).
+                    4 => .{ .host_slot = .{
+                        .target_size = .{
+                            @intFromFloat(@max(0, @round(box.w))),
+                            @intFromFloat(@max(0, @round(box.h))),
+                        },
+                        .composite_shader_id = cu.shader_id,
+                        .compose_region = region,
+                        .invocation = blk: {
+                            const hook = cu.vtable.invoke_host_slot orelse
+                                return error.HostSlotElementMissingInvokeHook;
+                            break :blk hook(cu.ctx);
+                        },
+                        .sequence_index = seq,
+                    } },
+                    // Reserved arm (chain). Phase C lights up
+                    // pass_kind = 3.
                     else => unreachable,
                 };
                 try pd.append(dispatch);
@@ -1341,6 +1364,15 @@ fn mergePrivatePassDispatches(
                 ss.sequence_index += base;
                 ss.compose_region.x += ox;
                 ss.compose_region.y += oy;
+            },
+            // Effects-spec B.7. No subtree_dispatch_range to rebase;
+            // `invocation` is a per-instance pair captured at the
+            // worker's walk, valid as long as the source Component
+            // outlives this merge (same lifetime model as vtable/ctx).
+            .host_slot => |*hs| {
+                hs.sequence_index += base;
+                hs.compose_region.x += ox;
+                hs.compose_region.y += oy;
             },
         }
         out.appendAssumeCapacity(d_local);

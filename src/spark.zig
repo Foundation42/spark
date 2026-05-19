@@ -737,6 +737,13 @@ pub const Spark = struct {
                     try self.phase1ProcessSingleSource(cmd, i);
                     i = ss.subtree_dispatch_range[1] + 1;
                 },
+                // Effects-spec B.7. host_slot has no child subtree —
+                // the host owns the rendering wholesale — so advance
+                // is just `i += 1`, no skip-past-subtree fencepost.
+                .host_slot => {
+                    try self.phase1ProcessHostSlot(cmd, i);
+                    i += 1;
+                },
             }
         }
     }
@@ -766,6 +773,16 @@ pub const Spark = struct {
                 .single_source => |nested| {
                     try self.phase1ProcessSingleSource(cmd, i);
                     i = nested.subtree_dispatch_range[1] + 1;
+                },
+                // host_slot nested inside a single_source subtree
+                // (e.g. :::drop_shadow wrapping :::placeholder_scene).
+                // Same dispatch as top-level — acquire, transition,
+                // invoke, transition — just descended-into here so
+                // the parent's compose sees a populated target when
+                // it walks its subtree below.
+                .host_slot => {
+                    try self.phase1ProcessHostSlot(cmd, i);
+                    i += 1;
                 },
             }
         }
@@ -847,6 +864,19 @@ pub const Spark = struct {
                     const nh: f32 = @floatFromInt(nested.compose_region.h);
                     try self.recordSingleSourceCompose(cmd, nested, nested_target, nx, ny, nw, nh, &last_compose);
                     j = nested.subtree_dispatch_range[1];
+                },
+                // host_slot nested inside this single_source's
+                // subtree. Same compose shape as top-level host_slot
+                // (Phase 2 below); rendered into target-local coords
+                // rebased against S.compose_region.
+                .host_slot => |nested_hs| {
+                    const nested_target = self.dispatch_target_map.items[j] orelse unreachable;
+                    const nx: f32 = @floatFromInt(nested_hs.compose_region.x - S.compose_region.x);
+                    const ny: f32 = @floatFromInt(nested_hs.compose_region.y - S.compose_region.y);
+                    const nw: f32 = @floatFromInt(nested_hs.compose_region.w);
+                    const nh: f32 = @floatFromInt(nested_hs.compose_region.h);
+                    try self.recordHostSlotCompose(cmd, nested_hs, nested_target, nx, ny, nw, nh, &last_compose);
+                    j += 1;
                 },
             }
         }
@@ -932,6 +962,92 @@ pub const Spark = struct {
         // Barrier target → SHADER_READ_ONLY_OPTIMAL for Phase 2's
         // sampling pass (and any enclosing single_source's compose
         // in this same Phase 1 stack).
+        barrierImageLayout(cmd, target_handle.image(), .{
+            .src_stage = vk.c.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .dst_stage = vk.c.VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .src_access = vk.c.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            .dst_access = vk.c.VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            .old_layout = vk.c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .new_layout = vk.c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        });
+    }
+
+    /// Effects-spec B.7 — Phase 1 step for a `.host_slot` dispatch.
+    /// Acquires the offscreen target, transitions it to
+    /// `COLOR_ATTACHMENT_OPTIMAL`, hands the cmd buffer + target
+    /// off to the host callback (which opens its own render-pass
+    /// scope, draws, and closes it per the HostSlotCtx contract),
+    /// then transitions back to `SHADER_READ_ONLY_OPTIMAL` for
+    /// Phase 2's compose sample.
+    ///
+    /// **Substrate-only commit (B.7).** This path runs only when a
+    /// host_slot factory is registered on the Spark (B.7's
+    /// `:::placeholder_scene` does so in `integration_render.zig`
+    /// tests; Phase D's `:::3d-scene` lights it up in production).
+    /// `installCoreComponents` does NOT register one — production
+    /// frames never enter this method until Phase D.
+    fn phase1ProcessHostSlot(
+        self: *Spark,
+        cmd: vk.c.VkCommandBuffer,
+        dispatch_index: usize,
+    ) !void {
+        const H = self.pass_dispatches.items[dispatch_index].host_slot;
+
+        // Walker contract guarantees a resolved callback by the
+        // time a HostSlotStep lands on pass_dispatches; assert
+        // belt-and-suspenders so any future path that bypasses the
+        // walker (manual PassDispatch construction in tests) trips
+        // on the first frame instead of jumping to undefined memory
+        // mid-callback.
+        std.debug.assert(@intFromPtr(H.invocation.callback) != 0);
+
+        const target_key = pass_mod.TargetKey{
+            .width = H.target_size[0],
+            .height = H.target_size[1],
+            .format = self.color_format,
+        };
+        const target_handle = try self.target_pool.acquire(target_key);
+        try self.acquired_targets.append(target_handle);
+        self.dispatch_target_map.items[dispatch_index] = target_handle;
+
+        // UNDEFINED → COLOR_ATTACHMENT_OPTIMAL. The freshly-acquired
+        // target may have come back from the free list with
+        // SHADER_READ_ONLY_OPTIMAL from a previous frame; UNDEFINED
+        // as old_layout discards old contents which is correct
+        // because the host opens its own LOAD_OP_CLEAR scope.
+        barrierImageLayout(cmd, target_handle.image(), .{
+            .src_stage = vk.c.VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+            .dst_stage = vk.c.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .src_access = 0,
+            .dst_access = vk.c.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            .old_layout = vk.c.VK_IMAGE_LAYOUT_UNDEFINED,
+            .new_layout = vk.c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        });
+
+        // Hand off to the host. Per HostSlotCtx contract: host opens
+        // its own vkCmdBeginRendering scope, draws, closes the
+        // scope, leaves the target in COLOR_ATTACHMENT_OPTIMAL on
+        // return. Errors are NOT propagated — failed host renders
+        // produce degraded frames, not torn-down render loops.
+        const host_ctx = element.HostSlotCtx{
+            .cmd = @ptrCast(cmd),
+            .target_image = @ptrCast(target_handle.image()),
+            .target_view = @ptrCast(target_handle.view()),
+            .width = H.target_size[0],
+            .height = H.target_size[1],
+            .target_format = @intCast(self.color_format),
+        };
+        H.invocation.callback(H.invocation.user_data, host_ctx);
+
+        // COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL. This
+        // layout transition is ALSO the write-after-read barrier
+        // between the host's color writes and Phase 2's compose
+        // sampler — Vulkan image layout transitions execute a full
+        // execution + memory barrier as a side effect. A future
+        // "optimisation" that replaces this with a same-layout
+        // move would silently remove the barrier and let the
+        // compose sample stale data; the WAR sequencing is
+        // load-bearing.
         barrierImageLayout(cmd, target_handle.image(), .{
             .src_stage = vk.c.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
             .dst_stage = vk.c.VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
@@ -1066,6 +1182,69 @@ pub const Spark = struct {
             ss.filter_uniforms_len,
             &ss.filter_uniforms,
         );
+        vk.c.vkCmdDraw(cmd, 3, 1, 0, 0);
+    }
+
+    /// Effects-spec B.7 — bind + draw the compose step for one
+    /// `.host_slot` dispatch. Mirrors `recordSingleSourceCompose`:
+    /// reuses `single_source_pipelines` (same combined-image-sampler
+    /// layout) and `single_source_descriptor_pool`. The only
+    /// difference is no push-constants — v1's host_slot composite
+    /// shader (`copy.frag` for the B.7 stub) is a passthrough
+    /// sampler with no uniforms. Phase D may extend HostSlotStep
+    /// with a uniforms slot if real composite shaders need
+    /// parameters; for now the absence is explicit.
+    fn recordHostSlotCompose(
+        self: *Spark,
+        cmd: vk.c.VkCommandBuffer,
+        hs: element.HostSlotStep,
+        target_handle: pass_mod.TargetHandle,
+        vx: f32,
+        vy: f32,
+        vw: f32,
+        vh: f32,
+        last_bound: *vk.c.VkPipeline,
+    ) !void {
+        const pipeline = self.single_source_pipelines.lookup(hs.composite_shader_id) orelse return;
+        if (pipeline != last_bound.*) {
+            vk.c.vkCmdBindPipeline(cmd, vk.c.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            last_bound.* = pipeline;
+        }
+        const set = try self.single_source_descriptor_pool.acquire(
+            target_handle.view(),
+            self.single_source_pipelines.sampler,
+        );
+        var set_local = set;
+        vk.c.vkCmdBindDescriptorSets(
+            cmd,
+            vk.c.VK_PIPELINE_BIND_POINT_GRAPHICS,
+            self.single_source_pipelines.layout,
+            0,
+            1,
+            &set_local,
+            0,
+            null,
+        );
+        var viewport = vk.c.VkViewport{
+            .x = vx,
+            .y = vy,
+            .width = vw,
+            .height = vh,
+            .minDepth = 0,
+            .maxDepth = 1,
+        };
+        vk.c.vkCmdSetViewport(cmd, 0, 1, &viewport);
+        var scissor = vk.c.VkRect2D{
+            .offset = .{
+                .x = @intFromFloat(@max(0, @round(vx))),
+                .y = @intFromFloat(@max(0, @round(vy))),
+            },
+            .extent = .{
+                .width = @intFromFloat(@max(0, @round(vw))),
+                .height = @intFromFloat(@max(0, @round(vh))),
+            },
+        };
+        vk.c.vkCmdSetScissor(cmd, 0, 1, &scissor);
         vk.c.vkCmdDraw(cmd, 3, 1, 0, 0);
     }
 
@@ -1238,6 +1417,24 @@ pub const Spark = struct {
                         // the +1 we infinite-loop on this entry.
                         // Same fencepost as Phase 1.
                         i = ss.subtree_dispatch_range[1] + 1;
+                    },
+                    // Effects-spec B.7. Top-level host_slot compose —
+                    // same shape as single_source compose, with the
+                    // target filled by the host callback in Phase 1
+                    // instead of by spark's walker. No subtree, so
+                    // advance is plain `i += 1`.
+                    .host_slot => |hs| {
+                        const target = self.dispatch_target_map.items[i] orelse unreachable;
+                        const wx: f32 = @floatFromInt(hs.compose_region.x);
+                        const wy: f32 = @floatFromInt(hs.compose_region.y);
+                        const ww: f32 = @floatFromInt(hs.compose_region.w);
+                        const wh: f32 = @floatFromInt(hs.compose_region.h);
+                        const sxr = (wx - sx) * z;
+                        const syr = (wy - sy) * z;
+                        const swr = ww * z;
+                        const shr = wh * z;
+                        try self.recordHostSlotCompose(cmd, hs, target, sxr, syr, swr, shr, &last_compose);
+                        i += 1;
                     },
                 }
             }

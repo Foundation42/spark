@@ -182,14 +182,48 @@ pub const SingleSourcePass = struct {
 /// Phase C lights it up.
 pub const ChainPass = struct {};
 
+/// Host-slot dispatch contract — full doc lives at the producer
+/// module on `element.HostSlotCtx`. Re-exported here so factory code
+/// reads `component.HostSlotCtx`. See [[feedback-type-at-producer-module]]
+/// for why the canonical definition sits with the walker-output
+/// types (Hit / PassDispatch / HostSlotInvocation).
+pub const HostSlotCtx = element.HostSlotCtx;
+
 /// `.host_slot` arm payload — reserved in A.2, implemented in Phase
-/// B alongside the `:::placeholder_scene` stub factory. The stub
-/// proves `HostSlotPass.callback` end-to-end with a clear-to-color
-/// callback so the arm doesn't bitrot before Phase D lights up the
-/// real matryoshka adoption path (a `:::3d-scene` factory invoking
-/// the host's renderer). Empty in A.2; Phase B adds the `callback`
-/// field.
-pub const HostSlotPass = struct {};
+/// B.7 alongside the `:::placeholder_scene` stub factory. The stub
+/// proves the substrate end-to-end with a clear-to-color callback
+/// so the arm doesn't bitrot before Phase D's `:::3d-scene` factory
+/// lights up the real matryoshka adoption path.
+///
+/// **Dispatch shape.** Phase 1 acquires a target sized to the
+/// component's layout region, transitions it to
+/// `COLOR_ATTACHMENT_OPTIMAL`, and invokes the host callback.
+/// Phase 2 runs `composite_shader_id` against the host-filled target
+/// (sampler bound to the target) and writes the result to MAIN at
+/// the compose region. Mirrors `SingleSourcePass` minus the child
+/// subtree (host owns the rendering wholesale).
+///
+/// **HDR.** `hdr_target = false` allocates RGBA8 sRGB. Real-scene
+/// factories typically want `true` — matryoshka's 3D-scene renderer
+/// outputs HDR (post-chain expects scene RT to be 16F before the
+/// tone-map step). The B.7 stub uses LDR for simplicity; Phase D's
+/// `:::3d-scene` flips this to `true`.
+///
+/// **Callback wiring lives on the vtable, not here.** Symmetric
+/// with how `snapshot_uniforms` is mandatory for non-content
+/// factories: every `host_slot` factory MUST set
+/// `ElementVTable.invoke_host_slot`, which returns the per-instance
+/// `(callback, user_data)` pair the walker records onto the
+/// `HostSlotStep`. Phase D's `:::3d-scene scene_id=hud` and
+/// `:::3d-scene scene_id=settings` are then ONE factory with
+/// DIFFERENT vtable-returned invocations per instance — the only
+/// shape that admits per-instance scene state cleanly. The walker
+/// errors with `error.HostSlotElementMissingInvokeHook` if the
+/// hook is null on a `pass_kind == 4` element.
+pub const HostSlotPass = struct {
+    composite_shader_id: ShaderId = [_]u8{0} ** 16,
+    hdr_target: bool = false,
+};
 
 /// Tagged union — what kind of GPU work a factory contributes.
 /// Default `.content` keeps the entire pre-effects codebase
@@ -307,7 +341,7 @@ fn passShapeScalars(ps: PassShape) struct { kind: u8, shader_id: [16]u8 } {
         .pattern => |p| .{ .kind = 1, .shader_id = p.shader_id },
         .single_source => |p| .{ .kind = 2, .shader_id = p.shader_id },
         .chain => .{ .kind = 3, .shader_id = [_]u8{0} ** 16 },
-        .host_slot => .{ .kind = 4, .shader_id = [_]u8{0} ** 16 },
+        .host_slot => |p| .{ .kind = 4, .shader_id = p.composite_shader_id },
     };
 }
 

@@ -447,6 +447,17 @@ pub const ElementVTable = struct {
     /// declare `pass_shape != .content` MUST implement this and
     /// return their std140-padded uniform bytes.
     snapshot_uniforms: ?*const fn (ctx: *anyopaque, out: []u8) usize = null,
+    /// Per-instance host-slot callback override (Effects-spec B.7).
+    /// When non-null, the layout walker uses the returned `(callback,
+    /// user_data)` pair in place of the Factory.pass_shape.host_slot
+    /// defaults. Lets Phase D matryoshka register ONE `:::3d-scene`
+    /// factory whose instances each carry a different scene id —
+    /// `:::3d-scene scene_id=hud` and `:::3d-scene scene_id=settings`
+    /// resolve to different `user_data` pointers via this hook.
+    /// Mirrors `snapshot_uniforms`'s per-instance-data-onto-PassDispatch
+    /// pattern. The stub `:::placeholder_scene` factory leaves this
+    /// null and rides on its factory-level callback.
+    invoke_host_slot: ?*const fn (ctx: *anyopaque) HostSlotInvocation = null,
     /// Optional. Reports how this component participates in its
     /// parent stack's flow (stage 15 Phase E text exclusion). `null`
     /// (the default) means `.normal` — the component flows in
@@ -672,9 +683,93 @@ pub const SingleSourceStep = struct {
 /// arena coordination, no lifetime ambiguity. Wire format walks
 /// only the first `*_len` bytes; trailing zero padding is not
 /// hashed.
+/// Contract for the host-side callback `HostSlotPass` invokes during
+/// Phase 1 (offscreen render). Spark binds the cmd buffer and
+/// transitions `target_image` to `COLOR_ATTACHMENT_OPTIMAL` BEFORE
+/// the call; the host opens whatever `vkCmdBeginRendering` scope its
+/// own renderer needs (one color attachment, MRT, depth — spark
+/// doesn't care), draws, closes the scope, and returns with the
+/// target still in `COLOR_ATTACHMENT_OPTIMAL`. Spark then transitions
+/// to `SHADER_READ_ONLY_OPTIMAL` for the Phase 2 compose sample.
+///
+/// **Typing.** `cmd` / `target_image` / `target_view` are
+/// `*anyopaque` to keep vulkan-zig out of spark's public surface.
+/// Matryoshka casts on its side (it imports vulkan-zig regardless).
+/// `target_format` is the raw `VkFormat` value as `u32` — same
+/// rationale: hosts cast through their own vulkan-zig binding.
+///
+/// **Forward-compat.** `target_format` is forwarded even though the
+/// B.7 stub doesn't inspect it. Phase D's `:::3d-scene` will need
+/// it to configure renderer pipeline state (RGBA8 vs RGBA16F vs
+/// BGRA8). Adding it later would be an API break; free now.
+///
+/// **Error model.** Callback returns `void`. A failed host render
+/// shouldn't tank spark's frame; hosts handle errors internally
+/// (clear to an error color, log, return). Mirrors matryoshka's
+/// "render a degraded frame, log, keep going" policy.
+///
+/// **Type placement.** Lives in `element.zig` (walker/dispatch
+/// output sibling to `Hit` / `PassDispatch`) rather than
+/// `component.zig` because the function-pointer type
+/// `HostSlotInvocation.callback` references it, and element.zig
+/// can't import component.zig without re-igniting the element↔component
+/// cycle the A.6.a refactor dodged. `component.zig` re-exports
+/// the symbol so factory code reads `component.HostSlotCtx` as
+/// before.
+pub const HostSlotCtx = extern struct {
+    cmd: *anyopaque,
+    target_image: *anyopaque,
+    target_view: *anyopaque,
+    width: u32,
+    height: u32,
+    target_format: u32,
+};
+
+/// Resolved (callback, user_data) pair the layout walker records onto
+/// a `HostSlotStep`. Either from `ElementVTable.invoke_host_slot`
+/// (per-instance — Phase D's path) or from
+/// `Factory.pass_shape.host_slot.{callback, user_data}`
+/// (per-factory — the B.7 stub's path). Walker contract: emits
+/// `error.UnresolvedHostSlot` if neither side provides a callback;
+/// `HostSlotStep.invocation.callback` is therefore non-null at
+/// dispatch time by construction. Dispatch sites belt-and-suspender
+/// with `std.debug.assert(@intFromPtr(invocation.callback) != 0)`.
+pub const HostSlotInvocation = struct {
+    callback: *const fn (user_data: *anyopaque, ctx: HostSlotCtx) void,
+    user_data: *anyopaque,
+};
+
+/// Host-slot dispatch step (Effects-spec B.7). Phase 1 acquires an
+/// offscreen target sized `target_size`, transitions it to
+/// `COLOR_ATTACHMENT_OPTIMAL`, and invokes `invocation.callback` —
+/// the host opens its own render-pass scope, draws, closes the
+/// scope. Phase 2 samples that target with `composite_shader_id`
+/// (combined-image-sampler + fullscreen triangle, same pipeline
+/// shape as `SingleSourceStep`) and writes to MAIN at
+/// `compose_region`. Mirrors `SingleSourceStep` minus the child
+/// subtree (host owns the rendering wholesale, no spark walker
+/// recursion below this dispatch).
+///
+/// **Wire format / hashing.** `target_size`, `composite_shader_id`,
+/// `compose_region`, `sequence_index` participate in the
+/// determinism fingerprint. `invocation` does NOT — function
+/// pointers aren't stable across builds/processes and would defeat
+/// hash determinism. Same exclusion category as `PatternStep`'s
+/// trailing zero padding (memory-resident but not wire-format).
+pub const HostSlotStep = struct {
+    target_size: [2]u32,
+    composite_shader_id: [16]u8,
+    compose_region: PassRegion,
+    /// Resolved at walker time. NOT hashed. Non-null callback by
+    /// walker contract — see `HostSlotInvocation`.
+    invocation: HostSlotInvocation,
+    sequence_index: u32,
+};
+
 pub const PassDispatch = union(enum) {
     pattern: PatternStep,
     single_source: SingleSourceStep,
+    host_slot: HostSlotStep,
 };
 
 /// Layout result for one element. Pixel coords (display space, not

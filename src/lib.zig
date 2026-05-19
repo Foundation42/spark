@@ -67,6 +67,12 @@ pub const PatternPass = @import("component.zig").PatternPass;
 pub const SingleSourcePass = @import("component.zig").SingleSourcePass;
 pub const ChainPass = @import("component.zig").ChainPass;
 pub const HostSlotPass = @import("component.zig").HostSlotPass;
+// Effects-spec Phase B.7 — host-slot dispatch contract surfaces.
+// HostSlotCtx is the contract spark hands to the host callback at
+// dispatch time; HostSlotInvocation is the (callback, user_data)
+// pair the per-instance vtable hook returns to the layout walker.
+pub const HostSlotCtx = @import("element.zig").HostSlotCtx;
+pub const HostSlotInvocation = @import("element.zig").HostSlotInvocation;
 pub const ShaderId = @import("component.zig").ShaderId;
 pub const Edges = @import("component.zig").Edges;
 pub const LayoutInflationSpec = @import("component.zig").LayoutInflationSpec;

@@ -447,6 +447,18 @@ pub fn blitEntry(
                         ss.compose_region.x += ox_i32;
                         ss.compose_region.y += oy_i32;
                     },
+                    // Effects-spec B.7 — host_slot. No
+                    // subtree_dispatch_range (host owns rendering, no
+                    // walker recursion below). `invocation` is a
+                    // resolved per-instance pair, valid across cache
+                    // hits as long as the source Component instance
+                    // outlives the cache entry — same lifetime
+                    // assumption as `vtable`/`ctx` pointers above.
+                    .host_slot => |*hs| {
+                        hs.sequence_index += pd_base;
+                        hs.compose_region.x += ox_i32;
+                        hs.compose_region.y += oy_i32;
+                    },
                 }
                 out_pd.appendAssumeCapacity(d_local);
             }
@@ -578,6 +590,13 @@ pub fn snapshotEntry(
                 ss.sequence_index -= pd_start;
                 ss.compose_region.x -= ox_i32;
                 ss.compose_region.y -= oy_i32;
+            },
+            // Effects-spec B.7 — inverse of `blitEntry`'s host_slot
+            // rebase. No subtree_dispatch_range.
+            .host_slot => |*hs| {
+                hs.sequence_index -= pd_start;
+                hs.compose_region.x -= ox_i32;
+                hs.compose_region.y -= oy_i32;
             },
         }
     }

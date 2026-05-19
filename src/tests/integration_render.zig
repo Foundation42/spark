@@ -41,12 +41,12 @@ const known_doc =
 /// Drift in either layer fails the determinism / fingerprint tests
 /// below with a one-line message.
 ///
-/// PassDispatch serialization protocol **v2** (Phase B.3 — tagged
-/// union mint). Must match the comment on `element.PassDispatch` —
+/// PassDispatch serialization protocol **v3** (Phase B.7 — host_slot
+/// arm joins). Must match the comment on `element.PassDispatch` —
 /// both ends move together. Per dispatch the hasher writes an arm
 /// tag byte first, then arm-specific fields in canonical order:
 ///
-///   arm tag             — u8: 0 = pattern, 1 = single_source
+///   arm tag             — u8: 0 = pattern, 1 = single_source, 2 = host_slot
 ///
 ///   PatternStep (arm 0):
 ///     shader_id           — 16 bytes, raw
@@ -64,16 +64,32 @@ const known_doc =
 ///     subtree_dispatch_range — [2]u32 (start, end)
 ///     sequence_index      — u32
 ///
+///   HostSlotStep (arm 2):
+///     target_size         — [2]u32 (w, h)
+///     composite_shader_id — 16 bytes
+///     compose_region      — PassRegion
+///     sequence_index      — u32
+///     (NOTE: `invocation` is NOT hashed — function pointers aren't
+///     stable across builds/processes and would defeat determinism.
+///     Same exclusion category as `*_uniforms` trailing zero padding.)
+///
 /// **Inline uniform storage caveat.** `*_uniforms` are fixed-cap
 /// `[MAX_PASS_UNIFORM_BYTES]u8` arrays in memory; the wire format
 /// walks only the first `*_uniforms_len` bytes. Trailing zero
 /// padding is not hashed.
 ///
-/// **v2 mint.** The arm tag byte didn't exist in v1 (Phase A.6.a),
-/// so any Phase A doc's fingerprint changes when B.3 lands — the
-/// EXPECTED_GRADIENT_HASH constant below was regenerated against
-/// the v2 walk. From this commit forward, the constant is the
-/// contract; any future protocol change breaks the test loudly.
+/// **Exhaustive switch as structural-fingerprint guard.** The
+/// per-arm dispatch below is exhaustive over PassDispatch; if a
+/// fourth arm lands (Phase C `.chain`, future Phase E variants), the
+/// compiler fires a non-exhaustive-switch error here. Don't add a
+/// `_ => {}` catch-all — silently dropping arms from the fingerprint
+/// is exactly the regression class this gate exists to prevent.
+///
+/// **v3 mint.** The host_slot arm joined at B.7; any doc that
+/// exercises `:::placeholder_scene` (or Phase D's `:::3d-scene`)
+/// would shift fingerprint vs. v2. Existing Phase A docs that
+/// produce only pattern/single_source dispatches hash IDENTICALLY
+/// under v3 — the new arm is purely additive.
 fn hashFrame(sp: *const spark.Spark) u64 {
     var h = std.hash.Wyhash.init(0);
 
@@ -121,6 +137,14 @@ fn hashFrame(sp: *const spark.Spark) u64 {
                 h.update(s.filter_uniforms[0..s.filter_uniforms_len]);
                 h.update(std.mem.asBytes(&s.subtree_dispatch_range));
                 h.update(std.mem.asBytes(&s.sequence_index));
+            },
+            .host_slot => |hs| {
+                h.update(&[_]u8{2}); // arm tag
+                h.update(std.mem.asBytes(&hs.target_size));
+                h.update(&hs.composite_shader_id);
+                h.update(std.mem.asBytes(&hs.compose_region));
+                h.update(std.mem.asBytes(&hs.sequence_index));
+                // hs.invocation excluded by protocol — see header comment.
             },
         }
     }
