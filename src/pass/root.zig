@@ -32,6 +32,7 @@ const target_pool = @import("target_pool.zig");
 const pattern_pipeline = @import("pattern_pipeline.zig");
 const single_source_pipeline = @import("single_source_pipeline.zig");
 const single_source_descriptor_pool = @import("single_source_descriptor_pool.zig");
+const single_source_factory = @import("single_source_factory.zig");
 
 pub const Graph = graph.Graph;
 pub const ShaderResolver = shader_resolver.ShaderResolver;
@@ -44,3 +45,4 @@ pub const TargetHandle = target_pool.TargetHandle;
 pub const PatternPipelineCache = pattern_pipeline.PatternPipelineCache;
 pub const SingleSourcePipelineCache = single_source_pipeline.SingleSourcePipelineCache;
 pub const SingleSourceDescriptorPool = single_source_descriptor_pool.SingleSourceDescriptorPool;
+pub const SingleSourceFactory = single_source_factory.SingleSourceFactory;
