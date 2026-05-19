@@ -588,7 +588,7 @@ pub const Spark = struct {
             // stays valid. Cross-reference comments on both modules'
             // reset paths pin the discipline from each side.
             _ = self.target_pool.sweepUnreleased();
-            self.single_source_descriptor_pool.resetAll();
+            self.single_source_descriptor_pool.advance();
             try self.fonts.prewarmEffectiveSizesForZoom(info.zoom);
             self.layout_context.beginPass();
             self.drawlist_needs_transform = true;
