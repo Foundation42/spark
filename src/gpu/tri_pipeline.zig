@@ -31,9 +31,20 @@ const c = vk.c;
 /// display pixels (NDC conversion in the vertex shader).
 pub const Vertex = tess.Vertex;
 
+/// Push-constant block mirrors tri.vert's `PC`. `world_offset`
+/// matches the quad/text/image pipelines — (0, 0) for the main
+/// attachment, `compose_region.xy` for a single_source offscreen
+/// target (Phase B.5 substrate).
 pub const TriPushConsts = extern struct {
     viewport_size: [2]f32,
+    world_offset: [2]f32 = .{ 0, 0 },
 };
+
+comptime {
+    // Lock the std430 push-constant block size — mirrors the GLSL
+    // `PC` in tri.vert.
+    std.debug.assert(@sizeOf(TriPushConsts) == 16);
+}
 
 pub const TrianglePipeline = struct {
     pipeline_layout: c.VkPipelineLayout,
@@ -235,7 +246,7 @@ pub const TrianglePipeline = struct {
         extent: c.VkExtent2D,
         n_indices: u32,
     ) void {
-        self.recordDrawIndexedRange(cmd, extent, 0, n_indices);
+        self.recordDrawIndexedRange(cmd, extent, .{ 0, 0 }, 0, n_indices);
     }
 
     /// Bind + draw a contiguous subrange of the index buffer.
@@ -245,10 +256,14 @@ pub const TrianglePipeline = struct {
     /// (first_index, index_count) pair feeds `vkCmdDrawIndexed`
     /// directly; vertex offset stays 0 because indices reference
     /// absolute positions in the shared vertex buffer.
+    ///
+    /// `world_offset`: see `quad_pipeline.recordDrawRange` —
+    /// (0, 0) for MAIN, `compose_region.xy` for an offscreen target.
     pub fn recordDrawIndexedRange(
         self: *const TrianglePipeline,
         cmd: c.VkCommandBuffer,
         extent: c.VkExtent2D,
+        world_offset: [2]f32,
         first_index: u32,
         index_count: u32,
     ) void {
@@ -267,7 +282,7 @@ pub const TrianglePipeline = struct {
         var scissor = c.VkRect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = extent };
         c.vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-        const pc = TriPushConsts{ .viewport_size = .{
+        const pc = TriPushConsts{ .world_offset = world_offset, .viewport_size = .{
             @floatFromInt(extent.width),
             @floatFromInt(extent.height),
         } };

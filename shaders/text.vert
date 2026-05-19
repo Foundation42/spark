@@ -9,8 +9,13 @@
 // `attention` + `hot_color` drive the LM-driven hue shift + SDF
 // weight pulse in the fragment.
 
+// `world_offset` mirrors quad.vert's: subtracts a target-space origin
+// so the same SSBO data renders into both the main attachment
+// (world_offset = (0, 0)) and any single_source offscreen target
+// (world_offset = compose_region.xy). Phase B.5 substrate.
 layout(push_constant) uniform PC {
     vec2 viewport_size;
+    vec2 world_offset;
 } pc;
 
 struct GlyphInstance {
@@ -45,7 +50,7 @@ const vec2 CORNERS[6] = vec2[6](
 void main() {
     GlyphInstance g = glyphs[gl_InstanceIndex];
     vec2 corner = CORNERS[gl_VertexIndex];
-    vec2 px = g.dst_pos + corner * g.dst_size;
+    vec2 px = (g.dst_pos - pc.world_offset) + corner * g.dst_size;
     vec2 ndc = (px / pc.viewport_size) * 2.0 - 1.0;
     gl_Position = vec4(ndc, 0.0, 1.0);
     v_uv = mix(g.uv_min, g.uv_max, corner);

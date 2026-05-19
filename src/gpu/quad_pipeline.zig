@@ -45,9 +45,22 @@ comptime {
     std.debug.assert(@sizeOf(QuadInstance) == 48);
 }
 
+/// Push-constant block mirrors quad.vert's `PC`. `world_offset` is
+/// subtracted from each instance's `dst_pos` before NDC conversion;
+/// (0, 0) leaves world-space rendering unchanged, `compose_region.xy`
+/// rebases world coords to a single_source target's local frame
+/// (Phase B.5 substrate).
 pub const QuadPushConsts = extern struct {
     viewport_size: [2]f32,
+    world_offset: [2]f32 = .{ 0, 0 },
 };
+
+comptime {
+    // Lock the std430 push-constant block size — mirrors the GLSL
+    // `PC` in quad.vert. Reordering or adding fields without
+    // updating the shader produces silent GPU garbage.
+    std.debug.assert(@sizeOf(QuadPushConsts) == 16);
+}
 
 pub const QuadPipeline = struct {
     descriptor_set_layout: c.VkDescriptorSetLayout,
@@ -276,14 +289,14 @@ pub const QuadPipeline = struct {
     /// block whose colour format matches `init`'s `color_format`.
     /// Records before text_pipeline.recordDraw in the same block so
     /// backgrounds land under glyphs. Convenience over
-    /// `recordDrawRange(cmd, extent, 0, n_quads)`.
+    /// `recordDrawRange(cmd, extent, .{0, 0}, 0, n_quads)`.
     pub fn recordDraw(
         self: *const QuadPipeline,
         cmd: c.VkCommandBuffer,
         extent: c.VkExtent2D,
         n_quads: u32,
     ) void {
-        self.recordDrawRange(cmd, extent, 0, n_quads);
+        self.recordDrawRange(cmd, extent, .{ 0, 0 }, 0, n_quads);
     }
 
     /// Bind + draw a contiguous subrange of the quad instance
@@ -292,10 +305,17 @@ pub const QuadPipeline = struct {
     /// one of these per yielded `Run`. `quad.vert` reads
     /// `gl_InstanceIndex` which automatically includes
     /// `firstInstance`.
+    ///
+    /// `world_offset` rebases each instance's `dst_pos` before NDC.
+    /// MAIN attachment callers pass `(0, 0)`; single_source
+    /// offscreen-target callers pass `compose_region.xy` so the
+    /// world-space drawlist coords resolve to target-local coords
+    /// inside the shader (Phase B.5).
     pub fn recordDrawRange(
         self: *const QuadPipeline,
         cmd: c.VkCommandBuffer,
         extent: c.VkExtent2D,
+        world_offset: [2]f32,
         first_instance: u32,
         instance_count: u32,
     ) void {
@@ -323,7 +343,7 @@ pub const QuadPipeline = struct {
         var scissor = c.VkRect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = extent };
         c.vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-        const pc = QuadPushConsts{ .viewport_size = .{
+        const pc = QuadPushConsts{ .world_offset = world_offset, .viewport_size = .{
             @floatFromInt(extent.width),
             @floatFromInt(extent.height),
         } };

@@ -64,9 +64,20 @@ comptime {
     std.debug.assert(@sizeOf(GlyphInstance) == 80);
 }
 
+/// Push-constant block mirrors text.vert's `PC`. `world_offset`
+/// matches the quad/tri/image pipelines — (0, 0) for the main
+/// attachment, `compose_region.xy` for a single_source offscreen
+/// target (Phase B.5 substrate).
 pub const TextPushConsts = extern struct {
     viewport_size: [2]f32,
+    world_offset: [2]f32 = .{ 0, 0 },
 };
+
+comptime {
+    // Lock the std430 push-constant block size — mirrors the GLSL
+    // `PC` in text.vert.
+    std.debug.assert(@sizeOf(TextPushConsts) == 16);
+}
 
 pub const TextPipeline = struct {
     descriptor_set_layout: c.VkDescriptorSetLayout,
@@ -358,7 +369,7 @@ pub const TextPipeline = struct {
         extent: c.VkExtent2D,
         n_glyphs: u32,
     ) void {
-        self.recordDrawRange(cmd, extent, 0, n_glyphs);
+        self.recordDrawRange(cmd, extent, .{ 0, 0 }, 0, n_glyphs);
     }
 
     /// Bind + draw a contiguous subrange of the glyph instance
@@ -368,10 +379,14 @@ pub const TextPipeline = struct {
     /// is exactly the subrange offset — the vertex shader reads
     /// `gl_InstanceIndex` which is `gl_BaseInstance + per-instance
     /// counter`, so offset is transparent.
+    ///
+    /// `world_offset`: see `quad_pipeline.recordDrawRange` —
+    /// (0, 0) for MAIN, `compose_region.xy` for an offscreen target.
     pub fn recordDrawRange(
         self: *const TextPipeline,
         cmd: c.VkCommandBuffer,
         extent: c.VkExtent2D,
+        world_offset: [2]f32,
         first_instance: u32,
         instance_count: u32,
     ) void {
@@ -399,7 +414,7 @@ pub const TextPipeline = struct {
         var scissor = c.VkRect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = extent };
         c.vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-        const pc = TextPushConsts{ .viewport_size = .{
+        const pc = TextPushConsts{ .world_offset = world_offset, .viewport_size = .{
             @floatFromInt(extent.width),
             @floatFromInt(extent.height),
         } };

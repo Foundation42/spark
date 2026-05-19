@@ -10,9 +10,15 @@
 // then position it at `dst_pos + corner * dst_size`. The matching UV
 // is the corner itself (0..1 across each axis) so the sampler reads
 // the whole image stretched to the destination rect.
+//
+// `world_offset` mirrors quad.vert's: subtracts a target-space origin
+// so the same dst_pos renders into both the main attachment
+// (world_offset = (0, 0)) and any single_source offscreen target
+// (world_offset = compose_region.xy). Phase B.5 substrate.
 
 layout(push_constant) uniform PC {
     vec2 viewport_size;
+    vec2 world_offset;
     vec2 dst_pos;
     vec2 dst_size;
 } pc;
@@ -26,7 +32,7 @@ const vec2 CORNERS[6] = vec2[6](
 
 void main() {
     vec2 corner = CORNERS[gl_VertexIndex];
-    vec2 px = pc.dst_pos + corner * pc.dst_size;
+    vec2 px = (pc.dst_pos - pc.world_offset) + corner * pc.dst_size;
     vec2 ndc = (px / pc.viewport_size) * 2.0 - 1.0;
     gl_Position = vec4(ndc, 0.0, 1.0);
     v_uv = corner;

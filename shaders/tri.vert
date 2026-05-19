@@ -11,9 +11,14 @@
 //
 // Same coordinate convention as quad.vert: positions are in display
 // pixels, viewport_size push-constant supplies the NDC conversion.
+// `world_offset` mirrors quad.vert's: subtracts a target-space
+// origin so the same VBO data renders into both the main attachment
+// (world_offset = (0, 0)) and any single_source offscreen target
+// (world_offset = compose_region.xy). Phase B.5 substrate.
 
 layout(push_constant) uniform PC {
     vec2 viewport_size;
+    vec2 world_offset;
 } pc;
 
 layout(location = 0) in vec2 in_pos;
@@ -22,7 +27,7 @@ layout(location = 1) in vec4 in_color;
 layout(location = 0) out vec4 v_color;
 
 void main() {
-    vec2 ndc = (in_pos / pc.viewport_size) * 2.0 - 1.0;
+    vec2 ndc = ((in_pos - pc.world_offset) / pc.viewport_size) * 2.0 - 1.0;
     gl_Position = vec4(ndc, 0.0, 1.0);
     v_color = in_color;
 }

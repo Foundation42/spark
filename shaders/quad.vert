@@ -9,9 +9,18 @@
 // conversion. The fragment receives `v_local` (pixel offset within
 // the quad) so it can compute rounded-corner SDF anti-aliasing
 // without a derivatives trick.
+//
+// `world_offset` subtracts a target-space origin so the same SSBO
+// data renders correctly into both the main attachment (world_offset
+// = (0, 0)) and any single_source offscreen target (world_offset =
+// compose_region.xy). Without it, a quad at world (50, 1590) drawn
+// into a 266x106 target produces NDC.y = 29 and gets clip-volume-
+// culled; with it the math collapses to target-local coords and NDC
+// stays in [-1, 1] for any target size. Phase B.5 substrate.
 
 layout(push_constant) uniform PC {
     vec2 viewport_size;
+    vec2 world_offset;
 } pc;
 
 struct QuadInstance {
@@ -44,7 +53,7 @@ const vec2 CORNERS[6] = vec2[6](
 void main() {
     QuadInstance q = quads[gl_InstanceIndex];
     vec2 corner = CORNERS[gl_VertexIndex];
-    vec2 px = q.dst_pos + corner * q.dst_size;
+    vec2 px = (q.dst_pos - pc.world_offset) + corner * q.dst_size;
     vec2 ndc = (px / pc.viewport_size) * 2.0 - 1.0;
     gl_Position = vec4(ndc, 0.0, 1.0);
     v_local = corner * q.dst_size;

@@ -26,11 +26,28 @@ const vk = @import("vk.zig");
 const c = vk.c;
 const shaders = @import("shaders");
 
+/// Push-constant block mirrors image.vert's `PC`. Field ORDER must
+/// match the GLSL layout exactly — adding `world_offset` after
+/// `viewport_size` (and before `dst_pos`) keeps the std430 offset
+/// table aligned with the shader. `world_offset` matches the
+/// quad/text/tri pipelines — (0, 0) for the main attachment,
+/// `compose_region.xy` for a single_source offscreen target
+/// (Phase B.5 substrate).
 pub const ImagePushConsts = extern struct {
     viewport_size: [2]f32,
+    world_offset: [2]f32 = .{ 0, 0 },
     dst_pos: [2]f32,
     dst_size: [2]f32,
 };
+
+comptime {
+    // Lock the std430 push-constant block size — mirrors the GLSL
+    // `PC` in image.vert.
+    std.debug.assert(@sizeOf(ImagePushConsts) == 32);
+    std.debug.assert(@offsetOf(ImagePushConsts, "world_offset") == 8);
+    std.debug.assert(@offsetOf(ImagePushConsts, "dst_pos") == 16);
+    std.debug.assert(@offsetOf(ImagePushConsts, "dst_size") == 24);
+}
 
 pub const ImagePipeline = struct {
     pipeline_layout: c.VkPipelineLayout,
@@ -254,16 +271,21 @@ pub const ImagePipeline = struct {
     /// world-space units the rest of the layout uses); the world →
     /// screen transform is the host's post-layout pass on DrawList
     /// (handled there to keep the pipeline simple).
+    ///
+    /// `world_offset`: see `quad_pipeline.recordDrawRange` —
+    /// (0, 0) for MAIN, `compose_region.xy` for an offscreen target.
     pub fn recordOne(
         self: *const ImagePipeline,
         cmd: c.VkCommandBuffer,
         extent: c.VkExtent2D,
+        world_offset: [2]f32,
         ds: c.VkDescriptorSet,
         dst_pos: [2]f32,
         dst_size: [2]f32,
     ) void {
         const pc = ImagePushConsts{
             .viewport_size = .{ @floatFromInt(extent.width), @floatFromInt(extent.height) },
+            .world_offset = world_offset,
             .dst_pos = dst_pos,
             .dst_size = dst_size,
         };

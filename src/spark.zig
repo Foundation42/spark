@@ -257,6 +257,7 @@ pub const Spark = struct {
     /// cleared on click-outside or Esc. Compared by ctx pointer.
     focused: ?element.Hit = null,
 
+
     /// Construct a Spark and all engine resources. The host gives
     /// raw Vulkan handles (via opts.vk_ctx + opts.color_format), an
     /// owned FontRegistry, a borrowed Theme + root State, and
@@ -871,12 +872,37 @@ pub const Spark = struct {
             .width = S.target_size[0],
             .height = S.target_size[1],
         };
+        // Screen-space rebase to target-local. **Subtle SSBO timing
+        // bit, worth pinning.** Phase 1 RECORDS draws here in
+        // preDrawCb, but the actual SSBO upload happens later (in
+        // endFrame's `writeQuads/writeMesh/writeGlyphs`, after the
+        // world→screen transform on the drawlist). Vulkan executes
+        // recorded draws in submission order with the SSBO state at
+        // submit time — so by the time Phase 1's draws actually
+        // execute on GPU, each instance's `dst_pos` is already in
+        // SCREEN coords `(world - scroll) * zoom`, NOT the WORLD
+        // coords the walker emitted. `world_offset` must live in the
+        // SAME coord space — so it's SCREEN compose too, computed
+        // here from world compose + scroll + zoom.
+        //
+        // TODO(zoom): target_size + per-target viewport are still
+        // WORLD-sized. At zoom != 1 the box's screen extent exceeds
+        // the offscreen target's framebuffer extent and clips. Wire
+        // a zoom-scaled `acquire(target_key)` when zoom-on-effects
+        // is exercised; current demo runs at zoom=1.
+        const sx = self.frame_info.scroll_offset[0];
+        const sy = self.frame_info.scroll_offset[1];
+        const z = self.frame_info.zoom;
+        const world_offset_target: [2]f32 = .{
+            (@as(f32, @floatFromInt(S.compose_region.x)) - sx) * z,
+            (@as(f32, @floatFromInt(S.compose_region.y)) - sy) * z,
+        };
         const dl_p1 = &self.drawlist;
         const dispatch_index_u32: u32 = @intCast(dispatch_index);
         {
             var it = element.triRuns(dl_p1.tri_targets.items, dl_p1.tri_indices.items, dispatch_index_u32);
             while (it.next()) |run| {
-                self.tri_pipeline.recordDrawIndexedRange(cmd, target_extent_render, run.first_index, run.index_count);
+                self.tri_pipeline.recordDrawIndexedRange(cmd, target_extent_render, world_offset_target, run.first_index, run.index_count);
             }
         }
         {
@@ -887,20 +913,20 @@ pub const Spark = struct {
                 self.image_pipeline.bind(cmd, target_extent_render);
                 const subset = all_images[run.first .. run.first + run.count];
                 for (subset) |im| {
-                    self.image_pipeline.recordOne(cmd, target_extent_render, @ptrCast(@alignCast(im.descriptor_set)), im.dst_pos, im.dst_size);
+                    self.image_pipeline.recordOne(cmd, target_extent_render, world_offset_target, @ptrCast(@alignCast(im.descriptor_set)), im.dst_pos, im.dst_size);
                 }
             }
         }
         {
             var it = element.runs(dl_p1.quad_targets.items, dispatch_index_u32);
             while (it.next()) |run| {
-                self.quad_pipeline.recordDrawRange(cmd, target_extent_render, run.first, run.count);
+                self.quad_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count);
             }
         }
         {
             var it = element.runs(dl_p1.glyph_targets.items, dispatch_index_u32);
             while (it.next()) |run| {
-                self.text_pipeline.recordDrawRange(cmd, target_extent_render, run.first, run.count);
+                self.text_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count);
             }
         }
 
@@ -1213,10 +1239,17 @@ pub const Spark = struct {
         // Paint order: tri → image → quad → text. SVG fills under
         // chrome under glyphs — same as pre-B.4.b.4 and same as the
         // offscreen-target order inside Phase 1.
+        // MAIN attachment world_offset = (0, 0). Drawlist primitives
+        // already carry screen-space coords by this point (endFrame's
+        // world→screen transform ran above) — no rebase needed. The
+        // (0, 0) here is the documented identity case that makes the
+        // single-shader-path work for both attachments without
+        // branching (Phase B.5 substrate).
+        const main_world_offset: [2]f32 = .{ 0, 0 };
         {
             var it = element.triRuns(dl.tri_targets.items, dl.tri_indices.items, element.MAIN_TARGET);
             while (it.next()) |run| {
-                self.tri_pipeline.recordDrawIndexedRange(cmd, extent, run.first_index, run.index_count);
+                self.tri_pipeline.recordDrawIndexedRange(cmd, extent, main_world_offset, run.first_index, run.index_count);
             }
         }
         {
@@ -1227,20 +1260,20 @@ pub const Spark = struct {
                 self.image_pipeline.bind(cmd, extent);
                 const subset = all_images[run.first .. run.first + run.count];
                 for (subset) |im| {
-                    self.image_pipeline.recordOne(cmd, extent, @ptrCast(@alignCast(im.descriptor_set)), im.dst_pos, im.dst_size);
+                    self.image_pipeline.recordOne(cmd, extent, main_world_offset, @ptrCast(@alignCast(im.descriptor_set)), im.dst_pos, im.dst_size);
                 }
             }
         }
         {
             var it = element.runs(dl.quad_targets.items, element.MAIN_TARGET);
             while (it.next()) |run| {
-                self.quad_pipeline.recordDrawRange(cmd, extent, run.first, run.count);
+                self.quad_pipeline.recordDrawRange(cmd, extent, main_world_offset, run.first, run.count);
             }
         }
         {
             var it = element.runs(dl.glyph_targets.items, element.MAIN_TARGET);
             while (it.next()) |run| {
-                self.text_pipeline.recordDrawRange(cmd, extent, run.first, run.count);
+                self.text_pipeline.recordDrawRange(cmd, extent, main_world_offset, run.first, run.count);
             }
         }
 
