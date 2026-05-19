@@ -10,6 +10,7 @@ test {
     _ = @import("ansi.zig");
     _ = @import("markdown.zig");
     _ = @import("markdown_components.zig");
+    _ = @import("params.zig");
     _ = @import("component.zig");
     _ = @import("components/badge.zig");
     _ = @import("components/box.zig");
