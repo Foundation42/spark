@@ -90,7 +90,10 @@ pub const PassRegion = extern struct {
 /// If the protocol changes, this comment is the contract — update
 /// it and the hasher together in the same commit.
 pub const PassDispatch = struct {
-    shader_id: [16]u8,
+    /// Type-locked to `component_mod.ShaderId` (A.2). The hash
+    /// protocol above asserts 16 bytes; the type definition asserts
+    /// the same. Single source of truth.
+    shader_id: component_mod.ShaderId,
     layout_region: PassRegion,
     /// Borrowed view into uniform storage owned elsewhere (target
     /// pool / compiler arena once those land). Lifetime is the

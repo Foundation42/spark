@@ -61,6 +61,15 @@ pub const BlockMetrics = element.BlockMetrics;
 pub const Registry = @import("component.zig").Registry;
 pub const Factory = @import("component.zig").Factory;
 pub const Instance = @import("component.zig").Instance;
+// Effects-spec Phase A.2 — pass-shape types factories opt into.
+pub const PassShape = @import("component.zig").PassShape;
+pub const PatternPass = @import("component.zig").PatternPass;
+pub const SingleSourcePass = @import("component.zig").SingleSourcePass;
+pub const ChainPass = @import("component.zig").ChainPass;
+pub const HostSlotPass = @import("component.zig").HostSlotPass;
+pub const ShaderId = @import("component.zig").ShaderId;
+pub const Edges = @import("component.zig").Edges;
+pub const LayoutInflationSpec = @import("component.zig").LayoutInflationSpec;
 pub const Spec = @import("markdown_components.zig").Spec;
 pub const Attr = @import("markdown_components.zig").Attr;
 pub const params = @import("params.zig");

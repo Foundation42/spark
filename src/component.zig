@@ -76,6 +76,132 @@ pub const Error = error{
     SparkNotAttached,
 } || std.mem.Allocator.Error;
 
+// ── Pass-shape types (effects-spec Phase A.2) ──────────────────────
+//
+// Factory's `pass_shape` field declares what kind of GPU work this
+// component contributes. `.content` (the default) is the historical
+// behavior — the component layouts itself into the shared DrawList
+// like every pre-effects factory does. The other arms describe shader
+// dispatches the pass-graph compiler (Phase A.3+) consumes. Per-arm
+// config lives on the union arm, not on Factory — `.content`-only
+// factories carry no dead config slots they never read.
+//
+// A.3 may relocate these types into `src/pass/`. The split here is
+// "types Factory needs" (this file) vs "runtime dispatch records"
+// (spark.zig's PassDispatch). Both halves serialize via the same
+// A.0-locked wire-format protocol; ShaderId is the shared currency.
+
+/// 4-sided pixel inflation applied to a single-source pass's child
+/// layout region — the breathing room a `:::drop_shadow` or
+/// `:::frosted_glass` needs around the rasterized child for the
+/// effect's spatial spread (blur radius + offset) to render without
+/// clipping at the child's natural bounds.
+pub const Edges = extern struct {
+    left: f32 = 0,
+    right: f32 = 0,
+    top: f32 = 0,
+    bottom: f32 = 0,
+};
+
+/// How a `SingleSourcePass` factory declares its layout-inflation
+/// requirement. Resolved **once at create() from Spec** per Decision
+/// #8 — the resulting `Edges` value is stored on the instance and
+/// never re-evaluated. `.fixed` is the simple case (a built-in
+/// drop_shadow with a hardcoded blur margin); `.from_params` lets
+/// the factory peek at attrs to size the inflation against the
+/// declared blur radius / offset. Dynamic shader-uniform changes
+/// (animating the blur in real time) animate within the reserved
+/// edge — they never re-trigger inflation.
+pub const LayoutInflationSpec = union(enum) {
+    fixed: Edges,
+    from_params: *const fn (*const components.Spec) Edges,
+};
+
+/// Opaque 16-byte identifier for a shader resource. v1 is built-in
+/// embedded SPIR-V — the build step (A.4) derives a stable 16-byte
+/// id (e.g. content hash of the `.spv` blob, or a build-time stable
+/// slot id) and that's what the pass-graph compiler records into
+/// `PassDispatch.shader_id`. Hashed verbatim by the A.0 determinism
+/// hasher (16 bytes, raw — see protocol comment on `spark.PassDispatch`).
+///
+/// Future-flex (Decision #9 — provenance ladder): remote-fetched,
+/// WASM-emitted, or inference-emitted shaders may carry longer
+/// underlying identifiers. If that lands, `ShaderId` can become an
+/// opaque type with a `serialize() [16]u8` method (likely a content
+/// hash of the longer id) — call sites that read raw bytes today
+/// shift to calling `.serialize()`, the A.0 wire format stays 16
+/// bytes, the protocol stays untouched. The door is open; v1 takes
+/// the simple shape.
+pub const ShaderId = [16]u8;
+
+/// `.pattern` arm payload — a fragment shader with no input texture
+/// drawn into the laid-out region. v1 canaries: `:::gradient`,
+/// `:::pattern`, `:::noise`. Always-background of the parent region
+/// per Decision #12.
+pub const PatternPass = struct {
+    shader_id: ShaderId,
+    /// Decision #7 — v1 asserts `false`. Reserved for Phase C HDR
+    /// chains. Compiler enforces this until the chain arm lights up.
+    hdr_target: bool = false,
+};
+
+/// `.single_source` arm payload — child renders to an offscreen
+/// target, shader filters that target, result composites back at the
+/// child's region + inflation. Phase B canaries: `:::drop_shadow`,
+/// `:::frosted_glass`, `:::blur`.
+pub const SingleSourcePass = struct {
+    shader_id: ShaderId,
+    /// Decision #7 — v1 asserts `false`.
+    hdr_target: bool = false,
+    /// Decision #8 — resolved once at create() from Spec. `null`
+    /// means no inflation (rare; pure pass-through filters). The
+    /// pass-graph compiler reads this once per instance creation
+    /// and caches the resulting `Edges` on the instance side.
+    layout_inflation: ?LayoutInflationSpec = null,
+};
+
+/// `.chain` arm payload — reserved for Phase C. Multi-pass sequences
+/// with intermediate downsampled targets, HDR format negotiation.
+/// Empty in v1; the pass-graph compiler panics on this arm until
+/// Phase C lights it up.
+pub const ChainPass = struct {};
+
+/// `.host_slot` arm payload — reserved in A.2, implemented in Phase
+/// B alongside the `:::placeholder_scene` stub factory. The stub
+/// proves `HostSlotPass.callback` end-to-end with a clear-to-color
+/// callback so the arm doesn't bitrot before Phase D lights up the
+/// real matryoshka adoption path (a `:::3d-scene` factory invoking
+/// the host's renderer). Empty in A.2; Phase B adds the `callback`
+/// field.
+pub const HostSlotPass = struct {};
+
+/// Tagged union — what kind of GPU work a factory contributes.
+/// Default `.content` keeps the entire pre-effects codebase
+/// compiling unchanged; new factories opt into a shader-shape by
+/// setting this field.
+///
+/// Implementation state of each arm:
+///
+///   - `.content` ........... shipped (every pre-effects factory)
+///   - `.pattern` ........... v1 — implements in A.5/A.6
+///   - `.single_source` ..... v1 — implements in Phase B
+///   - `.chain` ............. reserved, Phase C
+///   - `.host_slot` ......... reserved in A.2; implements in Phase B
+///                            alongside `:::placeholder_scene` stub
+///
+/// The pass-graph compiler (A.3+) switches exhaustively on this
+/// union. Reserved arms panic with "Phase X variant not implemented
+/// in v1" until their phase ships — honest failure beats silent
+/// no-op, and the exhaustive switch is the documentation of which
+/// arms are live.
+pub const PassShape = union(enum) {
+    content,
+    pattern: PatternPass,
+    single_source: SingleSourcePass,
+    chain: ChainPass,
+    host_slot: HostSlotPass,
+};
+
 /// Component factory — host-supplied per directive name. `create` is
 /// called on cache miss; `update` (if non-null) is called on cache
 /// hit so the instance can react to attr changes between parses;
@@ -118,6 +244,14 @@ pub const Factory = struct {
         action: []const u8,
         body: []const u8,
     ) anyerror!void = null,
+
+    /// What kind of GPU work this factory contributes. Default
+    /// `.content` matches every pre-effects factory's behavior
+    /// (rasterize into the shared DrawList); shader-shaped factories
+    /// opt into `.pattern`, `.single_source`, etc. Per-arm config
+    /// (shader_id, hdr_target, layout_inflation) lives on the union
+    /// arm — not as parallel fields on Factory.
+    pass_shape: PassShape = .content,
 };
 
 /// What a factory produces — the (vtable, ctx) pair the Element
@@ -1086,4 +1220,93 @@ test "reactive: gc unsubscribes the binding" {
     // soft-deleted at gc).
     try st.set("c", "blue");
     try testing.expectEqual(@as(u32, 0), t_updates);
+}
+
+// ── Phase A.2 pass-shape tests ─────────────────────────────────────
+
+test "Factory defaults to .content pass_shape" {
+    // Anonymous-literal factory declarations across the codebase
+    // (box.zig, grid.zig, …) don't mention pass_shape — A.2's
+    // addition is non-breaking only as long as `.content` is the
+    // field default. This test pins that contract so a future change
+    // that drops the default fails here, not in 20 unrelated files.
+    const f: Factory = .{
+        .create = stub_create,
+    };
+    try testing.expectEqual(PassShape.content, f.pass_shape);
+}
+
+test "PassShape constructs in every variant" {
+    // Compile-time check that each arm is reachable. Effect factories
+    // from A.5 onward construct via these constructor sites; if a
+    // future edit renames an arm, the test breaks loudly.
+    const noop_inflation: LayoutInflationSpec = .{ .fixed = .{ .left = 8, .right = 8, .top = 8, .bottom = 8 } };
+    const sid: ShaderId = [_]u8{0} ** 16;
+
+    const shapes = [_]PassShape{
+        .content,
+        .{ .pattern = .{ .shader_id = sid } },
+        .{ .single_source = .{ .shader_id = sid, .layout_inflation = noop_inflation } },
+        .{ .chain = .{} },
+        .{ .host_slot = .{} },
+    };
+    try testing.expectEqual(@as(usize, 5), shapes.len);
+}
+
+test "PassShape switches exhaustively" {
+    // The pass-graph compiler (A.3+) will switch on PassShape and
+    // dispatch per arm. This test stands in for that switch site at
+    // A.2 time — proves the union is exhaustively matchable and
+    // locks the arm names. When the compiler lands, the real switch
+    // replaces this stub.
+    const sid: ShaderId = [_]u8{0} ** 16;
+    const cases = [_]PassShape{
+        .content,
+        .{ .pattern = .{ .shader_id = sid } },
+        .{ .single_source = .{ .shader_id = sid } },
+        .{ .chain = .{} },
+        .{ .host_slot = .{} },
+    };
+    for (cases) |shape| {
+        const tag: []const u8 = switch (shape) {
+            .content => "content",
+            .pattern => "pattern",
+            .single_source => "single_source",
+            .chain => "chain",
+            .host_slot => "host_slot",
+        };
+        try testing.expect(tag.len > 0);
+    }
+}
+
+test "LayoutInflationSpec.from_params resolves at create time" {
+    // Decision #8 contract: from_params evaluates once at create()
+    // from the Spec. This test exercises that function-pointer arm
+    // — the resolver-style API the spec calls out — to prove it
+    // compiles and behaves as a normal Zig function pointer.
+    const helpers = struct {
+        fn computeEdges(spec: *const components.Spec) Edges {
+            _ = spec;
+            return .{ .left = 4, .right = 4, .top = 8, .bottom = 8 };
+        }
+    };
+    const spec_inflation: LayoutInflationSpec = .{ .from_params = helpers.computeEdges };
+    const dummy_spec: components.Spec = .{ .name = "test" };
+    const edges = switch (spec_inflation) {
+        .fixed => |e| e,
+        .from_params => |f| f(&dummy_spec),
+    };
+    try testing.expectEqual(@as(f32, 4), edges.left);
+    try testing.expectEqual(@as(f32, 8), edges.top);
+}
+
+fn stub_create(
+    spark: *spark_mod.Spark,
+    allocator: std.mem.Allocator,
+    spec: *const components.Spec,
+) anyerror!Instance {
+    _ = spark;
+    _ = allocator;
+    _ = spec;
+    return error.UnknownComponentId;
 }
