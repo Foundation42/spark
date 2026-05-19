@@ -4,20 +4,33 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // ── glslc resolution ───────────────────────────────────────────
+    // Fail-fast with a clear contributor-onboarding message if glslc
+    // isn't reachable. `GLSLC=/path/to/glslc zig build` overrides the
+    // PATH lookup — useful when the Vulkan SDK lives somewhere
+    // unconventional or multiple toolchains are installed.
+    const glslc_path = resolveGlslc(b);
+
     // ── Compile GLSL → SPIR-V ──────────────────────────────────────
     // Each shader gets `-I shaders/` so it can `#include` common helpers,
     // and `-MD -MF <name>.d` emits a make-style depfile that Zig's build
     // system parses so edits to included `.glsl` files invalidate the
     // cached SPIR-V — without this, only edits to the top-level file
     // would trigger a recompile.
-    const text_vert_spv = compileShaderStage(b, "text", "vert", optimize);
-    const text_frag_spv = compileShaderStage(b, "text", "frag", optimize);
-    const quad_vert_spv = compileShaderStage(b, "quad", "vert", optimize);
-    const quad_frag_spv = compileShaderStage(b, "quad", "frag", optimize);
-    const tri_vert_spv = compileShaderStage(b, "tri", "vert", optimize);
-    const tri_frag_spv = compileShaderStage(b, "tri", "frag", optimize);
-    const image_vert_spv = compileShaderStage(b, "image", "vert", optimize);
-    const image_frag_spv = compileShaderStage(b, "image", "frag", optimize);
+    const text_vert_spv = compileShaderStage(b, glslc_path, "text", "vert", optimize);
+    const text_frag_spv = compileShaderStage(b, glslc_path, "text", "frag", optimize);
+    const quad_vert_spv = compileShaderStage(b, glslc_path, "quad", "vert", optimize);
+    const quad_frag_spv = compileShaderStage(b, glslc_path, "quad", "frag", optimize);
+    const tri_vert_spv = compileShaderStage(b, glslc_path, "tri", "vert", optimize);
+    const tri_frag_spv = compileShaderStage(b, glslc_path, "tri", "frag", optimize);
+    const image_vert_spv = compileShaderStage(b, glslc_path, "image", "vert", optimize);
+    const image_frag_spv = compileShaderStage(b, glslc_path, "image", "frag", optimize);
+    // Effects-spec Phase A.4 — first pass shader. Fullscreen-triangle
+    // vertex passthrough shared by every effect fragment shader from
+    // A.5 onward. The smoke test in `src/pass/shader_resolver.zig`
+    // asserts these bytes land non-empty so the build infrastructure
+    // is exercised before A.5 starts shipping real fragment shaders.
+    const fullscreen_vert_spv = compileShaderStage(b, glslc_path, "fullscreen", "vert", optimize);
 
     // ── Bundle SPIR-V into a generated Zig module ──────────────────
     // The compiled blobs need `align(4)` because Vulkan's `pCode` field
@@ -33,6 +46,7 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(tri_frag_spv, "tri.frag.spv");
     _ = wf.addCopyFile(image_vert_spv, "image.vert.spv");
     _ = wf.addCopyFile(image_frag_spv, "image.frag.spv");
+    _ = wf.addCopyFile(fullscreen_vert_spv, "fullscreen.vert.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const text_vert align(4) = @embedFile("text.vert.spv").*;
         \\pub const text_frag align(4) = @embedFile("text.frag.spv").*;
@@ -42,6 +56,7 @@ pub fn build(b: *std.Build) void {
         \\pub const tri_frag align(4) = @embedFile("tri.frag.spv").*;
         \\pub const image_vert align(4) = @embedFile("image.vert.spv").*;
         \\pub const image_frag align(4) = @embedFile("image.frag.spv").*;
+        \\pub const fullscreen_vert align(4) = @embedFile("fullscreen.vert.spv").*;
         \\
     );
 
@@ -262,6 +277,28 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(t).step);
 }
 
+// Resolve the glslc executable path. Honours `GLSLC` env-var
+// override first (for non-standard Vulkan SDK installs or when
+// multiple toolchains coexist), then falls back to a PATH lookup.
+// Fail-fast with a clear message — silent build failures are a
+// known contributor-onboarding pain point.
+fn resolveGlslc(b: *std.Build) []const u8 {
+    if (std.process.getEnvVarOwned(b.allocator, "GLSLC")) |path| {
+        return path;
+    } else |_| {}
+    return b.findProgram(&.{"glslc"}, &.{}) catch {
+        std.debug.print(
+            \\
+            \\error: glslc not found on PATH.
+            \\  Install the Vulkan SDK (https://vulkan.lunarg.com) to provide it,
+            \\  or set GLSLC=/path/to/glslc to point at an existing install.
+            \\
+            \\
+        , .{});
+        std.process.exit(1);
+    };
+}
+
 // Compile one shader stage (`name.<stage>` → `name.<stage>.spv`) via
 // glslc. `stage` is "vert" / "frag" / "comp"; the source file is
 // `shaders/<name>.<stage>`. Emits a depfile so #include'd helpers
@@ -272,11 +309,11 @@ pub fn build(b: *std.Build) void {
 //   * `ReleaseSafe`   → `-O`  (perf optimisation, debug info preserved)
 //   * `ReleaseFast`   → `-O`  (perf optimisation)
 //   * `ReleaseSmall`  → `-Os` (size optimisation)
-fn compileShaderStage(b: *std.Build, name: []const u8, stage: []const u8, optimize: std.builtin.OptimizeMode) std.Build.LazyPath {
+fn compileShaderStage(b: *std.Build, glslc: []const u8, name: []const u8, stage: []const u8, optimize: std.builtin.OptimizeMode) std.Build.LazyPath {
     const src = b.fmt("shaders/{s}.{s}", .{ name, stage });
     const spv = b.fmt("{s}.{s}.spv", .{ name, stage });
     const dep = b.fmt("{s}.{s}.d", .{ name, stage });
-    const cmd = b.addSystemCommand(&.{ "glslc", "--target-env=vulkan1.3" });
+    const cmd = b.addSystemCommand(&.{ glslc, "--target-env=vulkan1.3" });
     cmd.addArg("-I");
     cmd.addDirectoryArg(b.path("shaders"));
     cmd.addArg("-MD");

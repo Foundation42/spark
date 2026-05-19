@@ -324,11 +324,13 @@ pub const Spark = struct {
         io_channel.* = io_channel_mod.IoChannel.init(allocator, io_jobs);
         errdefer io_channel.deinit();
 
-        // ── DrawList + effects-side stubs ───────────────────────────
+        // ── DrawList + effects-side state ───────────────────────────
         const drawlist = element.DrawList.init(allocator);
         const pass_dispatches = std.ArrayList(PassDispatch).init(allocator);
         const target_pool = pass_mod.TargetPool.init(allocator);
-        const shader_resolver = pass_mod.ShaderResolver.init(allocator);
+        var shader_resolver = pass_mod.ShaderResolver.init(allocator);
+        errdefer shader_resolver.deinit();
+        try registerEmbeddedPassShaders(&shader_resolver);
 
         return .{
             .allocator = allocator,
@@ -831,6 +833,25 @@ pub const Spark = struct {
 };
 
 // ── Helpers ────────────────────────────────────────────────────────
+
+/// Seed the shader resolver with every built-in pass shader at
+/// Spark init time. Effects-spec Phase A.4 — today registers
+/// `fullscreen.vert` (shared by every effect from A.5 onward).
+/// Future phases add entries as they ship: A.5 lands the three
+/// canary fragment shaders (`gradient`, `pattern`, `noise`); B
+/// adds `drop_shadow`, `frosted_glass`, `blur`. When the list
+/// grows past comfortable inline size, split into
+/// `src/pass/embedded.zig`.
+///
+/// Borrowing contract: the registered slices point into the
+/// `shaders` module's `@embedFile`'d data — process-lifetime, no
+/// free needed. The resolver holds the borrowed pointers and never
+/// owns them. Future asset-cache-loaded shaders (per the resolver's
+/// provenance-ladder note) carry their own lifetime via the cache.
+fn registerEmbeddedPassShaders(resolver: *pass_mod.ShaderResolver) !void {
+    const shaders = @import("shaders");
+    try resolver.register("fullscreen.vert", &shaders.fullscreen_vert);
+}
 
 fn dispatchHit(hit: element.Hit, event: element.InputEvent, default_state: *state_mod.State) !void {
     const on_input = hit.vtable.on_input orelse return;

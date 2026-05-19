@@ -22,6 +22,7 @@ pub const Graph = graph.Graph;
 pub const ShaderResolver = shader_resolver.ShaderResolver;
 pub const ShaderDispatchHandle = shader_resolver.ShaderDispatchHandle;
 pub const ShaderResolverError = shader_resolver.Error;
+pub const shaderIdFromName = shader_resolver.shaderIdFromName;
 pub const TargetPool = target_pool.TargetPool;
 pub const TargetKey = target_pool.TargetKey;
 pub const TargetHandle = target_pool.TargetHandle;

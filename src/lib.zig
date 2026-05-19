@@ -70,7 +70,7 @@ pub const HostSlotPass = @import("component.zig").HostSlotPass;
 pub const ShaderId = @import("component.zig").ShaderId;
 pub const Edges = @import("component.zig").Edges;
 pub const LayoutInflationSpec = @import("component.zig").LayoutInflationSpec;
-// Effects-spec Phase A.3 — pass-graph compiler module.
+// Effects-spec Phase A.3+ — pass-graph compiler module.
 pub const pass = @import("pass/root.zig");
 pub const Spec = @import("markdown_components.zig").Spec;
 pub const Attr = @import("markdown_components.zig").Attr;
