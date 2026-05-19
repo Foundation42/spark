@@ -596,20 +596,12 @@ pub const PassRegion = extern struct {
 /// real target GPU should heap ownership enter the design.
 pub const MAX_PASS_UNIFORM_BYTES: u32 = 256;
 
-/// One record of work the pass-graph compiler emits per layout walk:
-/// a shader bound to a region of the frame, fed by uniform bytes,
-/// ordered within the frame by `sequence_index`. Hashed by the A.0
-/// determinism protocol — see the protocol comment in
-/// `src/tests/integration_render.zig`'s `hashFrame`.
-///
-/// **Inline uniform storage.** `uniform_bytes` is a fixed-cap inline
-/// array rather than a borrowed slice — eliminates lifetime concerns
-/// (no question about which arena owns the snapshot, no per-frame
-/// allocator coordination). Walker's `vtable.snapshot_uniforms` call
-/// writes directly into this slot. Wire format is still
-/// variable-length (`uniform_len + first uniform_len bytes`), so the
-/// A.0 hash protocol stays unchanged.
-pub const PassDispatch = struct {
+/// Pattern-pass dispatch step — fragment shader drawn directly into
+/// the main color attachment at `layout_region`, no offscreen target,
+/// no descriptor sets. Effects-spec Phase A.6.a was the original
+/// `PassDispatch` shape; at B.2/B.3 it became one arm of the tagged
+/// union below as `SingleSourceStep` joined.
+pub const PatternStep = struct {
     /// Opaque 16-byte shader identifier per the A.0 wire format.
     /// Type-locked to `component.ShaderId` at the type-system level;
     /// stored here as a raw byte array to avoid an element.zig →
@@ -619,6 +611,70 @@ pub const PassDispatch = struct {
     uniform_bytes: [MAX_PASS_UNIFORM_BYTES]u8 = [_]u8{0} ** MAX_PASS_UNIFORM_BYTES,
     uniform_len: u32 = 0,
     sequence_index: u32,
+};
+
+/// Single-source dispatch step — child subtree renders into an
+/// offscreen target sized to the effect's compose region, then a
+/// filter shader samples that target and composites the result back
+/// into the main color attachment at `compose_region`. Effects-spec
+/// Phase B.2/B.3 — the tagged-union extension of `PassDispatch`.
+///
+/// **Subtree capture via dispatch-range.** Walker captures
+/// `pass_dispatches.items.len` immediately before and after the
+/// effect's `layout_and_render` call. Any pass dispatches the child
+/// subtree emits (e.g., a `:::gradient` inside a `:::drop_shadow`)
+/// fall naturally inside this range — the index pair documents the
+/// containment without needing recursive data structures.
+///
+/// **Drawlist routing TBD at B.4.** Subtree drawlist items (glyphs,
+/// quads, tris) need to render into the offscreen target rather
+/// than the main attachment. The routing mechanism (per-item
+/// target tag vs per-target drawlist) lands with the GPU consumer
+/// that actually executes multi-render-pass dispatches. B.2/B.3
+/// emits the dispatch range; B.4 wires the drawlist side.
+pub const SingleSourceStep = struct {
+    /// Offscreen target dimensions in physical pixels. Equal to
+    /// `compose_region.{w, h}` for v1 (1:1 sampling); Phase C may
+    /// introduce target-vs-region scaling for multi-resolution
+    /// chain passes.
+    target_size: [2]u32,
+    /// Filter shader (e.g. drop-shadow blur+offset). Same opaque
+    /// 16-byte identifier shape as `PatternStep.shader_id`.
+    filter_shader_id: [16]u8,
+    filter_uniforms: [MAX_PASS_UNIFORM_BYTES]u8 = [_]u8{0} ** MAX_PASS_UNIFORM_BYTES,
+    filter_uniforms_len: u32 = 0,
+    /// Where the composed filter output lands on the main color
+    /// attachment.
+    compose_region: PassRegion,
+    /// Half-open `[start, end)` range into `pass_dispatches.items`
+    /// covering this effect's subtree. Nested single-source
+    /// dispatches fall inside; the GPU consumer recurses by
+    /// processing the subtree before the compose step.
+    subtree_dispatch_range: [2]u32,
+    sequence_index: u32,
+};
+
+/// One record of work the pass-graph compiler emits per layout walk.
+/// Tagged union: `.pattern` for direct fragment-shader-into-region
+/// effects (Phase A); `.single_source` for render-child-into-target-
+/// then-filter effects (Phase B). Hashed via per-arm dispatch by the
+/// A.0 determinism protocol — see the protocol comment in
+/// `src/tests/integration_render.zig`'s `hashFrame`.
+///
+/// **Wire format v2** (Phase B.3): the arm tag byte (0 = pattern,
+/// 1 = single_source) is hashed first, then arm-specific fields in
+/// canonical order. Adding a new arm (`.chain` in Phase C,
+/// `.host_slot` in Phase B with `:::placeholder_scene`) extends the
+/// switch — protocol grows additively.
+///
+/// **Inline uniform storage.** `uniform_bytes` / `filter_uniforms`
+/// are fixed-cap inline arrays rather than borrowed slices — no
+/// arena coordination, no lifetime ambiguity. Wire format walks
+/// only the first `*_len` bytes; trailing zero padding is not
+/// hashed.
+pub const PassDispatch = union(enum) {
+    pattern: PatternStep,
+    single_source: SingleSourceStep,
 };
 
 /// Layout result for one element. Pixel coords (display space, not

@@ -216,6 +216,17 @@ pub fn layoutAndRender(
         .code_block => |cb| return layoutCodeBlock(cb.content, origin, constraints, ctx, out),
 
         .custom => |cu| {
+            // **Subtree dispatch-range capture (Phase B.3).** For
+            // `.single_source` pass shapes, the walker records the
+            // pass-dispatch list length immediately before and after
+            // the child's `layout_and_render`. Any pass dispatches
+            // emitted by the child subtree fall naturally inside
+            // this range — nested single-source effects nest by
+            // construction, no recursive data structure needed.
+            // For `.pattern` and `.content`, the start index is
+            // unused (kept zero).
+            const dispatch_start: u32 = if (ctx.pass_dispatches) |pd| @intCast(pd.items.len) else 0;
+
             const box = try cu.vtable.layout_and_render(
                 cu.ctx,
                 origin,
@@ -245,13 +256,11 @@ pub fn layoutAndRender(
                     .focusable = cu.vtable.focusable,
                 });
             }
-            // Effects-spec Phase A.6.a — pass-graph emission. For
-            // any custom element whose factory declared a non-
-            // `.content` pass_shape, snapshot the uniforms and
-            // append a PassDispatch. Content-only elements MUST
-            // have `snapshot_uniforms = null`; the assert catches
-            // wrong-vtable-wiring at the dispatch site (cheaper to
-            // catch here than chasing weird GPU output later).
+            // Effects-spec Phase A.6.a + B.2/B.3 — pass-graph
+            // emission. Content elements MUST NOT declare
+            // snapshot_uniforms (asserted with a clear message);
+            // pattern + single-source elements emit per-arm
+            // dispatch records into LayoutCtx.pass_dispatches.
             if (cu.pass_kind == 0) {
                 // Content elements must not declare snapshot_uniforms;
                 // only pass-shape variants (.pattern / .single_source /
@@ -264,18 +273,41 @@ pub fn layoutAndRender(
             } else if (ctx.pass_dispatches) |pd| {
                 const snapshot = cu.vtable.snapshot_uniforms orelse
                     return error.NonContentElementMissingSnapshotUniforms;
-                var dispatch: element.PassDispatch = .{
-                    .shader_id = cu.shader_id,
-                    .layout_region = .{
-                        .x = @intFromFloat(@round(box.x)),
-                        .y = @intFromFloat(@round(box.y)),
-                        .w = @intFromFloat(@round(box.w)),
-                        .h = @intFromFloat(@round(box.h)),
-                    },
-                    .sequence_index = @intCast(pd.items.len),
+                var uniform_buf: [element.MAX_PASS_UNIFORM_BYTES]u8 = [_]u8{0} ** element.MAX_PASS_UNIFORM_BYTES;
+                const ulen: u32 = @intCast(snapshot(cu.ctx, uniform_buf[0..]));
+                const region: element.PassRegion = .{
+                    .x = @intFromFloat(@round(box.x)),
+                    .y = @intFromFloat(@round(box.y)),
+                    .w = @intFromFloat(@round(box.w)),
+                    .h = @intFromFloat(@round(box.h)),
                 };
-                const n = snapshot(cu.ctx, dispatch.uniform_bytes[0..]);
-                dispatch.uniform_len = @intCast(n);
+                const seq: u32 = @intCast(pd.items.len);
+                const dispatch: element.PassDispatch = switch (cu.pass_kind) {
+                    1 => .{ .pattern = .{
+                        .shader_id = cu.shader_id,
+                        .layout_region = region,
+                        .uniform_bytes = uniform_buf,
+                        .uniform_len = ulen,
+                        .sequence_index = seq,
+                    } },
+                    2 => .{ .single_source = .{
+                        .target_size = .{
+                            @intFromFloat(@max(0, @round(box.w))),
+                            @intFromFloat(@max(0, @round(box.h))),
+                        },
+                        .filter_shader_id = cu.shader_id,
+                        .filter_uniforms = uniform_buf,
+                        .filter_uniforms_len = ulen,
+                        .compose_region = region,
+                        .subtree_dispatch_range = .{ dispatch_start, seq },
+                        .sequence_index = seq,
+                    } },
+                    // Reserved arms (chain, host_slot) — no factory
+                    // declares them yet, so this branch is dead. When
+                    // Phase B's :::placeholder_scene lights up pass_kind
+                    // = 4, the host_slot arm gets its own case here.
+                    else => unreachable,
+                };
                 try pd.append(dispatch);
             }
             // Notify post-layout. Symmetric with the cache-hit branch

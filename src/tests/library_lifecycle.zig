@@ -189,12 +189,14 @@ test "beginFrame reset clears drawlist and pass_dispatches symmetrically" {
     // comment, which is the contract.
     try sp.drawlist.glyphs.append(std.mem.zeroes(@TypeOf(sp.drawlist.glyphs.items[0])));
     try sp.pass_dispatches.append(.{
-        .shader_id = [_]u8{0} ** 16,
-        .layout_region = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
-        // uniform_bytes is now an inline `[MAX_PASS_UNIFORM_BYTES]u8`
-        // array per A.6.a — default zeroes; uniform_len = 0 leaves
-        // the wire format empty.
-        .sequence_index = 0,
+        // Phase B.3 — PassDispatch is now a tagged union; .pattern is
+        // the A.6.a-shape arm. uniform_bytes defaults to zeros;
+        // uniform_len = 0 leaves the wire format empty.
+        .pattern = .{
+            .shader_id = [_]u8{0} ** 16,
+            .layout_region = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+            .sequence_index = 0,
+        },
     });
 
     // Dirty-gate path: both lists carry over.
@@ -266,7 +268,12 @@ test ":::gradient component lifecycle leaves no leaks" {
     // create → resolve → layout chain reached the pattern arm rather
     // than silently falling through to content treatment.
     try testing.expectEqual(@as(usize, 1), sp.pass_dispatches.items.len);
-    try testing.expect(sp.pass_dispatches.items[0].uniform_len > 0);
+    // PassDispatch became a tagged union at B.3; gradient is a
+    // pattern factory, so the emission is the `.pattern` arm.
+    switch (sp.pass_dispatches.items[0]) {
+        .pattern => |p| try testing.expect(p.uniform_len > 0),
+        else => unreachable,
+    }
 }
 
 test "Spark.installDotEnv mounts + tears down clean" {

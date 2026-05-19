@@ -153,10 +153,26 @@ pub const SingleSourcePass = struct {
     shader_id: ShaderId,
     /// Decision #7 — v1 asserts `false`.
     hdr_target: bool = false,
-    /// Decision #8 — resolved once at create() from Spec. `null`
-    /// means no inflation (rare; pure pass-through filters). The
-    /// pass-graph compiler reads this once per instance creation
-    /// and caches the resulting `Edges` on the instance side.
+    /// **Resolved at `create()` per Decision #8. Does NOT
+    /// re-evaluate on `handle_update`.** The factory's `create`
+    /// reads its own `LayoutInflationSpec` (either the `.fixed`
+    /// Edges literal or by calling `.from_params(spec)`), stores
+    /// the resolved Edges on the Component instance, and applies
+    /// it inside `layout_and_render` + `measure_block`.
+    ///
+    /// Dynamic uniform changes (e.g. `:::update {#shadow action=
+    /// set-blur value=12}` or `blur=${state.x}` running through
+    /// reactive binding) animate **within** the reserved edge —
+    /// the inflation does not re-resolve. An author writing
+    /// `:::drop_shadow blur=${state.x}` whose `state.x` later
+    /// exceeds the reserved edge will see the blur clip; the fix
+    /// is to recreate the component (factory.update destroys and
+    /// rebuilds via Registry path), not to re-inflate
+    /// in-place. Catches the surprise factor before it becomes a
+    /// "weird shadow clipping" bug report.
+    ///
+    /// `null` means no inflation (rare; pure pass-through filters
+    /// with no spatial spread).
     layout_inflation: ?LayoutInflationSpec = null,
 };
 
