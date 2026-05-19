@@ -34,20 +34,46 @@ const known_doc =
     \\
 ;
 
-fn hashDrawList(drawlist: *const spark.DrawList) u64 {
+/// Whole-frame fingerprint. Covers the rasterizer's DrawList (glyphs,
+/// quads, tris, indices) plus the pass-graph's dispatch list. Effects
+/// don't exist yet — the dispatch walk is empty under current docs and
+/// invisible to the fingerprint until Phase A.6 lands a pass-graph
+/// compiler that records dispatches. From that commit forward, drift in
+/// either layer fails this test with a one-line message.
+///
+/// PassDispatch serialization protocol (must match the comment on
+/// `spark.PassDispatch` — both ends move together):
+///
+///   shader_id           — 16 bytes, raw
+///   layout_region       — PassRegion, 16 bytes (x/y/w/h as i32)
+///   uniform_bytes_len   — u32, little-endian (native — runtime is LE)
+///   uniform_bytes       — raw uniform payload
+///   sequence_index      — u32, native
+fn hashFrame(sp: *const spark.Spark) u64 {
     var h = std.hash.Wyhash.init(0);
 
-    h.update(std.mem.asBytes(&drawlist.glyphs.items.len));
-    for (drawlist.glyphs.items) |g| h.update(std.mem.asBytes(&g));
+    const dl = &sp.drawlist;
+    h.update(std.mem.asBytes(&dl.glyphs.items.len));
+    for (dl.glyphs.items) |g| h.update(std.mem.asBytes(&g));
 
-    h.update(std.mem.asBytes(&drawlist.quads.items.len));
-    for (drawlist.quads.items) |q| h.update(std.mem.asBytes(&q));
+    h.update(std.mem.asBytes(&dl.quads.items.len));
+    for (dl.quads.items) |q| h.update(std.mem.asBytes(&q));
 
-    h.update(std.mem.asBytes(&drawlist.tris.items.len));
-    for (drawlist.tris.items) |v| h.update(std.mem.asBytes(&v));
+    h.update(std.mem.asBytes(&dl.tris.items.len));
+    for (dl.tris.items) |v| h.update(std.mem.asBytes(&v));
 
-    h.update(std.mem.asBytes(&drawlist.tri_indices.items.len));
-    for (drawlist.tri_indices.items) |i| h.update(std.mem.asBytes(&i));
+    h.update(std.mem.asBytes(&dl.tri_indices.items.len));
+    for (dl.tri_indices.items) |i| h.update(std.mem.asBytes(&i));
+
+    h.update(std.mem.asBytes(&sp.pass_dispatches.items.len));
+    for (sp.pass_dispatches.items) |d| {
+        h.update(&d.shader_id);
+        h.update(std.mem.asBytes(&d.layout_region));
+        const ulen: u32 = @intCast(d.uniform_bytes.len);
+        h.update(std.mem.asBytes(&ulen));
+        h.update(d.uniform_bytes);
+        h.update(std.mem.asBytes(&d.sequence_index));
+    }
 
     return h.final();
 }
@@ -96,7 +122,7 @@ test "DrawList is deterministic across runs" {
         );
         _ = try sp.layoutAndRender(&doc, .{ 40, 40 }, .{ .max_w = 720 });
 
-        hashes[i] = hashDrawList(&sp.drawlist);
+        hashes[i] = hashFrame(&sp);
         counts[i] = .{
             .glyphs = sp.drawlist.glyphs.items.len,
             .quads = sp.drawlist.quads.items.len,

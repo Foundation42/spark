@@ -57,6 +57,48 @@ const element_layout = @import("element_layout.zig");
 const document_mod = @import("document.zig");
 const io = io_channel_mod;
 
+/// Wire-format region for a pass dispatch. i32 fields (not f32) so
+/// the determinism hash has no float-equality questions — the
+/// pass-graph compiler quantises layout regions to physical pixels
+/// before recording a dispatch. Distinct from `element.Box` (layout
+/// output, f32) — this type only ever appears in `PassDispatch`.
+pub const PassRegion = extern struct {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+};
+
+/// One record of work the pass-graph compiler will eventually emit:
+/// a shader bound to a region of the frame, fed by uniform bytes,
+/// ordered within the frame by `sequence_index`. Effects-spec Phase
+/// A.0 — the type, field, and hashing protocol land before the
+/// compiler that populates them, so every Phase A commit (.2, .3,
+/// .5, .6) verifies determinism through the same path.
+///
+/// Wire-format protocol (the hasher in `integration_render.zig`
+/// walks fields in this exact order; both ends move together):
+///
+///   shader_id           — 16 bytes (opaque, provenance-agnostic
+///                         per effects-spec Decision #9)
+///   layout_region       — PassRegion, 16 bytes (x/y/w/h as i32)
+///   uniform_bytes_len   — u32, little-endian
+///   uniform_bytes       — raw uniform payload, std140 layout
+///   sequence_index      — u32, pass-monotonic within frame
+///
+/// Order is canonical; the walk iterates the slice in index order.
+/// If the protocol changes, this comment is the contract — update
+/// it and the hasher together in the same commit.
+pub const PassDispatch = struct {
+    shader_id: [16]u8,
+    layout_region: PassRegion,
+    /// Borrowed view into uniform storage owned elsewhere (target
+    /// pool / compiler arena once those land). Lifetime is the
+    /// current frame; reset at `beginFrame(.{ .reset = true })`.
+    uniform_bytes: []const u8,
+    sequence_index: u32,
+};
+
 /// Per-frame info supplied by the host at `beginFrame`. Stored on
 /// the Spark instance until `endFrame`; `layoutAndRender` calls
 /// consult these fields for viewport math + zoom/scroll transforms.
@@ -148,6 +190,18 @@ pub const Spark = struct {
     /// Per-frame DrawList — reset in `beginFrame`, populated by
     /// `layoutAndRender`, drained in `endFrame`.
     drawlist: element.DrawList,
+    /// Per-frame pass-graph dispatch list. Sibling to `drawlist`
+    /// because pass-graph output is not rasterizer output — the
+    /// type-honesty split keeps `DrawList` meaning "things to
+    /// rasterize" and `pass_dispatches` meaning "shader passes to
+    /// execute." Empty until effects-spec Phase A.6 lands the
+    /// pass-graph compiler that populates it. Reset symmetry with
+    /// `drawlist` is enforced by `beginFrame` + a lifecycle test.
+    /// When A.3 grows real pass-graph state (target pool, barrier
+    /// plan, dependency edges), promote into a `PassGraph` struct
+    /// on Spark and rename to `pass_graph.dispatches` — one cheap
+    /// rename, no protocol churn.
+    pass_dispatches: std.ArrayList(PassDispatch),
 
     /// Owned via pointer (JobSystem.init returns `*JobSystem`).
     compute_jobs: *jobs_mod.JobSystem,
@@ -255,6 +309,7 @@ pub const Spark = struct {
 
         // ── DrawList ────────────────────────────────────────────────
         const drawlist = element.DrawList.init(allocator);
+        const pass_dispatches = std.ArrayList(PassDispatch).init(allocator);
 
         return .{
             .allocator = allocator,
@@ -273,6 +328,7 @@ pub const Spark = struct {
             .registry = registry,
             .io_channel = io_channel,
             .drawlist = drawlist,
+            .pass_dispatches = pass_dispatches,
             .compute_jobs = compute_jobs,
             .io_jobs = io_jobs,
             .fonts = opts.fonts,
@@ -345,6 +401,7 @@ pub const Spark = struct {
 
         // 5. Per-frame state.
         self.drawlist.deinit();
+        self.pass_dispatches.deinit();
 
         // 6. Layout state.
         self.layout_context.deinit();
@@ -445,6 +502,12 @@ pub const Spark = struct {
         self.frame_info = info;
         if (opts.reset) {
             self.drawlist.clearRetainingCapacity();
+            // Symmetry with drawlist — both per-frame lists clear
+            // together on the reset path, both carry over on the
+            // dirty-gate path. Asymmetry here is a class of bug
+            // (e.g. stale pass dispatches replayed against a
+            // freshly-rebuilt drawlist); the lifecycle test pins it.
+            self.pass_dispatches.clearRetainingCapacity();
             try self.fonts.prewarmEffectiveSizesForZoom(info.zoom);
             self.layout_context.beginPass();
             self.drawlist_needs_transform = true;
@@ -732,6 +795,7 @@ pub const Spark = struct {
             .registry = undefined,
             .io_channel = undefined,
             .drawlist = undefined,
+            .pass_dispatches = undefined,
             .compute_jobs = undefined,
             .io_jobs = undefined,
             .fonts = undefined,

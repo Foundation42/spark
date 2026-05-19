@@ -150,6 +150,68 @@ test "Spark.installAssetCache mounts + tears down clean" {
     try testing.expect(sp.asset_cache != null);
 }
 
+test "beginFrame reset clears drawlist and pass_dispatches symmetrically" {
+    // Effects-spec Phase A.0 guard. Both per-frame lists must clear on
+    // `reset = true` and carry over on `reset = false`. Asymmetry here
+    // is a class of bug — stale pass dispatches replayed against a
+    // freshly-rebuilt drawlist, or vice versa. The test seeds one
+    // element of each list and watches their fates under both gates.
+    // Generalises: any future per-frame list added on Spark gets a
+    // corresponding append + assertion here, and any author that
+    // forgets the reset wiring fails this test before merging.
+    const allocator = testing.allocator;
+
+    var fx = try fixture.Fixture.init(allocator);
+    defer fx.deinit();
+
+    const fonts = try fixture.makeFonts(allocator, fx.ft);
+    const theme = fixture.makeTheme(fonts);
+    var state = spark.State.init(allocator);
+    defer state.deinit();
+
+    var sp = try spark.Spark.init(allocator, .{
+        .vk_ctx = &fx.ctx,
+        .color_format = fx.swapchain.format,
+        .theme = &theme,
+        .fonts = fonts.registry,
+        .host_state = &state,
+    });
+    defer {
+        sp.deinit();
+        allocator.destroy(fonts.registry);
+    }
+    sp.attachToRegistry();
+
+    // Seed both lists with one synthetic entry each. The DrawList
+    // entry is a zero-init glyph (the rasterizer ignores it since we
+    // never reach endFrame); the PassDispatch is a zero-payload
+    // sentinel — its shape mirrors the spark.PassDispatch protocol
+    // comment, which is the contract.
+    try sp.drawlist.glyphs.append(std.mem.zeroes(@TypeOf(sp.drawlist.glyphs.items[0])));
+    try sp.pass_dispatches.append(.{
+        .shader_id = [_]u8{0} ** 16,
+        .layout_region = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+        .uniform_bytes = &.{},
+        .sequence_index = 0,
+    });
+
+    // Dirty-gate path: both lists carry over.
+    try sp.beginFrame(
+        .{ .extent = .{ .width = 800, .height = 600 } },
+        .{ .reset = false },
+    );
+    try testing.expectEqual(@as(usize, 1), sp.drawlist.glyphs.items.len);
+    try testing.expectEqual(@as(usize, 1), sp.pass_dispatches.items.len);
+
+    // Reset path: both lists empty together.
+    try sp.beginFrame(
+        .{ .extent = .{ .width = 800, .height = 600 } },
+        .{ .reset = true },
+    );
+    try testing.expectEqual(@as(usize, 0), sp.drawlist.glyphs.items.len);
+    try testing.expectEqual(@as(usize, 0), sp.pass_dispatches.items.len);
+}
+
 test "Spark.installDotEnv mounts + tears down clean" {
     const allocator = testing.allocator;
 
