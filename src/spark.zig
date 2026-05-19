@@ -829,25 +829,56 @@ pub const Spark = struct {
             }
         }
 
-        // TODO(B.4.b.4): drawlist routing into S's target.
-        // Walker emits drawlist primitives with target_dispatch_index
-        // == this dispatch_index for content nested inside the
-        // effect (text, quads, tris, images). At B.4.b.3 those
-        // primitives still rasterize to the main attachment in
-        // Phase 2 (effectively invisible because the effect's
-        // compose region covers them) — no factory ships a
-        // single_source until B.5, so there's no observable gap.
+        // Per-target drawlist routing (Phase B.4.b.4). Render every
+        // drawlist primitive whose target_dispatch_index equals
+        // this dispatch's index into S's offscreen target. By walker
+        // construction every primitive type yields exactly one
+        // contiguous run for an offscreen target (push target on
+        // enter, primitives append with that tag, pop on exit). The
+        // run iterator still tolerates zero or multiple runs as a
+        // generality; for offscreen the loop runs at most once per
+        // pipeline.
         //
-        // B.4.b.4 adds `recordDrawRange(first_instance,
-        // instance_count)` variants on the rasterizer pipelines and
-        // a per-target draw loop here. Per-target contiguity holds
-        // for offscreen targets by walker construction (one
-        // contiguous run per primitive type per offscreen target;
-        // one `recordDrawRange` call covers the run). The MAIN
-        // target breaks contiguity — interleaved single_source
-        // subtrees split MAIN into multiple runs — so Phase 2 will
-        // run a `findRunsByTarget` scan on the parallel target
-        // arrays to build (first, count) ranges (~1-3 runs typical).
+        // The order — tri, image, quad, text — mirrors Phase 2 and
+        // the host's main pass so paint order inside an effect's
+        // target matches paint order against the main attachment.
+        // SVG fills sit behind chrome; backgrounds sit under glyphs.
+        const target_extent_render = vk.c.VkExtent2D{
+            .width = S.target_size[0],
+            .height = S.target_size[1],
+        };
+        const dl_p1 = &self.drawlist;
+        const dispatch_index_u32: u32 = @intCast(dispatch_index);
+        {
+            var it = element.triRuns(dl_p1.tri_targets.items, dl_p1.tri_indices.items, dispatch_index_u32);
+            while (it.next()) |run| {
+                self.tri_pipeline.recordDrawIndexedRange(cmd, target_extent_render, run.first_index, run.index_count);
+            }
+        }
+        {
+            var it = element.runs(dl_p1.image_targets.items, dispatch_index_u32);
+            const all_images = dl_p1.images.items;
+            while (it.next()) |run| {
+                if (run.count == 0) continue;
+                self.image_pipeline.bind(cmd, target_extent_render);
+                const subset = all_images[run.first .. run.first + run.count];
+                for (subset) |im| {
+                    self.image_pipeline.recordOne(cmd, target_extent_render, @ptrCast(@alignCast(im.descriptor_set)), im.dst_pos, im.dst_size);
+                }
+            }
+        }
+        {
+            var it = element.runs(dl_p1.quad_targets.items, dispatch_index_u32);
+            while (it.next()) |run| {
+                self.quad_pipeline.recordDrawRange(cmd, target_extent_render, run.first, run.count);
+            }
+        }
+        {
+            var it = element.runs(dl_p1.glyph_targets.items, dispatch_index_u32);
+            while (it.next()) |run| {
+                self.text_pipeline.recordDrawRange(cmd, target_extent_render, run.first, run.count);
+            }
+        }
 
         vk.c.vkCmdEndRendering(cmd);
 
@@ -1125,26 +1156,56 @@ pub const Spark = struct {
             }
         }
 
-        // TODO(B.4.b.4): rasterizer per-target plumbing.
-        // Drawlist primitives carry a per-item `target_dispatch_index`
-        // (parallel arrays from B.4.a). Today's `recordDraw(0..N)`
-        // draws every primitive into the main attachment, ignoring
-        // the routing. B.4.b.4 swaps these for per-target subrange
-        // calls: offscreen targets get one `recordDrawRange(first,
-        // count)` call per primitive type (contiguous by walker
-        // construction); the MAIN target builds (first, count) runs
-        // from the parallel target arrays at dispatch time (~1-3
-        // runs typical) since interleaved single_source subtrees
-        // break contiguity for MAIN.
-        self.tri_pipeline.recordDraw(cmd, extent, @intCast(dl.tri_indices.items.len));
-        if (dl.images.items.len > 0) {
-            self.image_pipeline.bind(cmd, extent);
-            for (dl.images.items) |im| {
-                self.image_pipeline.recordOne(cmd, extent, @ptrCast(@alignCast(im.descriptor_set)), im.dst_pos, im.dst_size);
+        // Per-target rasterizer routing for the MAIN attachment
+        // (Phase B.4.b.4). Interleaved single_source subtrees split
+        // the MAIN run into multiple chunks separated by per-target
+        // primitives (`text :::drop_shadow{box} text` → two MAIN
+        // runs around one TARGET run). The iterator yields each
+        // MAIN run as `(first, count)`; recordDrawRange handles
+        // each one with vkCmdDraw's `firstInstance` argument (the
+        // shaders read `gl_InstanceIndex` which auto-includes it).
+        //
+        // For non-effect docs there's exactly one run covering the
+        // whole array, so the cost reduces to one recordDrawRange
+        // per pipeline — identical command volume to the pre-B.4.b.4
+        // single recordDraw, just with `firstInstance = 0` made
+        // explicit. The TriRun iterator's index-space arithmetic
+        // means `vkCmdDrawIndexed` receives the same arguments as
+        // before in the no-effect case.
+        //
+        // Paint order: tri → image → quad → text. SVG fills under
+        // chrome under glyphs — same as pre-B.4.b.4 and same as the
+        // offscreen-target order inside Phase 1.
+        {
+            var it = element.triRuns(dl.tri_targets.items, dl.tri_indices.items, element.MAIN_TARGET);
+            while (it.next()) |run| {
+                self.tri_pipeline.recordDrawIndexedRange(cmd, extent, run.first_index, run.index_count);
             }
         }
-        self.quad_pipeline.recordDraw(cmd, extent, @intCast(dl.quads.items.len));
-        self.text_pipeline.recordDraw(cmd, extent, @intCast(dl.glyphs.items.len));
+        {
+            var it = element.runs(dl.image_targets.items, element.MAIN_TARGET);
+            const all_images = dl.images.items;
+            while (it.next()) |run| {
+                if (run.count == 0) continue;
+                self.image_pipeline.bind(cmd, extent);
+                const subset = all_images[run.first .. run.first + run.count];
+                for (subset) |im| {
+                    self.image_pipeline.recordOne(cmd, extent, @ptrCast(@alignCast(im.descriptor_set)), im.dst_pos, im.dst_size);
+                }
+            }
+        }
+        {
+            var it = element.runs(dl.quad_targets.items, element.MAIN_TARGET);
+            while (it.next()) |run| {
+                self.quad_pipeline.recordDrawRange(cmd, extent, run.first, run.count);
+            }
+        }
+        {
+            var it = element.runs(dl.glyph_targets.items, element.MAIN_TARGET);
+            while (it.next()) |run| {
+                self.text_pipeline.recordDrawRange(cmd, extent, run.first, run.count);
+            }
+        }
 
         // Phase 3 — wholesale release every Phase 1 acquire back
         // to the target pool. v1: release all at end of Phase 2

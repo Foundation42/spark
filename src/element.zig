@@ -943,6 +943,114 @@ pub const LayoutCtx = struct {
 /// B.4.a — the drawlist routing tag.
 pub const MAIN_TARGET: u32 = std.math.maxInt(u32);
 
+// ── Per-target run iterators (Phase B.4.b.4) ───────────────────────
+//
+// Phase B.4.b.4 needs to issue per-target subrange draws against the
+// rasterizer pipelines. The DrawList's parallel target arrays
+// (`glyph_targets`, `quad_targets`, `tri_targets`, `image_targets`)
+// encode which dispatch's target each primitive belongs to. For
+// offscreen targets the matching primitives form a single contiguous
+// run by walker construction (push target on enter, emit primitives
+// tagged with that target, pop on exit). For the MAIN target the run
+// may break into multiple chunks separated by single_source subtrees
+// (text :::drop_shadow{box} text → [MAIN_run][TARGET_run][MAIN_run]).
+//
+// The iterators below scan the parallel arrays once and yield each
+// `(first, count)` run matching a target. Pure CPU; no Vulkan
+// dependency; trivially unit-testable. Consumer loop shape:
+//
+//   var it = element.runs(dl.glyph_targets.items, target);
+//   while (it.next()) |run| {
+//       text_pipeline.recordDrawRange(cmd, extent, run.first, run.count);
+//   }
+
+/// One run of consecutive primitives with the same target. Units
+/// are primitive-instances (glyphs, quads, individual images).
+pub const Run = struct { first: u32, count: u32 };
+
+/// Iterator over `(first, count)` runs of primitives matching
+/// `match` in `targets`. For glyph/quad/image arrays — each entry
+/// in `targets` corresponds to one primitive instance, so the
+/// iterator's units are instance-units directly. For triangles
+/// see `triRuns` (different shape because target lives in vertex
+/// space while draws live in index space).
+pub const RunIterator = struct {
+    targets: []const u32,
+    match: u32,
+    cursor: usize,
+
+    pub fn next(self: *RunIterator) ?Run {
+        // Skip past entries that don't match the target.
+        while (self.cursor < self.targets.len and self.targets[self.cursor] != self.match) {
+            self.cursor += 1;
+        }
+        if (self.cursor >= self.targets.len) return null;
+        const first = self.cursor;
+        // Accumulate the contiguous match run.
+        while (self.cursor < self.targets.len and self.targets[self.cursor] == self.match) {
+            self.cursor += 1;
+        }
+        return .{
+            .first = @intCast(first),
+            .count = @intCast(self.cursor - first),
+        };
+    }
+};
+
+pub fn runs(targets: []const u32, match: u32) RunIterator {
+    return .{ .targets = targets, .match = match, .cursor = 0 };
+}
+
+/// One run of consecutive triangles with the same target,
+/// expressed as a slice of the index buffer ready to feed
+/// `vkCmdDrawIndexed`. `first_index = first_triangle * 3`,
+/// `index_count = triangle_count * 3`.
+pub const TriRun = struct { first_index: u32, index_count: u32 };
+
+/// Iterator over triangle runs matching `match`. Triangles are
+/// the natural primitive unit for tris, but the target tag lives
+/// in *vertex* space (one `tri_targets` entry per vertex in `tris`,
+/// not per index in `tri_indices`). The walker invariant (an SVG
+/// mesh emits all its vertices first with one shared target tag,
+/// then its indices referencing only those vertices) means every
+/// triangle's three vertices share one target — so looking up
+/// `targets[indices[T * 3]]` correctly identifies triangle T's
+/// target. The iterator yields each contiguous-by-target triangle
+/// run as a `(first_index, index_count)` pair the pipeline can
+/// pass directly to `vkCmdDrawIndexed`.
+pub const TriRunIterator = struct {
+    targets: []const u32, // per-vertex (parallels `tris`)
+    indices: []const u32, // index buffer (`tri_indices`)
+    match: u32,
+    tri_cursor: usize, // triangle index (each triangle = 3 indices)
+
+    pub fn next(self: *TriRunIterator) ?TriRun {
+        const total_tris = self.indices.len / 3;
+        // Skip triangles whose first vertex doesn't match.
+        while (self.tri_cursor < total_tris and
+            self.targets[self.indices[self.tri_cursor * 3]] != self.match)
+        {
+            self.tri_cursor += 1;
+        }
+        if (self.tri_cursor >= total_tris) return null;
+        const first_tri = self.tri_cursor;
+        // Accumulate the contiguous matching triangle run.
+        while (self.tri_cursor < total_tris and
+            self.targets[self.indices[self.tri_cursor * 3]] == self.match)
+        {
+            self.tri_cursor += 1;
+        }
+        return .{
+            .first_index = @intCast(first_tri * 3),
+            .index_count = @intCast((self.tri_cursor - first_tri) * 3),
+        };
+    }
+};
+
+pub fn triRuns(targets: []const u32, indices: []const u32, match: u32) TriRunIterator {
+    return .{ .targets = targets, .indices = indices, .match = match, .tri_cursor = 0 };
+}
+
 /// GPU draw work accumulated during the walk. Quads land first
 /// (backgrounds, bars, rules) then glyphs on top — the host's frame
 /// loop records them in that order inside one render pass.
@@ -1208,3 +1316,117 @@ const tri_pipeline = @import("gpu/tri_pipeline.zig");
 const layout_cache_mod = @import("layout_cache.zig");
 const jobs_mod = @import("jobs.zig");
 const layout_context_mod = @import("layout/context.zig");
+
+// ── Tests ──────────────────────────────────────────────────────────
+//
+// Phase B.4.b.4 — run iterator gates. Pure CPU logic; no Vulkan.
+
+const testing = std.testing;
+
+test "runs: empty array yields nothing" {
+    const targets: []const u32 = &.{};
+    var it = runs(targets, MAIN_TARGET);
+    try testing.expect(it.next() == null);
+}
+
+test "runs: single contiguous match yields one run" {
+    const targets: []const u32 = &.{ 7, 7, 7, 7 };
+    var it = runs(targets, 7);
+    const r1 = it.next().?;
+    try testing.expectEqual(@as(u32, 0), r1.first);
+    try testing.expectEqual(@as(u32, 4), r1.count);
+    try testing.expect(it.next() == null);
+}
+
+test "runs: leading/trailing non-matches are skipped" {
+    const targets: []const u32 = &.{ 1, 1, 7, 7, 1, 1 };
+    var it = runs(targets, 7);
+    const r1 = it.next().?;
+    try testing.expectEqual(@as(u32, 2), r1.first);
+    try testing.expectEqual(@as(u32, 2), r1.count);
+    try testing.expect(it.next() == null);
+}
+
+test "runs: interleaved MAIN/target splits into multiple runs" {
+    // The B.4.b.4 critical case — MAIN target broken into chunks
+    // by a single_source subtree. text :::drop_shadow{...} text
+    // produces [MAIN, MAIN][TARGET, TARGET][MAIN] in the parallel
+    // target array. The run-finder must yield two MAIN runs and
+    // one TARGET run.
+    const targets: []const u32 = &.{ MAIN_TARGET, MAIN_TARGET, 0, 0, MAIN_TARGET };
+    var it = runs(targets, MAIN_TARGET);
+    const r1 = it.next().?;
+    try testing.expectEqual(@as(u32, 0), r1.first);
+    try testing.expectEqual(@as(u32, 2), r1.count);
+    const r2 = it.next().?;
+    try testing.expectEqual(@as(u32, 4), r2.first);
+    try testing.expectEqual(@as(u32, 1), r2.count);
+    try testing.expect(it.next() == null);
+}
+
+test "runs: no matches yields nothing" {
+    const targets: []const u32 = &.{ 1, 2, 3, 4 };
+    var it = runs(targets, 7);
+    try testing.expect(it.next() == null);
+}
+
+test "triRuns: empty index buffer yields nothing" {
+    const targets: []const u32 = &.{};
+    const indices: []const u32 = &.{};
+    var it = triRuns(targets, indices, MAIN_TARGET);
+    try testing.expect(it.next() == null);
+}
+
+test "triRuns: single mesh's triangles yield one index-range run" {
+    // SVG mesh with 4 vertices, 2 triangles (indices 0,1,2 + 0,2,3).
+    // All 4 vertices tagged with target 5 (walker invariant).
+    const targets: []const u32 = &.{ 5, 5, 5, 5 };
+    const indices: []const u32 = &.{ 0, 1, 2, 0, 2, 3 };
+    var it = triRuns(targets, indices, 5);
+    const r1 = it.next().?;
+    try testing.expectEqual(@as(u32, 0), r1.first_index);
+    try testing.expectEqual(@as(u32, 6), r1.index_count);
+    try testing.expect(it.next() == null);
+}
+
+test "triRuns: two meshes targeting different dispatches split correctly" {
+    // Mesh A: vertices 0..3 tagged target 7 → indices 0,1,2 + 0,2,3.
+    // Mesh B: vertices 4..7 tagged target 9 → indices 4,5,6 + 4,6,7.
+    // The walker appends Mesh A's indices first, then Mesh B's,
+    // mirroring the order of appendTri calls.
+    const targets: []const u32 = &.{ 7, 7, 7, 7, 9, 9, 9, 9 };
+    const indices: []const u32 = &.{ 0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7 };
+    var it = triRuns(targets, indices, 7);
+    const r1 = it.next().?;
+    try testing.expectEqual(@as(u32, 0), r1.first_index);
+    try testing.expectEqual(@as(u32, 6), r1.index_count); // 2 triangles
+    try testing.expect(it.next() == null);
+
+    var it2 = triRuns(targets, indices, 9);
+    const r2 = it2.next().?;
+    try testing.expectEqual(@as(u32, 6), r2.first_index);
+    try testing.expectEqual(@as(u32, 6), r2.index_count); // 2 triangles
+    try testing.expect(it2.next() == null);
+}
+
+test "triRuns: interleaved meshes split into multiple per-target runs" {
+    // Three meshes, alternating targets: Main, Effect, Main.
+    // Mesh 1 (verts 0-2, target MAIN): indices 0,1,2.
+    // Mesh 2 (verts 3-5, target 0):     indices 3,4,5.
+    // Mesh 3 (verts 6-8, target MAIN):  indices 6,7,8.
+    // Expected for target MAIN: two runs (0..3 and 6..9).
+    const targets: []const u32 = &.{
+        MAIN_TARGET, MAIN_TARGET, MAIN_TARGET,
+        0,           0,           0,
+        MAIN_TARGET, MAIN_TARGET, MAIN_TARGET,
+    };
+    const indices: []const u32 = &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8 };
+    var it = triRuns(targets, indices, MAIN_TARGET);
+    const r1 = it.next().?;
+    try testing.expectEqual(@as(u32, 0), r1.first_index);
+    try testing.expectEqual(@as(u32, 3), r1.index_count);
+    const r2 = it.next().?;
+    try testing.expectEqual(@as(u32, 6), r2.first_index);
+    try testing.expectEqual(@as(u32, 3), r2.index_count);
+    try testing.expect(it.next() == null);
+}

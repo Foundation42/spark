@@ -349,14 +349,33 @@ pub const TextPipeline = struct {
     /// Bind pipeline + descriptor set, set viewport/scissor, push
     /// viewport size, draw 6 verts × `n_glyphs` instances. Must be
     /// called inside an active vkCmdBeginRendering block whose colour
-    /// format matches `init`'s `color_format`.
+    /// format matches `init`'s `color_format`. Convenience for the
+    /// "draw every glyph in the buffer from offset 0" common case —
+    /// thin wrapper over `recordDrawRange(cmd, extent, 0, n_glyphs)`.
     pub fn recordDraw(
         self: *const TextPipeline,
         cmd: c.VkCommandBuffer,
         extent: c.VkExtent2D,
         n_glyphs: u32,
     ) void {
-        if (n_glyphs == 0) return;
+        self.recordDrawRange(cmd, extent, 0, n_glyphs);
+    }
+
+    /// Bind + draw a contiguous subrange of the glyph instance
+    /// buffer. Phase B.4.b.4 per-target routing: callers iterate
+    /// `element.runs(dl.glyph_targets.items, target)` and issue one
+    /// of these per yielded `Run`. Vulkan's `firstInstance` argument
+    /// is exactly the subrange offset — the vertex shader reads
+    /// `gl_InstanceIndex` which is `gl_BaseInstance + per-instance
+    /// counter`, so offset is transparent.
+    pub fn recordDrawRange(
+        self: *const TextPipeline,
+        cmd: c.VkCommandBuffer,
+        extent: c.VkExtent2D,
+        first_instance: u32,
+        instance_count: u32,
+    ) void {
+        if (instance_count == 0) return;
         c.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipeline);
         c.vkCmdBindDescriptorSets(
             cmd,
@@ -392,7 +411,7 @@ pub const TextPipeline = struct {
             @sizeOf(TextPushConsts),
             &pc,
         );
-        c.vkCmdDraw(cmd, 6, n_glyphs, 0, 0);
+        c.vkCmdDraw(cmd, 6, instance_count, 0, first_instance);
     }
 };
 

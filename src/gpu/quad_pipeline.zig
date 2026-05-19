@@ -275,14 +275,31 @@ pub const QuadPipeline = struct {
     /// Bind + draw. Must run inside an active vkCmdBeginRendering
     /// block whose colour format matches `init`'s `color_format`.
     /// Records before text_pipeline.recordDraw in the same block so
-    /// backgrounds land under glyphs.
+    /// backgrounds land under glyphs. Convenience over
+    /// `recordDrawRange(cmd, extent, 0, n_quads)`.
     pub fn recordDraw(
         self: *const QuadPipeline,
         cmd: c.VkCommandBuffer,
         extent: c.VkExtent2D,
         n_quads: u32,
     ) void {
-        if (n_quads == 0) return;
+        self.recordDrawRange(cmd, extent, 0, n_quads);
+    }
+
+    /// Bind + draw a contiguous subrange of the quad instance
+    /// buffer. Phase B.4.b.4 per-target routing — callers iterate
+    /// `element.runs(dl.quad_targets.items, target)` and issue
+    /// one of these per yielded `Run`. `quad.vert` reads
+    /// `gl_InstanceIndex` which automatically includes
+    /// `firstInstance`.
+    pub fn recordDrawRange(
+        self: *const QuadPipeline,
+        cmd: c.VkCommandBuffer,
+        extent: c.VkExtent2D,
+        first_instance: u32,
+        instance_count: u32,
+    ) void {
+        if (instance_count == 0) return;
         c.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipeline);
         c.vkCmdBindDescriptorSets(
             cmd,
@@ -318,7 +335,7 @@ pub const QuadPipeline = struct {
             @sizeOf(QuadPushConsts),
             &pc,
         );
-        c.vkCmdDraw(cmd, 6, n_quads, 0, 0);
+        c.vkCmdDraw(cmd, 6, instance_count, 0, first_instance);
     }
 };
 

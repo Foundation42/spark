@@ -227,14 +227,32 @@ pub const TrianglePipeline = struct {
 
     /// Bind + draw `n_indices / 3` triangles. Records before quads /
     /// text in the same render pass so SVG fills sit behind chrome
-    /// and glyphs.
+    /// and glyphs. Convenience over `recordDrawIndexedRange(cmd,
+    /// extent, 0, n_indices)`.
     pub fn recordDraw(
         self: *const TrianglePipeline,
         cmd: c.VkCommandBuffer,
         extent: c.VkExtent2D,
         n_indices: u32,
     ) void {
-        if (n_indices == 0) return;
+        self.recordDrawIndexedRange(cmd, extent, 0, n_indices);
+    }
+
+    /// Bind + draw a contiguous subrange of the index buffer.
+    /// Phase B.4.b.4 per-target routing — callers iterate
+    /// `element.triRuns(dl.tri_targets.items, dl.tri_indices.items,
+    /// target)` and issue one of these per yielded `TriRun`. The
+    /// (first_index, index_count) pair feeds `vkCmdDrawIndexed`
+    /// directly; vertex offset stays 0 because indices reference
+    /// absolute positions in the shared vertex buffer.
+    pub fn recordDrawIndexedRange(
+        self: *const TrianglePipeline,
+        cmd: c.VkCommandBuffer,
+        extent: c.VkExtent2D,
+        first_index: u32,
+        index_count: u32,
+    ) void {
+        if (index_count == 0) return;
         c.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipeline);
 
         var viewport = c.VkViewport{
@@ -265,7 +283,7 @@ pub const TrianglePipeline = struct {
         var offsets = [_]c.VkDeviceSize{0};
         c.vkCmdBindVertexBuffers(cmd, 0, 1, &self.vertex_buffer, &offsets);
         c.vkCmdBindIndexBuffer(cmd, self.index_buffer, 0, c.VK_INDEX_TYPE_UINT32);
-        c.vkCmdDrawIndexed(cmd, n_indices, 1, 0, 0, 0);
+        c.vkCmdDrawIndexed(cmd, index_count, 1, first_index, 0, 0);
     }
 };
 
