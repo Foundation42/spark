@@ -96,19 +96,6 @@ Block extensions parse into Specs, get resolved through a host-owned registry in
 :::slider {#height_slider target=box_height min=20 max=120 value=${state.box_height} width=320}
 :::
 
-## Effects (stage 17 Phase A)
-
-Pattern-pass effect factories — fragment shaders dispatched directly into the framebuffer via the pass-graph compiler. Three canaries with deliberately distinct param shapes exercise the typed-marshalling resolver. Each renders into its `width × height` region with no rasterizer-side geometry; uniforms ride a push-constant range to the fragment shader. See `docs/effects-spec.md` for the full Phase A roadmap.
-
-:::gradient {from=#1a1a2e to=#0f3460 direction=vertical width=320 height=80}
-:::
-
-:::pattern {type=checker seed=0 width=320 height=80}
-:::
-
-:::noise {seed=1 scale=12.0 octaves=4 width=320 height=80}
-:::
-
 ## Flex layout (stage 15c)
 
 The first multi-child constraint-aware provider. `:::flex` walks its children with cumulative-x positioning, dropping `gap` pixels between siblings. Each child still goes through the kiwi solver for its own bounds — the flex parent computes positions, the children constrain their sizes.
