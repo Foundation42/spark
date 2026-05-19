@@ -530,11 +530,12 @@ pub fn main() !void {
     rdr.draw_fn = drawCb;
     rdr.draw_ctx = @ptrCast(&host_ctx);
     rdr.pre_draw_fn = preDrawCb;
-    // Light surface so the drop_shadow's dark shadow is visible —
-    // temporary demo polish while B.5 is fresh. Revert to the
-    // dark default (.{0.04, 0.04, 0.07, 1.0}) once the effect's
-    // calibrated.
-    rdr.clear_color = .{ 0.93, 0.94, 0.96, 1.0 };
+    // Dim cool gray — bright enough that drop_shadow's #000c shadow
+    // reads as a distinct halo (a near-black clear swallowed the
+    // shadow entirely), dark enough that the demo doesn't feel like
+    // a Word document. Sits between the original near-black
+    // (.{0.04, 0.04, 0.07, 1.0}) and a stark white.
+    rdr.clear_color = .{ 0.15, 0.15, 0.18, 1.0 };
 
     win.c.glfwSetWindowUserPointer(window.handle, @ptrCast(&host_ctx));
     _ = win.c.glfwSetScrollCallback(window.handle, scrollCb);
