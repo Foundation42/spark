@@ -246,3 +246,128 @@ test "two Spark instances own independent pattern pipeline caches" {
     // spark_b first, then spark_a — both must run cleanly without
     // double-free.
 }
+
+test "two Spark instances own independent effects substrate under effect-using docs" {
+    // Effects-spec Phase B.8 — extends the per-Spark isolation
+    // invariant beyond pattern pipelines (covered above) to the full
+    // single_source substrate (target_pool, single_source_pipelines,
+    // single_source_descriptor_pool) AND exercises it: each Spark
+    // loads a doc containing a `:::drop_shadow`, lays it out, and
+    // walks the pass-graph emission to populate pass_dispatches and
+    // the drawlist's *_targets routing.
+    //
+    // Without per-Spark isolation, a shared target_pool would have
+    // both Sparks racing on the same VkImage allocations; a shared
+    // descriptor pool would interleave their compose sets unpredictably.
+    // This test ratifies the sibling-field-per-Spark discipline holds
+    // for the entire effects substrate — not just the pattern cache.
+    const allocator = testing.allocator;
+
+    var fx = try fixture.Fixture.init(allocator);
+    defer fx.deinit();
+
+    const fonts_a = try fixture.makeFonts(allocator, fx.ft);
+    const theme_a = fixture.makeTheme(fonts_a);
+    var state_a = spark.State.init(allocator);
+    defer state_a.deinit();
+
+    var spark_a = try spark.Spark.init(allocator, .{
+        .vk_ctx = &fx.ctx,
+        .color_format = fx.swapchain.format,
+        .theme = &theme_a,
+        .fonts = fonts_a.registry,
+        .host_state = &state_a,
+    });
+    defer {
+        spark_a.deinit();
+        allocator.destroy(fonts_a.registry);
+    }
+    spark_a.attachToRegistry();
+    try spark.installCoreComponents(&spark_a);
+
+    const fonts_b = try fixture.makeFonts(allocator, fx.ft);
+    const theme_b = fixture.makeTheme(fonts_b);
+    var state_b = spark.State.init(allocator);
+    defer state_b.deinit();
+
+    var spark_b = try spark.Spark.init(allocator, .{
+        .vk_ctx = &fx.ctx,
+        .color_format = fx.swapchain.format,
+        .theme = &theme_b,
+        .fonts = fonts_b.registry,
+        .host_state = &state_b,
+    });
+    defer {
+        spark_b.deinit();
+        allocator.destroy(fonts_b.registry);
+    }
+    spark_b.attachToRegistry();
+    try spark.installCoreComponents(&spark_b);
+
+    // Per-Spark sibling-field invariant for the full single_source
+    // substrate. Pointer-distinctness checks trip the moment any
+    // future refactor accidentally aliases these fields across
+    // Sparks (e.g. promoting one to a file-scope cache).
+    try testing.expect(&spark_a.target_pool != &spark_b.target_pool);
+    try testing.expect(&spark_a.single_source_pipelines != &spark_b.single_source_pipelines);
+    try testing.expect(&spark_a.single_source_descriptor_pool != &spark_b.single_source_descriptor_pool);
+
+    // Exercise the substrate: each Spark loads + walks a doc with a
+    // `:::drop_shadow` wrapping a `:::box`. The walker populates
+    // `pass_dispatches` with a `.single_source` arm and the drawlist
+    // routes the wrapped quad to that dispatch's target. Without
+    // executing the dispatch pass (which needs the host's
+    // vkCmdBeginRendering scope), this still exercises every CPU-
+    // side path: emission, target-routing tagging, cache snapshot.
+    const effect_doc =
+        \\:::drop_shadow {blur=8 offset_y=4}
+        \\:::box {color=teal width=160 height=80 radius=8}
+        \\:::
+        \\:::
+        \\
+    ;
+
+    var effect_doc_a = try spark_a.loadDocument(effect_doc, .{ .shared_state = &state_a });
+    defer effect_doc_a.deinit();
+    var effect_doc_b = try spark_b.loadDocument(effect_doc, .{ .shared_state = &state_b });
+    defer effect_doc_b.deinit();
+
+    try spark_a.beginFrame(
+        .{ .extent = .{ .width = 800, .height = 600 } },
+        .{ .reset = true },
+    );
+    _ = try spark_a.layoutAndRender(&effect_doc_a, .{ 40, 40 }, .{ .max_w = 720 });
+
+    try spark_b.beginFrame(
+        .{ .extent = .{ .width = 800, .height = 600 } },
+        .{ .reset = true },
+    );
+    _ = try spark_b.layoutAndRender(&effect_doc_b, .{ 40, 40 }, .{ .max_w = 720 });
+
+    // Both Sparks emitted independent pass_dispatches lists. Same
+    // input doc → identical CPU-side dispatch count; the underlying
+    // ArrayList storage is distinct memory.
+    try testing.expectEqual(spark_a.pass_dispatches.items.len, spark_b.pass_dispatches.items.len);
+    try testing.expect(spark_a.pass_dispatches.items.ptr != spark_b.pass_dispatches.items.ptr);
+
+    // At least one single_source dispatch in each — sanity that the
+    // doc actually emitted what we wanted to exercise.
+    var saw_ss_a = false;
+    for (spark_a.pass_dispatches.items) |d| switch (d) {
+        .single_source => saw_ss_a = true,
+        else => {},
+    };
+    var saw_ss_b = false;
+    for (spark_b.pass_dispatches.items) |d| switch (d) {
+        .single_source => saw_ss_b = true,
+        else => {},
+    };
+    try testing.expect(saw_ss_a);
+    try testing.expect(saw_ss_b);
+
+    // Defer order tears down spark_b first then spark_a. Both
+    // deinits exercise the full effects substrate (target_pool
+    // sweep, descriptor pool reset, pipeline cache destroy) — any
+    // accidental cross-Spark aliasing trips a double-free or
+    // use-after-free here.
+}

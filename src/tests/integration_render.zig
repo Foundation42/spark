@@ -570,3 +570,127 @@ test "PassDispatch: :::placeholder_scene emits one host_slot dispatch determinis
     // this assertion trips deterministically.
     try testing.expectEqual(hashes[0], hashes[1]);
 }
+
+// Effects-spec Phase B.8 — per-single-source-effect determinism
+// docs. One test per shipped single_source factory (drop_shadow /
+// frosted_glass / liquid_glass), each loading a minimal doc that
+// exercises the factory's emission path and asserting:
+//
+//   * Hash equality across two consecutive Sparks (catches drift in
+//     uniform encoding, std140 padding, region quantisation,
+//     subtree_dispatch_range computation).
+//   * Exactly one `.single_source` dispatch lands in pass_dispatches
+//     (the wrapped child's pattern/content doesn't add additional
+//     single_source dispatches by accident).
+//   * The dispatch's `filter_shader_id` matches the factory's
+//     declared shader (catches "wrong shader bound at compose"
+//     bugs that wouldn't show in a hash test alone).
+//
+// These complement (and don't duplicate) the existing cache replay
+// test for drop_shadow — that test exercises the snapshot → blit
+// round-trip path; these exercise the emission path in isolation.
+
+fn assertSingleSourceDoc(
+    fx: *fixture.Fixture,
+    doc_src: []const u8,
+    expected_shader_id: spark.ShaderId,
+) !void {
+    const allocator = testing.allocator;
+    var hashes: [2]u64 = undefined;
+    var counts: [2]usize = undefined;
+    var shader_ids: [2][16]u8 = undefined;
+
+    inline for (0..2) |i| {
+        const fonts = try fixture.makeFonts(allocator, fx.ft);
+        const theme = fixture.makeTheme(fonts);
+        var state = spark.State.init(allocator);
+        defer state.deinit();
+
+        var sp = try spark.Spark.init(allocator, .{
+            .vk_ctx = &fx.ctx,
+            .color_format = fx.swapchain.format,
+            .theme = &theme,
+            .fonts = fonts.registry,
+            .host_state = &state,
+        });
+        defer {
+            sp.deinit();
+            allocator.destroy(fonts.registry);
+        }
+        sp.attachToRegistry();
+        try spark.installCoreComponents(&sp);
+
+        var doc = try sp.loadDocument(doc_src, .{ .shared_state = &state });
+        defer doc.deinit();
+
+        try sp.beginFrame(
+            .{ .extent = .{ .width = 800, .height = 600 } },
+            .{ .reset = true },
+        );
+        _ = try sp.layoutAndRender(&doc, .{ 40, 40 }, .{ .max_w = 720 });
+
+        hashes[i] = hashFrame(&sp);
+
+        var ss_count: usize = 0;
+        var captured_shader: [16]u8 = [_]u8{0} ** 16;
+        for (sp.pass_dispatches.items) |d| switch (d) {
+            .single_source => |ss| {
+                ss_count += 1;
+                captured_shader = ss.filter_shader_id;
+            },
+            else => {},
+        };
+        counts[i] = ss_count;
+        shader_ids[i] = captured_shader;
+    }
+
+    try testing.expectEqual(hashes[0], hashes[1]);
+    try testing.expectEqual(@as(usize, 1), counts[0]);
+    try testing.expectEqual(@as(usize, 1), counts[1]);
+    try testing.expectEqual(expected_shader_id, shader_ids[0]);
+}
+
+test "single_source determinism: :::drop_shadow" {
+    var fx = try fixture.Fixture.init(testing.allocator);
+    defer fx.deinit();
+    try assertSingleSourceDoc(
+        &fx,
+        \\:::drop_shadow {blur=8 offset_y=4 color=#000c}
+        \\:::box {color=teal width=160 height=80 radius=8}
+        \\:::
+        \\:::
+        \\
+        ,
+        spark.pass.shaderIdFromName("drop_shadow.frag"),
+    );
+}
+
+test "single_source determinism: :::frosted_glass" {
+    var fx = try fixture.Fixture.init(testing.allocator);
+    defer fx.deinit();
+    try assertSingleSourceDoc(
+        &fx,
+        \\:::frosted_glass {blur=12 tint=#ffffff14}
+        \\:::box {color=#1a1a2e width=200 height=80 radius=8}
+        \\:::
+        \\:::
+        \\
+        ,
+        spark.pass.shaderIdFromName("frosted_glass.frag"),
+    );
+}
+
+test "single_source determinism: :::liquid_glass" {
+    var fx = try fixture.Fixture.init(testing.allocator);
+    defer fx.deinit();
+    try assertSingleSourceDoc(
+        &fx,
+        \\:::liquid_glass {radius=0.18 refraction=0.2 rim_brightness=0.5}
+        \\:::box {color=#ffffff width=200 height=80 radius=8}
+        \\:::
+        \\:::
+        \\
+        ,
+        spark.pass.shaderIdFromName("liquid_glass.frag"),
+    );
+}
