@@ -1593,6 +1593,13 @@ fn registerEmbeddedPassShaders(
     // pipeline cache, same eager-compile discipline.
     try resolver.register("frosted_glass.frag", &shaders.frosted_glass_frag);
     try single_source.compile(pass_mod.shaderIdFromName("frosted_glass.frag"), &shaders.frosted_glass_frag);
+
+    // Effects-spec Phase B.6.d — third single_source filter.
+    // Liquid-glass factory (`:::liquid_glass`). Rounded-box SDF
+    // refraction + chromatic aberration + rim + tint. First effect
+    // authored via the B.6.c SingleSourceFactory generator.
+    try resolver.register("liquid_glass.frag", &shaders.liquid_glass_frag);
+    try single_source.compile(pass_mod.shaderIdFromName("liquid_glass.frag"), &shaders.liquid_glass_frag);
 }
 
 fn dispatchHit(hit: element.Hit, event: element.InputEvent, default_state: *state_mod.State) !void {

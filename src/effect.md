@@ -86,3 +86,28 @@ FBM noise wrapped in frosted glass — the per-pixel jitter blurs into a soft cl
 :::noise {seed=42 scale=8.0 octaves=4 width=240 height=80}
 :::
 :::
+
+## Liquid glass — rounded-box refraction (Phase B.6.d)
+
+Third single_source factory, and the first authored via the B.6.c `SingleSourceFactory` generator (~100 LOC for the whole factory file). Rounded-box SDF defines the panel; sampling UV bends back toward center near the edges, simulating a curved-glass lens; chromatic aberration adds a prismatic flash at corners; a thin rim highlight traces the edge; an optional tint washes over. Refraction works on the child's content (not on what's behind the panel) — the Apple "see-through" look needs MAIN sampling, which is Phase D territory.
+
+A checker pattern through liquid glass — high-contrast input shows the corner refraction + chromatic aberration clearly:
+
+:::liquid_glass {#liquid_checker radius=0.18 refraction=0.2 rim_brightness=0.5}
+:::pattern {type=checker seed=0 width=240 height=80}
+:::
+:::
+
+FBM noise through liquid glass — softer source, the rim highlight dominates the visible result:
+
+:::liquid_glass {#liquid_noise radius=0.25 refraction=0.15 rim_brightness=0.4 tint=#0d948820}
+:::noise {seed=42 scale=8.0 octaves=4 width=240 height=80}
+:::
+:::
+
+Solid box through liquid glass — baseline, edges + rim + tint visible without competing content:
+
+:::liquid_glass {#liquid_box radius=0.3 refraction=0.1 rim_brightness=0.6 tint=#16213e30}
+:::box {color=#ffffff width=240 height=80 radius=8}
+:::
+:::
