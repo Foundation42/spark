@@ -202,7 +202,62 @@ the win is visible same-session it lands.
 
 ## Locked-in answers to earlier open questions
 
-Empty until redline + matryoshka review. Decisions migrate from §"Design decisions" here as they survive scrutiny.
+Decisions that survived Phase A and are now load-bearing in shipped
+code. Each row points at the commit / test / file where the decision
+became observable in the codebase — anyone wondering "why is it this
+way?" can read the spec row + the implementation site together.
+
+| Decision | Locked at | Implementation site |
+|---|---|---|
+| D#1 — `Factory.pass_shape: PassShape` default `.content` | A.2 (`88fc955`) | `src/component.zig` — every pre-effects factory's anonymous literal still compiles. |
+| D#2 — `PassShape` tagged union with five arms (3 implemented, 2 reserved) | A.2 (`88fc955`) | `src/component.zig` — `.chain` and `.host_slot` reserved-but-typed; `dispatchPass` exhaustive switch panics on the reserved arms with phase-tagged messages. |
+| D#3 — Effects scope structurally by document tree | A.6.a (`f68235e`) | `src/element_layout.zig` walker emits `PassDispatch` per custom-element with `pass_kind != 0` — composition falls out of the layout walk. |
+| D#5 — Flat `:::name` grammar | A.5 (`dfd4c2b`) | `:::gradient`, `:::pattern`, `:::noise` registered under their flat names via `installCoreComponents`. Same shape as `:::box` / `:::chart`. |
+| D#6 — Fragment-only, no compute dispatch | A.5 (`dfd4c2b`) | `shaders/{gradient,pattern,noise}.frag` paired with `fullscreen.vert`. No compute path lit. |
+| D#7 — LDR sRGB only in v1; `hdr_target: bool` reserved | A.2 (`88fc955`) | `PatternPass.hdr_target = false` default in `src/component.zig`. Compiler-side enforcement deferred to Phase B per spec. |
+| D#8 — `SingleSourcePass.layout_inflation` resolved once at create() | A.2 (`88fc955`) | `LayoutInflationSpec` union (`.fixed` / `.from_params`) declared in `src/component.zig`; exercised by Phase B factories. |
+| D#9 — `ShaderId` opaque (`[16]u8`) | A.2 / A.4 (`88fc955` / `540f8c1`) | `src/component.zig` defines the type; `src/pass/shader_resolver.zig` derives stable build-time ids via `shaderIdFromName` (Wyhash×2, dodges Vulkan SDK drift). |
+| D#10 — `extern struct` uniforms (std140-compatible) | A.5 (`dfd4c2b`) | Each effect factory carries an `extern struct` uniform block with explicit padding + an offset-lock-in test. Policy comment pinned on `GradientUniforms`. |
+| D#11 — Effects register via `installCoreComponents` | A.5 (`dfd4c2b`) | `src/lib.zig` — `components.effects.{gradient,pattern,noise}` install entries alongside the rasterizer-shaped components. |
+| D#12 — Pattern-pass always-background, top-level covers full canvas | A.6.b (`bee8586`) | `Spark.endFrame` dispatches pattern passes BEFORE rasterizer draws inside the same render-pass scope. |
+| D#13 — Pass-graph compiler lives in `src/pass/` | A.3 (`8d35f3c`) | Directory module with `root.zig` re-exporter (kiwi convention). Four submodules: `graph`, `shader_resolver`, `target_pool` (Phase B), `pattern_pipeline` (A.6.b). |
+| D#14 — GLSL + `glslc -O` at build time, `@embedFile`'d SPIR-V | A.4 (`540f8c1`) | `build.zig` `compileShaderStage` + `resolveGlslc` (env-override + fail-fast). Generated `shaders.zig` module re-exported via `spark.shaders`. |
+
+**Still in §"Design decisions"** (not yet exercised at Phase A close —
+land in Phase B):
+
+- D#4 — Transient target pool keyed by `(w, h, format)`, mid-frame
+  ref-count release. Phase B implements; A.3 shipped the typed-null
+  stub (`acquire`/`release` panic with `"Phase B:"` tag).
+- D#15 — Recursive single-source has no recursion cap. Phase B
+  exercises with `:::drop_shadow` nested in `:::drop_shadow`; target
+  pool's mid-frame release per D#4 is what makes this bounded.
+
+**Phase A close — additional invariants locked through implementation**
+(not in the original spec, surfaced during Phase A and worth
+recording):
+
+- **PassDispatch wire format** (A.0 protocol) verified against real
+  data at A.6.a (`f68235e`). `integration_render.zig`'s first
+  non-empty fingerprint test is the contract; protocol comment on
+  `element.PassDispatch` is the source of truth for both ends.
+- **Type-at-producer-module placement** — `PassDispatch` lives in
+  `element.zig` (layout walker output, sibling to Hit/DrawList),
+  not at any consumer. Captured as
+  `feedback_type_at_producer_module.md` memory.
+- **Per-Spark pipeline cache isolation** — `pattern_pipelines` is a
+  Spark sibling field; two_instances test pins the invariant that
+  same `shader_id` yields distinct `VkPipeline` handles across two
+  Sparks.
+- **Push constants over descriptor sets for pattern-pass uniforms**
+  — pipeline layout has zero descriptor sets, one push-constant
+  range `[0..MAX_PASS_UNIFORM_BYTES = 256] @ STAGE_FRAGMENT`. Shaders
+  use `layout(push_constant)`. Phase B's `.single_source` arm forks
+  here (will need descriptor sets for offscreen-target sampling).
+- **`MAX_PASS_UNIFORM_BYTES = 256` inline storage on `PassDispatch`**
+  — no allocator coordination, no lifetime ambiguity. Bump the
+  constant before introducing heap ownership; the no-ownership
+  invariant is load-bearing.
 
 ## What this unlocks
 
