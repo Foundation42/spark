@@ -16,6 +16,7 @@ test {
     _ = @import("pass/target_pool.zig");
     _ = @import("pass/pattern_pipeline.zig");
     _ = @import("components/effects/gradient.zig");
+    _ = @import("components/effects/drop_shadow.zig");
     _ = @import("components/effects/pattern.zig");
     _ = @import("components/effects/noise.zig");
     _ = @import("component.zig");

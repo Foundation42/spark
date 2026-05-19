@@ -1,6 +1,6 @@
-# Pattern-pass effects (stage 17 Phase A)
+# Shader effects (stage 17)
 
-Three fragment-shader canaries dispatched directly into the framebuffer by the pass-graph compiler. No rasterizer-side geometry — each effect covers its `width × height` region with a fullscreen quad, and its uniforms ride a push-constant range straight to the fragment shader. The three factories deliberately exercise distinct param shapes to keep the typed-marshalling resolver honest: `:::gradient` takes vec4 colors plus an enum direction, `:::pattern` takes an enum type plus an integer seed, `:::noise` takes an integer seed plus float scale and octave count. See `docs/effects-spec.md` for the full Phase A roadmap.
+Pattern-pass and single-source effects exercised through the pass-graph compiler. Pattern factories cover their `width × height` region with a fullscreen quad whose fragment shader reads push-constant uniforms straight to the GPU; single-source factories render their wrapped child content into an offscreen target, then composite a filtered result (blur, glass) back over the main attachment. See `docs/effects-spec.md` for the full roadmap.
 
 Load this doc with `./spark_demo src/effect.md`.
 
@@ -44,4 +44,13 @@ Fractal-Brownian-motion noise. `seed` picks the field, `scale` controls cell siz
 :::
 
 :::noise {seed=99 scale=24.0 octaves=6 width=320 height=80}
+:::
+
+## Drop shadow — single-source filter (Phase B)
+
+The first user-facing single_source factory. Wraps any child content, renders it into an offscreen target sized to the child plus an inflation halo, then composites a blurred + offset + tinted version of that target underneath the original. Inflation is `blur` pixels on every side plus `max(0, offset)` on the lower-right and `-min(0, offset)` on the upper-left — so a `blur=8 offset_x=4 offset_y=4` wrapping a 200×80 box reserves a 220×100 region with the box at (8, 8) inside.
+
+:::drop_shadow {#shadow_demo offset_x=6 offset_y=6 blur=10 color=#000c}
+:::box {color=teal width=240 height=80 radius=8}
+:::
 :::

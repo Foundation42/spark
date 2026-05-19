@@ -221,6 +221,84 @@ test "beginFrame reset clears drawlist and pass_dispatches symmetrically" {
     try testing.expectEqual(@as(usize, 0), sp.pass_dispatches.items.len);
 }
 
+test ":::drop_shadow component lifecycle emits single_source dispatch" {
+    // Effects-spec Phase B.5 — first user-facing single_source
+    // factory. Equivalent to the `:::gradient` test below but for
+    // the single_source path: loads a `:::drop_shadow` wrapping a
+    // styled box, walks layout, and verifies:
+    //   (a) Walker emitted a `.single_source` PassDispatch (not
+    //       `.pattern`).
+    //   (b) Filter uniforms were populated (snapshot_uniforms ran
+    //       and copied DropShadowUniforms bytes).
+    //   (c) Target size matches the inflated child box — proves
+    //       inflation = target_size invariant holds end-to-end.
+    //   (d) Subtree dispatch range captured (empty for this case;
+    //       the wrapped box is a content element, not a
+    //       single_source).
+    //   (e) Teardown leaves no leaks (Spark.deinit + arena cleanup).
+    const allocator = testing.allocator;
+
+    var fx = try fixture.Fixture.init(allocator);
+    defer fx.deinit();
+
+    const fonts = try fixture.makeFonts(allocator, fx.ft);
+    const theme = fixture.makeTheme(fonts);
+    var state = spark.State.init(allocator);
+    defer state.deinit();
+
+    var sp = try spark.Spark.init(allocator, .{
+        .vk_ctx = &fx.ctx,
+        .color_format = fx.swapchain.format,
+        .theme = &theme,
+        .fonts = fonts.registry,
+        .host_state = &state,
+    });
+    defer {
+        sp.deinit();
+        allocator.destroy(fonts.registry);
+    }
+    sp.attachToRegistry();
+    try spark.installCoreComponents(&sp);
+
+    const drop_shadow_doc =
+        \\:::drop_shadow {#shadow1 offset_x=4 offset_y=4 blur=8 color=#000a}
+        \\:::box {color=teal width=200 height=80 radius=8}
+        \\:::
+        \\:::
+        \\
+    ;
+    var doc = try sp.loadDocument(drop_shadow_doc, .{ .shared_state = &state });
+    defer doc.deinit();
+
+    try sp.beginFrame(
+        .{ .extent = .{ .width = 800, .height = 600 } },
+        .{ .reset = true },
+    );
+    _ = try sp.layoutAndRender(&doc, .{ 40, 40 }, .{ .max_w = 720 });
+
+    // One dispatch emitted, and it's the single_source arm.
+    try testing.expectEqual(@as(usize, 1), sp.pass_dispatches.items.len);
+    switch (sp.pass_dispatches.items[0]) {
+        .single_source => |ss| {
+            // Uniforms populated.
+            try testing.expect(ss.filter_uniforms_len > 0);
+            // Target size = inflated child box. Child is 200×80;
+            // inflation = (8, 12, 8, 12) for blur=8 offset=(4,4).
+            // Inflated = (200+8+12, 80+8+12) = (220, 100).
+            try testing.expectEqual(@as(u32, 220), ss.target_size[0]);
+            try testing.expectEqual(@as(u32, 100), ss.target_size[1]);
+            try testing.expectEqual(@as(u32, 220), @as(u32, @intCast(ss.compose_region.w)));
+            try testing.expectEqual(@as(u32, 100), @as(u32, @intCast(ss.compose_region.h)));
+            // Subtree range — the wrapped box is content, not a
+            // pass-shape variant, so the subtree emits zero
+            // dispatches → empty range [0, 0).
+            try testing.expectEqual(@as(u32, 0), ss.subtree_dispatch_range[0]);
+            try testing.expectEqual(@as(u32, 0), ss.subtree_dispatch_range[1]);
+        },
+        else => unreachable,
+    }
+}
+
 test ":::gradient component lifecycle leaves no leaks" {
     // Effects-spec Phase A.7 deliverable. Full create → layout →
     // deinit roundtrip on an effect component through the public

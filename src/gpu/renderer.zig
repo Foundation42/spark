@@ -55,6 +55,25 @@ pub const Renderer = struct {
     draw_fn: ?*const fn (ctx: ?*anyopaque, cmd: c.VkCommandBuffer, extent: c.VkExtent2D) void = null,
     draw_ctx: ?*anyopaque = null,
 
+    /// Optional hook called AFTER the swapchain image's layout
+    /// transition to COLOR_ATTACHMENT_OPTIMAL but BEFORE
+    /// `vkCmdBeginRendering`. Use this for offscreen render passes
+    /// the host needs to scope outside the main pass — effects-spec
+    /// Phase B.4.b.3's `Spark.dispatchOffscreenPasses` is the
+    /// canonical consumer (Vulkan forbids nested render passes, so
+    /// Phase 1's per-effect offscreen passes can't live inside the
+    /// main pass scope).
+    ///
+    /// Preconditions when this fires: cmd is in recording state,
+    /// no render pass is active, the swapchain image is in
+    /// COLOR_ATTACHMENT_OPTIMAL (not strictly required by this
+    /// hook's consumers since they target offscreen images, but
+    /// it's the simplest place where all three preconditions hold
+    /// cleanly). Shares the `draw_ctx` opaque pointer with
+    /// `draw_fn` — host wires both to point at the same context
+    /// (typically `*HostCtx { spark, ... }`).
+    pre_draw_fn: ?*const fn (ctx: ?*anyopaque, cmd: c.VkCommandBuffer) anyerror!void = null,
+
     pub fn init(
         allocator: std.mem.Allocator,
         ctx: *vk.Context,
@@ -201,6 +220,14 @@ pub const Renderer = struct {
             .old_layout = c.VK_IMAGE_LAYOUT_UNDEFINED,
             .new_layout = c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         });
+
+        // ── Pre-rendering hook (effects-spec B.4.b.3 single_source
+        //    offscreen passes). Fires after the swapchain transition
+        //    but before vkCmdBeginRendering. See `pre_draw_fn` field
+        //    docs for the precondition contract.
+        if (self.pre_draw_fn) |fnp| {
+            try fnp(self.draw_ctx, cmd);
+        }
 
         // ── vkCmdBeginRendering: clear-color only, no draws yet ─────
         var color_att = std.mem.zeroes(c.VkRenderingAttachmentInfo);

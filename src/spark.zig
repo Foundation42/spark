@@ -1424,13 +1424,13 @@ fn barrierImageLayout(cmd: vk.c.VkCommandBuffer, image: vk.c.VkImage, t: ImageBa
 }
 
 /// Seed the shader resolver with every built-in pass shader at
-/// Spark init time. Effects-spec Phase A.4 + A.5 + B.4.b.1:
+/// Spark init time. Effects-spec Phase A.4 + A.5 + B.4.b.1 + B.5:
 /// registers `fullscreen.vert` (shared), the three Phase A.5 canary
-/// pattern fragments (`gradient`, `pattern`, `noise`), and the
-/// Phase B.4.b.1 substrate-smoke filter (`copy`). Phase B.5+ adds
-/// real single-source filters (`drop_shadow`, `frosted_glass`).
-/// When the list grows past comfortable inline size, split into
-/// `src/pass/embedded.zig`.
+/// pattern fragments (`gradient`, `pattern`, `noise`), the Phase
+/// B.4.b.1 substrate-smoke filter (`copy`), and the Phase B.5
+/// first user-facing single_source filter (`drop_shadow`). Phase
+/// B.6+ adds `frosted_glass`. When the list grows past comfortable
+/// inline size, split into `src/pass/embedded.zig`.
 ///
 /// **Eager-registration scaling caveat.** v1 registers every
 /// shader at Spark init — fine while the set is small. Phase C
@@ -1484,6 +1484,13 @@ fn registerEmbeddedPassShaders(
     // it's substrate validation, not a user-facing effect.
     try resolver.register("copy.frag", &shaders.copy_frag);
     try single_source.compile(pass_mod.shaderIdFromName("copy.frag"), &shaders.copy_frag);
+
+    // Effects-spec Phase B.5 — first user-facing single_source
+    // filter. Drop-shadow factory (`:::drop_shadow`) registers
+    // against this shader_id; substrate-side eager-compile here
+    // ensures the pipeline is ready before any doc loads.
+    try resolver.register("drop_shadow.frag", &shaders.drop_shadow_frag);
+    try single_source.compile(pass_mod.shaderIdFromName("drop_shadow.frag"), &shaders.drop_shadow_frag);
 }
 
 fn dispatchHit(hit: element.Hit, event: element.InputEvent, default_state: *state_mod.State) !void {

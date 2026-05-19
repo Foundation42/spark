@@ -70,6 +70,15 @@ const HostCtx = struct {
     overflow_logged: bool = false,
 };
 
+/// Renderer pre_draw_fn. Fires after the swapchain transition but
+/// BEFORE `vkCmdBeginRendering` — Phase 1 offscreen render passes
+/// for effects-spec single_source dispatches scope here so they
+/// don't nest inside the main pass. Lives outside any render scope.
+fn preDrawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer) anyerror!void {
+    const h: *HostCtx = @ptrCast(@alignCast(ctx.?));
+    try h.spark.dispatchOffscreenPasses(cmd);
+}
+
 /// Renderer draw_fn. Called per frame WITH the active cmd buffer
 /// already inside `vkCmdBeginRendering` (the renderer.zig wraps with
 /// loadOp=CLEAR + the demo's clear colour). Spark records draws into
@@ -517,6 +526,7 @@ pub fn main() !void {
     };
     rdr.draw_fn = drawCb;
     rdr.draw_ctx = @ptrCast(&host_ctx);
+    rdr.pre_draw_fn = preDrawCb;
 
     win.c.glfwSetWindowUserPointer(window.handle, @ptrCast(&host_ctx));
     _ = win.c.glfwSetScrollCallback(window.handle, scrollCb);

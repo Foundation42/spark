@@ -156,6 +156,7 @@ pub const components = struct {
         pub const gradient = @import("components/effects/gradient.zig");
         pub const pattern = @import("components/effects/pattern.zig");
         pub const noise = @import("components/effects/noise.zig");
+        pub const drop_shadow = @import("components/effects/drop_shadow.zig");
     };
 };
 
@@ -194,6 +195,8 @@ pub fn installCoreComponents(spark: *Spark) !void {
     try components.effects.gradient.install(spark);
     try components.effects.pattern.install(spark);
     try components.effects.noise.install(spark);
+    // Effects-spec Phase B.5 — first single_source filter.
+    try components.effects.drop_shadow.install(spark);
 }
 
 /// Compiled SPIR-V blobs. Anonymous module wired in by `build.zig`;
