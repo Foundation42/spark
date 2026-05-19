@@ -214,6 +214,61 @@ test "beginFrame reset clears drawlist and pass_dispatches symmetrically" {
     try testing.expectEqual(@as(usize, 0), sp.pass_dispatches.items.len);
 }
 
+test ":::gradient component lifecycle leaves no leaks" {
+    // Effects-spec Phase A.7 deliverable. Full create → layout →
+    // deinit roundtrip on an effect component through the public
+    // Spark surface, asserted under the testing allocator's leak
+    // checker. Equivalent to the existing "Spark + loadDocument +
+    // one layout pass" test but targeting a pattern-pass factory
+    // (`.pass_shape = .pattern`) — proves the A.5/A.6 plumbing
+    // (uniform extern struct allocation, shader_resolver fail-fast,
+    // pattern_pipelines cache entry, walker PassDispatch emission)
+    // tears down cleanly on Spark.deinit.
+    const allocator = testing.allocator;
+
+    var fx = try fixture.Fixture.init(allocator);
+    defer fx.deinit();
+
+    const fonts = try fixture.makeFonts(allocator, fx.ft);
+    const theme = fixture.makeTheme(fonts);
+    var state = spark.State.init(allocator);
+    defer state.deinit();
+
+    var sp = try spark.Spark.init(allocator, .{
+        .vk_ctx = &fx.ctx,
+        .color_format = fx.swapchain.format,
+        .theme = &theme,
+        .fonts = fonts.registry,
+        .host_state = &state,
+    });
+    defer {
+        sp.deinit();
+        allocator.destroy(fonts.registry);
+    }
+    sp.attachToRegistry();
+    try spark.installCoreComponents(&sp);
+
+    const gradient_doc =
+        \\:::gradient {from=#1a1a2e to=#16213e direction=horizontal width=200 height=60}
+        \\:::
+        \\
+    ;
+    var doc = try sp.loadDocument(gradient_doc, .{ .shared_state = &state });
+    defer doc.deinit();
+
+    try sp.beginFrame(
+        .{ .extent = .{ .width = 800, .height = 600 } },
+        .{ .reset = true },
+    );
+    _ = try sp.layoutAndRender(&doc, .{ 40, 40 }, .{ .max_w = 720 });
+
+    // Verify the walker actually emitted a PassDispatch — proves the
+    // create → resolve → layout chain reached the pattern arm rather
+    // than silently falling through to content treatment.
+    try testing.expectEqual(@as(usize, 1), sp.pass_dispatches.items.len);
+    try testing.expect(sp.pass_dispatches.items[0].uniform_len > 0);
+}
+
 test "Spark.installDotEnv mounts + tears down clean" {
     const allocator = testing.allocator;
 
