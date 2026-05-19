@@ -530,6 +530,11 @@ pub fn main() !void {
     rdr.draw_fn = drawCb;
     rdr.draw_ctx = @ptrCast(&host_ctx);
     rdr.pre_draw_fn = preDrawCb;
+    // Light surface so the drop_shadow's dark shadow is visible —
+    // temporary demo polish while B.5 is fresh. Revert to the
+    // dark default (.{0.04, 0.04, 0.07, 1.0}) once the effect's
+    // calibrated.
+    rdr.clear_color = .{ 0.93, 0.94, 0.96, 1.0 };
 
     win.c.glfwSetWindowUserPointer(window.handle, @ptrCast(&host_ctx));
     _ = win.c.glfwSetScrollCallback(window.handle, scrollCb);

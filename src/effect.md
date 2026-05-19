@@ -51,6 +51,6 @@ Fractal-Brownian-motion noise. `seed` picks the field, `scale` controls cell siz
 The first user-facing single_source factory. Wraps any child content, renders it into an offscreen target sized to the child plus an inflation halo, then composites a blurred + offset + tinted version of that target underneath the original. Inflation is `blur` pixels on every side plus `max(0, offset)` on the lower-right and `-min(0, offset)` on the upper-left — so a `blur=8 offset_x=4 offset_y=4` wrapping a 200×80 box reserves a 220×100 region with the box at (8, 8) inside.
 
 :::drop_shadow {#shadow_demo offset_x=6 offset_y=6 blur=10 color=#000c}
-:::box {color=teal width=240 height=80 radius=8}
+:::box {color=#0d9488 width=240 height=80 radius=8}
 :::
 :::
