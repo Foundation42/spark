@@ -1797,6 +1797,17 @@ fn registerEmbeddedPassShaders(
     // authored via the B.6.c SingleSourceFactory generator.
     try resolver.register("liquid_glass.frag", &shaders.liquid_glass_frag);
     try single_source.compile(pass_mod.shaderIdFromName("liquid_glass.frag"), &shaders.liquid_glass_frag);
+
+    // Effects-spec Phase B.7 — default composite shader for the
+    // `.host_slot` PassShape arm. Compiled into the single_source
+    // pipeline cache (combined-image-sampler layout matches; v1
+    // host_slot's composite step reuses the cache rather than
+    // standing up a parallel HostSlotPipelineCache). The B.7 stub
+    // factory (`:::placeholder_scene`, registered only by
+    // `integration_render.zig` tests) drives this shader; Phase D's
+    // `:::3d-scene` real-scene composite shaders register alongside.
+    try resolver.register("host_slot_passthrough.frag", &shaders.host_slot_passthrough_frag);
+    try single_source.compile(pass_mod.shaderIdFromName("host_slot_passthrough.frag"), &shaders.host_slot_passthrough_frag);
 }
 
 fn dispatchHit(hit: element.Hit, event: element.InputEvent, default_state: *state_mod.State) !void {

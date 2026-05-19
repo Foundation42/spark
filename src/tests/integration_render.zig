@@ -457,3 +457,116 @@ test "cache replay: cached drop_shadow subtree preserves target routing" {
     }
     try testing.expect(routed_quad_count > 0);
 }
+
+// Effects-spec Phase B.7 — `.host_slot` PassShape arm lit up
+// end-to-end via the `:::placeholder_scene` stub factory. The
+// factory is registered ONLY on this test's Spark — NOT by
+// `installCoreComponents` (spec D#11 exception: stubs aren't
+// vocabulary). Two load-bearing assertions:
+//
+//   1. A doc with `:::placeholder_scene` produces exactly one
+//      PassDispatch and it's the `.host_slot` arm with the correct
+//      composite_shader_id + non-null vtable-resolved invocation.
+//      Pre-B.7 the walker had no `pass_kind == 4` case and would
+//      hit the `unreachable`; this test trips on regression.
+//   2. Hash deterministic across two consecutive Sparks. Wire
+//      format v3 excludes `invocation` from the hash (function
+//      pointers aren't stable across processes); this test ratifies
+//      that exclusion — if a future refactor accidentally folds
+//      invocation into the hash, two consecutive Sparks will
+//      disagree (different vtable instance addresses each Spark)
+//      and the assertion trips.
+
+const placeholder_scene = @import("placeholder_scene.zig");
+
+const placeholder_doc =
+    \\:::placeholder_scene {width=200 height=120 color=#1a1a2e}
+    \\:::
+    \\
+;
+
+test "PassDispatch: :::placeholder_scene emits one host_slot dispatch deterministically" {
+    const allocator = testing.allocator;
+
+    var fx = try fixture.Fixture.init(allocator);
+    defer fx.deinit();
+
+    var hashes: [2]u64 = undefined;
+    var dispatch_counts: [2]usize = undefined;
+    var dispatch_shapes: [2]struct {
+        target_size: [2]u32,
+        composite_shader_id: [16]u8,
+        callback_nonnull: bool,
+    } = undefined;
+
+    inline for (0..2) |i| {
+        const fonts = try fixture.makeFonts(allocator, fx.ft);
+        const theme = fixture.makeTheme(fonts);
+        var state = spark.State.init(allocator);
+        defer state.deinit();
+
+        var sp = try spark.Spark.init(allocator, .{
+            .vk_ctx = &fx.ctx,
+            .color_format = fx.swapchain.format,
+            .theme = &theme,
+            .fonts = fonts.registry,
+            .host_state = &state,
+        });
+        defer {
+            sp.deinit();
+            allocator.destroy(fonts.registry);
+        }
+        sp.attachToRegistry();
+        try spark.installCoreComponents(&sp);
+        // Test-only registration — the stub factory is NEVER in
+        // installCoreComponents; tests opt in explicitly.
+        try placeholder_scene.install(&sp);
+
+        var doc = try sp.loadDocument(placeholder_doc, .{ .shared_state = &state });
+        defer doc.deinit();
+
+        try sp.beginFrame(
+            .{ .extent = .{ .width = 800, .height = 600 } },
+            .{ .reset = true },
+        );
+        _ = try sp.layoutAndRender(&doc, .{ 40, 40 }, .{ .max_w = 720 });
+
+        hashes[i] = hashFrame(&sp);
+        dispatch_counts[i] = sp.pass_dispatches.items.len;
+        switch (sp.pass_dispatches.items[0]) {
+            .host_slot => |hs| {
+                dispatch_shapes[i] = .{
+                    .target_size = hs.target_size,
+                    .composite_shader_id = hs.composite_shader_id,
+                    .callback_nonnull = @intFromPtr(hs.invocation.callback) != 0,
+                };
+            },
+            else => return error.ExpectedHostSlotArm,
+        }
+    }
+
+    // Exactly one dispatch — the :::placeholder_scene block emits
+    // its host_slot arm; no other content in the doc to add
+    // dispatches.
+    try testing.expectEqual(@as(usize, 1), dispatch_counts[0]);
+    try testing.expectEqual(@as(usize, 1), dispatch_counts[1]);
+
+    // Shape: composite shader matches the placeholder factory's
+    // declaration; target size matches the doc's width × height
+    // (200 × 120). Callback is non-null (walker resolved via the
+    // vtable hook; absent hook would have errored at layout time
+    // with HostSlotElementMissingInvokeHook).
+    try testing.expectEqual(@as(u32, 200), dispatch_shapes[0].target_size[0]);
+    try testing.expectEqual(@as(u32, 120), dispatch_shapes[0].target_size[1]);
+    try testing.expectEqual(placeholder_scene.SHADER_ID, dispatch_shapes[0].composite_shader_id);
+    try testing.expect(dispatch_shapes[0].callback_nonnull);
+
+    // Determinism across two Sparks. Each Spark constructs its own
+    // vtable instance and its own Component allocation, so
+    // `invocation.callback` and `invocation.user_data` are DIFFERENT
+    // pointers between iterations. The fingerprint must still match
+    // — proves the v3 hasher excludes the `invocation` field per
+    // protocol. If a future refactor folds invocation into the hash,
+    // this assertion trips deterministically.
+    try testing.expectEqual(hashes[0], hashes[1]);
+}

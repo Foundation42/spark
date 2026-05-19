@@ -74,4 +74,5 @@ test {
     _ = @import("tests/two_instances.zig");
     _ = @import("tests/integration_render.zig");
     _ = @import("tests/single_source_dispatch.zig");
+    _ = @import("tests/placeholder_scene.zig");
 }

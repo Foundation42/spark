@@ -57,6 +57,12 @@ pub fn build(b: *std.Build) void {
     // tint, Apple-Liquid-Glass-inspired. First effect authored via
     // the B.6.c SingleSourceFactory generator.
     const liquid_glass_frag_spv = compileShaderStage(b, glslc_path, "liquid_glass", "frag", optimize);
+    // Effects-spec Phase B.7 — default composite shader for the
+    // `.host_slot` PassShape arm. Trivial passthrough sampler, no
+    // push-constant block (HostSlotStep carries no uniforms in v1).
+    // Distinct from `copy.frag` (the B.4.b SingleSourcePipelineCache
+    // substrate test shader) which declares a push-constant `alpha`.
+    const host_slot_passthrough_frag_spv = compileShaderStage(b, glslc_path, "host_slot_passthrough", "frag", optimize);
 
     // ── Bundle SPIR-V into a generated Zig module ──────────────────
     // The compiled blobs need `align(4)` because Vulkan's `pCode` field
@@ -80,6 +86,7 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(drop_shadow_frag_spv, "drop_shadow.frag.spv");
     _ = wf.addCopyFile(frosted_glass_frag_spv, "frosted_glass.frag.spv");
     _ = wf.addCopyFile(liquid_glass_frag_spv, "liquid_glass.frag.spv");
+    _ = wf.addCopyFile(host_slot_passthrough_frag_spv, "host_slot_passthrough.frag.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const text_vert align(4) = @embedFile("text.vert.spv").*;
         \\pub const text_frag align(4) = @embedFile("text.frag.spv").*;
@@ -97,6 +104,7 @@ pub fn build(b: *std.Build) void {
         \\pub const drop_shadow_frag align(4) = @embedFile("drop_shadow.frag.spv").*;
         \\pub const frosted_glass_frag align(4) = @embedFile("frosted_glass.frag.spv").*;
         \\pub const liquid_glass_frag align(4) = @embedFile("liquid_glass.frag.spv").*;
+        \\pub const host_slot_passthrough_frag align(4) = @embedFile("host_slot_passthrough.frag.spv").*;
         \\
     );
 
