@@ -191,7 +191,9 @@ test "beginFrame reset clears drawlist and pass_dispatches symmetrically" {
     try sp.pass_dispatches.append(.{
         .shader_id = [_]u8{0} ** 16,
         .layout_region = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
-        .uniform_bytes = &.{},
+        // uniform_bytes is now an inline `[MAX_PASS_UNIFORM_BYTES]u8`
+        // array per A.6.a — default zeroes; uniform_len = 0 leaves
+        // the wire format empty.
         .sequence_index = 0,
     });
 

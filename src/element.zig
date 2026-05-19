@@ -243,6 +243,29 @@ pub const Element = union(enum) {
     custom: struct {
         vtable: *const ElementVTable,
         ctx: *anyopaque,
+        /// Pass-graph dispatch metadata for effect components.
+        /// **Raw scalar fields rather than an imported `PassShape`
+        /// tag** — dodges the element.zig ↔ component.zig import
+        /// cycle that would form if we typed this against
+        /// `component.PassShape`. `Registry.resolve` (in
+        /// component.zig) translates from `Factory.pass_shape`
+        /// into these fields at element-construction time; the
+        /// walker (`element_layout.zig`) reads them to emit
+        /// `PassDispatch` entries into `LayoutCtx.pass_dispatches`.
+        ///
+        ///   `pass_kind = 0` → `.content` (default, rasterizer-only)
+        ///   `pass_kind = 1` → `.pattern`
+        ///   `pass_kind = 2` → `.single_source`  (Phase B)
+        ///   `pass_kind = 3` → `.chain`           (Phase C)
+        ///   `pass_kind = 4` → `.host_slot`       (Phase B/D)
+        ///
+        /// `shader_id` is the wire-format 16-byte ShaderId
+        /// (`component.ShaderId`) the factory committed to at
+        /// comptime via `pass.shaderIdFromName(name)`. Zero when
+        /// `pass_kind == 0` — the walker uses this as a redundant
+        /// sanity check.
+        pass_kind: u8 = 0,
+        shader_id: [16]u8 = [_]u8{0} ** 16,
     },
 
     /// Inline-context component. Flows alongside text in a
@@ -415,6 +438,15 @@ pub const ElementVTable = struct {
         box: Box,
         lc: *LayoutCtx,
     ) void = null,
+    /// Pass-graph snapshot hook for effect components. Returns the
+    /// number of bytes written into `out`; `out` is sized at the
+    /// caller end against `MAX_PASS_UNIFORM_BYTES`. `null` for
+    /// content-only components — and MUST be null when the owning
+    /// element's `pass_kind == 0` (asserted by the layout walker
+    /// at every custom-element dispatch). Effect factories that
+    /// declare `pass_shape != .content` MUST implement this and
+    /// return their std140-padded uniform bytes.
+    snapshot_uniforms: ?*const fn (ctx: *anyopaque, out: []u8) usize = null,
     /// Optional. Reports how this component participates in its
     /// parent stack's flow (stage 15 Phase E text exclusion). `null`
     /// (the default) means `.normal` — the component flows in
@@ -520,6 +552,73 @@ pub const Constraints = struct {
     max_w: f32 = std.math.inf(f32),
     min_h: f32 = 0,
     max_h: f32 = std.math.inf(f32),
+};
+
+// ── Pass-graph types (effects-spec Phase A.0 / A.6) ────────────────
+//
+// These live in element.zig rather than spark.zig (where the A.0 stub
+// originally lived) because they're layout-walker output — conceptual
+// siblings to `Hit` and `DrawList`. Moving them here lets `LayoutCtx`
+// hold a `*std.ArrayList(PassDispatch)` without creating an
+// element.zig ↔ spark.zig import cycle. `spark.zig` still owns the
+// per-frame `pass_dispatches` list as a sibling field on Spark; it
+// imports the types from here.
+
+/// Wire-format region for a pass dispatch. i32 fields (not f32) so
+/// the determinism hash has no float-equality questions — the
+/// pass-graph compiler quantises layout regions to physical pixels
+/// before recording a dispatch.
+pub const PassRegion = extern struct {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+};
+
+/// Inline uniform-bytes cap on `PassDispatch`. v1 fits every Phase A
+/// canary (gradient 48, pattern 16, noise 16) and every Phase B
+/// effect with room to spare (drop_shadow / frosted_glass / blur all
+/// fit in 64).
+///
+/// **Sizing rationale.** 256 matches Vulkan's common push-constant
+/// range on desktop GPUs (the spec's guaranteed minimum is 128, but
+/// 256 is universal on Intel UHD / AMD / NVIDIA desktop and on most
+/// modern mobile). A.6.b will likely route pattern-pass uniforms
+/// through `vkCmdPushConstants` rather than per-frame uniform
+/// buffers — fixed cap here lines up with that path.
+///
+/// **No-ownership invariant.** Inline storage eliminates the
+/// lifetime question (no arena, no refcount, no per-frame
+/// allocator). If a future factory's uniforms exceed 256 bytes,
+/// **bump this constant first** — the no-ownership invariant is
+/// load-bearing and worth keeping. Only when bumping the constant
+/// would push PassDispatch past Vulkan's maxPushConstantsSize on a
+/// real target GPU should heap ownership enter the design.
+pub const MAX_PASS_UNIFORM_BYTES: u32 = 256;
+
+/// One record of work the pass-graph compiler emits per layout walk:
+/// a shader bound to a region of the frame, fed by uniform bytes,
+/// ordered within the frame by `sequence_index`. Hashed by the A.0
+/// determinism protocol — see the protocol comment in
+/// `src/tests/integration_render.zig`'s `hashFrame`.
+///
+/// **Inline uniform storage.** `uniform_bytes` is a fixed-cap inline
+/// array rather than a borrowed slice — eliminates lifetime concerns
+/// (no question about which arena owns the snapshot, no per-frame
+/// allocator coordination). Walker's `vtable.snapshot_uniforms` call
+/// writes directly into this slot. Wire format is still
+/// variable-length (`uniform_len + first uniform_len bytes`), so the
+/// A.0 hash protocol stays unchanged.
+pub const PassDispatch = struct {
+    /// Opaque 16-byte shader identifier per the A.0 wire format.
+    /// Type-locked to `component.ShaderId` at the type-system level;
+    /// stored here as a raw byte array to avoid an element.zig →
+    /// component.zig import cycle.
+    shader_id: [16]u8,
+    layout_region: PassRegion,
+    uniform_bytes: [MAX_PASS_UNIFORM_BYTES]u8 = [_]u8{0} ** MAX_PASS_UNIFORM_BYTES,
+    uniform_len: u32 = 0,
+    sequence_index: u32,
 };
 
 /// Layout result for one element. Pixel coords (display space, not
@@ -758,6 +857,16 @@ pub const LayoutCtx = struct {
     /// each new constraint-participating provider opts into this
     /// channel as it lands.
     layout_context: ?*layout_context_mod.LayoutContext = null,
+    /// Effects-spec Phase A.6. Per-frame pass-graph dispatch list
+    /// (owned by Spark; LayoutCtx borrows the pointer). When
+    /// non-null, the walker emits a `PassDispatch` per custom
+    /// element whose `pass_kind != 0`, using the element's
+    /// resolved box as the region and calling `vtable.snapshot_uniforms`
+    /// for the uniform bytes. `null` for code paths that pre-date
+    /// the pass-graph compiler (test fixtures, cached-layout
+    /// snapshot blits where the dispatch list isn't being
+    /// regenerated).
+    pass_dispatches: ?*std.ArrayList(PassDispatch) = null,
 };
 
 /// GPU draw work accumulated during the walk. Quads land first

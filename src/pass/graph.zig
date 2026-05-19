@@ -41,11 +41,21 @@ pub const Graph = struct {
         // A.6: iterate document tree → dispatchPass(shape).
     }
 
-    /// Per-component dispatch hook. Public so the A.6 walker (which
-    /// lands inside `compile`) and any test that wants to exercise a
-    /// specific arm can call directly. Reserved arms `@panic` with a
-    /// phase-tagged message; search `Phase X:` to find every
-    /// implementation site at once.
+    /// Per-component dispatch hook. Public so any test that wants to
+    /// exercise a specific arm can call directly. Reserved arms
+    /// `@panic` with a phase-tagged message; search `Phase X:` to
+    /// find every implementation site at once.
+    ///
+    /// **A.6.a status.** `.pattern` lights up: the layout walker
+    /// (`element_layout.zig`) handles pattern dispatches inline
+    /// when it encounters a custom element with `pass_kind == 1`,
+    /// snapshotting uniforms and appending a `PassDispatch` to
+    /// `LayoutCtx.pass_dispatches` directly. This function's
+    /// `.pattern` arm is therefore a no-op — it exists to keep the
+    /// exhaustive switch shape against a hypothetical caller that
+    /// hands a single `PassShape` value for ad-hoc dispatch.
+    /// `.single_source` / `.chain` / `.host_slot` still panic until
+    /// their phases ship.
     pub fn dispatchPass(self: *Graph, shape: PassShape) void {
         _ = self;
         switch (shape) {
@@ -53,7 +63,19 @@ pub const Graph = struct {
                 // Delegated to the rasterizer — `layoutAndRender`
                 // walks the same element into the shared DrawList.
             },
-            .pattern => @panic("Phase A.6: pattern-pass dispatch not implemented"),
+            .pattern => {
+                // v1 `.pattern` arm is a no-op; the layout walker in
+                // `element_layout.zig` emits the `PassDispatch`
+                // directly (it's already holding the resolved box
+                // and the component ctx, so cramming the emission
+                // through this hook would be busy-work). The arm is
+                // reserved for Phase B+ variant-specific dispatch
+                // logic that doesn't fit the CPU layout walker —
+                // target acquisition for `.single_source`, barrier
+                // emission for `.chain`, host-callback invocation
+                // for `.host_slot`. The exhaustive switch shape
+                // stays so those phases plug in without restructure.
+            },
             .single_source => @panic("Phase B: single-source-pass dispatch not implemented"),
             .chain => @panic("Phase C: chain-pass dispatch not implemented"),
             .host_slot => @panic("Phase B/D: host-slot-pass dispatch not implemented (Phase B lights the arm via :::placeholder_scene; Phase D ships :::3d-scene)"),
@@ -82,8 +104,17 @@ test "Graph: dispatchPass(.content) returns normally" {
     var g = Graph.init();
     defer g.deinit();
     g.dispatchPass(.content);
-    // The reserved arms' panic behavior isn't testable in-process
-    // (Zig has no panic catch). The exhaustive switch shape +
-    // searchable "Phase X:" tags are the load-bearing artifacts;
-    // those live in source above, not as test assertions.
+}
+
+test "Graph: dispatchPass(.pattern) returns normally (A.6.a)" {
+    // Pattern dispatch is handled inline in element_layout.zig's
+    // custom walker; this arm is a no-op for the public hook so it
+    // never panics. The reserved arms' panic behavior isn't
+    // testable in-process (Zig has no panic catch). The exhaustive
+    // switch shape + searchable "Phase X:" tags are the load-bearing
+    // artifacts; those live in source, not test assertions.
+    var g = Graph.init();
+    defer g.deinit();
+    const sid: component.ShaderId = [_]u8{0} ** 16;
+    g.dispatchPass(.{ .pattern = .{ .shader_id = sid } });
 }

@@ -245,6 +245,39 @@ pub fn layoutAndRender(
                     .focusable = cu.vtable.focusable,
                 });
             }
+            // Effects-spec Phase A.6.a — pass-graph emission. For
+            // any custom element whose factory declared a non-
+            // `.content` pass_shape, snapshot the uniforms and
+            // append a PassDispatch. Content-only elements MUST
+            // have `snapshot_uniforms = null`; the assert catches
+            // wrong-vtable-wiring at the dispatch site (cheaper to
+            // catch here than chasing weird GPU output later).
+            if (cu.pass_kind == 0) {
+                // Content elements must not declare snapshot_uniforms;
+                // only pass-shape variants (.pattern / .single_source /
+                // .chain / .host_slot) do. If this fires, a factory
+                // wired snapshot_uniforms on a content-shaped vtable —
+                // remove it or change the factory's pass_shape.
+                if (cu.vtable.snapshot_uniforms != null) {
+                    @panic("content element (pass_kind=0) must not declare snapshot_uniforms; only pass-shape variants do");
+                }
+            } else if (ctx.pass_dispatches) |pd| {
+                const snapshot = cu.vtable.snapshot_uniforms orelse
+                    return error.NonContentElementMissingSnapshotUniforms;
+                var dispatch: element.PassDispatch = .{
+                    .shader_id = cu.shader_id,
+                    .layout_region = .{
+                        .x = @intFromFloat(@round(box.x)),
+                        .y = @intFromFloat(@round(box.y)),
+                        .w = @intFromFloat(@round(box.w)),
+                        .h = @intFromFloat(@round(box.h)),
+                    },
+                    .sequence_index = @intCast(pd.items.len),
+                };
+                const n = snapshot(cu.ctx, dispatch.uniform_bytes[0..]);
+                dispatch.uniform_len = @intCast(n);
+                try pd.append(dispatch);
+            }
             // Notify post-layout. Symmetric with the cache-hit branch
             // in `layoutAndRenderCached` — every custom walk fires
             // the hook exactly once, regardless of whether the cache

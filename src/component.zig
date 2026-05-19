@@ -266,10 +266,34 @@ pub const Instance = struct {
 /// What `resolve` hands back to the caller — exactly the fields a
 /// `custom` Element needs. The Instance itself stays inside the
 /// registry; callers only see the pointers.
+///
+/// `pass_kind` + `shader_id` (effects-spec Phase A.6) mirror the
+/// raw fields on `Element.custom` — `Registry.resolve` translates
+/// `Factory.pass_shape` to these scalars at lookup time, the
+/// markdown builder copies them onto the Element, the layout
+/// walker reads them to emit `PassDispatch`. The translation lives
+/// here (single source of truth) rather than at every Element
+/// construction site.
 pub const Resolved = struct {
     vtable: *const element.ElementVTable,
     ctx: *anyopaque,
+    pass_kind: u8 = 0,
+    shader_id: [16]u8 = [_]u8{0} ** 16,
 };
+
+/// Translate `Factory.pass_shape` into the raw `(pass_kind, shader_id)`
+/// fields the Element / Resolved carry. Keeps the encoding policy
+/// in one place — if a new `PassShape` arm lands, update both this
+/// function and the Element.custom comment that lists the values.
+fn passShapeScalars(ps: PassShape) struct { kind: u8, shader_id: [16]u8 } {
+    return switch (ps) {
+        .content => .{ .kind = 0, .shader_id = [_]u8{0} ** 16 },
+        .pattern => |p| .{ .kind = 1, .shader_id = p.shader_id },
+        .single_source => |p| .{ .kind = 2, .shader_id = p.shader_id },
+        .chain => .{ .kind = 3, .shader_id = [_]u8{0} ** 16 },
+        .host_slot => .{ .kind = 4, .shader_id = [_]u8{0} ** 16 },
+    };
+}
 
 /// Per-cached-instance bookkeeping kept alongside the Instance the
 /// factory produced. `parses_unused` is bumped at the start of each
@@ -498,9 +522,12 @@ pub const Registry = struct {
                 const fresh = try self.buildEntry(factory, spec, state);
                 const reaq = self.instances.getPtr(id) orelse unreachable;
                 reaq.* = fresh;
+                const ps = passShapeScalars(factory.pass_shape);
                 return .{
                     .vtable = reaq.instance.vtable,
                     .ctx = reaq.instance.ctx,
+                    .pass_kind = ps.kind,
+                    .shader_id = ps.shader_id,
                 };
             }
             // Same factory — update path. The instance ctx pointer is
@@ -512,7 +539,13 @@ pub const Registry = struct {
             const vtable_stable = entry_ptr.instance.vtable;
             try self.invokeUpdate(factory, ctx_stable, spec, state);
             if (self.instances.getPtr(id)) |reaq| reaq.parses_unused = 0;
-            return .{ .vtable = vtable_stable, .ctx = ctx_stable };
+            const ps = passShapeScalars(factory.pass_shape);
+            return .{
+                .vtable = vtable_stable,
+                .ctx = ctx_stable,
+                .pass_kind = ps.kind,
+                .shader_id = ps.shader_id,
+            };
         }
 
         // Cache miss. Build the entry FIRST (recursive resolves grow
@@ -526,9 +559,12 @@ pub const Registry = struct {
         const stable_id = try self.allocator.dupe(u8, id);
         errdefer self.allocator.free(stable_id);
         try self.instances.putNoClobber(self.allocator, stable_id, built);
+        const ps = passShapeScalars(factory.pass_shape);
         return .{
             .vtable = built.instance.vtable,
             .ctx = built.instance.ctx,
+            .pass_kind = ps.kind,
+            .shader_id = ps.shader_id,
         };
     }
 

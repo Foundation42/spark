@@ -108,7 +108,16 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
 
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
+    .snapshot_uniforms = snapshotUniforms,
 };
+
+// See gradient.zig for the snapshot_uniforms contract; same pattern.
+fn snapshotUniforms(ctx: *anyopaque, out: []u8) usize {
+    const c: *const Component = @ptrCast(@alignCast(ctx));
+    const bytes = std.mem.asBytes(&c.uniforms);
+    @memcpy(out[0..bytes.len], bytes);
+    return bytes.len;
+}
 
 fn layoutAndRender(
     ctx: *anyopaque,

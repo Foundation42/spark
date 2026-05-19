@@ -331,6 +331,8 @@ fn mapBlock(
                             return .{ .custom = .{
                                 .vtable = inst.vtable,
                                 .ctx = inst.ctx,
+                                .pass_kind = inst.pass_kind,
+                                .shader_id = inst.shader_id,
                             } };
                         }
                     }

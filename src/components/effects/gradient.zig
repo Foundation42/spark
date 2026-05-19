@@ -148,7 +148,21 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
 
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
+    .snapshot_uniforms = snapshotUniforms,
 };
+
+/// Effects-spec Phase A.6.a hook. Copies the std140-padded
+/// `GradientUniforms` bytes into the walker-supplied scratch
+/// buffer. The pass-graph emission code in `element_layout.zig`
+/// hands this function a slice of `PassDispatch.uniform_bytes`
+/// (capped at `MAX_PASS_UNIFORM_BYTES = 256`); 48 bytes for
+/// gradient.
+fn snapshotUniforms(ctx: *anyopaque, out: []u8) usize {
+    const c: *const Component = @ptrCast(@alignCast(ctx));
+    const bytes = std.mem.asBytes(&c.uniforms);
+    @memcpy(out[0..bytes.len], bytes);
+    return bytes.len;
+}
 
 /// A.5 layout: claim the requested width/height; emit no DrawList
 /// work. A.6 will read this element's box from the document tree

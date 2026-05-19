@@ -58,51 +58,6 @@ const document_mod = @import("document.zig");
 const pass_mod = @import("pass/root.zig");
 const io = io_channel_mod;
 
-/// Wire-format region for a pass dispatch. i32 fields (not f32) so
-/// the determinism hash has no float-equality questions — the
-/// pass-graph compiler quantises layout regions to physical pixels
-/// before recording a dispatch. Distinct from `element.Box` (layout
-/// output, f32) — this type only ever appears in `PassDispatch`.
-pub const PassRegion = extern struct {
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-};
-
-/// One record of work the pass-graph compiler will eventually emit:
-/// a shader bound to a region of the frame, fed by uniform bytes,
-/// ordered within the frame by `sequence_index`. Effects-spec Phase
-/// A.0 — the type, field, and hashing protocol land before the
-/// compiler that populates them, so every Phase A commit (.2, .3,
-/// .5, .6) verifies determinism through the same path.
-///
-/// Wire-format protocol (the hasher in `integration_render.zig`
-/// walks fields in this exact order; both ends move together):
-///
-///   shader_id           — 16 bytes (opaque, provenance-agnostic
-///                         per effects-spec Decision #9)
-///   layout_region       — PassRegion, 16 bytes (x/y/w/h as i32)
-///   uniform_bytes_len   — u32, little-endian
-///   uniform_bytes       — raw uniform payload, std140 layout
-///   sequence_index      — u32, pass-monotonic within frame
-///
-/// Order is canonical; the walk iterates the slice in index order.
-/// If the protocol changes, this comment is the contract — update
-/// it and the hasher together in the same commit.
-pub const PassDispatch = struct {
-    /// Type-locked to `component_mod.ShaderId` (A.2). The hash
-    /// protocol above asserts 16 bytes; the type definition asserts
-    /// the same. Single source of truth.
-    shader_id: component_mod.ShaderId,
-    layout_region: PassRegion,
-    /// Borrowed view into uniform storage owned elsewhere (target
-    /// pool / compiler arena once those land). Lifetime is the
-    /// current frame; reset at `beginFrame(.{ .reset = true })`.
-    uniform_bytes: []const u8,
-    sequence_index: u32,
-};
-
 /// Per-frame info supplied by the host at `beginFrame`. Stored on
 /// the Spark instance until `endFrame`; `layoutAndRender` calls
 /// consult these fields for viewport math + zoom/scroll transforms.
@@ -210,7 +165,7 @@ pub const Spark = struct {
     /// `shader_resolver`) are loosely coupled at stub-time with no
     /// cross-field state to justify the struct. Revisit at A.6
     /// when the compiler ties them together.
-    pass_dispatches: std.ArrayList(PassDispatch),
+    pass_dispatches: std.ArrayList(element.PassDispatch),
     /// Transient render-target pool — Phase A.3 typed-null stub.
     /// Sibling field per the [[feedback-spark-sibling-fields]]
     /// pattern. Phase B fills with the real ref-counted allocator.
@@ -326,7 +281,7 @@ pub const Spark = struct {
 
         // ── DrawList + effects-side state ───────────────────────────
         const drawlist = element.DrawList.init(allocator);
-        const pass_dispatches = std.ArrayList(PassDispatch).init(allocator);
+        const pass_dispatches = std.ArrayList(element.PassDispatch).init(allocator);
         const target_pool = pass_mod.TargetPool.init(allocator);
         var shader_resolver = pass_mod.ShaderResolver.init(allocator);
         errdefer shader_resolver.deinit();
@@ -563,6 +518,7 @@ pub const Spark = struct {
             .glyph_cache_lock = &self.glyph_cache_lock,
             .zoom = self.frame_info.zoom,
             .layout_context = self.layout_context,
+            .pass_dispatches = &self.pass_dispatches,
         };
         return try element_layout.layoutAndRenderCached(doc.root, origin, constraints, &lc, &self.drawlist);
     }
