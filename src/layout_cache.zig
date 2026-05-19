@@ -128,6 +128,13 @@ pub const Entry = struct {
     images: []element.ImageDraw,
     /// Block-local hits: `box.x`/`box.y` are relative to (0, 0).
     hits: []element.Hit,
+    /// Block-local pass dispatches (effects-spec Phase B.5 polish).
+    /// Regions stored relative to (0, 0); indices stored relative to
+    /// start-of-block (0). On blit, both get translated back to the
+    /// current origin + current pd base. Without this field, cached
+    /// pattern / single_source dispatches were silently dropped on
+    /// cache hit — patterns vanished after frame 1.
+    pass_dispatches: []element.PassDispatch,
     /// Measured layout box at origin (0, 0). `baseline` is also
     /// block-local (relative to the cached origin).
     box: element.Box,
@@ -165,6 +172,7 @@ pub const BlockCache = struct {
         self.allocator.free(e.tri_indices);
         self.allocator.free(e.images);
         self.allocator.free(e.hits);
+        self.allocator.free(e.pass_dispatches);
     }
 
     /// Drop every cached entry. Call on full re-parse / theme swap.
@@ -374,6 +382,38 @@ pub fn blitEntry(
         try out.hits.append(h2);
     }
 
+    // Pass dispatches — translate regions by origin + offset indices
+    // by current pd base. Mirrors `mergePrivatePassDispatches` in
+    // element_layout.zig but reads from a cached entry instead of a
+    // worker's private pd. Skipped when the caller didn't thread a
+    // pd through `lc` (pre-effects-spec call sites).
+    if (lc.pass_dispatches) |out_pd| {
+        if (entry.pass_dispatches.len > 0) {
+            const base: u32 = @intCast(out_pd.items.len);
+            const ox_i32: i32 = @intFromFloat(@round(ox));
+            const oy_i32: i32 = @intFromFloat(@round(oy));
+            try out_pd.ensureUnusedCapacity(entry.pass_dispatches.len);
+            for (entry.pass_dispatches) |d| {
+                var d_local = d;
+                switch (d_local) {
+                    .pattern => |*p| {
+                        p.sequence_index += base;
+                        p.layout_region.x += ox_i32;
+                        p.layout_region.y += oy_i32;
+                    },
+                    .single_source => |*ss| {
+                        ss.subtree_dispatch_range[0] += base;
+                        ss.subtree_dispatch_range[1] += base;
+                        ss.sequence_index += base;
+                        ss.compose_region.x += ox_i32;
+                        ss.compose_region.y += oy_i32;
+                    },
+                }
+                out_pd.appendAssumeCapacity(d_local);
+            }
+        }
+    }
+
     return .{
         .x = ox,
         .y = oy,
@@ -387,6 +427,10 @@ pub fn blitEntry(
 /// cache `Entry` with block-local coordinates (origin subtracted from
 /// every position). The triangle indices in the snapshot are rebased
 /// against `tri_vertex_base` so the cached entry's indices start at 0.
+/// `pd_slice` is the pass-dispatch range emitted by this walk (caller
+/// passes `pass_dispatches.items[pd_start..]`); regions get translated
+/// to block-local and indices rebased to start-at-0 the same way
+/// `tri_indices` does.
 pub fn snapshotEntry(
     cache: *BlockCache,
     key: Key,
@@ -399,6 +443,8 @@ pub fn snapshotEntry(
     i_start: usize,
     h_start: usize,
     tri_vertex_base: u32,
+    pd_slice: []const element.PassDispatch,
+    pd_start: u32,
     origin: [2]f32,
     box: element.Box,
 ) !void {
@@ -444,6 +490,30 @@ pub fn snapshotEntry(
         h.box.y -= oy;
     }
 
+    // Pass dispatches — dup + translate regions to block-local +
+    // rebase indices to start-of-block. Mirrors the inverse of
+    // `blitEntry`'s pd merge.
+    const pds = try cache.allocator.dupe(element.PassDispatch, pd_slice);
+    errdefer cache.allocator.free(pds);
+    const ox_i32: i32 = @intFromFloat(@round(ox));
+    const oy_i32: i32 = @intFromFloat(@round(oy));
+    for (pds) |*d| {
+        switch (d.*) {
+            .pattern => |*p| {
+                p.sequence_index -= pd_start;
+                p.layout_region.x -= ox_i32;
+                p.layout_region.y -= oy_i32;
+            },
+            .single_source => |*ss| {
+                ss.subtree_dispatch_range[0] -= pd_start;
+                ss.subtree_dispatch_range[1] -= pd_start;
+                ss.sequence_index -= pd_start;
+                ss.compose_region.x -= ox_i32;
+                ss.compose_region.y -= oy_i32;
+            },
+        }
+    }
+
     try cache.insert(key, .{
         .version = version,
         .glyphs = glyphs,
@@ -452,6 +522,7 @@ pub fn snapshotEntry(
         .tri_indices = tri_indices,
         .images = images,
         .hits = hits,
+        .pass_dispatches = pds,
         .box = .{
             .x = 0,
             .y = 0,
@@ -484,6 +555,7 @@ test "BlockCache: insert/lookup roundtrip" {
     const tri_indices = try testing.allocator.alloc(u32, 0);
     const images = try testing.allocator.alloc(element.ImageDraw, 0);
     const hits = try testing.allocator.alloc(element.Hit, 0);
+    const pass_dispatches = try testing.allocator.alloc(element.PassDispatch, 0);
 
     try cache.insert(key, .{
         .version = 1,
@@ -493,6 +565,7 @@ test "BlockCache: insert/lookup roundtrip" {
         .tri_indices = tri_indices,
         .images = images,
         .hits = hits,
+        .pass_dispatches = pass_dispatches,
         .box = .{ .x = 0, .y = 0, .w = 100, .h = 20, .baseline = 0 },
     });
 
@@ -528,6 +601,7 @@ test "BlockCache: insert replaces existing entry" {
         .tri_indices = try testing.allocator.alloc(u32, 0),
         .images = try testing.allocator.alloc(element.ImageDraw, 0),
         .hits = try testing.allocator.alloc(element.Hit, 0),
+        .pass_dispatches = try testing.allocator.alloc(element.PassDispatch, 0),
         .box = .{ .x = 0, .y = 0, .w = 1, .h = 1, .baseline = 0 },
     });
     // Insert again — first allocation must be freed by the cache.
@@ -540,6 +614,7 @@ test "BlockCache: insert replaces existing entry" {
         .tri_indices = try testing.allocator.alloc(u32, 0),
         .images = try testing.allocator.alloc(element.ImageDraw, 0),
         .hits = try testing.allocator.alloc(element.Hit, 0),
+        .pass_dispatches = try testing.allocator.alloc(element.PassDispatch, 0),
         .box = .{ .x = 0, .y = 0, .w = 2, .h = 2, .baseline = 0 },
     });
 
@@ -568,6 +643,7 @@ test "BlockCache: clear frees all entries" {
             .tri_indices = try testing.allocator.alloc(u32, 0),
             .images = try testing.allocator.alloc(element.ImageDraw, 0),
             .hits = try testing.allocator.alloc(element.Hit, 0),
+            .pass_dispatches = try testing.allocator.alloc(element.PassDispatch, 0),
             .box = .{ .x = 0, .y = 0, .w = 10, .h = 5, .baseline = 0 },
         });
     }

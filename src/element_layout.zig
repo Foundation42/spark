@@ -123,9 +123,14 @@ pub fn layoutAndRenderCached(
     const i_start = out.images.items.len;
     const h_start = out.hits.items.len;
     const tri_vertex_base: u32 = @intCast(out.tris.items.len);
+    const pd_start: u32 = if (ctx.pass_dispatches) |pd| @intCast(pd.items.len) else 0;
 
     const box = try layoutAndRender(elem, origin, constraints, ctx, out);
 
+    const pd_slice: []const element.PassDispatch = if (ctx.pass_dispatches) |pd|
+        pd.items[pd_start..]
+    else
+        &[_]element.PassDispatch{};
     try layout_cache.snapshotEntry(
         cache,
         key,
@@ -138,6 +143,8 @@ pub fn layoutAndRenderCached(
         i_start,
         h_start,
         tri_vertex_base,
+        pd_slice,
+        pd_start,
         origin,
         box,
     );
@@ -1076,7 +1083,7 @@ fn layoutStackVParallel(
                 const pd_offset = try mergePrivatePassDispatches(ctx.pass_dispatches, spec.private_pd, child_origin);
                 try blitPrivate(out, spec.private_dl.?, child_origin, pd_offset);
                 if (spec.cache_key) |key| {
-                    try snapshotFromPrivate(cache, key, spec.version, spec.private_dl.?, spec.box);
+                    try snapshotFromPrivate(cache, key, spec.version, spec.private_dl.?, spec.private_pd, spec.box);
                 }
                 if (spec.box.w > max_w) max_w = spec.box.w;
                 y += spec.box.h;
@@ -1343,12 +1350,16 @@ fn mergePrivatePassDispatches(
 
 /// Copy a private DrawList's contents into a new cache Entry (block-
 /// local coords — no translation needed because the worker already
-/// walked at origin (0,0)).
+/// walked at origin (0,0)). Includes the worker's private
+/// pass_dispatches — also already block-local for the same reason
+/// (worker's pd indices start at 0; regions captured at origin
+/// (0, 0)).
 fn snapshotFromPrivate(
     cache: *layout_cache.BlockCache,
     key: layout_cache.Key,
     version: u64,
     src: *const element.DrawList,
+    src_pd_opt: ?*const std.ArrayList(element.PassDispatch),
     box: element.Box,
 ) !void {
     const glyphs = try cache.allocator.dupe(@TypeOf(src.glyphs.items[0]), src.glyphs.items);
@@ -1363,6 +1374,11 @@ fn snapshotFromPrivate(
     errdefer cache.allocator.free(images);
     const hits = try cache.allocator.dupe(element.Hit, src.hits.items);
     errdefer cache.allocator.free(hits);
+    const pds = if (src_pd_opt) |src_pd|
+        try cache.allocator.dupe(element.PassDispatch, src_pd.items)
+    else
+        try cache.allocator.alloc(element.PassDispatch, 0);
+    errdefer cache.allocator.free(pds);
 
     try cache.insert(key, .{
         .version = version,
@@ -1372,6 +1388,7 @@ fn snapshotFromPrivate(
         .tri_indices = tri_indices,
         .images = images,
         .hits = hits,
+        .pass_dispatches = pds,
         .box = .{
             .x = 0,
             .y = 0,

@@ -948,10 +948,15 @@ pub const Spark = struct {
             .maxDepth = 1,
         };
         vk.c.vkCmdSetViewport(cmd, 0, 1, &viewport);
+        // Scissor offset must be non-negative per Vulkan spec.
+        // Clamp to (0, 0) when the region extends above/left of
+        // the framebuffer (scroll bringing the top of an effect
+        // off-screen); the viewport already positions the
+        // rasterizer correctly, scissor only bounds the write.
         var scissor = vk.c.VkRect2D{
             .offset = .{
-                .x = @intFromFloat(@round(vx)),
-                .y = @intFromFloat(@round(vy)),
+                .x = @intFromFloat(@max(0, @round(vx))),
+                .y = @intFromFloat(@max(0, @round(vy))),
             },
             .extent = .{
                 .width = @intFromFloat(@max(0, @round(vw))),
@@ -1016,10 +1021,13 @@ pub const Spark = struct {
             .maxDepth = 1,
         };
         vk.c.vkCmdSetViewport(cmd, 0, 1, &viewport);
+        // Scissor offset clamp — same as recordPatternStep, for
+        // single_source composes scrolled partly above/left of the
+        // framebuffer.
         var scissor = vk.c.VkRect2D{
             .offset = .{
-                .x = @intFromFloat(@round(vx)),
-                .y = @intFromFloat(@round(vy)),
+                .x = @intFromFloat(@max(0, @round(vx))),
+                .y = @intFromFloat(@max(0, @round(vy))),
             },
             .extent = .{
                 .width = @intFromFloat(@max(0, @round(vw))),
