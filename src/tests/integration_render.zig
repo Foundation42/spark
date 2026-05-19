@@ -78,17 +78,28 @@ fn hashFrame(sp: *const spark.Spark) u64 {
     var h = std.hash.Wyhash.init(0);
 
     const dl = &sp.drawlist;
+    // Phase B.4.a: parallel `*_targets` arrays length-locked to
+    // their primitive siblings; hashed in lockstep — drift in
+    // either array (item content OR routing tag) flips the
+    // fingerprint loudly.
     h.update(std.mem.asBytes(&dl.glyphs.items.len));
     for (dl.glyphs.items) |g| h.update(std.mem.asBytes(&g));
+    for (dl.glyph_targets.items) |t| h.update(std.mem.asBytes(&t));
 
     h.update(std.mem.asBytes(&dl.quads.items.len));
     for (dl.quads.items) |q| h.update(std.mem.asBytes(&q));
+    for (dl.quad_targets.items) |t| h.update(std.mem.asBytes(&t));
 
     h.update(std.mem.asBytes(&dl.tris.items.len));
     for (dl.tris.items) |v| h.update(std.mem.asBytes(&v));
+    for (dl.tri_targets.items) |t| h.update(std.mem.asBytes(&t));
 
     h.update(std.mem.asBytes(&dl.tri_indices.items.len));
     for (dl.tri_indices.items) |i| h.update(std.mem.asBytes(&i));
+
+    h.update(std.mem.asBytes(&dl.images.items.len));
+    for (dl.images.items) |im| h.update(std.mem.asBytes(&im));
+    for (dl.image_targets.items) |t| h.update(std.mem.asBytes(&t));
 
     h.update(std.mem.asBytes(&sp.pass_dispatches.items.len));
     for (sp.pass_dispatches.items) |d| {
@@ -256,15 +267,21 @@ test "PassDispatch fingerprint: :::gradient produces one deterministic dispatch"
     try testing.expectEqual(@as(usize, 1), dispatch_counts[0]);
 }
 
-/// Wire-format v2 baseline (Phase B.3 mint). The exact 64-bit hash a
-/// `:::gradient` doc through the full layout + emission path produces
-/// under the v2 protocol (tagged-union PassDispatch). Any drift here
-/// is a deliberate protocol change — regenerate this constant only
-/// when the spec table moves and both ends of the protocol comment
-/// in `hashFrame` are updated together.
-const EXPECTED_GRADIENT_HASH_V2: u64 = 0x9C10_7207_86DF_A0D9;
+/// Wire-format v3 baseline (Phase B.4.a mint). The exact 64-bit hash
+/// a `:::gradient` doc through the full layout + emission path
+/// produces under the v3 protocol (tagged-union PassDispatch + per-
+/// primitive parallel target-routing arrays). Any drift here is a
+/// deliberate protocol change — regenerate this constant only when
+/// the spec table moves and both ends of the protocol comment in
+/// `hashFrame` are updated together.
+///
+/// Version trail:
+///   v1 (A.6.a) — single PassDispatch struct, no routing.
+///   v2 (B.3)   — tagged-union PassDispatch (pattern + single_source).
+///   v3 (B.4.a) — adds parallel `*_targets` arrays per primitive.
+const EXPECTED_GRADIENT_HASH_V3: u64 = 0xE1E0_6B9A_CD1A_814C;
 
-test "PassDispatch wire-format v2: stored baseline hash" {
+test "PassDispatch wire-format v3: stored baseline hash" {
     const allocator = testing.allocator;
 
     var fx = try fixture.Fixture.init(allocator);
@@ -299,5 +316,5 @@ test "PassDispatch wire-format v2: stored baseline hash" {
     _ = try sp.layoutAndRender(&doc, .{ 40, 40 }, .{ .max_w = 720 });
 
     const actual = hashFrame(&sp);
-    try testing.expectEqual(EXPECTED_GRADIENT_HASH_V2, actual);
+    try testing.expectEqual(EXPECTED_GRADIENT_HASH_V3, actual);
 }

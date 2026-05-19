@@ -219,7 +219,7 @@ fn layoutAndRender(
     const x_centre_y = baseline_y - em * 0.32;
     const dot_y = x_centre_y - g.dot_d * 0.5;
 
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0], dot_y },
         .dst_size = .{ g.dot_d, g.dot_d },
         .color = c.color,
@@ -230,6 +230,8 @@ fn layoutAndRender(
         const label_x = origin[0] + g.dot_d + g.gap;
         _ = try text_layout.appendShapedRun(
             &out.glyphs,
+        &out.glyph_targets,
+        lc.current_target_dispatch_index,
             lc.fonts,
             lc.cache,
             lc.mono_atlas,

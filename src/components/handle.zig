@@ -208,7 +208,6 @@ fn layoutAndRender(
     lc: *element.LayoutCtx,
     out: *element.DrawList,
 ) anyerror!element.Box {
-    _ = lc;
     const c: *Component = @ptrCast(@alignCast(ctx));
 
     const max_w = constraints.max_w;
@@ -218,7 +217,7 @@ fn layoutAndRender(
     const h = c.height.resolve(max_h, max_h);
 
     const color = if (c.drag_active) HANDLE_ACTIVE_COLOR else c.color;
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0], origin[1] },
         .dst_size = .{ w, h },
         .color = color,

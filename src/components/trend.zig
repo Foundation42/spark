@@ -226,6 +226,8 @@ fn layoutAndRender(
     const baseline_y = origin[1] + g.ascender;
     _ = try text_layout.appendShapedRun(
         &out.glyphs,
+        &out.glyph_targets,
+        lc.current_target_dispatch_index,
         lc.fonts,
         lc.cache,
         lc.mono_atlas,

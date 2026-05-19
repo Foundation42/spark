@@ -235,13 +235,13 @@ fn layoutAndRender(
     const h = c.height;
 
     // Border + body
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0], origin[1] },
         .dst_size = .{ w, h },
         .color = BUTTON_BORDER,
         .radius = BUTTON_RADIUS,
     });
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0] + BUTTON_BORDER_PX, origin[1] + BUTTON_BORDER_PX },
         .dst_size = .{ w - 2 * BUTTON_BORDER_PX, h - 2 * BUTTON_BORDER_PX },
         .color = BUTTON_BG,
@@ -254,6 +254,8 @@ fn layoutAndRender(
     const text_x = origin[0] + (w - text_w) * 0.5;
     _ = try text_layout.appendShapedRun(
         &out.glyphs,
+        &out.glyph_targets,
+        lc.current_target_dispatch_index,
         lc.fonts,
         lc.cache,
         lc.mono_atlas,

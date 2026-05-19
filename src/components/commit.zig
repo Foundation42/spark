@@ -210,7 +210,7 @@ fn layoutAndRender(
     const run = result.run;
 
     // Background tint — no border, no shadow. A flat slate plate.
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0], origin[1] },
         .dst_size = .{ g.width, g.height },
         .color = FILL_COLOR,
@@ -222,6 +222,8 @@ fn layoutAndRender(
     const text_x = origin[0] + g.pad_x;
     _ = try text_layout.appendShapedRun(
         &out.glyphs,
+        &out.glyph_targets,
+        lc.current_target_dispatch_index,
         lc.fonts,
         lc.cache,
         lc.mono_atlas,

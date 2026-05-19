@@ -73,6 +73,12 @@ pub const Paragraph = struct {
 /// worker thread.
 pub fn appendShapedRun(
     out: *std.ArrayList(tp.GlyphInstance),
+    /// Parallel target-routing array (effects-spec Phase B.4.a).
+    /// Length-locked to `out` — every glyph append also appends
+    /// `target_index` here, keeping the parallel-array invariant
+    /// for downstream `Spark.endFrame` render-pass routing.
+    out_targets: *std.ArrayList(u32),
+    target_index: u32,
     fonts: *registry_mod.FontRegistry,
     cache: *glyph_cache_mod.GlyphCache,
     mono_atlas: *atlas_mod.Atlas,
@@ -215,6 +221,7 @@ pub fn appendShapedRun(
                 .fx_kind = 0,
                 ._pad = 0,
             });
+            try out_targets.append(target_index);
         }
         // Advances came from BASE shaping — scale by base entry's
         // strike factor (= 1 for scalable mono fonts; < 1 for the
@@ -229,6 +236,8 @@ pub fn appendShapedRun(
 /// a baseline supplied by the caller.
 pub fn appendLineFromSpans(
     out: *std.ArrayList(tp.GlyphInstance),
+    out_targets: *std.ArrayList(u32),
+    target_index: u32,
     allocator: std.mem.Allocator,
     fonts: *registry_mod.FontRegistry,
     cache: *glyph_cache_mod.GlyphCache,
@@ -247,6 +256,8 @@ pub fn appendLineFromSpans(
         defer run.deinit();
         x = try appendShapedRun(
             out,
+            out_targets,
+            target_index,
             fonts,
             cache,
             mono_atlas,

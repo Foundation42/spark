@@ -170,11 +170,10 @@ fn layoutAndRender(
     out: *element.DrawList,
 ) anyerror!element.Box {
     _ = constraints;
-    _ = lc;
     const c: *const Component = @ptrCast(@alignCast(ctx));
 
     // Track (full width). Pill ends from radius = h/2.
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0], origin[1] },
         .dst_size = .{ c.width, c.height },
         .color = c.bg_color,
@@ -185,7 +184,7 @@ fn layoutAndRender(
     // a stray 0-width quad.
     const fill_w = c.width * c.ratio;
     if (fill_w > 0.5) {
-        try out.quads.append(.{
+        try out.appendQuad(lc, .{
             .dst_pos = .{ origin[0], origin[1] },
             .dst_size = .{ fill_w, c.height },
             .color = c.color,

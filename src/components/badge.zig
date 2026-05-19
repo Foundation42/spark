@@ -237,7 +237,7 @@ fn layoutAndRender(
 
     // Pill body. Radius = half height for a full-pill end-cap; the
     // existing rounded-quad pipeline supports this for free.
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0], origin[1] },
         .dst_size = .{ g.width, g.height },
         .color = c.bg_color,
@@ -252,6 +252,8 @@ fn layoutAndRender(
     const text_x = origin[0] + g.pad_x;
     _ = try text_layout.appendShapedRun(
         &out.glyphs,
+        &out.glyph_targets,
+        lc.current_target_dispatch_index,
         lc.fonts,
         lc.cache,
         lc.mono_atlas,

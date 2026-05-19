@@ -335,13 +335,13 @@ fn layoutAndRender(
     // negotiate against the same solver this box just produced
     // bounds in.
     if (lc.layout_context) |layout_ctx| {
-        return layoutViaConstraints(c, layout_ctx, lc.allocator, origin, w_target, h_target, out);
+        return layoutViaConstraints(c, lc, layout_ctx, lc.allocator, origin, w_target, h_target, out);
     }
 
     // Fallback: imperative path used by tests + by any future host
     // that hasn't wired a LayoutContext yet. Produces the same
     // bounds; just skips the solver round-trip.
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0], origin[1] },
         .dst_size = .{ w_target, h_target },
         .color = c.color,
@@ -370,6 +370,7 @@ fn layoutAndRender(
 /// box having to expose its variable handles.
 fn layoutViaConstraints(
     c: *Component,
+    lc: *const element.LayoutCtx,
     layout_ctx: *layout_context_mod.LayoutContext,
     alloc: std.mem.Allocator,
     origin: [2]f32,
@@ -436,7 +437,7 @@ fn layoutViaConstraints(
     const sw: f32 = @floatCast(layout_ctx.solver.value(bounds.x_max) - layout_ctx.solver.value(bounds.x_min));
     const sh: f32 = @floatCast(layout_ctx.solver.value(bounds.y_max) - layout_ctx.solver.value(bounds.y_min));
 
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ sx, sy },
         .dst_size = .{ sw, sh },
         .color = c.color,

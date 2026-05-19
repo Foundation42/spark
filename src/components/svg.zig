@@ -260,9 +260,9 @@ fn layoutAndRender(
     const ty = origin[1] - c.view_y * sy;
 
     const base_idx: u32 = @intCast(out.tris.items.len);
-    try out.tris.ensureUnusedCapacity(c.vertices.len);
+    try out.ensureUnusedTriCapacity(c.vertices.len);
     for (c.vertices) |v| {
-        out.tris.appendAssumeCapacity(.{
+        out.appendTriAssumeCapacity(lc, .{
             .pos = .{ v.pos[0] * sx + tx, v.pos[1] * sy + ty },
             .color = v.color,
         });
@@ -294,13 +294,13 @@ fn renderError(
 
     const total_w = w;
     const total_h = m.line_height + 2 * ERR_PAD_Y;
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0], origin[1] },
         .dst_size = .{ total_w, total_h },
         .color = ERR_BORDER,
         .radius = ERR_RADIUS,
     });
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0] + ERR_BORDER_PX, origin[1] + ERR_BORDER_PX },
         .dst_size = .{ total_w - 2 * ERR_BORDER_PX, total_h - 2 * ERR_BORDER_PX },
         .color = ERR_BG,
@@ -309,6 +309,8 @@ fn renderError(
     const baseline_y = origin[1] + ERR_PAD_Y + m.ascender;
     _ = try text_layout.appendShapedRun(
         &out.glyphs,
+        &out.glyph_targets,
+        lc.current_target_dispatch_index,
         lc.fonts,
         lc.cache,
         lc.mono_atlas,

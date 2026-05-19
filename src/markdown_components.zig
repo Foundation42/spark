@@ -649,7 +649,7 @@ fn placeholderLayoutAndRender(
 
     // Border (outer rounded panel) — opaque-ish red. Drawn first so
     // the inner panel layers on top, leaving only a 2px ring visible.
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0], origin[1] },
         .dst_size = .{ total_w, total_h },
         .color = PLACEHOLDER_BORDER,
@@ -658,7 +658,7 @@ fn placeholderLayoutAndRender(
     // Inner panel — darker semi-transparent fill, inset by the border
     // thickness with proportionally-smaller corner radius so the inner
     // rounding follows the outer.
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0] + PLACEHOLDER_BORDER_PX, origin[1] + PLACEHOLDER_BORDER_PX },
         .dst_size = .{ total_w - 2 * PLACEHOLDER_BORDER_PX, total_h - 2 * PLACEHOLDER_BORDER_PX },
         .color = PLACEHOLDER_BG,
@@ -668,6 +668,8 @@ fn placeholderLayoutAndRender(
     const baseline_y = origin[1] + PLACEHOLDER_PAD_Y + m.ascender;
     _ = try text_layout.appendShapedRun(
         &out.glyphs,
+        &out.glyph_targets,
+        lc.current_target_dispatch_index,
         lc.fonts,
         lc.cache,
         lc.mono_atlas,

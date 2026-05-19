@@ -605,7 +605,7 @@ fn layoutAndRender(
     // generating…" placeholder above/below. Phase placeholders
     // only render when there's no mesh yet.
     if (c.vertices.len > 0 and c.indices.len > 0) {
-        return try renderMesh(c, origin, w, h, out);
+        return try renderMesh(c, lc, origin, w, h, out);
     }
 
     return switch (c.phase) {
@@ -623,6 +623,7 @@ fn layoutAndRender(
 
 fn renderMesh(
     c: *Component,
+    lc: *const element.LayoutCtx,
     origin: [2]f32,
     w: f32,
     h: f32,
@@ -634,9 +635,9 @@ fn renderMesh(
     const ty = origin[1] - c.view_y * sy;
 
     const base_idx: u32 = @intCast(out.tris.items.len);
-    try out.tris.ensureUnusedCapacity(c.vertices.len);
+    try out.ensureUnusedTriCapacity(c.vertices.len);
     for (c.vertices) |v| {
-        out.tris.appendAssumeCapacity(.{
+        out.appendTriAssumeCapacity(lc, .{
             .pos = .{ v.pos[0] * sx + tx, v.pos[1] * sy + ty },
             .color = v.color,
         });
@@ -692,13 +693,13 @@ fn renderPlaceholder(
     const total_w: f32 = w;
     const total_h: f32 = m.line_height + 2 * PLACEHOLDER_PAD_Y;
 
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0], origin[1] },
         .dst_size = .{ total_w, total_h },
         .color = border_rgba,
         .radius = PLACEHOLDER_RADIUS,
     });
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0] + PLACEHOLDER_BORDER_PX, origin[1] + PLACEHOLDER_BORDER_PX },
         .dst_size = .{ total_w - 2 * PLACEHOLDER_BORDER_PX, total_h - 2 * PLACEHOLDER_BORDER_PX },
         .color = bg_rgba,
@@ -708,6 +709,8 @@ fn renderPlaceholder(
     const baseline_y = origin[1] + PLACEHOLDER_PAD_Y + m.ascender;
     _ = try text_layout.appendShapedRun(
         &out.glyphs,
+        &out.glyph_targets,
+        lc.current_target_dispatch_index,
         lc.fonts,
         lc.cache,
         lc.mono_atlas,

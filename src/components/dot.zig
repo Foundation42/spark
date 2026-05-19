@@ -131,7 +131,7 @@ fn layoutAndRender(
     const x_centre_y = baseline_y - x_centre_offset;
     const dot_y = x_centre_y - half;
 
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0] + pad, dot_y },
         .dst_size = .{ dot_d, dot_d },
         .color = c.color,

@@ -199,13 +199,13 @@ fn layoutAndRender(
     // its body background colour directly, so use a near-black
     // fill that matches the demo's dark surface.
     const radius: f32 = 3;
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0], origin[1] },
         .dst_size = .{ g.width, g.height },
         .color = c.color,
         .radius = radius,
     });
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0] + BORDER_PX, origin[1] + BORDER_PX },
         .dst_size = .{ g.width - 2 * BORDER_PX, g.height - 2 * BORDER_PX },
         .color = .{ 0.08, 0.10, 0.13, 1.0 },
@@ -218,6 +218,8 @@ fn layoutAndRender(
     const text_x = origin[0] + g.pad_x;
     _ = try text_layout.appendShapedRun(
         &out.glyphs,
+        &out.glyph_targets,
+        lc.current_target_dispatch_index,
         lc.fonts,
         lc.cache,
         lc.mono_atlas,

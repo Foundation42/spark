@@ -187,7 +187,12 @@ test "beginFrame reset clears drawlist and pass_dispatches symmetrically" {
     // never reach endFrame); the PassDispatch is a zero-payload
     // sentinel — its shape mirrors the spark.PassDispatch protocol
     // comment, which is the contract.
+    // Maintain the Phase B.4.a lockstep invariant manually here —
+    // no LayoutCtx is available in this test, so we append directly
+    // to both arrays. `std.math.maxInt(u32)` == element.MAIN_TARGET
+    // (the main-color-attachment sentinel).
     try sp.drawlist.glyphs.append(std.mem.zeroes(@TypeOf(sp.drawlist.glyphs.items[0])));
+    try sp.drawlist.glyph_targets.append(std.math.maxInt(u32));
     try sp.pass_dispatches.append(.{
         // Phase B.3 — PassDispatch is now a tagged union; .pattern is
         // the A.6.a-shape arm. uniform_bytes defaults to zeros;

@@ -207,7 +207,7 @@ fn layoutAndRender(
     ctx: *anyopaque,
     origin: [2]f32,
     constraints: element.Constraints,
-    _: *element.LayoutCtx,
+    lc: *element.LayoutCtx,
     out: *element.DrawList,
 ) anyerror!element.Box {
     const c: *const Component = @ptrCast(@alignCast(ctx));
@@ -218,7 +218,7 @@ fn layoutAndRender(
     const h = c.height.resolve(max_w, 120.0);
 
     // Background panel.
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0], origin[1] },
         .dst_size = .{ w, h },
         .color = c.bg,
@@ -247,7 +247,7 @@ fn layoutAndRender(
         const norm = (clamped - c.min_val) / safe_range; // 0..1
         const bar_h = norm * h;
         const x = origin[0] + @as(f32, @floatFromInt(i)) * slot_w;
-        try out.quads.append(.{
+        try out.appendQuad(lc, .{
             .dst_pos = .{ x, baseline_y - bar_h },
             .dst_size = .{ bar_w, bar_h },
             .color = c.color,

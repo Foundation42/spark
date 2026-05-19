@@ -166,7 +166,7 @@ fn layoutAndRender(
     ctx: *anyopaque,
     origin: [2]f32,
     constraints: element.Constraints,
-    _: *element.LayoutCtx,
+    lc: *element.LayoutCtx,
     out: *element.DrawList,
 ) anyerror!element.Box {
     const c: *Component = @ptrCast(@alignCast(ctx));
@@ -185,7 +185,7 @@ fn layoutAndRender(
     const track_w = w - 2 * thumb_pad;
 
     // Track (full, dim).
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ track_x, track_y },
         .dst_size = .{ track_w, TRACK_THICKNESS },
         .color = TRACK_COLOR,
@@ -198,7 +198,7 @@ fn layoutAndRender(
     const t = normalised(c);
     const fill_w = track_w * t;
     if (fill_w > 0) {
-        try out.quads.append(.{
+        try out.appendQuad(lc, .{
             .dst_pos = .{ track_x, track_y },
             .dst_size = .{ fill_w, TRACK_THICKNESS },
             .color = TRACK_FILL_COLOR,
@@ -209,7 +209,7 @@ fn layoutAndRender(
     // Thumb. Stable size; centred on the track at `value`.
     const thumb_cx = track_x + fill_w;
     const thumb_cy = track_y + TRACK_THICKNESS * 0.5;
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ thumb_cx - THUMB_RADIUS, thumb_cy - THUMB_RADIUS },
         .dst_size = .{ THUMB_RADIUS * 2, THUMB_RADIUS * 2 },
         .color = THUMB_COLOR,

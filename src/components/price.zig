@@ -261,7 +261,7 @@ fn layoutAndRender(
     const g = result.geom;
     const run = result.run;
 
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0], origin[1] },
         .dst_size = .{ g.width, g.height },
         .color = PLATE_COLOR,
@@ -272,6 +272,8 @@ fn layoutAndRender(
     const baseline_y = origin[1] + g.ascender;
     _ = try text_layout.appendShapedRun(
         &out.glyphs,
+        &out.glyph_targets,
+        lc.current_target_dispatch_index,
         lc.fonts,
         lc.cache,
         lc.mono_atlas,

@@ -189,7 +189,6 @@ fn layoutAndRender(
     out: *element.DrawList,
 ) anyerror!element.Box {
     _ = constraints;
-    _ = lc;
     const c: *const Component = @ptrCast(@alignCast(ctx));
 
     const box: element.Box = .{
@@ -228,7 +227,7 @@ fn layoutAndRender(
         if (v > 0 and bar_h < MIN_BAR_HEIGHT_PX) bar_h = MIN_BAR_HEIGHT_PX;
         const y = origin[1] + c.height - bar_h;
 
-        try out.quads.append(.{
+        try out.appendQuad(lc, .{
             .dst_pos = .{ x, y },
             .dst_size = .{ bar_w, bar_h },
             .color = c.color,

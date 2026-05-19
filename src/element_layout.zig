@@ -103,7 +103,7 @@ pub fn layoutAndRenderCached(
     const version = layout_cache.versionFor(elem);
 
     if (cache.lookup(key, version)) |entry| {
-        const box = try layout_cache.blitEntry(out, entry, origin);
+        const box = try layout_cache.blitEntry(out, ctx, entry, origin);
         // The component's `on_layout_complete` hook needs to fire on
         // cache hit too — `layoutAndRender` didn't run, so without
         // this the persistent `last_sizes` cache would never see the
@@ -226,6 +226,22 @@ pub fn layoutAndRender(
             // For `.pattern` and `.content`, the start index is
             // unused (kept zero).
             const dispatch_start: u32 = if (ctx.pass_dispatches) |pd| @intCast(pd.items.len) else 0;
+
+            // **Drawlist target push (Phase B.4.a).** For
+            // `.single_source` effects, every drawlist primitive the
+            // child subtree emits should route into the offscreen
+            // target — not the main color attachment. Push the new
+            // dispatch index onto LayoutCtx before the child walk,
+            // restore the saved value on return. Nested single-source
+            // children push deeper indices that override during their
+            // own subtree, restoring back to the enclosing target on
+            // exit. Pattern dispatches don't push because they render
+            // directly to the parent target via scissored viewport.
+            const saved_target = ctx.current_target_dispatch_index;
+            if (cu.pass_kind == 2 and ctx.pass_dispatches != null) {
+                ctx.current_target_dispatch_index = dispatch_start;
+            }
+            defer ctx.current_target_dispatch_index = saved_target;
 
             const box = try cu.vtable.layout_and_render(
                 cu.ctx,
@@ -478,7 +494,7 @@ fn layoutQuote(
     // render before glyphs in the frame loop, so the bar still
     // appears under any text that happens to overlap it (it doesn't,
     // but the ordering is correct regardless).
-    try out.quads.append(.{
+    try out.appendQuad(ctx, .{
         .dst_pos = .{ origin[0], origin[1] },
         .dst_size = .{ ctx.theme.quote_bar_width, inner_box.h },
         .color = ctx.theme.quote_bar_color,
@@ -508,7 +524,7 @@ fn layoutThematicBreak(
     const thickness = ctx.theme.thematic_break_thickness;
     const w: f32 = if (std.math.isFinite(constraints.max_w)) constraints.max_w else 320.0;
 
-    try out.quads.append(.{
+    try out.appendQuad(ctx, .{
         .dst_pos = .{ origin[0], origin[1] + (h - thickness) * 0.5 },
         .dst_size = .{ w, thickness },
         .color = ctx.theme.thematic_break_color,
@@ -621,7 +637,7 @@ fn layoutCodeBlock(
             const pad_x = ctx.theme.code_block_pad_x;
             const pad_y = ctx.theme.code_block_pad_y;
             const bg_idx = out.quads.items.len;
-            try out.quads.append(.{
+            try out.appendQuad(ctx, .{
                 .dst_pos = .{ origin[0], origin[1] },
                 .dst_size = .{ 0, 0 },
                 .color = ctx.theme.code_block_bg,
@@ -657,7 +673,7 @@ fn layoutCodeBlock(
             // quads-before-glyphs, but keeping insertion-order
             // background-then-content matches mental model.
             const bg_idx = out.quads.items.len;
-            try out.quads.append(.{
+            try out.appendQuad(ctx, .{
                 .dst_pos = .{ origin[0], origin[1] },
                 .dst_size = .{ 0, 0 },
                 .color = ctx.theme.code_block_bg,
@@ -676,6 +692,8 @@ fn layoutCodeBlock(
                     defer run.deinit();
                     _ = try text_layout.appendShapedRun(
                         &out.glyphs,
+        &out.glyph_targets,
+        ctx.current_target_dispatch_index,
                         ctx.fonts,
                         ctx.cache,
                         ctx.mono_atlas,
@@ -994,7 +1012,7 @@ fn layoutStackVParallel(
         const child_origin: [2]f32 = .{ origin[0], y };
         switch (classifications[i]) {
             .cache_hit => |entry| {
-                const box = try layout_cache.blitEntry(out, entry, child_origin);
+                const box = try layout_cache.blitEntry(out, ctx, entry, child_origin);
                 if (box.w > max_w) max_w = box.w;
                 y += entry.box.h;
             },
@@ -1129,22 +1147,26 @@ fn blitPrivate(out: *element.DrawList, src: *const element.DrawList, origin: [2]
     const ox = origin[0];
     const oy = origin[1];
 
+    // Parallel walker merge: preserve worker-side target tags
+    // verbatim (workers run with their own LayoutCtx, their tagging
+    // is already correct relative to the shared pass_dispatches
+    // index space). Phase B.4.a.
     const g_start = out.glyphs.items.len;
-    try out.glyphs.appendSlice(src.glyphs.items);
+    try out.appendGlyphsPreservingTargets(src.glyphs.items, src.glyph_targets.items);
     for (out.glyphs.items[g_start..]) |*g| {
         g.dst_pos[0] += ox;
         g.dst_pos[1] += oy;
     }
 
     const q_start = out.quads.items.len;
-    try out.quads.appendSlice(src.quads.items);
+    try out.appendQuadsPreservingTargets(src.quads.items, src.quad_targets.items);
     for (out.quads.items[q_start..]) |*q| {
         q.dst_pos[0] += ox;
         q.dst_pos[1] += oy;
     }
 
     const tri_vertex_base: u32 = @intCast(out.tris.items.len);
-    try out.tris.appendSlice(src.tris.items);
+    try out.appendTrisPreservingTargets(src.tris.items, src.tri_targets.items);
     for (out.tris.items[tri_vertex_base..]) |*v| {
         v.pos[0] += ox;
         v.pos[1] += oy;
@@ -1153,11 +1175,11 @@ fn blitPrivate(out: *element.DrawList, src: *const element.DrawList, origin: [2]
     try out.tri_indices.appendSlice(src.tri_indices.items);
     for (out.tri_indices.items[ti_start..]) |*idx| idx.* += tri_vertex_base;
 
-    for (src.images.items) |im| {
+    for (src.images.items, src.image_targets.items) |im, tag| {
         var im2 = im;
         im2.dst_pos[0] += ox;
         im2.dst_pos[1] += oy;
-        try out.images.append(im2);
+        try out.appendImagePreservingTarget(im2, tag);
     }
 
     for (src.hits.items) |h| {
@@ -1709,13 +1731,13 @@ fn emitLine(
         if (tok == .object) {
             const obj = tok.object;
             if (bg_run.flush()) {
-                try emitBgQuad(out, bg_run.start_x, x, line_top, max_lh, bg_run.color);
+                try emitBgQuad(out, ctx, bg_run.start_x, x, line_top, max_lh, bg_run.color);
             }
             if (underline_run.flush()) {
-                try emitUnderline(out, ctx.theme, underline_run.start_x, x, baseline_y, underline_run.max_px, underline_run.color);
+                try emitUnderline(out, ctx, ctx.theme, underline_run.start_x, x, baseline_y, underline_run.max_px, underline_run.color);
             }
             if (strike_run.flush()) {
-                try emitStrikethrough(out, ctx.theme, strike_run.start_x, x, baseline_y, strike_run.max_px, strike_run.color);
+                try emitStrikethrough(out, ctx, ctx.theme, strike_run.start_x, x, baseline_y, strike_run.max_px, strike_run.color);
             }
 
             try emitInlineObject(obj, x, baseline_y, max_asc, max_lh, line_top, ctx, out);
@@ -1732,7 +1754,7 @@ fn emitLine(
             px,
             atom.style.bg orelse .{ 0, 0, 0, 0 },
         )) {
-            try emitBgQuad(out, bg_run.start_x, x, line_top, max_lh, bg_run.color);
+            try emitBgQuad(out, ctx, bg_run.start_x, x, line_top, max_lh, bg_run.color);
         }
         if (underline_run.step(
             atom.style.link or atom.style.underline,
@@ -1742,6 +1764,7 @@ fn emitLine(
         )) {
             try emitUnderline(
                 out,
+                ctx,
                 ctx.theme,
                 underline_run.start_x,
                 x,
@@ -1758,6 +1781,7 @@ fn emitLine(
         )) {
             try emitStrikethrough(
                 out,
+                ctx,
                 ctx.theme,
                 strike_run.start_x,
                 x,
@@ -1769,6 +1793,8 @@ fn emitLine(
 
         x = try text_layout.appendShapedRun(
             &out.glyphs,
+        &out.glyph_targets,
+        ctx.current_target_dispatch_index,
             ctx.fonts,
             ctx.cache,
             ctx.mono_atlas,
@@ -1788,11 +1814,12 @@ fn emitLine(
     // Trailing flushes — runs reaching the line's trailing edge.
     // Same order as the in-loop emits: bg first, then decorations.
     if (bg_run.flush()) {
-        try emitBgQuad(out, bg_run.start_x, x, line_top, max_lh, bg_run.color);
+        try emitBgQuad(out, ctx, bg_run.start_x, x, line_top, max_lh, bg_run.color);
     }
     if (underline_run.flush()) {
         try emitUnderline(
             out,
+            ctx,
             ctx.theme,
             underline_run.start_x,
             x,
@@ -1804,6 +1831,7 @@ fn emitLine(
     if (strike_run.flush()) {
         try emitStrikethrough(
             out,
+            ctx,
             ctx.theme,
             strike_run.start_x,
             x,
@@ -1823,6 +1851,7 @@ fn emitLine(
 /// disappears even at tiny sizes.
 fn emitUnderline(
     out: *element.DrawList,
+    lc: *const element.LayoutCtx,
     theme: *const element.Theme,
     x0: f32,
     x1: f32,
@@ -1834,7 +1863,7 @@ fn emitUnderline(
     const px_f: f32 = @floatFromInt(run_px);
     const thickness = @max(1.0, px_f * theme.link_underline_thickness_em);
     const offset = px_f * theme.link_underline_offset_em;
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ x0, baseline_y + offset },
         .dst_size = .{ x1 - x0, thickness },
         .color = color,
@@ -1848,6 +1877,7 @@ fn emitUnderline(
 /// clamped to >= 1px.
 fn emitStrikethrough(
     out: *element.DrawList,
+    lc: *const element.LayoutCtx,
     theme: *const element.Theme,
     x0: f32,
     x1: f32,
@@ -1859,7 +1889,7 @@ fn emitStrikethrough(
     const px_f: f32 = @floatFromInt(run_px);
     const thickness = @max(1.0, px_f * theme.strikethrough_thickness_em);
     const offset = px_f * theme.strikethrough_offset_em;
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ x0, baseline_y - offset },
         .dst_size = .{ x1 - x0, thickness },
         .color = color,
@@ -1874,6 +1904,7 @@ fn emitStrikethrough(
 /// glyphs layer on top.
 fn emitBgQuad(
     out: *element.DrawList,
+    lc: *const element.LayoutCtx,
     x0: f32,
     x1: f32,
     line_top: f32,
@@ -1881,7 +1912,7 @@ fn emitBgQuad(
     color: [4]f32,
 ) !void {
     if (x1 <= x0) return;
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ x0, line_top },
         .dst_size = .{ x1 - x0, line_height },
         .color = color,

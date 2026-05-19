@@ -246,13 +246,13 @@ fn layoutAndRender(
     const border_rgba = if (c.focused) FIELD_BORDER_FOCUSED else FIELD_BORDER;
     const bg_rgba = if (c.focused) FIELD_BG_FOCUSED else FIELD_BG;
 
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0], origin[1] },
         .dst_size = .{ w, h },
         .color = border_rgba,
         .radius = RADIUS,
     });
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0] + border_px, origin[1] + border_px },
         .dst_size = .{ w - 2 * border_px, h - 2 * border_px },
         .color = bg_rgba,
@@ -272,6 +272,8 @@ fn layoutAndRender(
         const run = try shape.shapeUtf8(aa, hb, display_text);
         _ = try text_layout.appendShapedRun(
             &out.glyphs,
+        &out.glyph_targets,
+        lc.current_target_dispatch_index,
             lc.fonts,
             lc.cache,
             lc.mono_atlas,
@@ -308,7 +310,7 @@ fn layoutAndRender(
             const caret_x = text_x + prefix_w;
             const caret_y = origin[1] + (h - m.line_height) * 0.5 + 2;
             const caret_h = m.line_height - 4;
-            try out.quads.append(.{
+            try out.appendQuad(lc, .{
                 .dst_pos = .{ caret_x, caret_y },
                 .dst_size = .{ CARET_W, caret_h },
                 .color = CARET_COLOR,

@@ -315,15 +315,23 @@ pub fn aggregateChildVersions(children: []const element.Element) u64 {
 /// count of `out.tris`. Returns the `Box` at `origin`.
 pub fn blitEntry(
     out: *element.DrawList,
+    lc: *const element.LayoutCtx,
     entry: Entry,
     origin: [2]f32,
 ) !element.Box {
     const ox = origin[0];
     const oy = origin[1];
 
+    // Phase B.4.a — cache pre-dates routing, so cached entries have
+    // no parallel target tags. Re-tag every blitted item with the
+    // walker's current dispatch index at hit time: if the cached
+    // subtree is being blitted inside a `.single_source` descent,
+    // the items correctly inherit the enclosing effect's target;
+    // otherwise they tag as `MAIN_TARGET`.
+
     // Glyphs — translate dst_pos.
     const g_start = out.glyphs.items.len;
-    try out.glyphs.appendSlice(entry.glyphs);
+    try out.appendGlyphsTaggingWith(lc, entry.glyphs);
     for (out.glyphs.items[g_start..]) |*g| {
         g.dst_pos[0] += ox;
         g.dst_pos[1] += oy;
@@ -331,7 +339,7 @@ pub fn blitEntry(
 
     // Quads — translate dst_pos.
     const q_start = out.quads.items.len;
-    try out.quads.appendSlice(entry.quads);
+    try out.appendQuadsTaggingWith(lc, entry.quads);
     for (out.quads.items[q_start..]) |*q| {
         q.dst_pos[0] += ox;
         q.dst_pos[1] += oy;
@@ -339,7 +347,7 @@ pub fn blitEntry(
 
     // Triangles — translate vertex positions, rebase indices.
     const tri_vertex_base: u32 = @intCast(out.tris.items.len);
-    try out.tris.appendSlice(entry.tris);
+    try out.appendTrisTaggingWith(lc, entry.tris);
     for (out.tris.items[tri_vertex_base..]) |*v| {
         v.pos[0] += ox;
         v.pos[1] += oy;
@@ -354,7 +362,7 @@ pub fn blitEntry(
         var im2 = im;
         im2.dst_pos[0] += ox;
         im2.dst_pos[1] += oy;
-        try out.images.append(im2);
+        try out.appendImage(lc, im2);
     }
 
     // Hits — translate box origin. Pointer fields (vtable/ctx/state)

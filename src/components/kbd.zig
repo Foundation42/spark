@@ -218,7 +218,7 @@ fn layoutAndRender(
     const cap_h = g.height - SHADOW_PX;
 
     // Shadow stripe (bottom). Drawn first so the cap sits on top.
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0], origin[1] + SHADOW_PX },
         .dst_size = .{ g.width, g.height - SHADOW_PX },
         .color = SHADOW_COLOR,
@@ -226,7 +226,7 @@ fn layoutAndRender(
     });
 
     // Border (cap, outer).
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0], origin[1] },
         .dst_size = .{ g.width, cap_h },
         .color = border_color,
@@ -234,7 +234,7 @@ fn layoutAndRender(
     });
 
     // Fill (cap, inset by border thickness).
-    try out.quads.append(.{
+    try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0] + BORDER_PX, origin[1] + BORDER_PX },
         .dst_size = .{ g.width - 2 * BORDER_PX, cap_h - 2 * BORDER_PX },
         .color = FILL_COLOR,
@@ -247,6 +247,8 @@ fn layoutAndRender(
     const text_x = origin[0] + (g.width - g.text_w) * 0.5;
     _ = try text_layout.appendShapedRun(
         &out.glyphs,
+        &out.glyph_targets,
+        lc.current_target_dispatch_index,
         lc.fonts,
         lc.cache,
         lc.mono_atlas,

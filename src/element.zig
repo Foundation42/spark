@@ -923,24 +923,74 @@ pub const LayoutCtx = struct {
     /// snapshot blits where the dispatch list isn't being
     /// regenerated).
     pass_dispatches: ?*std.ArrayList(PassDispatch) = null,
+    /// Effects-spec Phase B.4.a — drawlist routing. The walker
+    /// updates this on entering / exiting a `.single_source`
+    /// element (save → set to the new dispatch's index → restore).
+    /// `DrawList.appendGlyph` / `appendQuad` / `appendTri` /
+    /// `appendImage` read it to stamp the parallel `*_targets`
+    /// arrays in lockstep with each primitive append.
+    ///
+    /// `MAIN_TARGET` (= `std.math.maxInt(u32)`) is the sentinel
+    /// for the main color attachment. Any other value is an index
+    /// into `pass_dispatches` identifying the owning single-source
+    /// effect's `SingleSourceStep`.
+    current_target_dispatch_index: u32 = MAIN_TARGET,
 };
+
+/// Sentinel value for `LayoutCtx.current_target_dispatch_index` and
+/// `DrawList.*_targets` entries meaning "main color attachment"
+/// (not part of a `.single_source` subtree). Effects-spec Phase
+/// B.4.a — the drawlist routing tag.
+pub const MAIN_TARGET: u32 = std.math.maxInt(u32);
 
 /// GPU draw work accumulated during the walk. Quads land first
 /// (backgrounds, bars, rules) then glyphs on top — the host's frame
 /// loop records them in that order inside one render pass.
 ///
-/// Future fields slot in unchanged: `lines` (borders, separators),
-/// `images` (markdown images, widget icons). Element handlers grow
-/// into the new fields without breaking the contract.
+/// **Per-primitive routing tags (Phase B.4.a).** Each primitive
+/// array (`glyphs`, `quads`, `tris`, `images`) has a parallel
+/// `*_targets: ArrayList(u32)` of identical length — element `i`
+/// of the targets array names the render pass that owns primitive
+/// `i`. `MAIN_TARGET` (= `std.math.maxInt(u32)`) means the main
+/// color attachment; any other value is the index into
+/// `pass_dispatches` of the owning `.single_source` effect's
+/// `SingleSourceStep`. The targets arrays are **CPU-only metadata**
+/// — never uploaded to GPU. The consumer (`Spark.endFrame`)
+/// iterates each primitive array filtering by the parallel target
+/// tag when choosing which render pass each primitive lands in.
+///
+/// **Lockstep invariant.** `*_targets.items.len ==
+/// primitive.items.len` after every emit. Maintained by the emit
+/// helpers (`appendGlyph` / `appendQuad` / `appendTri` /
+/// `appendImage`) which append to both arrays in one call —
+/// callers must use these helpers, never the underlying
+/// `glyphs.append` etc. directly. The `assertTargetsInSync`
+/// debug-build sanity check catches drift.
+///
+/// **Why parallel arrays rather than extending the primitive
+/// `extern struct`s?** The primitive types are GPU upload formats
+/// (read by shaders via std430 SSBOs); extending them would force
+/// GLSL stride updates and waste GPU bandwidth on routing metadata
+/// the GPU never reads. Routing is a CPU-side render-pass dispatch
+/// decision — keeping it sideways preserves the GPU/CPU layer split.
+///
+/// **Why not Hits or tri_indices?** Hits are input-routing, not
+/// draw work — they're processed by the input dispatcher regardless
+/// of render pass. tri_indices reference `tris` by index; an index
+/// inherits its target from the vertex it references, so a separate
+/// `tri_index_targets` array would be redundant.
 pub const DrawList = struct {
     glyphs: std.ArrayList(tp.GlyphInstance),
+    glyph_targets: std.ArrayList(u32),
     quads: std.ArrayList(qp.QuadInstance),
+    quad_targets: std.ArrayList(u32),
     /// Triangle mesh layer (stage 13d.1). Populated by `:::svg`
     /// during layoutAndRender; rendered first (under quads + text)
     /// so background fills sit behind chrome. Indices reference
     /// `tris` vertices; the host's TrianglePipeline copies both
     /// arrays into its VBO/IBO and issues one `vkCmdDrawIndexed`.
     tris: std.ArrayList(tri_pipeline.Vertex),
+    tri_targets: std.ArrayList(u32),
     tri_indices: std.ArrayList(u32),
     /// Raster image layer (stage 14c). One entry per `:::image-stream`
     /// component that has a decoded texture ready. Each carries the
@@ -948,32 +998,38 @@ pub const DrawList = struct {
     /// world-space rect; the host's ImagePipeline records one draw
     /// per entry, binding the descriptor between draws.
     images: std.ArrayList(ImageDraw),
+    image_targets: std.ArrayList(u32),
     /// Hit-test layer. Populated alongside glyphs / quads during the
     /// layout walk; only elements with a non-null `vtable.on_input`
     /// register an entry. Walked in reverse on each mouse event so
     /// the deepest-laid interactive element wins.
     hits: std.ArrayList(Hit),
-    // future:
-    // lines:  std.ArrayList(LineInstance),
-    // images: std.ArrayList(ImageInstance),
 
     pub fn init(allocator: std.mem.Allocator) DrawList {
         return .{
             .glyphs = std.ArrayList(tp.GlyphInstance).init(allocator),
+            .glyph_targets = std.ArrayList(u32).init(allocator),
             .quads = std.ArrayList(qp.QuadInstance).init(allocator),
+            .quad_targets = std.ArrayList(u32).init(allocator),
             .tris = std.ArrayList(tri_pipeline.Vertex).init(allocator),
+            .tri_targets = std.ArrayList(u32).init(allocator),
             .tri_indices = std.ArrayList(u32).init(allocator),
             .images = std.ArrayList(ImageDraw).init(allocator),
+            .image_targets = std.ArrayList(u32).init(allocator),
             .hits = std.ArrayList(Hit).init(allocator),
         };
     }
 
     pub fn deinit(self: *DrawList) void {
         self.glyphs.deinit();
+        self.glyph_targets.deinit();
         self.quads.deinit();
+        self.quad_targets.deinit();
         self.tris.deinit();
+        self.tri_targets.deinit();
         self.tri_indices.deinit();
         self.images.deinit();
+        self.image_targets.deinit();
         self.hits.deinit();
         self.* = undefined;
     }
@@ -982,11 +1038,156 @@ pub const DrawList = struct {
     /// the common case at frame start.
     pub fn clearRetainingCapacity(self: *DrawList) void {
         self.glyphs.clearRetainingCapacity();
+        self.glyph_targets.clearRetainingCapacity();
         self.quads.clearRetainingCapacity();
+        self.quad_targets.clearRetainingCapacity();
         self.tris.clearRetainingCapacity();
+        self.tri_targets.clearRetainingCapacity();
         self.tri_indices.clearRetainingCapacity();
         self.images.clearRetainingCapacity();
+        self.image_targets.clearRetainingCapacity();
         self.hits.clearRetainingCapacity();
+    }
+
+    // ── Emit helpers (Phase B.4.a) ─────────────────────────────────
+    // Single source of truth for parallel-array lockstep — every
+    // primitive append goes through these so the routing tag lands
+    // alongside. The `lc` parameter carries the current dispatch
+    // index via `lc.current_target_dispatch_index`, which the walker
+    // pushes/pops on entering/exiting a `.single_source` element.
+
+    pub fn appendGlyph(self: *DrawList, lc: *const LayoutCtx, item: tp.GlyphInstance) !void {
+        try self.glyphs.append(item);
+        try self.glyph_targets.append(lc.current_target_dispatch_index);
+    }
+
+    pub fn appendQuad(self: *DrawList, lc: *const LayoutCtx, item: qp.QuadInstance) !void {
+        try self.quads.append(item);
+        try self.quad_targets.append(lc.current_target_dispatch_index);
+    }
+
+    pub fn appendTri(self: *DrawList, lc: *const LayoutCtx, vertex: tri_pipeline.Vertex) !void {
+        try self.tris.append(vertex);
+        try self.tri_targets.append(lc.current_target_dispatch_index);
+    }
+
+    pub fn appendImage(self: *DrawList, lc: *const LayoutCtx, item: ImageDraw) !void {
+        try self.images.append(item);
+        try self.image_targets.append(lc.current_target_dispatch_index);
+    }
+
+    /// Bulk-append from a worker's private DrawList during the
+    /// parallel stack_v merge (`element_layout.zig`'s
+    /// `mergePrivate`). Preserves worker-side target tags — workers
+    /// run with their own LayoutCtx so their tagging stays valid as
+    /// long as the dispatch indices are coordinated across workers.
+    pub fn appendGlyphsPreservingTargets(
+        self: *DrawList,
+        items: []const tp.GlyphInstance,
+        targets: []const u32,
+    ) !void {
+        std.debug.assert(items.len == targets.len);
+        try self.glyphs.appendSlice(items);
+        try self.glyph_targets.appendSlice(targets);
+    }
+
+    pub fn appendQuadsPreservingTargets(
+        self: *DrawList,
+        items: []const qp.QuadInstance,
+        targets: []const u32,
+    ) !void {
+        std.debug.assert(items.len == targets.len);
+        try self.quads.appendSlice(items);
+        try self.quad_targets.appendSlice(targets);
+    }
+
+    pub fn appendTrisPreservingTargets(
+        self: *DrawList,
+        vertices: []const tri_pipeline.Vertex,
+        targets: []const u32,
+    ) !void {
+        std.debug.assert(vertices.len == targets.len);
+        try self.tris.appendSlice(vertices);
+        try self.tri_targets.appendSlice(targets);
+    }
+
+    pub fn appendImagePreservingTarget(
+        self: *DrawList,
+        item: ImageDraw,
+        target: u32,
+    ) !void {
+        try self.images.append(item);
+        try self.image_targets.append(target);
+    }
+
+    /// Bulk-append from cache (`layout_cache.zig`'s `blitEntry`).
+    /// Cache stores primitive items only — no parallel target tags
+    /// (cache existed pre-routing). Re-tag every blitted item with
+    /// the walker's current dispatch index at hit time; if the
+    /// cached subtree is being blitted inside a `.single_source`
+    /// descent, the items correctly inherit the enclosing effect's
+    /// target. If outside any effect, they tag as `MAIN_TARGET`.
+    pub fn appendGlyphsTaggingWith(
+        self: *DrawList,
+        lc: *const LayoutCtx,
+        items: []const tp.GlyphInstance,
+    ) !void {
+        try self.glyphs.appendSlice(items);
+        try self.glyph_targets.ensureUnusedCapacity(items.len);
+        for (items) |_| self.glyph_targets.appendAssumeCapacity(lc.current_target_dispatch_index);
+    }
+
+    pub fn appendQuadsTaggingWith(
+        self: *DrawList,
+        lc: *const LayoutCtx,
+        items: []const qp.QuadInstance,
+    ) !void {
+        try self.quads.appendSlice(items);
+        try self.quad_targets.ensureUnusedCapacity(items.len);
+        for (items) |_| self.quad_targets.appendAssumeCapacity(lc.current_target_dispatch_index);
+    }
+
+    pub fn appendTrisTaggingWith(
+        self: *DrawList,
+        lc: *const LayoutCtx,
+        vertices: []const tri_pipeline.Vertex,
+    ) !void {
+        try self.tris.appendSlice(vertices);
+        try self.tri_targets.ensureUnusedCapacity(vertices.len);
+        for (vertices) |_| self.tri_targets.appendAssumeCapacity(lc.current_target_dispatch_index);
+    }
+
+    // ── Hot-path helpers for high-frequency tri emission (svg) ────
+
+    /// Pair-ensure capacity on `tris` + `tri_targets` so a tight
+    /// loop can call `appendTriAssumeCapacity` repeatedly without
+    /// any per-iteration allocation. Used by `:::svg` and
+    /// `:::svg-stream` which emit hundreds of triangles in one
+    /// burst.
+    pub fn ensureUnusedTriCapacity(self: *DrawList, n: usize) !void {
+        try self.tris.ensureUnusedCapacity(n);
+        try self.tri_targets.ensureUnusedCapacity(n);
+    }
+
+    pub fn appendTriAssumeCapacity(
+        self: *DrawList,
+        lc: *const LayoutCtx,
+        vertex: tri_pipeline.Vertex,
+    ) void {
+        self.tris.appendAssumeCapacity(vertex);
+        self.tri_targets.appendAssumeCapacity(lc.current_target_dispatch_index);
+    }
+
+    /// Debug-build sanity check — primitives and their parallel
+    /// target arrays must stay equal-length at every quiescent
+    /// point. Run at frame boundaries to catch any direct
+    /// `glyphs.append` / `quads.append` etc. that slipped past the
+    /// emit-helper refactor.
+    pub fn assertTargetsInSync(self: *const DrawList) void {
+        std.debug.assert(self.glyphs.items.len == self.glyph_targets.items.len);
+        std.debug.assert(self.quads.items.len == self.quad_targets.items.len);
+        std.debug.assert(self.tris.items.len == self.tri_targets.items.len);
+        std.debug.assert(self.images.items.len == self.image_targets.items.len);
     }
 };
 
