@@ -168,6 +168,17 @@ pub const TargetPool = struct {
     /// the leak count in debug builds; resets quietly otherwise so
     /// the next frame doesn't compound the bug. Returns the number
     /// of stragglers swept (zero is healthy).
+    ///
+    /// **Reset cadence symmetric with `SingleSourceDescriptorPool.resetAll()`
+    /// in `single_source_descriptor_pool.zig`.** Both are wired
+    /// into `Spark.beginFrame`'s `.reset = true` branch; both no-op
+    /// on `.reset = false`. The dirty-gate path preserves target
+    /// allocations *and* the descriptor sets that reference them,
+    /// so frame N+1's identical redraw stays valid. Asymmetry here
+    /// is a class of bug — drift in either direction (descriptor
+    /// sets reset while targets carry over, or vice versa) leaves
+    /// dangling references that validation layers won't catch
+    /// until first dispatch.
     pub fn sweepUnreleased(self: *TargetPool) usize {
         var leaked: usize = 0;
         for (self.allocations.items) |alloc| {

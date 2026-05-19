@@ -189,6 +189,13 @@ pub const Spark = struct {
     /// init time as the substrate smoke shader; B.5+ filters
     /// (`drop_shadow`, `frosted_glass`) register here too.
     single_source_pipelines: pass_mod.SingleSourcePipelineCache,
+    /// Per-frame descriptor-set pool for single-source compose
+    /// dispatches (effects-spec Phase B.4.b.2). Borrows the
+    /// descriptor set layout from `single_source_pipelines` —
+    /// teardown order in `deinit` destroys the pool before the
+    /// cache. Reset cadence symmetric with `target_pool` per
+    /// `single_source_descriptor_pool.zig`'s module comment.
+    single_source_descriptor_pool: pass_mod.SingleSourceDescriptorPool,
 
     /// Owned via pointer (JobSystem.init returns `*JobSystem`).
     compute_jobs: *jobs_mod.JobSystem,
@@ -324,6 +331,14 @@ pub const Spark = struct {
             &shaders.fullscreen_vert,
         );
         errdefer single_source_pipelines.deinit();
+        // Descriptor pool borrows the set layout from
+        // single_source_pipelines — must init after the cache.
+        var single_source_descriptor_pool = try pass_mod.SingleSourceDescriptorPool.init(
+            allocator,
+            opts.vk_ctx,
+            single_source_pipelines.descriptor_set_layout,
+        );
+        errdefer single_source_descriptor_pool.deinit();
         try registerEmbeddedPassShaders(
             &shader_resolver,
             &pattern_pipelines,
@@ -352,6 +367,7 @@ pub const Spark = struct {
             .shader_resolver = shader_resolver,
             .pattern_pipelines = pattern_pipelines,
             .single_source_pipelines = single_source_pipelines,
+            .single_source_descriptor_pool = single_source_descriptor_pool,
             .compute_jobs = compute_jobs,
             .io_jobs = io_jobs,
             .fonts = opts.fonts,
@@ -428,6 +444,12 @@ pub const Spark = struct {
         self.target_pool.deinit();
         self.shader_resolver.deinit();
         self.pattern_pipelines.deinit();
+        // Descriptor pool borrows single_source_pipelines'
+        // descriptor set layout — destroy the pool first so the
+        // borrowed handle is alive across its tear-down (Vulkan
+        // doesn't require this ordering for descriptor-pool
+        // destruction, but the conceptual hierarchy reads cleaner).
+        self.single_source_descriptor_pool.deinit();
         self.single_source_pipelines.deinit();
 
         // 6. Layout state.
@@ -535,6 +557,15 @@ pub const Spark = struct {
             // (e.g. stale pass dispatches replayed against a
             // freshly-rebuilt drawlist); the lifecycle test pins it.
             self.pass_dispatches.clearRetainingCapacity();
+            // Effects-spec B.4.b.2: target_pool sweep + descriptor
+            // pool reset run together on the reset boundary; both
+            // are skipped on `.reset = false` so the dirty-gate
+            // path preserves the (target, descriptor-set) pairings
+            // from the previous frame and the identical redraw
+            // stays valid. Cross-reference comments on both modules'
+            // reset paths pin the discipline from each side.
+            _ = self.target_pool.sweepUnreleased();
+            self.single_source_descriptor_pool.resetAll();
             try self.fonts.prewarmEffectiveSizesForZoom(info.zoom);
             self.layout_context.beginPass();
             self.drawlist_needs_transform = true;
@@ -920,6 +951,7 @@ pub const Spark = struct {
             .shader_resolver = undefined,
             .pattern_pipelines = undefined,
             .single_source_pipelines = undefined,
+            .single_source_descriptor_pool = undefined,
             .compute_jobs = undefined,
             .io_jobs = undefined,
             .fonts = undefined,
