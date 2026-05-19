@@ -11,6 +11,9 @@ test {
     _ = @import("markdown.zig");
     _ = @import("markdown_components.zig");
     _ = @import("params.zig");
+    _ = @import("pass/graph.zig");
+    _ = @import("pass/shader_resolver.zig");
+    _ = @import("pass/target_pool.zig");
     _ = @import("component.zig");
     _ = @import("components/badge.zig");
     _ = @import("components/box.zig");

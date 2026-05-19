@@ -55,6 +55,7 @@ const tri_pipeline_mod = @import("gpu/tri_pipeline.zig");
 const image_pipeline_mod = @import("gpu/image_pipeline.zig");
 const element_layout = @import("element_layout.zig");
 const document_mod = @import("document.zig");
+const pass_mod = @import("pass/root.zig");
 const io = io_channel_mod;
 
 /// Wire-format region for a pass dispatch. i32 fields (not f32) so
@@ -200,11 +201,24 @@ pub const Spark = struct {
     /// execute." Empty until effects-spec Phase A.6 lands the
     /// pass-graph compiler that populates it. Reset symmetry with
     /// `drawlist` is enforced by `beginFrame` + a lifecycle test.
-    /// When A.3 grows real pass-graph state (target pool, barrier
-    /// plan, dependency edges), promote into a `PassGraph` struct
-    /// on Spark and rename to `pass_graph.dispatches` — one cheap
-    /// rename, no protocol churn.
+    /// When the pass-graph compiler grows real co-located state
+    /// (target pool, barrier plan, dependency edges), promote into
+    /// a `PassGraph` struct on Spark and rename to
+    /// `pass_graph.dispatches` — one cheap rename, no protocol
+    /// churn. A.3 deliberately did NOT promote: the three new
+    /// effects-side fields (this list, `target_pool`,
+    /// `shader_resolver`) are loosely coupled at stub-time with no
+    /// cross-field state to justify the struct. Revisit at A.6
+    /// when the compiler ties them together.
     pass_dispatches: std.ArrayList(PassDispatch),
+    /// Transient render-target pool — Phase A.3 typed-null stub.
+    /// Sibling field per the [[feedback-spark-sibling-fields]]
+    /// pattern. Phase B fills with the real ref-counted allocator.
+    target_pool: pass_mod.TargetPool,
+    /// Shader resolver — `ShaderId` → `ShaderDispatchHandle`.
+    /// Phase A.3 empty-cache stub; Phase A.4 populates from the
+    /// glslc build step.
+    shader_resolver: pass_mod.ShaderResolver,
 
     /// Owned via pointer (JobSystem.init returns `*JobSystem`).
     compute_jobs: *jobs_mod.JobSystem,
@@ -310,9 +324,11 @@ pub const Spark = struct {
         io_channel.* = io_channel_mod.IoChannel.init(allocator, io_jobs);
         errdefer io_channel.deinit();
 
-        // ── DrawList ────────────────────────────────────────────────
+        // ── DrawList + effects-side stubs ───────────────────────────
         const drawlist = element.DrawList.init(allocator);
         const pass_dispatches = std.ArrayList(PassDispatch).init(allocator);
+        const target_pool = pass_mod.TargetPool.init(allocator);
+        const shader_resolver = pass_mod.ShaderResolver.init(allocator);
 
         return .{
             .allocator = allocator,
@@ -332,6 +348,8 @@ pub const Spark = struct {
             .io_channel = io_channel,
             .drawlist = drawlist,
             .pass_dispatches = pass_dispatches,
+            .target_pool = target_pool,
+            .shader_resolver = shader_resolver,
             .compute_jobs = compute_jobs,
             .io_jobs = io_jobs,
             .fonts = opts.fonts,
@@ -402,9 +420,11 @@ pub const Spark = struct {
             self.dotenv = null;
         }
 
-        // 5. Per-frame state.
+        // 5. Per-frame state + effects-side stubs.
         self.drawlist.deinit();
         self.pass_dispatches.deinit();
+        self.target_pool.deinit();
+        self.shader_resolver.deinit();
 
         // 6. Layout state.
         self.layout_context.deinit();
@@ -799,6 +819,8 @@ pub const Spark = struct {
             .io_channel = undefined,
             .drawlist = undefined,
             .pass_dispatches = undefined,
+            .target_pool = undefined,
+            .shader_resolver = undefined,
             .compute_jobs = undefined,
             .io_jobs = undefined,
             .fonts = undefined,
