@@ -289,7 +289,7 @@ pub const Spark = struct {
         // ── DrawList + effects-side state ───────────────────────────
         const drawlist = element.DrawList.init(allocator);
         const pass_dispatches = std.ArrayList(element.PassDispatch).init(allocator);
-        const target_pool = pass_mod.TargetPool.init(allocator);
+        const target_pool = pass_mod.TargetPool.init(allocator, opts.vk_ctx);
         var shader_resolver = pass_mod.ShaderResolver.init(allocator);
         errdefer shader_resolver.deinit();
         // Pipeline cache must init before `registerEmbeddedPassShaders`
