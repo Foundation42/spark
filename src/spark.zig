@@ -710,13 +710,34 @@ pub const Spark = struct {
         // are deferred to Phase 2 (`endFrame`); pattern arms inside
         // single_source subtrees are processed during their parent's
         // Phase 1 walk. Single_source arms drive the recursion.
-        var i: usize = 0;
+        // `subtree_dispatch_range[1]` is the EXCLUSIVE end of the
+        // subtree, but the single_source itself sits AT that index
+        // (walker captures `seq = pd.items.len` BEFORE appending
+        // the single_source, then appends it at pd[seq]). So to
+        // advance past the single_source we use `subtree[1] + 1`,
+        // not `subtree[1]` — the latter loops forever on the same
+        // entry. Same fix mirrored in phase1ProcessSingleSource's
+        // nested loop.
+        //
+        // TODO(B.6): forward iteration treats patterns inside
+        // single_source subtrees as top-level. The walker emits
+        // patterns BEFORE their single_source parent (post-order),
+        // so a forward walk encounters nested patterns and dispatches
+        // them at the main attachment AND inside the parent's
+        // offscreen pass — double-rendering. Doesn't trigger on
+        // current effect.md because `:::drop_shadow { :::box }`
+        // wraps a content element (`:::box` emits no dispatches).
+        // B.6's `:::frosted_glass { :::gradient … }` (or any
+        // shape wrapping a pass-emitting child) will surface it.
+        // Fix: backward iteration + skip-past-subtree, OR an
+        // `is_top_level` bitmap pre-computed once.
+        var i: u32 = 0;
         while (i < self.pass_dispatches.items.len) {
             switch (self.pass_dispatches.items[i]) {
                 .pattern => i += 1,
                 .single_source => |ss| {
                     try self.phase1ProcessSingleSource(cmd, i);
-                    i = ss.subtree_dispatch_range[1];
+                    i = ss.subtree_dispatch_range[1] + 1;
                 },
             }
         }
@@ -737,13 +758,16 @@ pub const Spark = struct {
         // Recurse into nested single_sources first (depth-first
         // post-order). Same skip-past-subtree shape as Phase 1's
         // top-level iteration so nested-of-nested still works.
+        // See dispatchOffscreenPasses for the fencepost note —
+        // same `+ 1` to advance past the nested single_source's own
+        // index, not just past its subtree.
         var i: u32 = S.subtree_dispatch_range[0];
         while (i < S.subtree_dispatch_range[1]) {
             switch (self.pass_dispatches.items[i]) {
                 .pattern => i += 1,
                 .single_source => |nested| {
                     try self.phase1ProcessSingleSource(cmd, i);
-                    i = nested.subtree_dispatch_range[1];
+                    i = nested.subtree_dispatch_range[1] + 1;
                 },
             }
         }
@@ -1150,7 +1174,12 @@ pub const Spark = struct {
                         const swr = ww * z;
                         const shr = wh * z;
                         try self.recordSingleSourceCompose(cmd, ss, target, sxr, syr, swr, shr, &last_compose);
-                        i = ss.subtree_dispatch_range[1]; // skip Phase-1-handled subtree
+                        // +1 advances past the single_source itself
+                        // (subtree[1] is exclusive END of subtree,
+                        // single_source sits AT that index). Without
+                        // the +1 we infinite-loop on this entry.
+                        // Same fencepost as Phase 1.
+                        i = ss.subtree_dispatch_range[1] + 1;
                     },
                 }
             }
