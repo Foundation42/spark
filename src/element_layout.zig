@@ -1069,8 +1069,11 @@ fn layoutStackVParallel(
                 // Merge pd FIRST so pd_offset matches where the
                 // private entries land in the shared pd. Then
                 // blitPrivate uses that offset to rewrite the
-                // drawlist's parallel target tags.
-                const pd_offset = try mergePrivatePassDispatches(ctx.pass_dispatches, spec.private_pd);
+                // drawlist's parallel target tags. Same
+                // child_origin flows into both so dispatch regions
+                // and drawlist primitives end up in the same
+                // (screen-space) coord system.
+                const pd_offset = try mergePrivatePassDispatches(ctx.pass_dispatches, spec.private_pd, child_origin);
                 try blitPrivate(out, spec.private_dl.?, child_origin, pd_offset);
                 if (spec.cache_key) |key| {
                     try snapshotFromPrivate(cache, key, spec.version, spec.private_dl.?, spec.box);
@@ -1085,7 +1088,7 @@ fn layoutStackVParallel(
                     y += box.h;
                     continue;
                 }
-                const pd_offset = try mergePrivatePassDispatches(ctx.pass_dispatches, spec.private_pd);
+                const pd_offset = try mergePrivatePassDispatches(ctx.pass_dispatches, spec.private_pd, child_origin);
                 try blitPrivate(out, spec.private_dl.?, child_origin, pd_offset);
                 if (spec.box.w > max_w) max_w = spec.box.w;
                 y += spec.box.h;
@@ -1274,9 +1277,12 @@ fn rebaseTargets(targets: []u32, offset: u32) void {
 
 /// Append every entry from a worker's private `pass_dispatches`
 /// array into the shared `out` pd, offsetting every internal index
-/// by the merge base so cross-references stay valid. Returns the
-/// base offset so the caller can pass it to `blitPrivate` to
-/// rewrite the matching drawlist target tags.
+/// by the merge base so cross-references stay valid, AND translating
+/// `layout_region` / `compose_region` by the worker's `origin` so
+/// the regions are in shared (screen-space) coords rather than
+/// worker-local (0,0) coords. Returns the base offset so the caller
+/// can pass it to `blitPrivate` to rewrite the matching drawlist
+/// target tags.
 ///
 /// Index rewrites per entry:
 ///   * Both arms: `sequence_index += base` (preserves hashing
@@ -1286,27 +1292,48 @@ fn rebaseTargets(targets: []u32, offset: u32) void {
 ///     (range still describes the same subtree, just at shifted
 ///     positions).
 ///
+/// Region translation per entry:
+///   * `pattern.layout_region`: offset by (origin.x, origin.y) —
+///     worker captured this at its own (0,0) origin via the walker;
+///     screen-space requires the parent's child_origin.
+///   * `single_source.compose_region`: same translation.
+///   * `single_source.target_size`: unchanged (size is invariant).
+///
+/// Symmetric with `blitPrivate`'s positional translation of
+/// drawlist primitives — same `origin` value flows into both so the
+/// per-target rendering's coord systems stay aligned (drawlist quads
+/// rendered into an offscreen target use target-local coords derived
+/// from compose_region; compose dispatches use screen-space derived
+/// from compose_region).
+///
 /// No-op when `out_opt` is null (parent ctx had no pass_dispatches —
 /// the worker didn't allocate a private_pd either, so src is null
 /// and we return 0).
 fn mergePrivatePassDispatches(
     out_opt: ?*std.ArrayList(element.PassDispatch),
     src_opt: ?*const std.ArrayList(element.PassDispatch),
+    origin: [2]f32,
 ) !u32 {
     const out = out_opt orelse return 0;
     const src = src_opt orelse return 0;
     const base: u32 = @intCast(out.items.len);
+    const ox: i32 = @intFromFloat(@round(origin[0]));
+    const oy: i32 = @intFromFloat(@round(origin[1]));
     try out.ensureUnusedCapacity(src.items.len);
     for (src.items) |d| {
         var d_local = d;
         switch (d_local) {
             .pattern => |*p| {
                 p.sequence_index += base;
+                p.layout_region.x += ox;
+                p.layout_region.y += oy;
             },
             .single_source => |*ss| {
                 ss.subtree_dispatch_range[0] += base;
                 ss.subtree_dispatch_range[1] += base;
                 ss.sequence_index += base;
+                ss.compose_region.x += ox;
+                ss.compose_region.y += oy;
             },
         }
         out.appendAssumeCapacity(d_local);
