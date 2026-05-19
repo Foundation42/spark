@@ -196,6 +196,23 @@ pub const Spark = struct {
     /// cache. Reset cadence symmetric with `target_pool` per
     /// `single_source_descriptor_pool.zig`'s module comment.
     single_source_descriptor_pool: pass_mod.SingleSourceDescriptorPool,
+    /// Targets acquired during this frame's Phase 1 (effects-spec
+    /// Phase B.4.b.3 dispatch processor). Released wholesale at
+    /// end of Phase 3 (end of `endFrame`). Sibling list so any
+    /// straggler at frame boundary is caught by
+    /// `target_pool.sweepUnreleased` on the next `beginFrame.reset
+    /// = true`.
+    acquired_targets: std.ArrayList(pass_mod.TargetHandle),
+    /// Parallel array indexed by `pass_dispatches` position;
+    /// `single_source` entries get their acquired `TargetHandle`
+    /// stored here so Phase 1's nested compose lookups and Phase 2's
+    /// top-level compose lookups can resolve dispatch_index → target
+    /// in O(1) without a hashmap. `null` for `.pattern` entries and
+    /// for indices the iteration hasn't visited yet. Sized to
+    /// `pass_dispatches.items.len` at the start of
+    /// `dispatchOffscreenPasses`; cleared at frame reset alongside
+    /// `pass_dispatches`.
+    dispatch_target_map: std.ArrayList(?pass_mod.TargetHandle),
 
     /// Owned via pointer (JobSystem.init returns `*JobSystem`).
     compute_jobs: *jobs_mod.JobSystem,
@@ -304,6 +321,8 @@ pub const Spark = struct {
         // ── DrawList + effects-side state ───────────────────────────
         const drawlist = element.DrawList.init(allocator);
         const pass_dispatches = std.ArrayList(element.PassDispatch).init(allocator);
+        const acquired_targets = std.ArrayList(pass_mod.TargetHandle).init(allocator);
+        const dispatch_target_map = std.ArrayList(?pass_mod.TargetHandle).init(allocator);
         const target_pool = pass_mod.TargetPool.init(allocator, opts.vk_ctx);
         var shader_resolver = pass_mod.ShaderResolver.init(allocator);
         errdefer shader_resolver.deinit();
@@ -363,6 +382,8 @@ pub const Spark = struct {
             .io_channel = io_channel,
             .drawlist = drawlist,
             .pass_dispatches = pass_dispatches,
+            .acquired_targets = acquired_targets,
+            .dispatch_target_map = dispatch_target_map,
             .target_pool = target_pool,
             .shader_resolver = shader_resolver,
             .pattern_pipelines = pattern_pipelines,
@@ -441,6 +462,8 @@ pub const Spark = struct {
         // 5. Per-frame state + effects-side stubs.
         self.drawlist.deinit();
         self.pass_dispatches.deinit();
+        self.acquired_targets.deinit();
+        self.dispatch_target_map.deinit();
         self.target_pool.deinit();
         self.shader_resolver.deinit();
         self.pattern_pipelines.deinit();
@@ -639,10 +662,340 @@ pub const Spark = struct {
         self.layout_cache.clear();
     }
 
+    /// Effects-spec Phase B.4.b.3 — Phase 1 of the three-phase
+    /// dispatch processor. Records every top-level single-source
+    /// effect's offscreen render pass into `cmd`, recursively
+    /// descending into nested single-source children before each
+    /// parent's pass begins.
+    ///
+    /// **Three-phase structure** (single command buffer, sequential
+    /// dynamic-rendering passes, no nesting — Vulkan forbids nested
+    /// render passes):
+    ///
+    ///   * **Phase 1 (this method)** — offscreen targets. Each
+    ///     top-level single_source's processing **includes** any
+    ///     nested children's compose dispatches inside that parent's
+    ///     render pass; the recursion absorbs nesting so Phase 2
+    ///     only ever sees top-level entries. Every offscreen target
+    ///     ends in `SHADER_READ_ONLY_OPTIMAL` ready for sampling.
+    ///   * **Phase 2 (Spark.endFrame)** — main render pass. Single
+    ///     `vkCmdBeginRendering` owned by the host; pattern arms
+    ///     render in place, top-level single_source arms compose-
+    ///     sample their pre-rendered targets via descriptor sets,
+    ///     drawlist primitives with `MAIN_TARGET` sentinel interleave.
+    ///   * **Phase 3 (end of Spark.endFrame)** — wholesale release
+    ///     of every Phase 1 acquire back to `target_pool`. v1 ships
+    ///     release-at-end-of-Phase-2; Decision #4's mid-frame
+    ///     release optimisation is deferred to Phase C+ when target
+    ///     reuse within a frame matters at bloom-mip scale.
+    ///
+    /// **Call ordering.** Host calls this BEFORE its
+    /// `vkCmdBeginRendering(swapchain)` — Phase 1 needs its own
+    /// render-pass scopes against the offscreen targets, and
+    /// Vulkan forbids nesting. Until B.5 ships a real
+    /// single_source factory, `pass_dispatches` never contains a
+    /// single_source entry in production code, so this method is
+    /// a no-op for current spark_demo frames; the synthetic
+    /// substrate test in `src/tests/single_source_dispatch.zig`
+    /// exercises the populated path.
+    pub fn dispatchOffscreenPasses(self: *Spark, cmd: vk.c.VkCommandBuffer) !void {
+        // Resize the dispatch_target_map to mirror pass_dispatches
+        // and start every entry as null. Phase 1 fills in the
+        // acquired handles at single_source positions; Phase 2 reads
+        // them at the matching indices.
+        self.dispatch_target_map.clearRetainingCapacity();
+        try self.dispatch_target_map.appendNTimes(null, self.pass_dispatches.items.len);
+
+        // Skip-past-subtree iteration. Pattern arms at the top level
+        // are deferred to Phase 2 (`endFrame`); pattern arms inside
+        // single_source subtrees are processed during their parent's
+        // Phase 1 walk. Single_source arms drive the recursion.
+        var i: usize = 0;
+        while (i < self.pass_dispatches.items.len) {
+            switch (self.pass_dispatches.items[i]) {
+                .pattern => i += 1,
+                .single_source => |ss| {
+                    try self.phase1ProcessSingleSource(cmd, i);
+                    i = ss.subtree_dispatch_range[1];
+                },
+            }
+        }
+    }
+
+    /// Recursive Phase 1 step: process nested single_source children
+    /// first (depth-first post-order), then acquire `S`'s target,
+    /// begin its offscreen render pass, render pattern + nested
+    /// composes into it, end the pass, barrier to
+    /// `SHADER_READ_ONLY_OPTIMAL`.
+    fn phase1ProcessSingleSource(
+        self: *Spark,
+        cmd: vk.c.VkCommandBuffer,
+        dispatch_index: usize,
+    ) !void {
+        const S = self.pass_dispatches.items[dispatch_index].single_source;
+
+        // Recurse into nested single_sources first (depth-first
+        // post-order). Same skip-past-subtree shape as Phase 1's
+        // top-level iteration so nested-of-nested still works.
+        var i: u32 = S.subtree_dispatch_range[0];
+        while (i < S.subtree_dispatch_range[1]) {
+            switch (self.pass_dispatches.items[i]) {
+                .pattern => i += 1,
+                .single_source => |nested| {
+                    try self.phase1ProcessSingleSource(cmd, i);
+                    i = nested.subtree_dispatch_range[1];
+                },
+            }
+        }
+
+        // Acquire S's target. Record it in dispatch_target_map at
+        // S's position (Phase 2 reads from there) and in
+        // acquired_targets (Phase 3 releases from there).
+        const target_key = pass_mod.TargetKey{
+            .width = S.target_size[0],
+            .height = S.target_size[1],
+            .format = self.color_format,
+        };
+        const target_handle = try self.target_pool.acquire(target_key);
+        try self.acquired_targets.append(target_handle);
+        self.dispatch_target_map.items[dispatch_index] = target_handle;
+
+        // Transition the freshly-acquired target from UNDEFINED to
+        // COLOR_ATTACHMENT_OPTIMAL. The target may have come back
+        // from the free list with `SHADER_READ_ONLY_OPTIMAL` from
+        // a previous frame's last use; UNDEFINED as `old_layout`
+        // is correct in both cases (Vulkan spec — old contents are
+        // discarded, which is what we want here since we'll
+        // LOAD_OP_CLEAR anyway).
+        barrierImageLayout(cmd, target_handle.image(), .{
+            .src_stage = vk.c.VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+            .dst_stage = vk.c.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .src_access = 0,
+            .dst_access = vk.c.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            .old_layout = vk.c.VK_IMAGE_LAYOUT_UNDEFINED,
+            .new_layout = vk.c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        });
+
+        // Begin S's offscreen render pass — clear to transparent
+        // black so unwritten regions don't poison the compose
+        // sample. Render area covers the full target.
+        var color_att = std.mem.zeroes(vk.c.VkRenderingAttachmentInfo);
+        color_att.sType = vk.c.VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        color_att.imageView = target_handle.view();
+        color_att.imageLayout = vk.c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        color_att.loadOp = vk.c.VK_ATTACHMENT_LOAD_OP_CLEAR;
+        color_att.storeOp = vk.c.VK_ATTACHMENT_STORE_OP_STORE;
+        color_att.clearValue = .{ .color = .{ .float32 = .{ 0, 0, 0, 0 } } };
+
+        const target_extent = vk.c.VkExtent2D{
+            .width = S.target_size[0],
+            .height = S.target_size[1],
+        };
+        var ri = std.mem.zeroes(vk.c.VkRenderingInfo);
+        ri.sType = vk.c.VK_STRUCTURE_TYPE_RENDERING_INFO;
+        ri.renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = target_extent };
+        ri.layerCount = 1;
+        ri.colorAttachmentCount = 1;
+        ri.pColorAttachments = &color_att;
+        vk.c.vkCmdBeginRendering(cmd, &ri);
+
+        // Walk subtree dispatches and record pattern + nested
+        // single_source composes target-locally. All viewports
+        // here are in target-space coords (origin at S's
+        // compose_region top-left, no zoom — target_size ==
+        // compose_region.size by construction).
+        var last_pattern: vk.c.VkPipeline = null;
+        var last_compose: vk.c.VkPipeline = null;
+        var j: u32 = S.subtree_dispatch_range[0];
+        while (j < S.subtree_dispatch_range[1]) {
+            switch (self.pass_dispatches.items[j]) {
+                .pattern => |p| {
+                    const px: f32 = @floatFromInt(p.layout_region.x - S.compose_region.x);
+                    const py: f32 = @floatFromInt(p.layout_region.y - S.compose_region.y);
+                    const pw: f32 = @floatFromInt(p.layout_region.w);
+                    const ph: f32 = @floatFromInt(p.layout_region.h);
+                    self.recordPatternStep(cmd, p, px, py, pw, ph, &last_pattern);
+                    j += 1;
+                },
+                .single_source => |nested| {
+                    const nested_target = self.dispatch_target_map.items[j] orelse unreachable;
+                    const nx: f32 = @floatFromInt(nested.compose_region.x - S.compose_region.x);
+                    const ny: f32 = @floatFromInt(nested.compose_region.y - S.compose_region.y);
+                    const nw: f32 = @floatFromInt(nested.compose_region.w);
+                    const nh: f32 = @floatFromInt(nested.compose_region.h);
+                    try self.recordSingleSourceCompose(cmd, nested, nested_target, nx, ny, nw, nh, &last_compose);
+                    j = nested.subtree_dispatch_range[1];
+                },
+            }
+        }
+
+        // TODO(B.4.b.4): drawlist routing into S's target.
+        // Walker emits drawlist primitives with target_dispatch_index
+        // == this dispatch_index for content nested inside the
+        // effect (text, quads, tris, images). At B.4.b.3 those
+        // primitives still rasterize to the main attachment in
+        // Phase 2 (effectively invisible because the effect's
+        // compose region covers them) — no factory ships a
+        // single_source until B.5, so there's no observable gap.
+        //
+        // B.4.b.4 adds `recordDrawRange(first_instance,
+        // instance_count)` variants on the rasterizer pipelines and
+        // a per-target draw loop here. Per-target contiguity holds
+        // for offscreen targets by walker construction (one
+        // contiguous run per primitive type per offscreen target;
+        // one `recordDrawRange` call covers the run). The MAIN
+        // target breaks contiguity — interleaved single_source
+        // subtrees split MAIN into multiple runs — so Phase 2 will
+        // run a `findRunsByTarget` scan on the parallel target
+        // arrays to build (first, count) ranges (~1-3 runs typical).
+
+        vk.c.vkCmdEndRendering(cmd);
+
+        // Barrier target → SHADER_READ_ONLY_OPTIMAL for Phase 2's
+        // sampling pass (and any enclosing single_source's compose
+        // in this same Phase 1 stack).
+        barrierImageLayout(cmd, target_handle.image(), .{
+            .src_stage = vk.c.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .dst_stage = vk.c.VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .src_access = vk.c.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            .dst_access = vk.c.VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            .old_layout = vk.c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .new_layout = vk.c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        });
+    }
+
+    /// Bind + draw one `.pattern` dispatch step at a caller-supplied
+    /// viewport. Phase 1 supplies target-local coords; Phase 2
+    /// supplies world-local coords. `last_bound` is the bind-on-
+    /// change cursor — null on entry forces a fresh bind, mutated
+    /// in place so successive calls only re-bind on shader change.
+    fn recordPatternStep(
+        self: *const Spark,
+        cmd: vk.c.VkCommandBuffer,
+        pattern_step: element.PatternStep,
+        vx: f32,
+        vy: f32,
+        vw: f32,
+        vh: f32,
+        last_bound: *vk.c.VkPipeline,
+    ) void {
+        const pipeline = self.pattern_pipelines.lookup(pattern_step.shader_id) orelse return;
+        if (pipeline != last_bound.*) {
+            vk.c.vkCmdBindPipeline(cmd, vk.c.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            last_bound.* = pipeline;
+        }
+        var viewport = vk.c.VkViewport{
+            .x = vx,
+            .y = vy,
+            .width = vw,
+            .height = vh,
+            .minDepth = 0,
+            .maxDepth = 1,
+        };
+        vk.c.vkCmdSetViewport(cmd, 0, 1, &viewport);
+        var scissor = vk.c.VkRect2D{
+            .offset = .{
+                .x = @intFromFloat(@round(vx)),
+                .y = @intFromFloat(@round(vy)),
+            },
+            .extent = .{
+                .width = @intFromFloat(@max(0, @round(vw))),
+                .height = @intFromFloat(@max(0, @round(vh))),
+            },
+        };
+        vk.c.vkCmdSetScissor(cmd, 0, 1, &scissor);
+        vk.c.vkCmdPushConstants(
+            cmd,
+            self.pattern_pipelines.layout,
+            vk.c.VK_SHADER_STAGE_FRAGMENT_BIT,
+            0,
+            pattern_step.uniform_len,
+            &pattern_step.uniform_bytes,
+        );
+        vk.c.vkCmdDraw(cmd, 3, 1, 0, 0);
+    }
+
+    /// Bind + draw one single-source compose dispatch — sampling
+    /// `target_handle` (which Phase 1 already populated and
+    /// barriered to `SHADER_READ_ONLY_OPTIMAL`) through the filter
+    /// pipeline keyed by `ss.filter_shader_id`. Acquires a fresh
+    /// descriptor set from the per-frame pool, writes the
+    /// (view, sampler) binding, binds + draws.
+    fn recordSingleSourceCompose(
+        self: *Spark,
+        cmd: vk.c.VkCommandBuffer,
+        ss: element.SingleSourceStep,
+        target_handle: pass_mod.TargetHandle,
+        vx: f32,
+        vy: f32,
+        vw: f32,
+        vh: f32,
+        last_bound: *vk.c.VkPipeline,
+    ) !void {
+        const pipeline = self.single_source_pipelines.lookup(ss.filter_shader_id) orelse return;
+        if (pipeline != last_bound.*) {
+            vk.c.vkCmdBindPipeline(cmd, vk.c.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            last_bound.* = pipeline;
+        }
+        const set = try self.single_source_descriptor_pool.acquire(
+            target_handle.view(),
+            self.single_source_pipelines.sampler,
+        );
+        var set_local = set; // pDescriptorSets wants a pointer
+        vk.c.vkCmdBindDescriptorSets(
+            cmd,
+            vk.c.VK_PIPELINE_BIND_POINT_GRAPHICS,
+            self.single_source_pipelines.layout,
+            0,
+            1,
+            &set_local,
+            0,
+            null,
+        );
+        var viewport = vk.c.VkViewport{
+            .x = vx,
+            .y = vy,
+            .width = vw,
+            .height = vh,
+            .minDepth = 0,
+            .maxDepth = 1,
+        };
+        vk.c.vkCmdSetViewport(cmd, 0, 1, &viewport);
+        var scissor = vk.c.VkRect2D{
+            .offset = .{
+                .x = @intFromFloat(@round(vx)),
+                .y = @intFromFloat(@round(vy)),
+            },
+            .extent = .{
+                .width = @intFromFloat(@max(0, @round(vw))),
+                .height = @intFromFloat(@max(0, @round(vh))),
+            },
+        };
+        vk.c.vkCmdSetScissor(cmd, 0, 1, &scissor);
+        vk.c.vkCmdPushConstants(
+            cmd,
+            self.single_source_pipelines.layout,
+            vk.c.VK_SHADER_STAGE_FRAGMENT_BIT,
+            0,
+            ss.filter_uniforms_len,
+            &ss.filter_uniforms,
+        );
+        vk.c.vkCmdDraw(cmd, 3, 1, 0, 0);
+    }
+
     /// Apply scroll/zoom transform, upload glyph SSBO, record
     /// tri/image/quad/text draws into the attached cmd. **Must run
     /// inside an active `vkCmdBeginRendering` scope** owned by the
     /// host (host has the swapchain image; spark just records draws).
+    ///
+    /// Effects-spec Phase B.4.b.3: pass-dispatch loop now Phase 2 of
+    /// the three-phase processor — skip-past-subtree iteration over
+    /// `pass_dispatches`, handling top-level `.pattern` arms (render
+    /// in place against the main attachment) and top-level
+    /// `.single_source` arms (compose-sample their pre-rendered
+    /// targets via descriptor sets). Subtrees were already processed
+    /// by `dispatchOffscreenPasses` (Phase 1). Phase 3 wholesale-
+    /// releases every Phase 1 acquire at the end of this method.
     pub fn endFrame(self: *Spark) !void {
         const cmd = self.attached_cmd orelse return error.NoCmdAttached;
         const extent = self.frame_info.extent;
@@ -701,98 +1054,88 @@ pub const Spark = struct {
         try self.tri_pipeline.writeMesh(dl.tris.items, dl.tri_indices.items);
         try self.text_pipeline.writeGlyphs(dl.glyphs.items);
 
-        // Pattern-pass dispatches first (Decision #12 — always-
-        // background). Same render-pass scope as the rasterizer
-        // draws below; scissor + viewport land each dispatch into
-        // its `PassRegion`. Bind-on-change for v1 — no sort by
-        // shader_id since N is small (1-3 effects/doc); sort
-        // optimisation deferred until Phase C+ chain effects
-        // (bloom mips) make per-bind cost matter.
+        // Phase 2 dispatch loop — skip-past-subtree iteration over
+        // pass_dispatches. Top-level `.pattern` arms render in place
+        // against the main attachment with world-local coords
+        // (existing Decision #12 always-background behaviour); top-
+        // level `.single_source` arms compose-sample their pre-
+        // rendered targets (populated by Phase 1's
+        // `dispatchOffscreenPasses`). Subtrees of single_source
+        // arms were processed inside Phase 1 — the iteration
+        // advances past them via `subtree_dispatch_range[1]`. Same
+        // iteration shape as Phase 1 so adding a new arm variant
+        // means changing one switch in two places, not redesigning
+        // either loop.
+        //
+        // Bind-on-change for v1 (per-arm cursors — pattern and
+        // single_source pipelines have different layouts so they
+        // can't share a cursor); no sort by shader_id since N is
+        // small (~1-3 effects/doc). Sort optimisation deferred to
+        // Phase C+ chain effects (bloom mips) make per-bind cost
+        // matter.
         if (self.pass_dispatches.items.len > 0) {
             const sx = self.frame_info.scroll_offset[0];
             const sy = self.frame_info.scroll_offset[1];
             const z = self.frame_info.zoom;
-            var last_bound: vk.c.VkPipeline = null;
-            for (self.pass_dispatches.items) |dispatch| {
-                // PassDispatch became a tagged union at B.3. The
-                // pattern arm renders inline against the main color
-                // attachment exactly as it did pre-union. The
-                // single_source arm needs the GPU compose pipeline
-                // + descriptor sets + multi-render-pass dispatch
-                // landing at B.4.b — until then, hitting it is a
-                // programmer error (a single_source factory ships
-                // but the compose path didn't).
-                const pattern_step = switch (dispatch) {
-                    .pattern => |p| p,
-                    .single_source => @panic("Phase B.4.b: single_source dispatch GPU compose not yet wired"),
-                };
-                const pipeline = self.pattern_pipelines.lookup(pattern_step.shader_id) orelse continue;
-                if (pipeline != last_bound) {
-                    vk.c.vkCmdBindPipeline(cmd, vk.c.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-                    last_bound = pipeline;
+            var last_pattern: vk.c.VkPipeline = null;
+            var last_compose: vk.c.VkPipeline = null;
+            var i: usize = 0;
+            while (i < self.pass_dispatches.items.len) {
+                switch (self.pass_dispatches.items[i]) {
+                    .pattern => |p| {
+                        // World-local viewport: (region - scroll) * zoom.
+                        // Coord-space assumption — world coords are
+                        // top-left-origin pixel space, matching
+                        // `VkRect2D`'s expectation directly. Phase C's
+                        // multi-resolution chain passes will introduce
+                        // per-pass scale; revisit when chain effects
+                        // land non-1:1 target ratios.
+                        const wx: f32 = @floatFromInt(p.layout_region.x);
+                        const wy: f32 = @floatFromInt(p.layout_region.y);
+                        const ww: f32 = @floatFromInt(p.layout_region.w);
+                        const wh: f32 = @floatFromInt(p.layout_region.h);
+                        const sxr = (wx - sx) * z;
+                        const syr = (wy - sy) * z;
+                        const swr = ww * z;
+                        const shr = wh * z;
+                        self.recordPatternStep(cmd, p, sxr, syr, swr, shr, &last_pattern);
+                        i += 1;
+                    },
+                    .single_source => |ss| {
+                        // Top-level compose. Phase 1 already
+                        // populated the target and barriered it to
+                        // SHADER_READ_ONLY_OPTIMAL; dispatch_target_map
+                        // stores the handle at this dispatch index.
+                        // Missing handle here would mean Phase 1
+                        // failed silently — unreachable in healthy
+                        // code, asserted explicitly.
+                        const target = self.dispatch_target_map.items[i] orelse unreachable;
+                        const wx: f32 = @floatFromInt(ss.compose_region.x);
+                        const wy: f32 = @floatFromInt(ss.compose_region.y);
+                        const ww: f32 = @floatFromInt(ss.compose_region.w);
+                        const wh: f32 = @floatFromInt(ss.compose_region.h);
+                        const sxr = (wx - sx) * z;
+                        const syr = (wy - sy) * z;
+                        const swr = ww * z;
+                        const shr = wh * z;
+                        try self.recordSingleSourceCompose(cmd, ss, target, sxr, syr, swr, shr, &last_compose);
+                        i = ss.subtree_dispatch_range[1]; // skip Phase-1-handled subtree
+                    },
                 }
-                // World → screen transform for the region. PassRegion
-                // is i32 world coords (walker rounds the f32 layout
-                // box at emit time); applying (region - scroll) * zoom
-                // here matches the world→screen transform applied to
-                // the rasterizer's glyph/quad/tri positions above.
-                //
-                // **Coord-space assumption.** World coords are
-                // top-left-origin pixel space, matching `VkRect2D`'s
-                // expectation directly. Phase B's offscreen-target
-                // path (rendering to a target at, say, half-res for
-                // a blur downsample) will introduce a per-pass scale
-                // — revisit this transform when `.single_source`
-                // dispatches start landing into non-1:1 targets.
-                const wx: f32 = @floatFromInt(pattern_step.layout_region.x);
-                const wy: f32 = @floatFromInt(pattern_step.layout_region.y);
-                const ww: f32 = @floatFromInt(pattern_step.layout_region.w);
-                const wh: f32 = @floatFromInt(pattern_step.layout_region.h);
-                const sxr = (wx - sx) * z;
-                const syr = (wy - sy) * z;
-                const swr = ww * z;
-                const shr = wh * z;
-
-                // Viewport-positioned (not scissor-clipped) — the
-                // fullscreen-triangle vert produces a triangle
-                // covering [-1, 1]² in clip space; the viewport
-                // maps that to the region, so `gl_FragCoord` aligns
-                // with the region and `v_uv` is [0, 1] across it
-                // exactly. Scissor matches viewport as a safety
-                // bound for partially off-screen regions.
-                var viewport = vk.c.VkViewport{
-                    .x = sxr,
-                    .y = syr,
-                    .width = swr,
-                    .height = shr,
-                    .minDepth = 0,
-                    .maxDepth = 1,
-                };
-                vk.c.vkCmdSetViewport(cmd, 0, 1, &viewport);
-                var scissor = vk.c.VkRect2D{
-                    .offset = .{
-                        .x = @intFromFloat(@round(sxr)),
-                        .y = @intFromFloat(@round(syr)),
-                    },
-                    .extent = .{
-                        .width = @intFromFloat(@max(0, @round(swr))),
-                        .height = @intFromFloat(@max(0, @round(shr))),
-                    },
-                };
-                vk.c.vkCmdSetScissor(cmd, 0, 1, &scissor);
-
-                vk.c.vkCmdPushConstants(
-                    cmd,
-                    self.pattern_pipelines.layout,
-                    vk.c.VK_SHADER_STAGE_FRAGMENT_BIT,
-                    0,
-                    pattern_step.uniform_len,
-                    &pattern_step.uniform_bytes,
-                );
-                vk.c.vkCmdDraw(cmd, 3, 1, 0, 0);
             }
         }
 
+        // TODO(B.4.b.4): rasterizer per-target plumbing.
+        // Drawlist primitives carry a per-item `target_dispatch_index`
+        // (parallel arrays from B.4.a). Today's `recordDraw(0..N)`
+        // draws every primitive into the main attachment, ignoring
+        // the routing. B.4.b.4 swaps these for per-target subrange
+        // calls: offscreen targets get one `recordDrawRange(first,
+        // count)` call per primitive type (contiguous by walker
+        // construction); the MAIN target builds (first, count) runs
+        // from the parallel target arrays at dispatch time (~1-3
+        // runs typical) since interleaved single_source subtrees
+        // break contiguity for MAIN.
         self.tri_pipeline.recordDraw(cmd, extent, @intCast(dl.tri_indices.items.len));
         if (dl.images.items.len > 0) {
             self.image_pipeline.bind(cmd, extent);
@@ -802,6 +1145,18 @@ pub const Spark = struct {
         }
         self.quad_pipeline.recordDraw(cmd, extent, @intCast(dl.quads.items.len));
         self.text_pipeline.recordDraw(cmd, extent, @intCast(dl.glyphs.items.len));
+
+        // Phase 3 — wholesale release every Phase 1 acquire back
+        // to the target pool. v1: release all at end of Phase 2
+        // (the main pass has consumed every offscreen target's
+        // compose dispatch by now, so the CPU side is done with
+        // every handle). Mid-frame release (Decision #4) deferred
+        // to Phase C+ when target reuse within a frame matters at
+        // bloom-mip scale; not a v1 cost.
+        for (self.acquired_targets.items) |handle| {
+            self.target_pool.release(handle);
+        }
+        self.acquired_targets.clearRetainingCapacity();
     }
 
     /// Drain pending I/O completions on the main thread. Host calls
@@ -952,6 +1307,8 @@ pub const Spark = struct {
             .pattern_pipelines = undefined,
             .single_source_pipelines = undefined,
             .single_source_descriptor_pool = undefined,
+            .acquired_targets = undefined,
+            .dispatch_target_map = undefined,
             .compute_jobs = undefined,
             .io_jobs = undefined,
             .fonts = undefined,
@@ -962,6 +1319,48 @@ pub const Spark = struct {
 };
 
 // ── Helpers ────────────────────────────────────────────────────────
+
+/// Image-layout barrier helper for Phase 1 offscreen target
+/// transitions. Same shape as `src/gpu/renderer.zig`'s private
+/// `transitionImage` (color aspect, single mip, single layer,
+/// queue-family-ignored) — duplicated here rather than threaded
+/// through a cross-module dependency because the transition
+/// inputs (stages, accesses, layouts) are all the divergence and
+/// the boilerplate is short. Phase B.4.b.3.
+const ImageBarrier = struct {
+    src_stage: vk.c.VkPipelineStageFlags2,
+    dst_stage: vk.c.VkPipelineStageFlags2,
+    src_access: vk.c.VkAccessFlags2,
+    dst_access: vk.c.VkAccessFlags2,
+    old_layout: vk.c.VkImageLayout,
+    new_layout: vk.c.VkImageLayout,
+};
+
+fn barrierImageLayout(cmd: vk.c.VkCommandBuffer, image: vk.c.VkImage, t: ImageBarrier) void {
+    var b = std.mem.zeroes(vk.c.VkImageMemoryBarrier2);
+    b.sType = vk.c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    b.srcStageMask = t.src_stage;
+    b.dstStageMask = t.dst_stage;
+    b.srcAccessMask = t.src_access;
+    b.dstAccessMask = t.dst_access;
+    b.oldLayout = t.old_layout;
+    b.newLayout = t.new_layout;
+    b.srcQueueFamilyIndex = vk.c.VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = vk.c.VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = .{
+        .aspectMask = vk.c.VK_IMAGE_ASPECT_COLOR_BIT,
+        .baseMipLevel = 0,
+        .levelCount = 1,
+        .baseArrayLayer = 0,
+        .layerCount = 1,
+    };
+    var dep = std.mem.zeroes(vk.c.VkDependencyInfo);
+    dep.sType = vk.c.VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.imageMemoryBarrierCount = 1;
+    dep.pImageMemoryBarriers = &b;
+    vk.c.vkCmdPipelineBarrier2(cmd, &dep);
+}
 
 /// Seed the shader resolver with every built-in pass shader at
 /// Spark init time. Effects-spec Phase A.4 + A.5 + B.4.b.1:

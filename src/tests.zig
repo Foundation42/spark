@@ -72,4 +72,5 @@ test {
     _ = @import("tests/library_lifecycle.zig");
     _ = @import("tests/two_instances.zig");
     _ = @import("tests/integration_render.zig");
+    _ = @import("tests/single_source_dispatch.zig");
 }
