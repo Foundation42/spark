@@ -880,6 +880,19 @@ const WalkSpec = struct {
     /// it at origin (0,0). Allocated lazily in phase 2 once we're
     /// committed to dispatching. c_allocator-backed for thread-safety.
     private_dl: ?*element.DrawList = null,
+    /// Private per-job `pass_dispatches` — siblings of `private_dl`,
+    /// same reason: std.ArrayList is not thread-safe and the walker's
+    /// .custom arm both reads (for dispatch_start / seq capture) and
+    /// writes (for the dispatch emission) it. Per-worker private
+    /// arrays let each worker capture indices into its own local
+    /// space; the merge phase appends them into the shared pd in
+    /// child order, offsetting every dispatch's sequence_index and
+    /// subtree_dispatch_range by the merge base, and the matching
+    /// blitPrivate offsets the drawlist's parallel target tags by
+    /// the same base. Allocated only when ctx.pass_dispatches is
+    /// non-null (no point in allocation for a pre-effects-spec
+    /// walker call that doesn't carry a pd).
+    private_pd: ?*std.ArrayList(element.PassDispatch) = null,
     /// `null` for the `walk_no_cache` variant; set when this child
     /// will be snapshotted back into the cache after walking.
     cache_key: ?layout_cache.Key = null,
@@ -964,16 +977,27 @@ fn layoutStackVParallel(
 
     // Phase 2 — allocate private DrawLists for every walk slot. These
     // are released after the merge, regardless of success/failure.
+    // private_pd allocated alongside iff the parent ctx carries a
+    // pass_dispatches (effects-spec post-B.2/B.3).
+    const want_private_pd = ctx.pass_dispatches != null;
     for (classifications) |*cls| {
         switch (cls.*) {
             .cache_hit => {},
             .walk_with_snapshot => |*s| {
                 s.private_dl = try a.create(element.DrawList);
                 s.private_dl.?.* = element.DrawList.init(std.heap.c_allocator);
+                if (want_private_pd) {
+                    s.private_pd = try a.create(std.ArrayList(element.PassDispatch));
+                    s.private_pd.?.* = std.ArrayList(element.PassDispatch).init(std.heap.c_allocator);
+                }
             },
             .walk_no_cache => |*s| {
                 s.private_dl = try a.create(element.DrawList);
                 s.private_dl.?.* = element.DrawList.init(std.heap.c_allocator);
+                if (want_private_pd) {
+                    s.private_pd = try a.create(std.ArrayList(element.PassDispatch));
+                    s.private_pd.?.* = std.ArrayList(element.PassDispatch).init(std.heap.c_allocator);
+                }
             },
         }
     }
@@ -987,6 +1011,15 @@ fn layoutStackVParallel(
             if (pdl_opt) |pdl| {
                 pdl.deinit();
                 a.destroy(pdl);
+            }
+            const ppd_opt: ?*std.ArrayList(element.PassDispatch) = switch (cls) {
+                .cache_hit => null,
+                .walk_with_snapshot => |s| s.private_pd,
+                .walk_no_cache => |s| s.private_pd,
+            };
+            if (ppd_opt) |ppd| {
+                ppd.deinit();
+                a.destroy(ppd);
             }
         }
     }
@@ -1033,7 +1066,12 @@ fn layoutStackVParallel(
                     y += box.h;
                     continue;
                 }
-                try blitPrivate(out, spec.private_dl.?, child_origin);
+                // Merge pd FIRST so pd_offset matches where the
+                // private entries land in the shared pd. Then
+                // blitPrivate uses that offset to rewrite the
+                // drawlist's parallel target tags.
+                const pd_offset = try mergePrivatePassDispatches(ctx.pass_dispatches, spec.private_pd);
+                try blitPrivate(out, spec.private_dl.?, child_origin, pd_offset);
                 if (spec.cache_key) |key| {
                     try snapshotFromPrivate(cache, key, spec.version, spec.private_dl.?, spec.box);
                 }
@@ -1047,7 +1085,8 @@ fn layoutStackVParallel(
                     y += box.h;
                     continue;
                 }
-                try blitPrivate(out, spec.private_dl.?, child_origin);
+                const pd_offset = try mergePrivatePassDispatches(ctx.pass_dispatches, spec.private_pd);
+                try blitPrivate(out, spec.private_dl.?, child_origin, pd_offset);
                 if (spec.box.w > max_w) max_w = spec.box.w;
                 y += spec.box.h;
             },
@@ -1135,6 +1174,16 @@ fn walkOneJob(job: *jobs_mod.Job) void {
             .walk_no_cache => |*s| s,
         };
         const pdl = spec_ptr.private_dl orelse continue;
+        // Route pass_dispatches through this worker's private
+        // pd. Workers can capture dispatch_start / seq inside
+        // their own local index space without racing other
+        // workers' appends; merge phase rewrites indices.
+        // current_target_dispatch_index starts at MAIN_TARGET
+        // for each worker — top-level children begin outside
+        // any effect, identical to the serial walker's start
+        // state.
+        worker_ctx.pass_dispatches = spec_ptr.private_pd;
+        worker_ctx.current_target_dispatch_index = element.MAIN_TARGET;
         const box = layoutAndRender(
             wc.children[i],
             .{ 0, 0 },
@@ -1153,20 +1202,30 @@ fn walkOneJob(job: *jobs_mod.Job) void {
 /// positions by `origin` and rebasing triangle indices. Symmetric to
 /// `layout_cache.blitEntry`, but reads from a live DrawList rather
 /// than a cached snapshot.
-fn blitPrivate(out: *element.DrawList, src: *const element.DrawList, origin: [2]f32) !void {
+///
+/// `pd_offset` rewrites the worker-side target tags to point at
+/// their post-merge positions in the shared pass_dispatches. Workers
+/// captured dispatch indices into their PRIVATE pd (worker-local);
+/// the merge slid those entries to `pd_offset` in main pd. Every
+/// non-sentinel target tag in src's parallel arrays needs the same
+/// slide. `MAIN_TARGET` is the sentinel for "main color attachment,
+/// no dispatch" and stays unmodified. Phase B.5 polish.
+fn blitPrivate(
+    out: *element.DrawList,
+    src: *const element.DrawList,
+    origin: [2]f32,
+    pd_offset: u32,
+) !void {
     const ox = origin[0];
     const oy = origin[1];
 
-    // Parallel walker merge: preserve worker-side target tags
-    // verbatim (workers run with their own LayoutCtx, their tagging
-    // is already correct relative to the shared pass_dispatches
-    // index space). Phase B.4.a.
     const g_start = out.glyphs.items.len;
     try out.appendGlyphsPreservingTargets(src.glyphs.items, src.glyph_targets.items);
     for (out.glyphs.items[g_start..]) |*g| {
         g.dst_pos[0] += ox;
         g.dst_pos[1] += oy;
     }
+    rebaseTargets(out.glyph_targets.items[g_start..], pd_offset);
 
     const q_start = out.quads.items.len;
     try out.appendQuadsPreservingTargets(src.quads.items, src.quad_targets.items);
@@ -1174,6 +1233,7 @@ fn blitPrivate(out: *element.DrawList, src: *const element.DrawList, origin: [2]
         q.dst_pos[0] += ox;
         q.dst_pos[1] += oy;
     }
+    rebaseTargets(out.quad_targets.items[q_start..], pd_offset);
 
     const tri_vertex_base: u32 = @intCast(out.tris.items.len);
     try out.appendTrisPreservingTargets(src.tris.items, src.tri_targets.items);
@@ -1181,6 +1241,7 @@ fn blitPrivate(out: *element.DrawList, src: *const element.DrawList, origin: [2]
         v.pos[0] += ox;
         v.pos[1] += oy;
     }
+    rebaseTargets(out.tri_targets.items[tri_vertex_base..], pd_offset);
     const ti_start = out.tri_indices.items.len;
     try out.tri_indices.appendSlice(src.tri_indices.items);
     for (out.tri_indices.items[ti_start..]) |*idx| idx.* += tri_vertex_base;
@@ -1189,7 +1250,8 @@ fn blitPrivate(out: *element.DrawList, src: *const element.DrawList, origin: [2]
         var im2 = im;
         im2.dst_pos[0] += ox;
         im2.dst_pos[1] += oy;
-        try out.appendImagePreservingTarget(im2, tag);
+        const rebased: u32 = if (tag == element.MAIN_TARGET) tag else tag + pd_offset;
+        try out.appendImagePreservingTarget(im2, rebased);
     }
 
     for (src.hits.items) |h| {
@@ -1198,6 +1260,58 @@ fn blitPrivate(out: *element.DrawList, src: *const element.DrawList, origin: [2]
         h2.box.y += oy;
         try out.hits.append(h2);
     }
+}
+
+/// In-place rewrite of parallel target tags by `offset`. Sentinel
+/// `MAIN_TARGET` entries are preserved verbatim — they mean "main
+/// color attachment, no offset applies."
+fn rebaseTargets(targets: []u32, offset: u32) void {
+    if (offset == 0) return;
+    for (targets) |*t| {
+        if (t.* != element.MAIN_TARGET) t.* += offset;
+    }
+}
+
+/// Append every entry from a worker's private `pass_dispatches`
+/// array into the shared `out` pd, offsetting every internal index
+/// by the merge base so cross-references stay valid. Returns the
+/// base offset so the caller can pass it to `blitPrivate` to
+/// rewrite the matching drawlist target tags.
+///
+/// Index rewrites per entry:
+///   * Both arms: `sequence_index += base` (preserves hashing
+///     determinism — sequence_index is hashed, so it must reflect
+///     position in the merged pd).
+///   * `single_source`: `subtree_dispatch_range[0..2] += base`
+///     (range still describes the same subtree, just at shifted
+///     positions).
+///
+/// No-op when `out_opt` is null (parent ctx had no pass_dispatches —
+/// the worker didn't allocate a private_pd either, so src is null
+/// and we return 0).
+fn mergePrivatePassDispatches(
+    out_opt: ?*std.ArrayList(element.PassDispatch),
+    src_opt: ?*const std.ArrayList(element.PassDispatch),
+) !u32 {
+    const out = out_opt orelse return 0;
+    const src = src_opt orelse return 0;
+    const base: u32 = @intCast(out.items.len);
+    try out.ensureUnusedCapacity(src.items.len);
+    for (src.items) |d| {
+        var d_local = d;
+        switch (d_local) {
+            .pattern => |*p| {
+                p.sequence_index += base;
+            },
+            .single_source => |*ss| {
+                ss.subtree_dispatch_range[0] += base;
+                ss.subtree_dispatch_range[1] += base;
+                ss.sequence_index += base;
+            },
+        }
+        out.appendAssumeCapacity(d_local);
+    }
+    return base;
 }
 
 /// Copy a private DrawList's contents into a new cache Entry (block-

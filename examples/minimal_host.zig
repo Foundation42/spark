@@ -66,19 +66,12 @@ const HostCtx = struct {
     last_extent: vk.c.VkExtent2D = .{ .width = 0, .height = 0 },
 };
 
-/// Renderer pre_draw_fn. Fires before `vkCmdBeginRendering` so
-/// spark's offscreen single_source effect passes (effects-spec
-/// B.4.b.3) can scope outside the main pass — Vulkan forbids
-/// nested render passes.
-fn preDrawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer) anyerror!void {
-    const h: *HostCtx = @ptrCast(@alignCast(ctx.?));
-    try h.spark.dispatchOffscreenPasses(cmd);
-}
-
-/// Renderer draw_fn. Called inside `vkCmdBeginRendering` (the
-/// renderer wraps the frame with loadOp=CLEAR). Spark records its
-/// glyphs / quads / tris into the open scope via `endFrame`.
-fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) void {
+/// Renderer pre_draw_fn. Fires before `vkCmdBeginRendering`. Does
+/// all spark work that must complete before the main render pass
+/// opens: attachCmd + beginFrame + layoutAndRender + Phase 1
+/// offscreen passes (single_source effects scope here since Vulkan
+/// forbids nested render passes).
+fn preDrawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) anyerror!void {
     const h: *HostCtx = @ptrCast(@alignCast(ctx.?));
 
     const extent_changed = extent.width != h.last_extent.width or extent.height != h.last_extent.height;
@@ -98,6 +91,15 @@ fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) 
         h.state.clearDirty();
     }
 
+    try h.spark.dispatchOffscreenPasses(cmd);
+}
+
+/// Renderer draw_fn. Called inside `vkCmdBeginRendering` — records
+/// rasterizer draws + Phase 2 composes via `endFrame`.
+fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) void {
+    const h: *HostCtx = @ptrCast(@alignCast(ctx.?));
+    _ = cmd;
+    _ = extent;
     h.spark.endFrame() catch return;
 }
 

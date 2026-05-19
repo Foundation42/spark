@@ -71,27 +71,25 @@ const HostCtx = struct {
 };
 
 /// Renderer pre_draw_fn. Fires after the swapchain transition but
-/// BEFORE `vkCmdBeginRendering` — Phase 1 offscreen render passes
-/// for effects-spec single_source dispatches scope here so they
-/// don't nest inside the main pass. Lives outside any render scope.
-fn preDrawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer) anyerror!void {
-    const h: *HostCtx = @ptrCast(@alignCast(ctx.?));
-    try h.spark.dispatchOffscreenPasses(cmd);
-}
-
-/// Renderer draw_fn. Called per frame WITH the active cmd buffer
-/// already inside `vkCmdBeginRendering` (the renderer.zig wraps with
-/// loadOp=CLEAR + the demo's clear colour). Spark records draws into
-/// the open scope via `endFrame`.
-fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) void {
+/// BEFORE `vkCmdBeginRendering`. Does ALL spark work that has to
+/// happen before the main render pass opens:
+///   * attachCmd + beginFrame (per-frame state setup)
+///   * layoutAndRender (populates pass_dispatches + drawlist)
+///   * dispatchOffscreenPasses (effects-spec Phase 1 single-source
+///     offscreen render passes — scope here so they don't nest
+///     inside the main render pass, which Vulkan forbids)
+///
+/// drawCb (draw_fn) below handles only endFrame — recording
+/// rasterizer draws + Phase 2 composes into the active main pass.
+fn preDrawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) anyerror!void {
     const h: *HostCtx = @ptrCast(@alignCast(ctx.?));
 
     // ── Scroll tween ───────────────────────────────────────────────
     const now_ms = std.time.milliTimestamp();
     if (h.last_frame_ms == 0) h.last_frame_ms = now_ms;
-    const dt_ms: f32 = @floatFromInt(@max(now_ms - h.last_frame_ms, 0));
+    const dt_ms: f32 = @floatFromInt(now_ms - h.last_frame_ms);
     h.last_frame_ms = now_ms;
-    if (@abs(h.target_scroll_y - h.scroll_y) > 0.25) {
+    if (@abs(h.target_scroll_y - h.scroll_y) > 0.5) {
         const tau_ms: f32 = 60.0;
         const clamped_dt = @min(dt_ms, 50.0);
         const alpha = 1.0 - std.math.exp(-clamped_dt / tau_ms);
@@ -102,13 +100,6 @@ fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) 
         h.state.dirty = true;
     }
 
-    // ── Event-driven re-layout ─────────────────────────────────────
-    // Skip the walk when nothing changed — block_cache hits do most
-    // of the work but the prewarm + solver-reset + transform pass
-    // are still per-frame fixed costs we'd rather not pay 13 K
-    // times a second. Triggers: viewport resize, state mutation
-    // (slider drag, scroll tween, chart append, color cycle), or
-    // first frame (last_extent={0,0} forces an initial layout).
     const extent_changed = extent.width != h.last_extent.width or extent.height != h.last_extent.height;
     const re_layout = extent_changed or h.state.dirty;
     h.last_extent = extent;
@@ -170,6 +161,18 @@ fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) 
 
         h.state.clearDirty();
     }
+
+    try h.spark.dispatchOffscreenPasses(cmd);
+}
+
+/// Renderer draw_fn. Called per frame WITH the active cmd buffer
+/// already inside `vkCmdBeginRendering` (the renderer.zig wraps with
+/// loadOp=CLEAR + the demo's clear colour). Spark records draws into
+/// the open scope via `endFrame`.
+fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) void {
+    const h: *HostCtx = @ptrCast(@alignCast(ctx.?));
+    _ = cmd; // spark has it via attachCmd from preDrawCb
+    _ = extent;
 
     h.spark.endFrame() catch |err| {
         if (!h.overflow_logged) {

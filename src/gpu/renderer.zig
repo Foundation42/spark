@@ -57,22 +57,26 @@ pub const Renderer = struct {
 
     /// Optional hook called AFTER the swapchain image's layout
     /// transition to COLOR_ATTACHMENT_OPTIMAL but BEFORE
-    /// `vkCmdBeginRendering`. Use this for offscreen render passes
-    /// the host needs to scope outside the main pass — effects-spec
-    /// Phase B.4.b.3's `Spark.dispatchOffscreenPasses` is the
-    /// canonical consumer (Vulkan forbids nested render passes, so
-    /// Phase 1's per-effect offscreen passes can't live inside the
-    /// main pass scope).
+    /// `vkCmdBeginRendering`. Use this for everything the host
+    /// needs to do BEFORE the main render pass opens — typically
+    /// CPU-side layout work (so per-frame state is populated by
+    /// the time the GPU hooks fire) AND any GPU work that scopes
+    /// outside the main pass (effects-spec Phase B.4.b.3 single-
+    /// source offscreen render passes — Vulkan forbids nested
+    /// render passes, so Phase 1's per-effect offscreen passes
+    /// must scope outside the main pass).
+    ///
+    /// Receives `extent` so the layout work knows the current
+    /// viewport (the host's layout constraints derive from it).
+    /// Without this the host would have to read extent off the
+    /// renderer's swapchain, which races resize handling.
     ///
     /// Preconditions when this fires: cmd is in recording state,
     /// no render pass is active, the swapchain image is in
-    /// COLOR_ATTACHMENT_OPTIMAL (not strictly required by this
-    /// hook's consumers since they target offscreen images, but
-    /// it's the simplest place where all three preconditions hold
-    /// cleanly). Shares the `draw_ctx` opaque pointer with
-    /// `draw_fn` — host wires both to point at the same context
-    /// (typically `*HostCtx { spark, ... }`).
-    pre_draw_fn: ?*const fn (ctx: ?*anyopaque, cmd: c.VkCommandBuffer) anyerror!void = null,
+    /// COLOR_ATTACHMENT_OPTIMAL. Shares the `draw_ctx` opaque
+    /// pointer with `draw_fn` — host wires both to point at the
+    /// same context (typically `*HostCtx { spark, ... }`).
+    pre_draw_fn: ?*const fn (ctx: ?*anyopaque, cmd: c.VkCommandBuffer, extent: c.VkExtent2D) anyerror!void = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -226,7 +230,7 @@ pub const Renderer = struct {
         //    but before vkCmdBeginRendering. See `pre_draw_fn` field
         //    docs for the precondition contract.
         if (self.pre_draw_fn) |fnp| {
-            try fnp(self.draw_ctx, cmd);
+            try fnp(self.draw_ctx, cmd, self.swapchain.extent);
         }
 
         // ── vkCmdBeginRendering: clear-color only, no draws yet ─────
