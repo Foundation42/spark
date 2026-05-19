@@ -657,7 +657,19 @@ pub const Spark = struct {
             const z = self.frame_info.zoom;
             var last_bound: vk.c.VkPipeline = null;
             for (self.pass_dispatches.items) |dispatch| {
-                const pipeline = self.pattern_pipelines.lookup(dispatch.shader_id) orelse continue;
+                // PassDispatch became a tagged union at B.3. The
+                // pattern arm renders inline against the main color
+                // attachment exactly as it did pre-union. The
+                // single_source arm needs the GPU compose pipeline
+                // + descriptor sets + multi-render-pass dispatch
+                // landing at B.4.b — until then, hitting it is a
+                // programmer error (a single_source factory ships
+                // but the compose path didn't).
+                const pattern_step = switch (dispatch) {
+                    .pattern => |p| p,
+                    .single_source => @panic("Phase B.4.b: single_source dispatch GPU compose not yet wired"),
+                };
+                const pipeline = self.pattern_pipelines.lookup(pattern_step.shader_id) orelse continue;
                 if (pipeline != last_bound) {
                     vk.c.vkCmdBindPipeline(cmd, vk.c.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
                     last_bound = pipeline;
@@ -675,10 +687,10 @@ pub const Spark = struct {
                 // a blur downsample) will introduce a per-pass scale
                 // — revisit this transform when `.single_source`
                 // dispatches start landing into non-1:1 targets.
-                const wx: f32 = @floatFromInt(dispatch.layout_region.x);
-                const wy: f32 = @floatFromInt(dispatch.layout_region.y);
-                const ww: f32 = @floatFromInt(dispatch.layout_region.w);
-                const wh: f32 = @floatFromInt(dispatch.layout_region.h);
+                const wx: f32 = @floatFromInt(pattern_step.layout_region.x);
+                const wy: f32 = @floatFromInt(pattern_step.layout_region.y);
+                const ww: f32 = @floatFromInt(pattern_step.layout_region.w);
+                const wh: f32 = @floatFromInt(pattern_step.layout_region.h);
                 const sxr = (wx - sx) * z;
                 const syr = (wy - sy) * z;
                 const swr = ww * z;
@@ -717,8 +729,8 @@ pub const Spark = struct {
                     self.pattern_pipelines.layout,
                     vk.c.VK_SHADER_STAGE_FRAGMENT_BIT,
                     0,
-                    dispatch.uniform_len,
-                    &dispatch.uniform_bytes,
+                    pattern_step.uniform_len,
+                    &pattern_step.uniform_bytes,
                 );
                 vk.c.vkCmdDraw(cmd, 3, 1, 0, 0);
             }

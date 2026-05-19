@@ -225,6 +225,16 @@ pub fn layoutAndRender(
             // construction, no recursive data structure needed.
             // For `.pattern` and `.content`, the start index is
             // unused (kept zero).
+            //
+            // TODO(B.6): nested single-source coverage. No factory
+            // ships with `.pass_shape = .single_source` until B.6
+            // (`:::drop_shadow`) and B.7 (`:::frosted_glass`), so
+            // there is no integration test exercising a nested
+            // single-source case (e.g. `:::drop_shadow { :::drop_shadow … }`)
+            // at B.4.a. The dispatch-range nesting and walker
+            // push/pop are structurally correct by construction,
+            // but the round-trip is unproven until B.6 lands a real
+            // factory and a test stacks it on itself.
             const dispatch_start: u32 = if (ctx.pass_dispatches) |pd| @intCast(pd.items.len) else 0;
 
             // **Drawlist target push (Phase B.4.a).** For
