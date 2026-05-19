@@ -1229,40 +1229,79 @@ pub const DrawList = struct {
     }
 
     /// Bulk-append from cache (`layout_cache.zig`'s `blitEntry`).
-    /// Cache stores primitive items only — no parallel target tags
-    /// (cache existed pre-routing). Re-tag every blitted item with
-    /// the walker's current dispatch index at hit time; if the
-    /// cached subtree is being blitted inside a `.single_source`
-    /// descent, the items correctly inherit the enclosing effect's
-    /// target. If outside any effect, they tag as `MAIN_TARGET`.
-    pub fn appendGlyphsTaggingWith(
+    /// Phase B.6 — cache snapshots stored the parallel routing tags
+    /// alongside primitives, locally-rebased so the snapshot's own
+    /// pass-dispatch range starts at 0 (and `MAIN_TARGET` preserved
+    /// as the sentinel). Replay-with-offset here resolves each
+    /// cached tag against the live context:
+    ///
+    ///   * `MAIN_TARGET` → `lc.current_target_dispatch_index`. The
+    ///     sentinel means "outer context's active target at render
+    ///     time," not "literally the framebuffer" — so a cached
+    ///     subtree blitted inside an enclosing `.single_source`
+    ///     descent correctly inherits the enclosing effect's
+    ///     offscreen target.
+    ///   * Any other value → `cached + pd_base`. The cached `local_pd_idx`
+    ///     was rebased to start-at-0 at snapshot; `pd_base` is the
+    ///     live `pass_dispatches.items.len` captured before the
+    ///     cache entry's own dispatches get merged in (so primitive
+    ///     targets and dispatch `sequence_index` land at matching
+    ///     positions in the live list).
+    pub fn appendGlyphsReplayingTargets(
         self: *DrawList,
         lc: *const LayoutCtx,
         items: []const tp.GlyphInstance,
+        cached_targets: []const u32,
+        pd_base: u32,
     ) !void {
+        std.debug.assert(items.len == cached_targets.len);
         try self.glyphs.appendSlice(items);
         try self.glyph_targets.ensureUnusedCapacity(items.len);
-        for (items) |_| self.glyph_targets.appendAssumeCapacity(lc.current_target_dispatch_index);
+        for (cached_targets) |t| {
+            const resolved: u32 = if (t == MAIN_TARGET)
+                lc.current_target_dispatch_index
+            else
+                t + pd_base;
+            self.glyph_targets.appendAssumeCapacity(resolved);
+        }
     }
 
-    pub fn appendQuadsTaggingWith(
+    pub fn appendQuadsReplayingTargets(
         self: *DrawList,
         lc: *const LayoutCtx,
         items: []const qp.QuadInstance,
+        cached_targets: []const u32,
+        pd_base: u32,
     ) !void {
+        std.debug.assert(items.len == cached_targets.len);
         try self.quads.appendSlice(items);
         try self.quad_targets.ensureUnusedCapacity(items.len);
-        for (items) |_| self.quad_targets.appendAssumeCapacity(lc.current_target_dispatch_index);
+        for (cached_targets) |t| {
+            const resolved: u32 = if (t == MAIN_TARGET)
+                lc.current_target_dispatch_index
+            else
+                t + pd_base;
+            self.quad_targets.appendAssumeCapacity(resolved);
+        }
     }
 
-    pub fn appendTrisTaggingWith(
+    pub fn appendTrisReplayingTargets(
         self: *DrawList,
         lc: *const LayoutCtx,
         vertices: []const tri_pipeline.Vertex,
+        cached_targets: []const u32,
+        pd_base: u32,
     ) !void {
+        std.debug.assert(vertices.len == cached_targets.len);
         try self.tris.appendSlice(vertices);
         try self.tri_targets.ensureUnusedCapacity(vertices.len);
-        for (vertices) |_| self.tri_targets.appendAssumeCapacity(lc.current_target_dispatch_index);
+        for (cached_targets) |t| {
+            const resolved: u32 = if (t == MAIN_TARGET)
+                lc.current_target_dispatch_index
+            else
+                t + pd_base;
+            self.tri_targets.appendAssumeCapacity(resolved);
+        }
     }
 
     // ── Hot-path helpers for high-frequency tri emission (svg) ────

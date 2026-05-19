@@ -219,31 +219,11 @@ fn applyAttrs(c: *Component, spec: *const components.Spec) void {
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .snapshot_uniforms = snapshotUniforms,
-    // Disable block-cache for single_source factories. The cache's
-    // `blitEntry` re-tags cached drawlist items with the OUTER
-    // `lc.current_target_dispatch_index` (because the walker's
-    // .custom arm — which pushes our dispatch index — is bypassed
-    // on cache hit). For a pattern factory with zero drawlist
-    // content (gradient/pattern/noise) that's harmless. For a
-    // single_source factory wrapping rasterizer content (us), the
-    // wrapped child's quads/glyphs get tagged with MAIN_TARGET
-    // instead of our offscreen dispatch index — content draws on
-    // the main attachment AND the compose dispatch samples an
-    // empty target. Disabling cache forces a fresh walker pass
-    // every frame; the .custom arm's push works, target tagging
-    // is correct, shadow renders.
-    //
-    // Children INSIDE our subtree (e.g. the wrapped :::box) still
-    // cache individually — their cache hits happen inside our walk
-    // where target push is active. The perf cost is just our own
-    // re-walk, not a recursive cache loss.
-    //
-    // Proper fix (deferred): store target tags in cache entries +
-    // replay with offset on blit (mirror of blitPrivate's
-    // rebaseTargets). Restores caching benefit. B.6 will surface
-    // the same shape for :::frosted_glass; if both need
-    // disable_cache, the proper fix moves up the priority list.
-    .disable_cache = true,
+    // Cacheable as of Phase B.6 — the cache layer's blitEntry now
+    // stores per-primitive routing tags alongside the cached items
+    // and replays them with offset against the live pd_base + outer
+    // walker target. See `layout_cache.zig` blitEntry / snapshotEntry
+    // and `element.zig` appendGlyphsReplayingTargets.
 };
 
 /// Copy the std140-padded `DropShadowUniforms` bytes into the

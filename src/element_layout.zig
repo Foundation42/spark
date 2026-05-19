@@ -1374,6 +1374,19 @@ fn snapshotFromPrivate(
     errdefer cache.allocator.free(images);
     const hits = try cache.allocator.dupe(element.Hit, src.hits.items);
     errdefer cache.allocator.free(hits);
+    // Phase B.6 — dup parallel routing tags. Worker walked its
+    // private DrawList from scratch (pd_start = 0, no outer
+    // single_source context), so any local-pd indices on the
+    // primitives are already 0-based and `MAIN_TARGET` is its own
+    // sentinel — neither needs further rebase here.
+    const glyph_targets = try cache.allocator.dupe(u32, src.glyph_targets.items);
+    errdefer cache.allocator.free(glyph_targets);
+    const quad_targets = try cache.allocator.dupe(u32, src.quad_targets.items);
+    errdefer cache.allocator.free(quad_targets);
+    const tri_targets = try cache.allocator.dupe(u32, src.tri_targets.items);
+    errdefer cache.allocator.free(tri_targets);
+    const image_targets = try cache.allocator.dupe(u32, src.image_targets.items);
+    errdefer cache.allocator.free(image_targets);
     const pds = if (src_pd_opt) |src_pd|
         try cache.allocator.dupe(element.PassDispatch, src_pd.items)
     else
@@ -1383,10 +1396,14 @@ fn snapshotFromPrivate(
     try cache.insert(key, .{
         .version = version,
         .glyphs = glyphs,
+        .glyph_targets = glyph_targets,
         .quads = quads,
+        .quad_targets = quad_targets,
         .tris = tris,
+        .tri_targets = tri_targets,
         .tri_indices = tri_indices,
         .images = images,
+        .image_targets = image_targets,
         .hits = hits,
         .pass_dispatches = pds,
         .box = .{

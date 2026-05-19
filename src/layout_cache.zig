@@ -115,10 +115,22 @@ pub const Entry = struct {
     version: u64,
     /// Block-local glyphs: `dst_pos` is relative to (0, 0).
     glyphs: []tp.GlyphInstance,
+    /// Routing tags parallel to `glyphs`. Block-local indices: an
+    /// entry of `MAIN_TARGET` means "outer context's active target at
+    /// blit time"; any other value is a `local_pd_idx` rebased so the
+    /// snapshot's own pass-dispatch range starts at 0. Resolved by
+    /// `blitEntry`'s replay-with-offset. See effects-spec Phase B.6.
+    glyph_targets: []u32,
     /// Block-local quads: `dst_pos` is relative to (0, 0).
     quads: []qp.QuadInstance,
+    /// Routing tags parallel to `quads`. Same semantics as `glyph_targets`.
+    quad_targets: []u32,
     /// Block-local triangle vertices: `pos` is relative to (0, 0).
     tris: []tri_pipeline.Vertex,
+    /// Routing tags parallel to `tris` (per-vertex; consumer-side
+    /// run iterators in `element.zig` already handle the vertex-level
+    /// resolution). Same semantics as `glyph_targets`.
+    tri_targets: []u32,
     /// Indices relative to the start of `tris` (already rebased to 0).
     tri_indices: []u32,
     /// Block-local image draws (descriptor pointer + relative rect).
@@ -126,6 +138,8 @@ pub const Entry = struct {
     /// and stay valid across cache hits (a re-fire bumps version and
     /// re-snapshots, but the descriptor handle is rewritten in place).
     images: []element.ImageDraw,
+    /// Routing tags parallel to `images`. Same semantics as `glyph_targets`.
+    image_targets: []u32,
     /// Block-local hits: `box.x`/`box.y` are relative to (0, 0).
     hits: []element.Hit,
     /// Block-local pass dispatches (effects-spec Phase B.5 polish).
@@ -167,10 +181,14 @@ pub const BlockCache = struct {
 
     fn freeEntry(self: *BlockCache, e: Entry) void {
         self.allocator.free(e.glyphs);
+        self.allocator.free(e.glyph_targets);
         self.allocator.free(e.quads);
+        self.allocator.free(e.quad_targets);
         self.allocator.free(e.tris);
+        self.allocator.free(e.tri_targets);
         self.allocator.free(e.tri_indices);
         self.allocator.free(e.images);
+        self.allocator.free(e.image_targets);
         self.allocator.free(e.hits);
         self.allocator.free(e.pass_dispatches);
     }
@@ -330,16 +348,22 @@ pub fn blitEntry(
     const ox = origin[0];
     const oy = origin[1];
 
-    // Phase B.4.a — cache pre-dates routing, so cached entries have
-    // no parallel target tags. Re-tag every blitted item with the
-    // walker's current dispatch index at hit time: if the cached
-    // subtree is being blitted inside a `.single_source` descent,
-    // the items correctly inherit the enclosing effect's target;
-    // otherwise they tag as `MAIN_TARGET`.
+    // Phase B.6 — replay-with-offset for primitive routing tags.
+    // Symmetric mirror of the `pass_dispatches` rebase below:
+    // snapshot stored locally-rebased indices (own range starting
+    // at 0; `MAIN_TARGET` preserved as the sentinel); blit
+    // resolves them against the live pass-dispatch base + the
+    // outer walker's active target.
+    //
+    // `pd_base` snapshotted up front: we use the same value for
+    // both the primitive replay (here) and the pass_dispatches
+    // merge below, so cached `local_pd_idx` and cached `sequence_index`
+    // land at matching positions in the live list.
+    const pd_base: u32 = if (lc.pass_dispatches) |out_pd| @intCast(out_pd.items.len) else 0;
 
     // Glyphs — translate dst_pos.
     const g_start = out.glyphs.items.len;
-    try out.appendGlyphsTaggingWith(lc, entry.glyphs);
+    try out.appendGlyphsReplayingTargets(lc, entry.glyphs, entry.glyph_targets, pd_base);
     for (out.glyphs.items[g_start..]) |*g| {
         g.dst_pos[0] += ox;
         g.dst_pos[1] += oy;
@@ -347,7 +371,7 @@ pub fn blitEntry(
 
     // Quads — translate dst_pos.
     const q_start = out.quads.items.len;
-    try out.appendQuadsTaggingWith(lc, entry.quads);
+    try out.appendQuadsReplayingTargets(lc, entry.quads, entry.quad_targets, pd_base);
     for (out.quads.items[q_start..]) |*q| {
         q.dst_pos[0] += ox;
         q.dst_pos[1] += oy;
@@ -355,7 +379,7 @@ pub fn blitEntry(
 
     // Triangles — translate vertex positions, rebase indices.
     const tri_vertex_base: u32 = @intCast(out.tris.items.len);
-    try out.appendTrisTaggingWith(lc, entry.tris);
+    try out.appendTrisReplayingTargets(lc, entry.tris, entry.tri_targets, pd_base);
     for (out.tris.items[tri_vertex_base..]) |*v| {
         v.pos[0] += ox;
         v.pos[1] += oy;
@@ -365,12 +389,25 @@ pub fn blitEntry(
     for (out.tri_indices.items[ti_start..]) |*i| i.* += tri_vertex_base;
 
     // Images — translate dst_pos. Descriptor handle is stable across
-    // hits (owned by the source component).
-    for (entry.images) |im| {
+    // hits (owned by the source component). Replay cached targets
+    // per-item (parallel to glyph/quad/tri above) using the
+    // singular `appendImagePreservingTarget` API.
+    std.debug.assert(entry.images.len == entry.image_targets.len);
+    for (entry.images, entry.image_targets) |im, cached_target| {
         var im2 = im;
         im2.dst_pos[0] += ox;
         im2.dst_pos[1] += oy;
-        try out.appendImage(lc, im2);
+        // MAIN_TARGET sentinel resolution: "whatever the active
+        // outer target is at render time," not "literally the
+        // framebuffer." This is what makes the cache compose under
+        // nesting — a cached subtree blitted inside an enclosing
+        // single_source effect correctly routes its outer-tagged
+        // primitives to that effect's offscreen target.
+        const resolved: u32 = if (cached_target == element.MAIN_TARGET)
+            lc.current_target_dispatch_index
+        else
+            cached_target + pd_base;
+        try out.appendImagePreservingTarget(im2, resolved);
     }
 
     // Hits — translate box origin. Pointer fields (vtable/ctx/state)
@@ -389,7 +426,9 @@ pub fn blitEntry(
     // pd through `lc` (pre-effects-spec call sites).
     if (lc.pass_dispatches) |out_pd| {
         if (entry.pass_dispatches.len > 0) {
-            const base: u32 = @intCast(out_pd.items.len);
+            // Reuses `pd_base` captured at function entry so cached
+            // primitive `local_pd_idx` targets above and cached
+            // `sequence_index` here land at matching positions.
             const ox_i32: i32 = @intFromFloat(@round(ox));
             const oy_i32: i32 = @intFromFloat(@round(oy));
             try out_pd.ensureUnusedCapacity(entry.pass_dispatches.len);
@@ -397,14 +436,14 @@ pub fn blitEntry(
                 var d_local = d;
                 switch (d_local) {
                     .pattern => |*p| {
-                        p.sequence_index += base;
+                        p.sequence_index += pd_base;
                         p.layout_region.x += ox_i32;
                         p.layout_region.y += oy_i32;
                     },
                     .single_source => |*ss| {
-                        ss.subtree_dispatch_range[0] += base;
-                        ss.subtree_dispatch_range[1] += base;
-                        ss.sequence_index += base;
+                        ss.subtree_dispatch_range[0] += pd_base;
+                        ss.subtree_dispatch_range[1] += pd_base;
+                        ss.sequence_index += pd_base;
                         ss.compose_region.x += ox_i32;
                         ss.compose_region.y += oy_i32;
                     },
@@ -458,6 +497,17 @@ pub fn snapshotEntry(
         g.dst_pos[1] -= oy;
     }
 
+    // Phase B.6 — snapshot the parallel routing tags alongside the
+    // primitives, rebasing local pass-dispatch indices against
+    // `pd_start` so the cache entry is self-contained. `MAIN_TARGET`
+    // is preserved verbatim; it resolves to the outer walker's
+    // active target at blit time.
+    const glyph_targets = try cache.allocator.dupe(u32, out.glyph_targets.items[g_start..]);
+    errdefer cache.allocator.free(glyph_targets);
+    for (glyph_targets) |*t| {
+        if (t.* != element.MAIN_TARGET) t.* -= pd_start;
+    }
+
     const quads = try cache.allocator.dupe(qp.QuadInstance, out.quads.items[q_start..]);
     errdefer cache.allocator.free(quads);
     for (quads) |*q| {
@@ -465,11 +515,23 @@ pub fn snapshotEntry(
         q.dst_pos[1] -= oy;
     }
 
+    const quad_targets = try cache.allocator.dupe(u32, out.quad_targets.items[q_start..]);
+    errdefer cache.allocator.free(quad_targets);
+    for (quad_targets) |*t| {
+        if (t.* != element.MAIN_TARGET) t.* -= pd_start;
+    }
+
     const tris = try cache.allocator.dupe(tri_pipeline.Vertex, out.tris.items[t_start..]);
     errdefer cache.allocator.free(tris);
     for (tris) |*v| {
         v.pos[0] -= ox;
         v.pos[1] -= oy;
+    }
+
+    const tri_targets = try cache.allocator.dupe(u32, out.tri_targets.items[t_start..]);
+    errdefer cache.allocator.free(tri_targets);
+    for (tri_targets) |*t| {
+        if (t.* != element.MAIN_TARGET) t.* -= pd_start;
     }
 
     const tri_indices = try cache.allocator.dupe(u32, out.tri_indices.items[ti_start..]);
@@ -481,6 +543,12 @@ pub fn snapshotEntry(
     for (images) |*im| {
         im.dst_pos[0] -= ox;
         im.dst_pos[1] -= oy;
+    }
+
+    const image_targets = try cache.allocator.dupe(u32, out.image_targets.items[i_start..]);
+    errdefer cache.allocator.free(image_targets);
+    for (image_targets) |*t| {
+        if (t.* != element.MAIN_TARGET) t.* -= pd_start;
     }
 
     const hits = try cache.allocator.dupe(element.Hit, out.hits.items[h_start..]);
@@ -517,10 +585,14 @@ pub fn snapshotEntry(
     try cache.insert(key, .{
         .version = version,
         .glyphs = glyphs,
+        .glyph_targets = glyph_targets,
         .quads = quads,
+        .quad_targets = quad_targets,
         .tris = tris,
+        .tri_targets = tri_targets,
         .tri_indices = tri_indices,
         .images = images,
+        .image_targets = image_targets,
         .hits = hits,
         .pass_dispatches = pds,
         .box = .{
@@ -550,20 +622,28 @@ test "BlockCache: insert/lookup roundtrip" {
     };
 
     const glyphs = try testing.allocator.alloc(tp.GlyphInstance, 0);
+    const glyph_targets = try testing.allocator.alloc(u32, 0);
     const quads = try testing.allocator.alloc(qp.QuadInstance, 0);
+    const quad_targets = try testing.allocator.alloc(u32, 0);
     const tris = try testing.allocator.alloc(tri_pipeline.Vertex, 0);
+    const tri_targets = try testing.allocator.alloc(u32, 0);
     const tri_indices = try testing.allocator.alloc(u32, 0);
     const images = try testing.allocator.alloc(element.ImageDraw, 0);
+    const image_targets = try testing.allocator.alloc(u32, 0);
     const hits = try testing.allocator.alloc(element.Hit, 0);
     const pass_dispatches = try testing.allocator.alloc(element.PassDispatch, 0);
 
     try cache.insert(key, .{
         .version = 1,
         .glyphs = glyphs,
+        .glyph_targets = glyph_targets,
         .quads = quads,
+        .quad_targets = quad_targets,
         .tris = tris,
+        .tri_targets = tri_targets,
         .tri_indices = tri_indices,
         .images = images,
+        .image_targets = image_targets,
         .hits = hits,
         .pass_dispatches = pass_dispatches,
         .box = .{ .x = 0, .y = 0, .w = 100, .h = 20, .baseline = 0 },
@@ -596,10 +676,14 @@ test "BlockCache: insert replaces existing entry" {
     try cache.insert(key, .{
         .version = 0,
         .glyphs = a_glyphs,
+        .glyph_targets = try testing.allocator.alloc(u32, 1),
         .quads = try testing.allocator.alloc(qp.QuadInstance, 0),
+        .quad_targets = try testing.allocator.alloc(u32, 0),
         .tris = try testing.allocator.alloc(tri_pipeline.Vertex, 0),
+        .tri_targets = try testing.allocator.alloc(u32, 0),
         .tri_indices = try testing.allocator.alloc(u32, 0),
         .images = try testing.allocator.alloc(element.ImageDraw, 0),
+        .image_targets = try testing.allocator.alloc(u32, 0),
         .hits = try testing.allocator.alloc(element.Hit, 0),
         .pass_dispatches = try testing.allocator.alloc(element.PassDispatch, 0),
         .box = .{ .x = 0, .y = 0, .w = 1, .h = 1, .baseline = 0 },
@@ -609,10 +693,14 @@ test "BlockCache: insert replaces existing entry" {
     try cache.insert(key, .{
         .version = 0,
         .glyphs = b_glyphs,
+        .glyph_targets = try testing.allocator.alloc(u32, 2),
         .quads = try testing.allocator.alloc(qp.QuadInstance, 0),
+        .quad_targets = try testing.allocator.alloc(u32, 0),
         .tris = try testing.allocator.alloc(tri_pipeline.Vertex, 0),
+        .tri_targets = try testing.allocator.alloc(u32, 0),
         .tri_indices = try testing.allocator.alloc(u32, 0),
         .images = try testing.allocator.alloc(element.ImageDraw, 0),
+        .image_targets = try testing.allocator.alloc(u32, 0),
         .hits = try testing.allocator.alloc(element.Hit, 0),
         .pass_dispatches = try testing.allocator.alloc(element.PassDispatch, 0),
         .box = .{ .x = 0, .y = 0, .w = 2, .h = 2, .baseline = 0 },
@@ -638,10 +726,14 @@ test "BlockCache: clear frees all entries" {
         try cache.insert(key, .{
             .version = 0,
             .glyphs = try testing.allocator.alloc(tp.GlyphInstance, 3),
+            .glyph_targets = try testing.allocator.alloc(u32, 3),
             .quads = try testing.allocator.alloc(qp.QuadInstance, 1),
+            .quad_targets = try testing.allocator.alloc(u32, 1),
             .tris = try testing.allocator.alloc(tri_pipeline.Vertex, 0),
+            .tri_targets = try testing.allocator.alloc(u32, 0),
             .tri_indices = try testing.allocator.alloc(u32, 0),
             .images = try testing.allocator.alloc(element.ImageDraw, 0),
+            .image_targets = try testing.allocator.alloc(u32, 0),
             .hits = try testing.allocator.alloc(element.Hit, 0),
             .pass_dispatches = try testing.allocator.alloc(element.PassDispatch, 0),
             .box = .{ .x = 0, .y = 0, .w = 10, .h = 5, .baseline = 0 },

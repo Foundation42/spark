@@ -279,6 +279,14 @@ test "PassDispatch fingerprint: :::gradient produces one deterministic dispatch"
 ///   v1 (A.6.a) — single PassDispatch struct, no routing.
 ///   v2 (B.3)   — tagged-union PassDispatch (pattern + single_source).
 ///   v3 (B.4.a) — adds parallel `*_targets` arrays per primitive.
+///
+/// B.6 note: cache-layer changes that added `*_targets` to `Entry`
+/// don't touch the wire format itself — the hasher reads the live
+/// DrawList + pass_dispatches, not cache internals. The existing
+/// gradient doc's path doesn't exercise `blitEntry` (one fresh Spark
+/// per iteration, no second walk), so the baseline is invariant.
+/// The new nested test below is what exercises the cache replay
+/// path and earns its own assertion.
 const EXPECTED_GRADIENT_HASH_V3: u64 = 0xE1E0_6B9A_CD1A_814C;
 
 test "PassDispatch wire-format v3: stored baseline hash" {
@@ -317,4 +325,111 @@ test "PassDispatch wire-format v3: stored baseline hash" {
 
     const actual = hashFrame(&sp);
     try testing.expectEqual(EXPECTED_GRADIENT_HASH_V3, actual);
+}
+
+// Phase B.6 — cache-layer replay-with-offset.
+//
+// Two sequential walks in ONE Spark of a doc whose cacheable subtree
+// contains a `.single_source` effect (`:::drop_shadow`). The first
+// walk snapshots `drop_shadow`'s entry (including the wrapped
+// `:::box`'s quad tagged with the drop_shadow's local pd index 0).
+// The second walk hits the cache and replays through `blitEntry`,
+// which is the codepath this phase fixed.
+//
+// Without the fix, `blitEntry` re-tagged every blitted primitive
+// with the outer walker's `current_target_dispatch_index` (MAIN_TARGET
+// at top level) — the wrapped box's quad drew on the main attachment
+// AND the drop_shadow compose dispatch sampled an empty offscreen
+// target. The `disable_cache = true` workaround on the drop_shadow
+// vtable was the band-aid; this test ratifies removing it.
+//
+// Two load-bearing assertions:
+//   1. Hash equality across walks — full determinism survives the
+//      snapshot → blit round-trip.
+//   2. At least one cached quad's target tag, after replay, equals
+//      the live `single_source` dispatch's `sequence_index` — proves
+//      the wrapped box routed to drop_shadow's offscreen target on
+//      the cache-hit walk, not MAIN_TARGET. This is the literal bug
+//      pre-B.6 — without the fix the quad's target would be
+//      MAIN_TARGET and the count would be 0.
+
+const cached_effect_doc =
+    \\Some text above.
+    \\
+    \\:::drop_shadow {blur=8 offset_y=4}
+    \\:::box {color=teal width=160 height=80 radius=8}
+    \\:::
+    \\:::
+    \\
+    \\Some text below.
+    \\
+;
+
+test "cache replay: cached drop_shadow subtree preserves target routing" {
+    const allocator = testing.allocator;
+
+    var fx = try fixture.Fixture.init(allocator);
+    defer fx.deinit();
+
+    const fonts = try fixture.makeFonts(allocator, fx.ft);
+    const theme = fixture.makeTheme(fonts);
+    var state = spark.State.init(allocator);
+    defer state.deinit();
+
+    var sp = try spark.Spark.init(allocator, .{
+        .vk_ctx = &fx.ctx,
+        .color_format = fx.swapchain.format,
+        .theme = &theme,
+        .fonts = fonts.registry,
+        .host_state = &state,
+    });
+    defer {
+        sp.deinit();
+        allocator.destroy(fonts.registry);
+    }
+    sp.attachToRegistry();
+    try spark.installCoreComponents(&sp);
+
+    var doc = try sp.loadDocument(cached_effect_doc, .{ .shared_state = &state });
+    defer doc.deinit();
+
+    var walk_hashes: [2]u64 = undefined;
+    for (&walk_hashes) |*h| {
+        try sp.beginFrame(
+            .{ .extent = .{ .width = 800, .height = 600 } },
+            .{ .reset = true },
+        );
+        _ = try sp.layoutAndRender(&doc, .{ 40, 40 }, .{ .max_w = 720 });
+        h.* = hashFrame(&sp);
+    }
+
+    // (1) Determinism across the snapshot → blit round-trip.
+    try testing.expectEqual(walk_hashes[0], walk_hashes[1]);
+
+    // Confirm the cache was actually exercised on walk 2 (otherwise
+    // this test silently degrades to two cache-miss walks and the
+    // replay path is never hit).
+    try testing.expect(sp.layout_cache.hits > 0);
+
+    // (2) Find the single_source dispatch (drop_shadow) and assert
+    // at least one quad routes to its offscreen target. Pre-B.6,
+    // blitEntry would have re-tagged every cached quad to MAIN_TARGET
+    // and this count would be 0.
+    var ss_seq: ?u32 = null;
+    for (sp.pass_dispatches.items) |d| {
+        switch (d) {
+            .single_source => |ss| {
+                ss_seq = ss.sequence_index;
+                break;
+            },
+            else => {},
+        }
+    }
+    const seq = ss_seq orelse return error.NoSingleSourceDispatchEmitted;
+
+    var routed_quad_count: u32 = 0;
+    for (sp.drawlist.quad_targets.items) |t| {
+        if (t == seq) routed_quad_count += 1;
+    }
+    try testing.expect(routed_quad_count > 0);
 }
