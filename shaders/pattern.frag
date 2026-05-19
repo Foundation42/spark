@@ -9,10 +9,10 @@
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 out_color;
 
-layout(set = 0, binding = 0, std140) uniform Params {
+// Push-constant block — see gradient.frag for the policy comment.
+layout(push_constant) uniform Params {
     uint pattern_type;  // 0=checker, 1=stripes, 2=grid, 3=dots
     uint seed;          // perturbs the cell count
-    // std140 pads the trailing scalars; mirrored on the Zig side.
 } u;
 
 void main() {

@@ -9,11 +9,11 @@
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 out_color;
 
-layout(set = 0, binding = 0, std140) uniform Params {
+// Push-constant block — see gradient.frag for the policy comment.
+layout(push_constant) uniform Params {
     uint seed;
     uint octaves;
     float scale;
-    // std140 padding to next vec4; mirrored on Zig side.
 } u;
 
 // 2D hash → [0, 1) via Inigo Quilez's iqint-style scramble. Cheap,

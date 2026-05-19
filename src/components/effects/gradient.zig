@@ -157,9 +157,19 @@ const vtable: element.ElementVTable = .{
 /// hands this function a slice of `PassDispatch.uniform_bytes`
 /// (capped at `MAX_PASS_UNIFORM_BYTES = 256`); 48 bytes for
 /// gradient.
+///
+/// **Zero-pads the unused tail.** A.6.b's `vkCmdPushConstants`
+/// only pushes the first `uniform_len` bytes, so the trailing
+/// (256 - 48) bytes of the inline buffer are "undefined but
+/// unread" on the GPU side. Most drivers are fine with that, but
+/// validation layers occasionally warn about partial-range pushes.
+/// Cheap defense: `@memset(0)` first, `@memcpy` over. Deterministic,
+/// zero validation noise, same hash output regardless of what
+/// random bytes were in the slot from a prior frame.
 fn snapshotUniforms(ctx: *anyopaque, out: []u8) usize {
     const c: *const Component = @ptrCast(@alignCast(ctx));
     const bytes = std.mem.asBytes(&c.uniforms);
+    @memset(out, 0);
     @memcpy(out[0..bytes.len], bytes);
     return bytes.len;
 }

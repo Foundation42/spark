@@ -174,6 +174,13 @@ pub const Spark = struct {
     /// Phase A.3 empty-cache stub; Phase A.4 populates from the
     /// glslc build step.
     shader_resolver: pass_mod.ShaderResolver,
+    /// Pattern-pass pipeline cache (effects-spec Phase A.6.b).
+    /// Per-Spark per the [[feedback-spark-sibling-fields]] pattern —
+    /// `two_instances.zig` invariant. Eagerly populated from
+    /// `registerEmbeddedPassShaders` after each shader registers;
+    /// dispatch-time lookup is constant-time. Holds one shared
+    /// `VkPipelineLayout` and one `VkPipeline` per pattern shader.
+    pattern_pipelines: pass_mod.PatternPipelineCache,
 
     /// Owned via pointer (JobSystem.init returns `*JobSystem`).
     compute_jobs: *jobs_mod.JobSystem,
@@ -285,7 +292,19 @@ pub const Spark = struct {
         const target_pool = pass_mod.TargetPool.init(allocator);
         var shader_resolver = pass_mod.ShaderResolver.init(allocator);
         errdefer shader_resolver.deinit();
-        try registerEmbeddedPassShaders(&shader_resolver);
+        // Pipeline cache must init before `registerEmbeddedPassShaders`
+        // so the per-shader `compile()` calls during seeding land into
+        // a live cache. `fullscreen.vert` is shared by every pattern
+        // pipeline; the cache holds the cached vert module + layout.
+        const shaders = @import("shaders");
+        var pattern_pipelines = try pass_mod.PatternPipelineCache.init(
+            allocator,
+            opts.vk_ctx,
+            opts.color_format,
+            &shaders.fullscreen_vert,
+        );
+        errdefer pattern_pipelines.deinit();
+        try registerEmbeddedPassShaders(&shader_resolver, &pattern_pipelines);
 
         return .{
             .allocator = allocator,
@@ -307,6 +326,7 @@ pub const Spark = struct {
             .pass_dispatches = pass_dispatches,
             .target_pool = target_pool,
             .shader_resolver = shader_resolver,
+            .pattern_pipelines = pattern_pipelines,
             .compute_jobs = compute_jobs,
             .io_jobs = io_jobs,
             .fonts = opts.fonts,
@@ -382,6 +402,7 @@ pub const Spark = struct {
         self.pass_dispatches.deinit();
         self.target_pool.deinit();
         self.shader_resolver.deinit();
+        self.pattern_pipelines.deinit();
 
         // 6. Layout state.
         self.layout_context.deinit();
@@ -623,6 +644,86 @@ pub const Spark = struct {
         try self.tri_pipeline.writeMesh(dl.tris.items, dl.tri_indices.items);
         try self.text_pipeline.writeGlyphs(dl.glyphs.items);
 
+        // Pattern-pass dispatches first (Decision #12 — always-
+        // background). Same render-pass scope as the rasterizer
+        // draws below; scissor + viewport land each dispatch into
+        // its `PassRegion`. Bind-on-change for v1 — no sort by
+        // shader_id since N is small (1-3 effects/doc); sort
+        // optimisation deferred until Phase C+ chain effects
+        // (bloom mips) make per-bind cost matter.
+        if (self.pass_dispatches.items.len > 0) {
+            const sx = self.frame_info.scroll_offset[0];
+            const sy = self.frame_info.scroll_offset[1];
+            const z = self.frame_info.zoom;
+            var last_bound: vk.c.VkPipeline = null;
+            for (self.pass_dispatches.items) |dispatch| {
+                const pipeline = self.pattern_pipelines.lookup(dispatch.shader_id) orelse continue;
+                if (pipeline != last_bound) {
+                    vk.c.vkCmdBindPipeline(cmd, vk.c.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+                    last_bound = pipeline;
+                }
+                // World → screen transform for the region. PassRegion
+                // is i32 world coords (walker rounds the f32 layout
+                // box at emit time); applying (region - scroll) * zoom
+                // here matches the world→screen transform applied to
+                // the rasterizer's glyph/quad/tri positions above.
+                //
+                // **Coord-space assumption.** World coords are
+                // top-left-origin pixel space, matching `VkRect2D`'s
+                // expectation directly. Phase B's offscreen-target
+                // path (rendering to a target at, say, half-res for
+                // a blur downsample) will introduce a per-pass scale
+                // — revisit this transform when `.single_source`
+                // dispatches start landing into non-1:1 targets.
+                const wx: f32 = @floatFromInt(dispatch.layout_region.x);
+                const wy: f32 = @floatFromInt(dispatch.layout_region.y);
+                const ww: f32 = @floatFromInt(dispatch.layout_region.w);
+                const wh: f32 = @floatFromInt(dispatch.layout_region.h);
+                const sxr = (wx - sx) * z;
+                const syr = (wy - sy) * z;
+                const swr = ww * z;
+                const shr = wh * z;
+
+                // Viewport-positioned (not scissor-clipped) — the
+                // fullscreen-triangle vert produces a triangle
+                // covering [-1, 1]² in clip space; the viewport
+                // maps that to the region, so `gl_FragCoord` aligns
+                // with the region and `v_uv` is [0, 1] across it
+                // exactly. Scissor matches viewport as a safety
+                // bound for partially off-screen regions.
+                var viewport = vk.c.VkViewport{
+                    .x = sxr,
+                    .y = syr,
+                    .width = swr,
+                    .height = shr,
+                    .minDepth = 0,
+                    .maxDepth = 1,
+                };
+                vk.c.vkCmdSetViewport(cmd, 0, 1, &viewport);
+                var scissor = vk.c.VkRect2D{
+                    .offset = .{
+                        .x = @intFromFloat(@round(sxr)),
+                        .y = @intFromFloat(@round(syr)),
+                    },
+                    .extent = .{
+                        .width = @intFromFloat(@max(0, @round(swr))),
+                        .height = @intFromFloat(@max(0, @round(shr))),
+                    },
+                };
+                vk.c.vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+                vk.c.vkCmdPushConstants(
+                    cmd,
+                    self.pattern_pipelines.layout,
+                    vk.c.VK_SHADER_STAGE_FRAGMENT_BIT,
+                    0,
+                    dispatch.uniform_len,
+                    &dispatch.uniform_bytes,
+                );
+                vk.c.vkCmdDraw(cmd, 3, 1, 0, 0);
+            }
+        }
+
         self.tri_pipeline.recordDraw(cmd, extent, @intCast(dl.tri_indices.items.len));
         if (dl.images.items.len > 0) {
             self.image_pipeline.bind(cmd, extent);
@@ -779,6 +880,7 @@ pub const Spark = struct {
             .pass_dispatches = undefined,
             .target_pool = undefined,
             .shader_resolver = undefined,
+            .pattern_pipelines = undefined,
             .compute_jobs = undefined,
             .io_jobs = undefined,
             .fonts = undefined,
@@ -813,12 +915,34 @@ pub const Spark = struct {
 /// free needed. The resolver holds the borrowed pointers and never
 /// owns them. Future asset-cache-loaded shaders (per the resolver's
 /// provenance-ladder note) carry their own lifetime via the cache.
-fn registerEmbeddedPassShaders(resolver: *pass_mod.ShaderResolver) !void {
+///
+/// **Pipeline construction is eager** (Phase A.6.b watch-point #3):
+/// for each `.frag` shader registered with the resolver, we also
+/// call `pattern_pipelines.compile()` so the `VkPipeline` is ready
+/// before any `Spark.endFrame` dispatches against it. Eager is
+/// cheap and simple for v1 — every shader produces one pipeline at
+/// init time. Lazy construction becomes valuable when Phase C bloom
+/// targets HDR mips at different formats and the pipeline-per-(id,
+/// format) space gets large; v1 doesn't need it.
+fn registerEmbeddedPassShaders(
+    resolver: *pass_mod.ShaderResolver,
+    pipelines: *pass_mod.PatternPipelineCache,
+) !void {
     const shaders = @import("shaders");
+    // Vertex shader is registered in the resolver for symmetry /
+    // future lookup paths, but doesn't get its own pattern pipeline
+    // (it's the shared vert paired with each frag — built into the
+    // cache directly at init time via `fullscreen_vert_module`).
     try resolver.register("fullscreen.vert", &shaders.fullscreen_vert);
+
     try resolver.register("gradient.frag", &shaders.gradient_frag);
+    try pipelines.compile(pass_mod.shaderIdFromName("gradient.frag"), &shaders.gradient_frag);
+
     try resolver.register("pattern.frag", &shaders.pattern_frag);
+    try pipelines.compile(pass_mod.shaderIdFromName("pattern.frag"), &shaders.pattern_frag);
+
     try resolver.register("noise.frag", &shaders.noise_frag);
+    try pipelines.compile(pass_mod.shaderIdFromName("noise.frag"), &shaders.noise_frag);
 }
 
 fn dispatchHit(hit: element.Hit, event: element.InputEvent, default_state: *state_mod.State) !void {

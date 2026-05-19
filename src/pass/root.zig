@@ -17,6 +17,7 @@
 const graph = @import("graph.zig");
 const shader_resolver = @import("shader_resolver.zig");
 const target_pool = @import("target_pool.zig");
+const pattern_pipeline = @import("pattern_pipeline.zig");
 
 pub const Graph = graph.Graph;
 pub const ShaderResolver = shader_resolver.ShaderResolver;
@@ -26,3 +27,4 @@ pub const shaderIdFromName = shader_resolver.shaderIdFromName;
 pub const TargetPool = target_pool.TargetPool;
 pub const TargetKey = target_pool.TargetKey;
 pub const TargetHandle = target_pool.TargetHandle;
+pub const PatternPipelineCache = pattern_pipeline.PatternPipelineCache;

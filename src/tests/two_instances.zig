@@ -180,3 +180,69 @@ test "applying an update on A does not see B's state" {
     try testing.expectEqualStrings("from-A", state_a.get("shared_key").?);
     try testing.expectEqual(@as(?[]const u8, null), state_b.get("shared_key"));
 }
+
+test "two Spark instances own independent pattern pipeline caches" {
+    // Effects-spec Phase A.6.b invariant — the pattern pipeline cache
+    // is per-Spark (sibling field, not file-scope state). If a future
+    // change accidentally shares a cache, this test trips: each Spark's
+    // cache must be a distinct pointer + distinct VkPipeline handles
+    // for the same shader_id (each Spark created its own pipelines via
+    // its own `vkCreateGraphicsPipelines` call against the device).
+    const allocator = testing.allocator;
+
+    var fx = try fixture.Fixture.init(allocator);
+    defer fx.deinit();
+
+    const fonts_a = try fixture.makeFonts(allocator, fx.ft);
+    const theme_a = fixture.makeTheme(fonts_a);
+    var state_a = spark.State.init(allocator);
+    defer state_a.deinit();
+
+    var spark_a = try spark.Spark.init(allocator, .{
+        .vk_ctx = &fx.ctx,
+        .color_format = fx.swapchain.format,
+        .theme = &theme_a,
+        .fonts = fonts_a.registry,
+        .host_state = &state_a,
+    });
+    defer {
+        spark_a.deinit();
+        allocator.destroy(fonts_a.registry);
+    }
+    spark_a.attachToRegistry();
+
+    const fonts_b = try fixture.makeFonts(allocator, fx.ft);
+    const theme_b = fixture.makeTheme(fonts_b);
+    var state_b = spark.State.init(allocator);
+    defer state_b.deinit();
+
+    var spark_b = try spark.Spark.init(allocator, .{
+        .vk_ctx = &fx.ctx,
+        .color_format = fx.swapchain.format,
+        .theme = &theme_b,
+        .fonts = fonts_b.registry,
+        .host_state = &state_b,
+    });
+    defer {
+        spark_b.deinit();
+        allocator.destroy(fonts_b.registry);
+    }
+    spark_b.attachToRegistry();
+
+    // Pipeline cache pointers differ (sibling-field-per-Spark).
+    try testing.expect(&spark_a.pattern_pipelines != &spark_b.pattern_pipelines);
+
+    // Same shader_id resolves to distinct VkPipeline handles in each
+    // Spark — each instance ran its own vkCreateGraphicsPipelines.
+    const gradient_id = spark.pass.shaderIdFromName("gradient.frag");
+    const pipe_a = spark_a.pattern_pipelines.lookup(gradient_id);
+    const pipe_b = spark_b.pattern_pipelines.lookup(gradient_id);
+    try testing.expect(pipe_a != null);
+    try testing.expect(pipe_b != null);
+    try testing.expect(pipe_a.? != pipe_b.?);
+
+    // Cross-instance leak check: nothing about A's deinit (deferred
+    // above) should free B's pipelines. The defer order tears down
+    // spark_b first, then spark_a — both must run cleanly without
+    // double-free.
+}

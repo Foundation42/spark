@@ -48,6 +48,11 @@ const doc_md =
     \\:::slider {target=radius min=0 max=60 value=${state.radius} width=320}
     \\:::
     \\
+    \\Effects-spec Phase A.6.b — first visible gradient.
+    \\
+    \\:::gradient {from=#1a1a2e to=#0f3460 direction=vertical width=320 height=80}
+    \\:::
+    \\
 ;
 
 /// Host frame context — passed to the Renderer's draw_fn through its

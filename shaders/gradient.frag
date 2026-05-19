@@ -8,12 +8,16 @@
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 out_color;
 
-layout(set = 0, binding = 0, std140) uniform Params {
+// Push-constant block per Phase A.6.b pipeline layout. std430-style
+// tightly packed (matches `extern struct GradientUniforms` exactly).
+// No descriptor set — uniforms ride in `vkCmdPushConstants` directly.
+layout(push_constant) uniform Params {
     vec4 from;       // 0..16
     vec4 to;         // 16..32
     uint direction;  // 32..36 — 0=vertical, 1=horizontal, 2=diagonal
-    // std140 pads scalars to the next vec4 boundary (16-byte align).
-    // The Zig-side struct mirrors this with `_pad: [3]u32`.
+    // Zig-side struct pads with `_pad: [3]u32` so sizeof is 48 and
+    // every subsequent push-constant range starts at a vec4 boundary
+    // if effects grow more fields.
 } u;
 
 void main() {

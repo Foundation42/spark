@@ -102,10 +102,12 @@ const vtable: element.ElementVTable = .{
     .snapshot_uniforms = snapshotUniforms,
 };
 
-// See gradient.zig for the snapshot_uniforms contract; same pattern.
+// See gradient.zig for the snapshot_uniforms contract + zero-pad
+// rationale; same pattern.
 fn snapshotUniforms(ctx: *anyopaque, out: []u8) usize {
     const c: *const Component = @ptrCast(@alignCast(ctx));
     const bytes = std.mem.asBytes(&c.uniforms);
+    @memset(out, 0);
     @memcpy(out[0..bytes.len], bytes);
     return bytes.len;
 }
