@@ -255,7 +255,15 @@ pub fn layoutAndRender(
             // exit. Pattern dispatches don't push because they render
             // directly to the parent target via scissored viewport.
             const saved_target = ctx.current_target_dispatch_index;
-            if (cu.pass_kind == 2 and ctx.pass_dispatches != null) {
+            // Effects-spec C.1.5 — chain (pass_kind=3) joins
+            // single_source (pass_kind=2) as a content-wrapping shape.
+            // Both render their child subtree's drawlist primitives
+            // into an offscreen target via `dispatch_target_map[idx]`:
+            // single_source's compose target, or chain's pool[0]
+            // (the chain's source image, written by the subtree
+            // before steps[] process it through the ping-pong pool).
+            // Same routing mechanism, no chain-specific path needed.
+            if ((cu.pass_kind == 2 or cu.pass_kind == 3) and ctx.pass_dispatches != null) {
                 ctx.current_target_dispatch_index = dispatch_start;
             }
             defer ctx.current_target_dispatch_index = saved_target;
@@ -399,6 +407,11 @@ pub fn layoutAndRender(
                             .steps = result.steps,
                             .compose_region = result.compose_region,
                             .final_pool_local = result.final_pool_local,
+                            // Effects-spec C.1.5 — captures the
+                            // dispatch range emitted by the child
+                            // walk above. Mirrors single_source
+                            // (case 2) exactly.
+                            .subtree_dispatch_range = .{ dispatch_start, seq },
                             .sequence_index = seq,
                         } };
                     },
@@ -1422,7 +1435,13 @@ fn mergePrivatePassDispatches(
             // dispatch-time against the chain's own per-frame
             // `pool_base`, not against the global dispatch index
             // space the merge rebases.
+            //
+            // Effects-spec C.1.5 — subtree_dispatch_range shifts by
+            // base (mirrors single_source). Empty ranges shift
+            // identically; no special case needed.
             .chain => |*c| {
+                c.subtree_dispatch_range[0] += base;
+                c.subtree_dispatch_range[1] += base;
                 c.sequence_index += base;
                 c.compose_region.x += ox;
                 c.compose_region.y += oy;

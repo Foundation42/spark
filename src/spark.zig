@@ -767,13 +767,15 @@ pub const Spark = struct {
                     try self.phase1ProcessHostSlot(cmd, i);
                     i += 1;
                 },
-                // Effects-spec C.1. chain has no child subtree —
-                // ping-pong topology is self-contained inside the
-                // step list, no walker-recursed children below.
-                // Advance is plain `i += 1`.
-                .chain => {
+                // Effects-spec C.1 + C.1.5. chain wraps content
+                // via subtree_dispatch_range (C.1.5); same skip-past-
+                // subtree shape as single_source. The `+ 1` advances
+                // past the chain dispatch's own index (chain sits at
+                // subtree_dispatch_range[1] by post-order walker
+                // emission — same fencepost as single_source).
+                .chain => |c| {
                     try self.phase1ProcessChain(cmd, i);
-                    i += 1;
+                    i = c.subtree_dispatch_range[1] + 1;
                 },
             }
         }
@@ -820,10 +822,12 @@ pub const Spark = struct {
                 // dispatch as top-level chain — phase1ProcessChain
                 // populates the chain's pool, leaving its
                 // final_pool_local target in SHADER_READ_ONLY_OPTIMAL
-                // for the parent's compose pass to sample.
-                .chain => {
+                // for the parent's compose pass to sample. C.1.5
+                // advance mirrors single_source nested: `+ 1` past
+                // the chain dispatch's own index.
+                .chain => |nested_c| {
                     try self.phase1ProcessChain(cmd, i);
-                    i += 1;
+                    i = nested_c.subtree_dispatch_range[1] + 1;
                 },
             }
         }
@@ -919,12 +923,16 @@ pub const Spark = struct {
                     try self.recordHostSlotCompose(cmd, nested_hs, nested_target, nx, ny, nw, nh, &last_compose);
                     j += 1;
                 },
-                // Effects-spec C.1 — chain nested inside this
-                // single_source's subtree. Phase 1 already populated
-                // the chain's pool; final-composite-into-parent-target
-                // is the same compose shape as nested single_source /
-                // host_slot, just sourced from
+                // Effects-spec C.1 + C.1.5 — chain nested inside
+                // this single_source's subtree. Phase 1 already
+                // populated the chain's pool; final-composite-into-
+                // parent-target is the same compose shape as nested
+                // single_source / host_slot, just sourced from
                 // `acquired_targets[pool_base + final_pool_local]`.
+                // C.1.5 advance mirrors nested single_source's
+                // no-+1 shape: `j = nested.subtree_dispatch_range[1]`
+                // (the inner walk's while-condition handles the
+                // chain's own-index termination).
                 .chain => |nested_c| {
                     _ = nested_c;
                     @panic("Phase C: chain step compose path lands with C.2 :::bloom");
@@ -935,7 +943,7 @@ pub const Spark = struct {
                     // const nw: f32 = @floatFromInt(nested_c.compose_region.w);
                     // const nh: f32 = @floatFromInt(nested_c.compose_region.h);
                     // try self.recordChainFinalComposite(cmd, nested_c, final_target, nx, ny, nw, nh, &last_compose);
-                    // j += 1;
+                    // j = nested_c.subtree_dispatch_range[1];
                 },
             }
         }
@@ -1117,26 +1125,39 @@ pub const Spark = struct {
         });
     }
 
-    /// Effects-spec C.1 — Phase 1 step for a `.chain` dispatch.
-    /// Pre-acquires every ping-pong target up front (v1 pool-serves-
-    /// one-chain-at-a-time simplicity; revisit if Phase E pool
-    /// pressure shows up — likely answer is pool partitions per chain
-    /// class, not interleaved acquire/release). Records `pool_base`
-    /// on `chain_pool_bases[dispatch_index]` so Phase 2 can resolve
-    /// `final_pool_local` against the global `acquired_targets[]`.
-    /// Walks `steps[]` sequentially — each step transitions its dest
-    /// pool target into COLOR_ATTACHMENT_OPTIMAL, composes via the
-    /// step's shader, transitions back to SHADER_READ_ONLY_OPTIMAL
-    /// for the next step's sampling. The layout transitions ALSO
-    /// execute the WAR memory barrier between steps as a side effect.
+    /// Effects-spec C.1 + C.1.5 — Phase 1 step for a `.chain` dispatch.
+    /// Three-phase shape mirrors `phase1ProcessSingleSource`:
     ///
-    /// **Substrate-only commit (C.1).** Per-step compose body
-    /// (`recordChainStepCompose`) lands with C.2 `:::bloom` — the
-    /// first real chain consumer brings the actual shader bindings.
-    /// C.1 ships pool acquisition, layout transitions, and pool_base
-    /// bookkeeping; the compose call itself panics with a searchable
-    /// `Phase C:` tag so any production frame that lands here before
-    /// C.2 trips loudly instead of silently no-op'ing.
+    ///   (1) Depth-first post-order recurse into nested
+    ///       single_source / host_slot / chain children — their
+    ///       offscreen targets must be populated before our subtree
+    ///       walk samples them via compose.
+    ///   (2) Acquire ping-pong pool up front (C.1). Records
+    ///       `pool_base` on `chain_pool_bases[dispatch_index]` so
+    ///       Phase 2 can resolve `final_pool_local`. Sets
+    ///       `dispatch_target_map[dispatch_index] = pool[0]` so the
+    ///       subtree's drawlist primitives route into pool[0] via
+    ///       the existing per-target rasterizer routing mechanism
+    ///       (B.4.b.4) — same dispatch_target_map machinery
+    ///       single_source uses, no chain-specific routing path.
+    ///   (3) Render subtree content into pool[0] (C.1.5): transition
+    ///       pool[0] to COLOR_ATTACHMENT_OPTIMAL, begin a render
+    ///       pass with LOAD_OP_CLEAR transparent, walk subtree
+    ///       patterns + nested composes target-locally, route this
+    ///       dispatch's drawlist primitives, end the render pass,
+    ///       transition pool[0] back to SHADER_READ_ONLY_OPTIMAL.
+    ///       After (3), pool[0] holds the content image that the
+    ///       chain's steps[] will filter/blur/composite through the
+    ///       remaining pool targets.
+    ///   (4) Walk `steps[]` (existing C.1 @panic — replaced by C.2).
+    ///       Each step samples source pool target, writes dest pool
+    ///       target; layout transitions also execute the WAR memory
+    ///       barrier between steps as a side effect.
+    ///
+    /// **Substrate-only commit (C.1.5).** Subtree machinery now
+    /// ships end-to-end (pool[0] holds rendered content), but the
+    /// steps[] compose body still panics — first real chain
+    /// consumer (C.2 `:::bloom`) brings the actual shader bindings.
     ///
     /// **Substrate-only commit caveat.** This path runs only when a
     /// chain factory is registered on the Spark; `installCoreComponents`
@@ -1146,11 +1167,39 @@ pub const Spark = struct {
         self: *Spark,
         cmd: vk.c.VkCommandBuffer,
         dispatch_index: usize,
-    ) !void {
+    ) anyerror!void {
+        // Explicit error set breaks the mutual-recursion inference
+        // cycle with phase1ProcessSingleSource (which calls back into
+        // phase1ProcessChain at its own nested-chain arm).
         const C = self.pass_dispatches.items[dispatch_index].chain;
 
-        // Pool-base capture happens BEFORE the first acquire so the
-        // first pool target lands at acquired_targets[pool_base].
+        // (1) Depth-first post-order recurse into nested children.
+        // Same skip-past-subtree shape as phase1ProcessSingleSource;
+        // see dispatchOffscreenPasses for the fencepost note —
+        // `+ 1` to advance past the nested dispatch's own index,
+        // not just past its subtree.
+        var i: u32 = C.subtree_dispatch_range[0];
+        while (i < C.subtree_dispatch_range[1]) {
+            switch (self.pass_dispatches.items[i]) {
+                .pattern => i += 1,
+                .single_source => |nested| {
+                    try self.phase1ProcessSingleSource(cmd, i);
+                    i = nested.subtree_dispatch_range[1] + 1;
+                },
+                .host_slot => {
+                    try self.phase1ProcessHostSlot(cmd, i);
+                    i += 1;
+                },
+                .chain => |nested_c| {
+                    try self.phase1ProcessChain(cmd, i);
+                    i = nested_c.subtree_dispatch_range[1] + 1;
+                },
+            }
+        }
+
+        // (2) Acquire pool. Pool-base capture happens BEFORE the
+        // first acquire so the first pool target lands at
+        // acquired_targets[pool_base].
         const pool_base: u32 = @intCast(self.acquired_targets.items.len);
         self.chain_pool_bases.items[dispatch_index] = pool_base;
 
@@ -1170,7 +1219,8 @@ pub const Spark = struct {
             try self.acquired_targets.append(target_handle);
             // v1 trades one transition per first-written-pool-target
             // for uniform initial state (UNDEFINED → SHADER_READ_ONLY,
-            // first step's first write then transitions UP); revisit
+            // pool[0]'s subtree-write then transitions UP, steps'
+            // dest pool targets transition UP as needed); revisit
             // if profiling shows it.
             barrierImageLayout(cmd, target_handle.image(), .{
                 .src_stage = vk.c.VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
@@ -1182,9 +1232,158 @@ pub const Spark = struct {
             });
         }
 
-        // Linear step walk: sample source pool target, write dest
-        // pool target. The compose body is deferred to C.2 — see
-        // function-level docstring.
+        // Wire pool[0]'s handle into dispatch_target_map so the
+        // subtree's drawlist primitives (tagged with this dispatch's
+        // index by the walker's current_target_dispatch_index push)
+        // route into pool[0] via the existing per-target rasterizer
+        // routing machinery. Symmetric with phase1ProcessSingleSource.
+        const pool_zero = self.acquired_targets.items[pool_base];
+        self.dispatch_target_map.items[dispatch_index] = pool_zero;
+
+        // (3) Render subtree into pool[0]. SHADER_READ_ONLY →
+        // COLOR_ATTACHMENT_OPTIMAL barrier opens write access.
+        barrierImageLayout(cmd, pool_zero.image(), .{
+            .src_stage = vk.c.VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .dst_stage = vk.c.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .src_access = vk.c.VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            .dst_access = vk.c.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            .old_layout = vk.c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .new_layout = vk.c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        });
+
+        var color_att = std.mem.zeroes(vk.c.VkRenderingAttachmentInfo);
+        color_att.sType = vk.c.VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        color_att.imageView = pool_zero.view();
+        color_att.imageLayout = vk.c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        color_att.loadOp = vk.c.VK_ATTACHMENT_LOAD_OP_CLEAR;
+        color_att.storeOp = vk.c.VK_ATTACHMENT_STORE_OP_STORE;
+        color_att.clearValue = .{ .color = .{ .float32 = .{ 0, 0, 0, 0 } } };
+
+        const target_extent = vk.c.VkExtent2D{
+            .width = C.target_size[0],
+            .height = C.target_size[1],
+        };
+        var ri = std.mem.zeroes(vk.c.VkRenderingInfo);
+        ri.sType = vk.c.VK_STRUCTURE_TYPE_RENDERING_INFO;
+        ri.renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = target_extent };
+        ri.layerCount = 1;
+        ri.colorAttachmentCount = 1;
+        ri.pColorAttachments = &color_att;
+        vk.c.vkCmdBeginRendering(cmd, &ri);
+
+        // Walk subtree dispatches and record pattern + nested
+        // composes target-locally. All viewports here are in
+        // target-space coords (origin at C's compose_region top-left,
+        // no zoom — target_size == compose_region.size by
+        // construction). Mirrors phase1ProcessSingleSource's
+        // subtree-walk loop exactly.
+        var last_pattern: vk.c.VkPipeline = null;
+        var last_compose: vk.c.VkPipeline = null;
+        var j: u32 = C.subtree_dispatch_range[0];
+        while (j < C.subtree_dispatch_range[1]) {
+            switch (self.pass_dispatches.items[j]) {
+                .pattern => |p| {
+                    const px: f32 = @floatFromInt(p.layout_region.x - C.compose_region.x);
+                    const py: f32 = @floatFromInt(p.layout_region.y - C.compose_region.y);
+                    const pw: f32 = @floatFromInt(p.layout_region.w);
+                    const ph: f32 = @floatFromInt(p.layout_region.h);
+                    self.recordPatternStep(cmd, p, px, py, pw, ph, &last_pattern);
+                    j += 1;
+                },
+                .single_source => |nested| {
+                    const nested_target = self.dispatch_target_map.items[j] orelse unreachable;
+                    const nx: f32 = @floatFromInt(nested.compose_region.x - C.compose_region.x);
+                    const ny: f32 = @floatFromInt(nested.compose_region.y - C.compose_region.y);
+                    const nw: f32 = @floatFromInt(nested.compose_region.w);
+                    const nh: f32 = @floatFromInt(nested.compose_region.h);
+                    try self.recordSingleSourceCompose(cmd, nested, nested_target, nx, ny, nw, nh, &last_compose);
+                    j = nested.subtree_dispatch_range[1];
+                },
+                .host_slot => |nested_hs| {
+                    const nested_target = self.dispatch_target_map.items[j] orelse unreachable;
+                    const nx: f32 = @floatFromInt(nested_hs.compose_region.x - C.compose_region.x);
+                    const ny: f32 = @floatFromInt(nested_hs.compose_region.y - C.compose_region.y);
+                    const nw: f32 = @floatFromInt(nested_hs.compose_region.w);
+                    const nh: f32 = @floatFromInt(nested_hs.compose_region.h);
+                    try self.recordHostSlotCompose(cmd, nested_hs, nested_target, nx, ny, nw, nh, &last_compose);
+                    j += 1;
+                },
+                .chain => |nested_c| {
+                    _ = nested_c;
+                    @panic("Phase C: chain step compose path lands with C.2 :::bloom");
+                    // const pool_base_inner = self.chain_pool_bases.items[j] orelse unreachable;
+                    // const final_target = self.acquired_targets.items[pool_base_inner + nested_c.final_pool_local];
+                    // ... recordChainFinalComposite at target-local coords ...
+                    // j = nested_c.subtree_dispatch_range[1];
+                },
+            }
+        }
+
+        // Per-target rasterizer routing (B.4.b.4) — render every
+        // drawlist primitive whose target_dispatch_index equals this
+        // chain's dispatch_index into pool[0]. Same shape as
+        // phase1ProcessSingleSource's routing block, just sized to
+        // pool[0]'s extent.
+        const target_extent_render = vk.c.VkExtent2D{
+            .width = C.target_size[0],
+            .height = C.target_size[1],
+        };
+        const sx = self.frame_info.scroll_offset[0];
+        const sy = self.frame_info.scroll_offset[1];
+        const z = self.frame_info.zoom;
+        const world_offset_target: [2]f32 = .{
+            (@as(f32, @floatFromInt(C.compose_region.x)) - sx) * z,
+            (@as(f32, @floatFromInt(C.compose_region.y)) - sy) * z,
+        };
+        const dl_p1 = &self.drawlist;
+        const dispatch_index_u32: u32 = @intCast(dispatch_index);
+        {
+            var it = element.triRuns(dl_p1.tri_targets.items, dl_p1.tri_indices.items, dispatch_index_u32);
+            while (it.next()) |run| {
+                self.tri_pipeline.recordDrawIndexedRange(cmd, target_extent_render, world_offset_target, run.first_index, run.index_count);
+            }
+        }
+        {
+            var it = element.runs(dl_p1.image_targets.items, dispatch_index_u32);
+            const all_images = dl_p1.images.items;
+            while (it.next()) |run| {
+                if (run.count == 0) continue;
+                self.image_pipeline.bind(cmd, target_extent_render);
+                const subset = all_images[run.first .. run.first + run.count];
+                for (subset) |im| {
+                    self.image_pipeline.recordOne(cmd, target_extent_render, world_offset_target, @ptrCast(@alignCast(im.descriptor_set)), im.dst_pos, im.dst_size);
+                }
+            }
+        }
+        {
+            var it = element.runs(dl_p1.quad_targets.items, dispatch_index_u32);
+            while (it.next()) |run| {
+                self.quad_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count);
+            }
+        }
+        {
+            var it = element.runs(dl_p1.glyph_targets.items, dispatch_index_u32);
+            while (it.next()) |run| {
+                self.text_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count);
+            }
+        }
+
+        vk.c.vkCmdEndRendering(cmd);
+
+        // pool[0] COLOR_ATTACHMENT → SHADER_READ_ONLY for steps[]
+        // to sample (and Phase 2's final composite if final_pool_local
+        // == 0). Mirrors phase1ProcessSingleSource's closing barrier.
+        barrierImageLayout(cmd, pool_zero.image(), .{
+            .src_stage = vk.c.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .dst_stage = vk.c.VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .src_access = vk.c.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            .dst_access = vk.c.VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            .old_layout = vk.c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .new_layout = vk.c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        });
+
+        // (4) Walk steps[]. The compose body is deferred to C.2 —
+        // see function-level docstring.
         for (C.steps) |step| {
             _ = step;
             @panic("Phase C: chain step compose path lands with C.2 :::bloom");
@@ -1498,6 +1697,16 @@ pub const Spark = struct {
                     .single_source => |ss| {
                         var k = ss.subtree_dispatch_range[0];
                         while (k < ss.subtree_dispatch_range[1]) : (k += 1) {
+                            is_nested[k] = true;
+                        }
+                    },
+                    // Effects-spec C.1.5 — chain joins single_source
+                    // as a content-wrapping shape. Its subtree
+                    // dispatches were rendered into pool[0] by
+                    // Phase 1; Phase 2 must skip them as nested.
+                    .chain => |c| {
+                        var k = c.subtree_dispatch_range[0];
+                        while (k < c.subtree_dispatch_range[1]) : (k += 1) {
                             is_nested[k] = true;
                         }
                     },

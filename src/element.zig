@@ -863,6 +863,19 @@ pub const ChainStep = struct {
     /// (e.g., picking an intermediate cascade for debug output)
     /// without scanning steps[].
     final_pool_local: u16,
+    /// Half-open `[start, end)` range into `pass_dispatches.items`
+    /// covering this chain's child subtree (Effects-spec C.1.5).
+    /// `phase1ProcessChain` renders the subtree into pool[0] BEFORE
+    /// walking `steps[]` — child content is the chain's source image,
+    /// `steps[]` are the per-step filter/blur/composite passes
+    /// processing it through the ping-pong pool. Mirrors
+    /// `SingleSourceStep.subtree_dispatch_range` exactly — same
+    /// walker-capture semantics (dispatch_start before child walk,
+    /// seq before self-append), same rebase logic across
+    /// `mergePrivatePassDispatches` / `blitEntry` / `snapshotEntry`.
+    /// Empty range `.{ N, N }` is legal — a chain with no content
+    /// subtree starts from a transparent pool[0].
+    subtree_dispatch_range: [2]u32,
     sequence_index: u32,
 };
 

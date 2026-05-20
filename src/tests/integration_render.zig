@@ -41,10 +41,11 @@ const known_doc =
 /// Drift in either layer fails the determinism / fingerprint tests
 /// below with a one-line message.
 ///
-/// PassDispatch serialization protocol **v4** (Effects-spec C.1 —
-/// chain arm joins). Must match the comment on `element.PassDispatch`
-/// — both ends move together. Per dispatch the hasher writes an arm
-/// tag byte first, then arm-specific fields in canonical order:
+/// PassDispatch serialization protocol **v5** (Effects-spec C.1.5 —
+/// ChainStep gains subtree_dispatch_range). Must match the comment
+/// on `element.PassDispatch` — both ends move together. Per dispatch
+/// the hasher writes an arm tag byte first, then arm-specific fields
+/// in canonical order:
 ///
 ///   arm tag             — u8: 0 = pattern, 1 = single_source, 2 = host_slot, 3 = chain
 ///
@@ -73,24 +74,26 @@ const known_doc =
 ///     stable across builds/processes and would defeat determinism.
 ///     Same exclusion category as `*_uniforms` trailing zero padding.)
 ///
-///   ChainStep (arm 3) — Effects-spec C.1:
-///     target_size         — [2]u32 (w, h)
-///     target_format       — u32 (raw VkFormat)
-///     target_pool_count   — u16
-///     compose_region      — PassRegion
-///     final_pool_local    — u16
-///     sequence_index      — u32
-///     steps_len           — u32 (slice length, NOT factory.max_steps)
+///   ChainStep (arm 3) — Effects-spec C.1 + C.1.5:
+///     target_size            — [2]u32 (w, h)
+///     target_format          — u32 (raw VkFormat)
+///     target_pool_count      — u16
+///     compose_region         — PassRegion
+///     final_pool_local       — u16
+///     subtree_dispatch_range — [2]u32 (start, end) — C.1.5
+///     sequence_index         — u32
+///     steps_len              — u32 (slice length, NOT factory.max_steps)
 ///     for each step in steps[0..steps_len]:
 ///       composite_shader_id — 16 bytes
 ///       source_pool_local   — u16
 ///       dest_pool_local     — u16
 ///       uniform_len         — u32
 ///       uniform_bytes       — `uniform_len` bytes
-///     (NOTE: `Spark.chain_pool_bases[i]` — the per-frame pool_base
-///     resolved at Phase 1 acquire — is NOT hashed. It's
-///     Phase-1-transient state on Spark, same exclusion category
-///     as `dispatch_target_map`.)
+///     (NOTE: `Spark.chain_pool_bases[i]` and
+///     `Spark.dispatch_target_map[i]` are NOT hashed. Both are
+///     Phase-1-transient state on Spark, excluded from
+///     fingerprinting by the same protocol category as drawlist
+///     target tags shipping outside the dispatch struct.)
 ///
 /// **Inline uniform storage caveat.** `*_uniforms` are fixed-cap
 /// `[MAX_PASS_UNIFORM_BYTES]u8` arrays in memory; the wire format
@@ -109,6 +112,13 @@ const known_doc =
 /// would shift fingerprint vs. v3. Existing Phase A/B docs that
 /// produce only pattern/single_source/host_slot dispatches hash
 /// IDENTICALLY under v4 — the new arm is purely additive.
+///
+/// **v5 mint.** ChainStep gained `subtree_dispatch_range: [2]u32`
+/// at C.1.5 (chain now wraps content via subtree, mirroring
+/// single_source). No chain consumer shipped at v4 → v5 boundary
+/// so no fingerprint test values change; the bump preserves
+/// archaeology — a future reader seeing "wire format v4" must NOT
+/// assume the chain arm has stable structure since C.1.
 fn hashFrame(sp: *const spark.Spark) u64 {
     var h = std.hash.Wyhash.init(0);
 
@@ -172,6 +182,10 @@ fn hashFrame(sp: *const spark.Spark) u64 {
                 h.update(std.mem.asBytes(&c.target_pool_count));
                 h.update(std.mem.asBytes(&c.compose_region));
                 h.update(std.mem.asBytes(&c.final_pool_local));
+                // C.1.5 — subtree_dispatch_range. Empty range
+                // .{ N, N } hashes deterministically (both u32s),
+                // so chains-without-content emit a stable hash too.
+                h.update(std.mem.asBytes(&c.subtree_dispatch_range));
                 h.update(std.mem.asBytes(&c.sequence_index));
                 const steps_len: u32 = @intCast(c.steps.len);
                 h.update(std.mem.asBytes(&steps_len));
@@ -182,9 +196,9 @@ fn hashFrame(sp: *const spark.Spark) u64 {
                     h.update(std.mem.asBytes(&step.uniform_len));
                     h.update(step.uniform_bytes[0..step.uniform_len]);
                 }
-                // chain_pool_bases excluded by protocol — see header
-                // comment. Phase-1-transient state on Spark, same
-                // exclusion category as dispatch_target_map.
+                // chain_pool_bases + dispatch_target_map[i] excluded
+                // by protocol — see header comment. Phase-1-transient
+                // state on Spark.
             },
         }
     }
@@ -343,8 +357,9 @@ test "PassDispatch fingerprint: :::gradient produces one deterministic dispatch"
 ///   v3 (B.4.a) — adds parallel `*_targets` arrays per primitive.
 ///   v3 (B.7)   — adds `.host_slot` arm (additive — pattern-only docs unchanged).
 ///   v4 (C.1)   — adds `.chain` arm (additive — non-chain docs unchanged).
+///   v5 (C.1.5) — ChainStep gains subtree_dispatch_range (chain wraps content).
 ///
-/// **Why the gradient baseline is invariant across v3 and v4.** The
+/// **Why the gradient baseline is invariant across v3–v5.** The
 /// gradient doc emits only pattern dispatches; the host_slot and
 /// chain arms aren't reached by hashFrame's switch for this doc.
 /// Additive protocol bumps that only extend per-arm hashing leave
@@ -361,7 +376,7 @@ test "PassDispatch fingerprint: :::gradient produces one deterministic dispatch"
 /// path and earns its own assertion.
 const EXPECTED_GRADIENT_HASH_V3: u64 = 0xE1E0_6B9A_CD1A_814C;
 
-test "PassDispatch wire-format v4: stored gradient baseline hash" {
+test "PassDispatch wire-format v5: stored gradient baseline hash" {
     const allocator = testing.allocator;
 
     var fx = try fixture.Fixture.init(allocator);

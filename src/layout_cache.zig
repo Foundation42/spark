@@ -465,7 +465,12 @@ pub fn blitEntry(
                     // resolution happens against per-frame
                     // `Spark.chain_pool_bases` at Phase 1, so
                     // pool-local indices on steps don't shift here.
+                    //
+                    // Effects-spec C.1.5 — subtree_dispatch_range
+                    // shifts by pd_base (mirrors single_source).
                     .chain => |*c| {
+                        c.subtree_dispatch_range[0] += pd_base;
+                        c.subtree_dispatch_range[1] += pd_base;
                         c.sequence_index += pd_base;
                         c.compose_region.x += ox_i32;
                         c.compose_region.y += oy_i32;
@@ -612,7 +617,12 @@ pub fn snapshotEntry(
             // Effects-spec C.1 — inverse of `blitEntry`'s chain
             // rebase. Pool-local indices on steps unchanged (no
             // global pool index space at cache scope).
+            //
+            // Effects-spec C.1.5 — subtree_dispatch_range inverse-
+            // shifts by pd_start (mirrors single_source).
             .chain => |*c| {
+                c.subtree_dispatch_range[0] -= pd_start;
+                c.subtree_dispatch_range[1] -= pd_start;
                 c.sequence_index -= pd_start;
                 c.compose_region.x -= ox_i32;
                 c.compose_region.y -= oy_i32;
