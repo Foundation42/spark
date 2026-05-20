@@ -176,11 +176,45 @@ pub const SingleSourcePass = struct {
     layout_inflation: ?LayoutInflationSpec = null,
 };
 
-/// `.chain` arm payload — reserved for Phase C. Multi-pass sequences
-/// with intermediate downsampled targets, HDR format negotiation.
-/// Empty in v1; the pass-graph compiler panics on this arm until
-/// Phase C lights it up.
-pub const ChainPass = struct {};
+/// `.chain` arm payload (Effects-spec C.1 substrate). Multi-pass
+/// sequences with intermediate ping-pong targets: bloom downsample +
+/// upsample cascade, tone_map's single-step HDR→LDR, etc.
+///
+/// **Per-instance topology via vtable hook.** The factory's
+/// `max_steps` bounds the component's per-instance scratch allocation
+/// (registry allocator, sized at `create()`); the actual step list
+/// per walk is produced by `ElementVTable.snapshot_chain_steps`
+/// returning a slice into that scratch. Walker enforces a universal
+/// `element.MAX_CHAIN_STEPS` ceiling; this factory-level `max_steps`
+/// is the component's internal scratch-sizing concern.
+///
+/// **Phase 2 composite.** `final_composite_shader_id` is the shader
+/// the Phase 2 final composite uses (mirrors `SingleSourcePass`'s
+/// `shader_id` role — sample one pool target, write to MAIN at
+/// `compose_region`). Per-step composite shaders live on
+/// `ChainPassStep.composite_shader_id` and drive inter-step
+/// downsample/upsample/etc shaders.
+///
+/// **HDR negotiation.** `hdr_target = true` is the common case —
+/// matryoshka dual-filter bloom and tone_map both want RGBA16F.
+/// Component reads this in `create()` and stashes the resolved
+/// VkFormat for use in `snapshot_chain_steps`'s `ChainHookResult`
+/// (component decides format; walker is consumer-only).
+pub const ChainPass = struct {
+    /// Maximum step count the chain will ever emit per walk.
+    /// Component pre-allocates scratch of this size at create-time;
+    /// snapshot_chain_steps returns a slice into that scratch.
+    /// Must be ≤ `element.MAX_CHAIN_STEPS` (universal ceiling).
+    max_steps: u16,
+    /// Phase 2 final-composite shader — reads
+    /// `pool[final_pool_local]`, writes to MAIN at `compose_region`.
+    /// Same opaque 16-byte identifier shape as `SingleSourcePass.shader_id`.
+    final_composite_shader_id: ShaderId,
+    /// RGBA16F ping-pong targets when true (Decision #7 — relaxed in
+    /// Phase C). Most chain effects operate in HDR; flip false only
+    /// for LDR-throughout consumers.
+    hdr_target: bool = true,
+};
 
 /// Host-slot dispatch contract — full doc lives at the producer
 /// module on `element.HostSlotCtx`. Re-exported here so factory code
@@ -235,7 +269,7 @@ pub const HostSlotPass = struct {
 ///   - `.content` ........... shipped (every pre-effects factory)
 ///   - `.pattern` ........... v1 — implements in A.5/A.6
 ///   - `.single_source` ..... v1 — implements in Phase B
-///   - `.chain` ............. reserved, Phase C
+///   - `.chain` ............. substrate lit in C.1; first consumer C.2
 ///   - `.host_slot` ......... reserved in A.2; implements in Phase B
 ///                            alongside `:::placeholder_scene` stub
 ///
@@ -340,7 +374,7 @@ fn passShapeScalars(ps: PassShape) struct { kind: u8, shader_id: [16]u8 } {
         .content => .{ .kind = 0, .shader_id = [_]u8{0} ** 16 },
         .pattern => |p| .{ .kind = 1, .shader_id = p.shader_id },
         .single_source => |p| .{ .kind = 2, .shader_id = p.shader_id },
-        .chain => .{ .kind = 3, .shader_id = [_]u8{0} ** 16 },
+        .chain => |c| .{ .kind = 3, .shader_id = c.final_composite_shader_id },
         .host_slot => |p| .{ .kind = 4, .shader_id = p.composite_shader_id },
     };
 }
@@ -1333,7 +1367,7 @@ test "PassShape constructs in every variant" {
         .content,
         .{ .pattern = .{ .shader_id = sid } },
         .{ .single_source = .{ .shader_id = sid, .layout_inflation = noop_inflation } },
-        .{ .chain = .{} },
+        .{ .chain = .{ .max_steps = 4, .final_composite_shader_id = sid } },
         .{ .host_slot = .{} },
     };
     try testing.expectEqual(@as(usize, 5), shapes.len);
@@ -1350,7 +1384,7 @@ test "PassShape switches exhaustively" {
         .content,
         .{ .pattern = .{ .shader_id = sid } },
         .{ .single_source = .{ .shader_id = sid } },
-        .{ .chain = .{} },
+        .{ .chain = .{ .max_steps = 4, .final_composite_shader_id = sid } },
         .{ .host_slot = .{} },
     };
     for (cases) |shape| {

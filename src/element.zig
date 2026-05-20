@@ -458,6 +458,24 @@ pub const ElementVTable = struct {
     /// pattern. The stub `:::placeholder_scene` factory leaves this
     /// null and rides on its factory-level callback.
     invoke_host_slot: ?*const fn (ctx: *anyopaque) HostSlotInvocation = null,
+    /// Per-instance chain snapshot hook (Effects-spec C.1). Mandatory
+    /// for factories with `pass_shape == .chain` — walker errors with
+    /// `error.ChainElementMissingSnapshotHook` if null on a
+    /// `pass_kind == 3` element. Returns the component-owned slice of
+    /// active steps + chain-level metadata; walker captures by slice
+    /// (no copy). Component MUST NOT mutate the backing storage until
+    /// the next walk — same single-writer-per-frame invariant as
+    /// DrawList / pass_dispatches. The component is responsible for
+    /// allocating scratch in `create()` (sized to its factory's
+    /// `max_steps`), honoring its own scratch limit, and producing
+    /// `target_format` from the factory's `hdr_target` it captured at
+    /// create-time. Walker enforces the universal `MAX_CHAIN_STEPS` /
+    /// `MAX_CHAIN_POOL_TARGETS` ceilings; factory-specific bounds are
+    /// the component's internal concern.
+    snapshot_chain_steps: ?*const fn (
+        ctx: *anyopaque,
+        target_size: [2]u32,
+    ) ChainHookResult = null,
     /// Optional. Reports how this component participates in its
     /// parent stack's flow (stage 15 Phase E text exclusion). `null`
     /// (the default) means `.normal` — the component flows in
@@ -766,10 +784,93 @@ pub const HostSlotStep = struct {
     sequence_index: u32,
 };
 
+/// Universal ceilings on chain-pass topology (Effects-spec C.1).
+/// Walker fail-fasts beyond these — defense-in-depth against a
+/// component hook returning a runaway step count or pool size.
+///
+/// Sizing rationale: 4K dual-filter bloom tops at ~10 mips with 25%
+/// headroom landing at 13; rounded to 16 for power-of-two ergonomics
+/// and symmetry across both axes. Tone_map is single-step; bloom
+/// covers the upper end. If a Phase D+ consumer trips these, bump
+/// independently — they're not coupled.
+pub const MAX_CHAIN_STEPS: u32 = 16;
+pub const MAX_CHAIN_POOL_TARGETS: u32 = 16;
+
+/// One step in a chain — sample `source_pool_local`, write to
+/// `dest_pool_local`, both indices resolved against the chain's
+/// `pool_base` (captured on Spark.chain_pool_bases at Phase 1 acquire
+/// time). Inline `uniform_bytes` matches PatternStep / SingleSourceStep
+/// — no per-step indirection, fits Vulkan push-constant range.
+///
+/// **Wire format / hashing** (Effects-spec C.1, v4). Every field
+/// participates — chains are walker-emitted, no per-instance pointer
+/// state to exclude. See `integration_render.zig` hashFrame protocol.
+pub const ChainPassStep = struct {
+    composite_shader_id: [16]u8,
+    source_pool_local: u16,
+    dest_pool_local: u16,
+    uniform_bytes: [MAX_PASS_UNIFORM_BYTES]u8 = [_]u8{0} ** MAX_PASS_UNIFORM_BYTES,
+    uniform_len: u32 = 0,
+};
+
+/// Per-walk return of `snapshot_chain_steps`. The component owns the
+/// `steps` backing storage (registry allocator, lifetime = instance);
+/// walker captures by slice. `target_format` is the raw VkFormat the
+/// component chose based on its factory's `hdr_target` (component
+/// captured this at create-time and produces the resolved format
+/// here). Walker is purely a consumer of this struct — no factory
+/// access needed at emission time.
+pub const ChainHookResult = struct {
+    /// Slice into component-owned scratch. Walker captures by
+    /// reference; component MUST NOT mutate backing storage until
+    /// next walk (single-writer-per-frame invariant).
+    steps: []const ChainPassStep,
+    target_format: u32,
+    target_pool_count: u16,
+    final_pool_local: u16,
+    compose_region: PassRegion,
+};
+
+/// Chain-pass dispatch step (Effects-spec C.1). Phase 1 acquires
+/// `target_pool_count` ping-pong targets, runs `steps` sequentially
+/// (each sampling its `source_pool_local`, writing to its
+/// `dest_pool_local`, with image-layout transitions providing the
+/// WAR barrier between steps). Phase 2 reads `pool[final_pool_local]`
+/// and composites into MAIN at `compose_region` via the factory's
+/// `final_composite_shader_id` (mirrors single_source's Phase 2
+/// shape exactly). Pool-local indices [0..target_pool_count-1]
+/// resolve against the chain's `pool_base` captured on
+/// `Spark.chain_pool_bases` at Phase 1 acquire time — no `pool_base`
+/// field on ChainStep keeps the dispatch struct structurally
+/// immutable (Phase-1-transient state lives on Spark via sibling
+/// parallel array, same shape as `dispatch_target_map`).
+pub const ChainStep = struct {
+    /// Format + dims for ALL ping-pong targets in this chain.
+    /// Uniform across the chain in v1 — format-mixed chains can land
+    /// in a follow-up with per-step format on ChainPassStep.
+    target_size: [2]u32,
+    target_format: u32, // raw VkFormat — promotion to TargetFormat enum tracked for C.2
+    target_pool_count: u16,
+    /// Slice into component-owned scratch. Length = active step
+    /// count. Walker enforces `len <= MAX_CHAIN_STEPS` at emission.
+    steps: []const ChainPassStep,
+    /// Phase 2 destination rect on MAIN — same semantics as
+    /// SingleSourceStep.compose_region. Walker captures from hook;
+    /// layout_cache rebase shifts xy on blit / inverse on snapshot.
+    compose_region: PassRegion,
+    /// Pool-local index Phase 2 reads from. Typically equals the last
+    /// step's `dest_pool_local`; explicit so a hook can short-circuit
+    /// (e.g., picking an intermediate cascade for debug output)
+    /// without scanning steps[].
+    final_pool_local: u16,
+    sequence_index: u32,
+};
+
 pub const PassDispatch = union(enum) {
     pattern: PatternStep,
     single_source: SingleSourceStep,
     host_slot: HostSlotStep,
+    chain: ChainStep,
 };
 
 /// Layout result for one element. Pixel coords (display space, not

@@ -459,6 +459,17 @@ pub fn blitEntry(
                         hs.compose_region.x += ox_i32;
                         hs.compose_region.y += oy_i32;
                     },
+                    // Effects-spec C.1 — chain. `steps` slice points
+                    // into source Component-owned scratch — same
+                    // lifetime model as host_slot's invocation. Pool
+                    // resolution happens against per-frame
+                    // `Spark.chain_pool_bases` at Phase 1, so
+                    // pool-local indices on steps don't shift here.
+                    .chain => |*c| {
+                        c.sequence_index += pd_base;
+                        c.compose_region.x += ox_i32;
+                        c.compose_region.y += oy_i32;
+                    },
                 }
                 out_pd.appendAssumeCapacity(d_local);
             }
@@ -597,6 +608,14 @@ pub fn snapshotEntry(
                 hs.sequence_index -= pd_start;
                 hs.compose_region.x -= ox_i32;
                 hs.compose_region.y -= oy_i32;
+            },
+            // Effects-spec C.1 — inverse of `blitEntry`'s chain
+            // rebase. Pool-local indices on steps unchanged (no
+            // global pool index space at cache scope).
+            .chain => |*c| {
+                c.sequence_index -= pd_start;
+                c.compose_region.x -= ox_i32;
+                c.compose_region.y -= oy_i32;
             },
         }
     }

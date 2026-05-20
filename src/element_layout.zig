@@ -360,8 +360,48 @@ pub fn layoutAndRender(
                         },
                         .sequence_index = seq,
                     } },
-                    // Reserved arm (chain). Phase C lights up
-                    // pass_kind = 3.
+                    // Effects-spec C.1 — chain. Per-instance topology
+                    // via mandatory `snapshot_chain_steps` hook
+                    // (parallel shape to invoke_host_slot mandatory
+                    // on host_slot). Walker enforces only the
+                    // universal MAX_CHAIN_STEPS / MAX_CHAIN_POOL_TARGETS
+                    // ceilings — factory-level `max_steps` is the
+                    // component's internal scratch-sizing concern.
+                    // target_format / compose_region come from the
+                    // hook return (component knows its factory's
+                    // hdr_target from create-time).
+                    3 => blk: {
+                        const hook = cu.vtable.snapshot_chain_steps orelse
+                            return error.ChainElementMissingSnapshotHook;
+                        const target_size: [2]u32 = .{
+                            @intFromFloat(@max(0, @round(box.w))),
+                            @intFromFloat(@max(0, @round(box.h))),
+                        };
+                        const result = hook(cu.ctx, target_size);
+                        if (result.steps.len > element.MAX_CHAIN_STEPS) {
+                            std.log.err(
+                                "chain hook returned {} steps, MAX_CHAIN_STEPS is {}",
+                                .{ result.steps.len, element.MAX_CHAIN_STEPS },
+                            );
+                            return error.ChainHookExceededMaxSteps;
+                        }
+                        if (result.target_pool_count > element.MAX_CHAIN_POOL_TARGETS) {
+                            std.log.err(
+                                "chain hook returned {} pool targets, MAX_CHAIN_POOL_TARGETS is {}",
+                                .{ result.target_pool_count, element.MAX_CHAIN_POOL_TARGETS },
+                            );
+                            return error.ChainHookExceededMaxPoolTargets;
+                        }
+                        break :blk .{ .chain = .{
+                            .target_size = target_size,
+                            .target_format = result.target_format,
+                            .target_pool_count = result.target_pool_count,
+                            .steps = result.steps,
+                            .compose_region = result.compose_region,
+                            .final_pool_local = result.final_pool_local,
+                            .sequence_index = seq,
+                        } };
+                    },
                     else => unreachable,
                 };
                 try pd.append(dispatch);
@@ -1373,6 +1413,19 @@ fn mergePrivatePassDispatches(
                 hs.sequence_index += base;
                 hs.compose_region.x += ox;
                 hs.compose_region.y += oy;
+            },
+            // Effects-spec C.1 — chain. `steps` slice points into
+            // component-owned scratch (lifetime = source Component,
+            // same model as host_slot's invocation pair) — captured
+            // by reference, not copied. Pool-local indices on each
+            // step are unchanged: pool resolution happens at Phase 1
+            // dispatch-time against the chain's own per-frame
+            // `pool_base`, not against the global dispatch index
+            // space the merge rebases.
+            .chain => |*c| {
+                c.sequence_index += base;
+                c.compose_region.x += ox;
+                c.compose_region.y += oy;
             },
         }
         out.appendAssumeCapacity(d_local);
