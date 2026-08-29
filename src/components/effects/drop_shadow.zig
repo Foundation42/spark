@@ -254,8 +254,10 @@ const Component = struct {
     /// the walker before the next one — the single-writer-per-frame
     /// invariant `snapshot_chain_steps` documents.
     steps: [3]element.ChainPassStep = undefined,
-    /// The pool format, resolved at create-time. The component decides the
-    /// format; the walker consumes what it is handed.
+    /// The pool format, read at create-time from the Spark. Effects-spec
+    /// C.1 had the component DECIDE this; C.2 made it one answer per Spark,
+    /// because a chain and a single_source nested inside it render through
+    /// pipelines built for one format and cannot disagree.
     target_format: u32 = 0,
 };
 
@@ -306,7 +308,11 @@ fn create(
         .version = 0,
         .body = .{},
         .steps = undefined,
-        .target_format = @intCast(spark.color_format),
+        // The offscreen format, not the host's — see `vk.pickOffscreenFormat`.
+        // The pool allocates in `Spark.offscreen_format` regardless; reporting
+        // the host format here would put a number in the frame fingerprint
+        // that nothing allocates.
+        .target_format = @intCast(spark.offscreen_format),
     };
     errdefer c.arena.deinit();
 

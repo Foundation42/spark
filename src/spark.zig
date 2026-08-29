@@ -150,6 +150,12 @@ pub const Spark = struct {
     // ── Vulkan (borrowed from host) ──────────────────────────────────
     vk_ctx: *const vk.Context,
     color_format: vk.c.VkFormat,
+    /// The format every OFFSCREEN effect target is rendered in, and the
+    /// second format every pipeline is built for. Not the host's: an HDR10
+    /// swapchain is `A2B10G10R10`, whose alpha is two bits, and coverage —
+    /// a glyph's antialiasing, a shadow's falloff — is alpha. See
+    /// `vk.pickOffscreenFormat` and `vk.Attachment`.
+    offscreen_format: vk.c.VkFormat,
 
     // ── Owned engine resources ───────────────────────────────────────
     mono_atlas: atlas_mod.Atlas,
@@ -307,6 +313,13 @@ pub const Spark = struct {
     /// sizing knobs. `deinit` reverses this — every resource Spark
     /// constructed is torn down in reverse order.
     pub fn init(allocator: std.mem.Allocator, opts: InitOptions) !Spark {
+        // The format every offscreen effect target is rendered in, and the
+        // second format every pipeline is built for. Chosen once, here,
+        // because it has to be the same answer for the pipelines and for
+        // the target pool — a mismatch between those two is a validation
+        // error at the first effect draw. See `vk.pickOffscreenFormat`.
+        const offscreen_format = vk.pickOffscreenFormat(opts.vk_ctx.physical_device, opts.color_format);
+
         // ── Atlases ─────────────────────────────────────────────────
         var mono_atlas = try atlas_mod.Atlas.init(opts.vk_ctx, opts.mono_atlas_size, opts.mono_atlas_size, .mono_r8);
         errdefer mono_atlas.deinit();
@@ -317,23 +330,25 @@ pub const Spark = struct {
         var text_pipeline = try tp.TextPipeline.init(
             opts.vk_ctx,
             opts.color_format,
+            offscreen_format,
             &mono_atlas,
             &color_atlas,
             opts.max_glyphs,
         );
         errdefer text_pipeline.deinit();
-        var quad_pipeline = try qp.QuadPipeline.init(opts.vk_ctx, opts.color_format, opts.max_quads);
+        var quad_pipeline = try qp.QuadPipeline.init(opts.vk_ctx, opts.color_format, offscreen_format, opts.max_quads);
         errdefer quad_pipeline.deinit();
         var tri_pipeline = try tri_pipeline_mod.TrianglePipeline.init(
             opts.vk_ctx,
             opts.color_format,
+            offscreen_format,
             opts.max_tri_vertices,
             opts.max_tri_indices,
         );
         errdefer tri_pipeline.deinit();
         const image_pipeline = try allocator.create(image_pipeline_mod.ImagePipeline);
         errdefer allocator.destroy(image_pipeline);
-        image_pipeline.* = try image_pipeline_mod.ImagePipeline.init(opts.vk_ctx, opts.color_format, opts.max_images);
+        image_pipeline.* = try image_pipeline_mod.ImagePipeline.init(opts.vk_ctx, opts.color_format, offscreen_format, opts.max_images);
         errdefer image_pipeline.deinit();
 
         // ── Glyph + layout caches ───────────────────────────────────
@@ -380,6 +395,7 @@ pub const Spark = struct {
             allocator,
             opts.vk_ctx,
             opts.color_format,
+            offscreen_format,
             &shaders.fullscreen_vert,
         );
         errdefer pattern_pipelines.deinit();
@@ -392,6 +408,7 @@ pub const Spark = struct {
             allocator,
             opts.vk_ctx,
             opts.color_format,
+            offscreen_format,
             &shaders.fullscreen_vert,
         );
         errdefer single_source_pipelines.deinit();
@@ -413,6 +430,7 @@ pub const Spark = struct {
             .allocator = allocator,
             .vk_ctx = opts.vk_ctx,
             .color_format = opts.color_format,
+            .offscreen_format = offscreen_format,
             .mono_atlas = mono_atlas,
             .color_atlas = color_atlas,
             .text_pipeline = text_pipeline,
@@ -864,7 +882,7 @@ pub const Spark = struct {
         const target_key = pass_mod.TargetKey{
             .width = S.target_size[0],
             .height = S.target_size[1],
-            .format = self.color_format,
+            .format = self.offscreen_format,
         };
         const target_handle = try self.target_pool.acquire(target_key);
         try self.acquired_targets.append(target_handle);
@@ -924,7 +942,7 @@ pub const Spark = struct {
                     const py: f32 = @floatFromInt(p.layout_region.y - S.compose_region.y);
                     const pw: f32 = @floatFromInt(p.layout_region.w);
                     const ph: f32 = @floatFromInt(p.layout_region.h);
-                    self.recordPatternStep(cmd, p, px, py, pw, ph, &last_pattern);
+                    self.recordPatternStep(cmd, p, px, py, pw, ph, &last_pattern, .offscreen);
                     j += 1;
                 },
                 .single_source => |nested| {
@@ -933,7 +951,7 @@ pub const Spark = struct {
                     const ny: f32 = @floatFromInt(nested.compose_region.y - S.compose_region.y);
                     const nw: f32 = @floatFromInt(nested.compose_region.w);
                     const nh: f32 = @floatFromInt(nested.compose_region.h);
-                    try self.recordSingleSourceCompose(cmd, nested, nested_target, nx, ny, nw, nh, &last_compose);
+                    try self.recordSingleSourceCompose(cmd, nested, nested_target, nx, ny, nw, nh, &last_compose, .offscreen);
                     j = nested.subtree_dispatch_range[1];
                 },
                 // host_slot nested inside this single_source's
@@ -946,7 +964,7 @@ pub const Spark = struct {
                     const ny: f32 = @floatFromInt(nested_hs.compose_region.y - S.compose_region.y);
                     const nw: f32 = @floatFromInt(nested_hs.compose_region.w);
                     const nh: f32 = @floatFromInt(nested_hs.compose_region.h);
-                    try self.recordHostSlotCompose(cmd, nested_hs, nested_target, nx, ny, nw, nh, &last_compose);
+                    try self.recordHostSlotCompose(cmd, nested_hs, nested_target, nx, ny, nw, nh, &last_compose, .offscreen);
                     j += 1;
                 },
                 // Effects-spec C.1 + C.1.5 — chain nested inside
@@ -966,7 +984,7 @@ pub const Spark = struct {
                     const ny: f32 = @floatFromInt(nested_c.compose_region.y - S.compose_region.y);
                     const nw: f32 = @floatFromInt(nested_c.compose_region.w);
                     const nh: f32 = @floatFromInt(nested_c.compose_region.h);
-                    try self.recordChainFinalComposite(cmd, nested_c, final_target, nx, ny, nw, nh, &last_compose);
+                    try self.recordChainFinalComposite(cmd, nested_c, final_target, nx, ny, nw, nh, &last_compose, .offscreen);
                     j = nested_c.subtree_dispatch_range[1];
                 },
             }
@@ -1020,7 +1038,7 @@ pub const Spark = struct {
         {
             var it = element.triRuns(dl_p1.tri_targets.items, dl_p1.tri_indices.items, dispatch_index_u32);
             while (it.next()) |run| {
-                self.tri_pipeline.recordDrawIndexedRange(cmd, target_extent_render, world_offset_target, run.first_index, run.index_count, display_mod.Push.offscreen);
+                self.tri_pipeline.recordDrawIndexedRange(cmd, target_extent_render, world_offset_target, run.first_index, run.index_count, display_mod.Push.offscreen, .offscreen);
             }
         }
         {
@@ -1028,7 +1046,7 @@ pub const Spark = struct {
             const all_images = dl_p1.images.items;
             while (it.next()) |run| {
                 if (run.count == 0) continue;
-                self.image_pipeline.bind(cmd, target_extent_render);
+                self.image_pipeline.bind(cmd, target_extent_render, .offscreen);
                 const subset = all_images[run.first .. run.first + run.count];
                 for (subset) |im| {
                     self.image_pipeline.recordOne(cmd, target_extent_render, world_offset_target, @ptrCast(@alignCast(im.descriptor_set)), im.dst_pos, im.dst_size, display_mod.Push.offscreen);
@@ -1038,13 +1056,13 @@ pub const Spark = struct {
         {
             var it = element.runs(dl_p1.quad_targets.items, dispatch_index_u32);
             while (it.next()) |run| {
-                self.quad_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen);
+                self.quad_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen, .offscreen);
             }
         }
         {
             var it = element.runs(dl_p1.glyph_targets.items, dispatch_index_u32);
             while (it.next()) |run| {
-                self.text_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen);
+                self.text_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen, .offscreen);
             }
         }
 
@@ -1095,7 +1113,7 @@ pub const Spark = struct {
         const target_key = pass_mod.TargetKey{
             .width = H.target_size[0],
             .height = H.target_size[1],
-            .format = self.color_format,
+            .format = self.offscreen_format,
         };
         const target_handle = try self.target_pool.acquire(target_key);
         try self.acquired_targets.append(target_handle);
@@ -1229,13 +1247,15 @@ pub const Spark = struct {
         const target_key = pass_mod.TargetKey{
             .width = C.target_size[0],
             .height = C.target_size[1],
-            .format = self.color_format,
+            .format = self.offscreen_format,
         };
-        // v1 ignores ChainStep.target_format — target_pool keys are
-        // (w, h, color_format) and the pool currently allocates in
-        // self.color_format. C.2 :::bloom will need RGBA16F; format
-        // negotiation lands with that consumer, likely via either
-        // a per-format pool partition or extending TargetKey.
+        // Effects-spec C.2 — format negotiation landed, and it landed one
+        // level up: EVERY offscreen target is `self.offscreen_format`
+        // (RGBA16F where the device allows), not just a chain's pool, so a
+        // chain does not get to disagree with the single_source target
+        // nested inside it. `ChainStep.target_format` is what the component
+        // reported and rides the frame fingerprint; the allocation follows
+        // Spark, which is the only thing the pipelines were built against.
         var k: u16 = 0;
         while (k < C.target_pool_count) : (k += 1) {
             const target_handle = try self.target_pool.acquire(target_key);
@@ -1310,7 +1330,7 @@ pub const Spark = struct {
                     const py: f32 = @floatFromInt(p.layout_region.y - C.compose_region.y);
                     const pw: f32 = @floatFromInt(p.layout_region.w);
                     const ph: f32 = @floatFromInt(p.layout_region.h);
-                    self.recordPatternStep(cmd, p, px, py, pw, ph, &last_pattern);
+                    self.recordPatternStep(cmd, p, px, py, pw, ph, &last_pattern, .offscreen);
                     j += 1;
                 },
                 .single_source => |nested| {
@@ -1319,7 +1339,7 @@ pub const Spark = struct {
                     const ny: f32 = @floatFromInt(nested.compose_region.y - C.compose_region.y);
                     const nw: f32 = @floatFromInt(nested.compose_region.w);
                     const nh: f32 = @floatFromInt(nested.compose_region.h);
-                    try self.recordSingleSourceCompose(cmd, nested, nested_target, nx, ny, nw, nh, &last_compose);
+                    try self.recordSingleSourceCompose(cmd, nested, nested_target, nx, ny, nw, nh, &last_compose, .offscreen);
                     j = nested.subtree_dispatch_range[1];
                 },
                 .host_slot => |nested_hs| {
@@ -1328,7 +1348,7 @@ pub const Spark = struct {
                     const ny: f32 = @floatFromInt(nested_hs.compose_region.y - C.compose_region.y);
                     const nw: f32 = @floatFromInt(nested_hs.compose_region.w);
                     const nh: f32 = @floatFromInt(nested_hs.compose_region.h);
-                    try self.recordHostSlotCompose(cmd, nested_hs, nested_target, nx, ny, nw, nh, &last_compose);
+                    try self.recordHostSlotCompose(cmd, nested_hs, nested_target, nx, ny, nw, nh, &last_compose, .offscreen);
                     j += 1;
                 },
                 .chain => |nested_c| {
@@ -1338,7 +1358,7 @@ pub const Spark = struct {
                     const ny: f32 = @floatFromInt(nested_c.compose_region.y - C.compose_region.y);
                     const nw: f32 = @floatFromInt(nested_c.compose_region.w);
                     const nh: f32 = @floatFromInt(nested_c.compose_region.h);
-                    try self.recordChainFinalComposite(cmd, nested_c, final_target, nx, ny, nw, nh, &last_compose);
+                    try self.recordChainFinalComposite(cmd, nested_c, final_target, nx, ny, nw, nh, &last_compose, .offscreen);
                     j = nested_c.subtree_dispatch_range[1];
                 },
             }
@@ -1365,7 +1385,7 @@ pub const Spark = struct {
         {
             var it = element.triRuns(dl_p1.tri_targets.items, dl_p1.tri_indices.items, dispatch_index_u32);
             while (it.next()) |run| {
-                self.tri_pipeline.recordDrawIndexedRange(cmd, target_extent_render, world_offset_target, run.first_index, run.index_count, display_mod.Push.offscreen);
+                self.tri_pipeline.recordDrawIndexedRange(cmd, target_extent_render, world_offset_target, run.first_index, run.index_count, display_mod.Push.offscreen, .offscreen);
             }
         }
         {
@@ -1373,7 +1393,7 @@ pub const Spark = struct {
             const all_images = dl_p1.images.items;
             while (it.next()) |run| {
                 if (run.count == 0) continue;
-                self.image_pipeline.bind(cmd, target_extent_render);
+                self.image_pipeline.bind(cmd, target_extent_render, .offscreen);
                 const subset = all_images[run.first .. run.first + run.count];
                 for (subset) |im| {
                     self.image_pipeline.recordOne(cmd, target_extent_render, world_offset_target, @ptrCast(@alignCast(im.descriptor_set)), im.dst_pos, im.dst_size, display_mod.Push.offscreen);
@@ -1383,13 +1403,13 @@ pub const Spark = struct {
         {
             var it = element.runs(dl_p1.quad_targets.items, dispatch_index_u32);
             while (it.next()) |run| {
-                self.quad_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen);
+                self.quad_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen, .offscreen);
             }
         }
         {
             var it = element.runs(dl_p1.glyph_targets.items, dispatch_index_u32);
             while (it.next()) |run| {
-                self.text_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen);
+                self.text_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen, .offscreen);
             }
         }
 
@@ -1439,8 +1459,9 @@ pub const Spark = struct {
         vw: f32,
         vh: f32,
         last_bound: *vk.c.VkPipeline,
+        att: vk.Attachment,
     ) void {
-        const pipeline = self.pattern_pipelines.lookup(pattern_step.shader_id) orelse return;
+        const pipeline = self.pattern_pipelines.lookup(pattern_step.shader_id, att) orelse return;
         if (pipeline != last_bound.*) {
             vk.c.vkCmdBindPipeline(cmd, vk.c.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
             last_bound.* = pipeline;
@@ -1497,8 +1518,9 @@ pub const Spark = struct {
         vw: f32,
         vh: f32,
         last_bound: *vk.c.VkPipeline,
+        att: vk.Attachment,
     ) !void {
-        const pipeline = self.single_source_pipelines.lookup(ss.filter_shader_id) orelse return;
+        const pipeline = self.single_source_pipelines.lookup(ss.filter_shader_id, att) orelse return;
         if (pipeline != last_bound.*) {
             vk.c.vkCmdBindPipeline(cmd, vk.c.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
             last_bound.* = pipeline;
@@ -1571,8 +1593,9 @@ pub const Spark = struct {
         vw: f32,
         vh: f32,
         last_bound: *vk.c.VkPipeline,
+        att: vk.Attachment,
     ) !void {
-        const pipeline = self.single_source_pipelines.lookup(hs.composite_shader_id) orelse return;
+        const pipeline = self.single_source_pipelines.lookup(hs.composite_shader_id, att) orelse return;
         if (pipeline != last_bound.*) {
             vk.c.vkCmdBindPipeline(cmd, vk.c.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
             last_bound.* = pipeline;
@@ -1637,7 +1660,9 @@ pub const Spark = struct {
         dest: pass_mod.TargetHandle,
         target_size: [2]u32,
     ) !void {
-        const pipeline = self.single_source_pipelines.lookup(step.composite_shader_id) orelse return;
+        // Always `.offscreen`: a chain step's destination is a pool
+        // target by definition — Phase 2 is the only thing that reaches MAIN.
+        const pipeline = self.single_source_pipelines.lookup(step.composite_shader_id, .offscreen) orelse return;
 
         // A `.keep` step composites over what is already in `dest`, so the
         // old contents must survive the transition — which means naming the
@@ -1748,8 +1773,9 @@ pub const Spark = struct {
         vw: f32,
         vh: f32,
         last_bound: *vk.c.VkPipeline,
+        att: vk.Attachment,
     ) !void {
-        const pipeline = self.single_source_pipelines.lookup(ch.final_composite_shader_id) orelse return;
+        const pipeline = self.single_source_pipelines.lookup(ch.final_composite_shader_id, att) orelse return;
         if (pipeline != last_bound.*) {
             vk.c.vkCmdBindPipeline(cmd, vk.c.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
             last_bound.* = pipeline;
@@ -1954,7 +1980,7 @@ pub const Spark = struct {
                         const syr = (wy - sy) * z;
                         const swr = ww * z;
                         const shr = wh * z;
-                        self.recordPatternStep(cmd, p, sxr, syr, swr, shr, &last_pattern);
+                        self.recordPatternStep(cmd, p, sxr, syr, swr, shr, &last_pattern, .main);
                         i += 1;
                     },
                     .single_source => |ss| {
@@ -1974,7 +2000,7 @@ pub const Spark = struct {
                         const syr = (wy - sy) * z;
                         const swr = ww * z;
                         const shr = wh * z;
-                        try self.recordSingleSourceCompose(cmd, ss, target, sxr, syr, swr, shr, &last_compose);
+                        try self.recordSingleSourceCompose(cmd, ss, target, sxr, syr, swr, shr, &last_compose, .main);
                         // +1 advances past the single_source itself
                         // (subtree[1] is exclusive END of subtree,
                         // single_source sits AT that index). Without
@@ -1997,7 +2023,7 @@ pub const Spark = struct {
                         const syr = (wy - sy) * z;
                         const swr = ww * z;
                         const shr = wh * z;
-                        try self.recordHostSlotCompose(cmd, hs, target, sxr, syr, swr, shr, &last_compose);
+                        try self.recordHostSlotCompose(cmd, hs, target, sxr, syr, swr, shr, &last_compose, .main);
                         i += 1;
                     },
                     // Effects-spec C.1 — top-level chain compose into
@@ -2019,7 +2045,7 @@ pub const Spark = struct {
                         const syr = (wy - sy) * z;
                         const swr = ww * z;
                         const shr = wh * z;
-                        try self.recordChainFinalComposite(cmd, c, final_target, sxr, syr, swr, shr, &last_compose);
+                        try self.recordChainFinalComposite(cmd, c, final_target, sxr, syr, swr, shr, &last_compose, .main);
                         i += 1;
                     },
                 }
@@ -2063,7 +2089,7 @@ pub const Spark = struct {
         {
             var it = element.triRuns(dl.tri_targets.items, dl.tri_indices.items, element.MAIN_TARGET);
             while (it.next()) |run| {
-                self.tri_pipeline.recordDrawIndexedRange(cmd, extent, main_world_offset, run.first_index, run.index_count, disp);
+                self.tri_pipeline.recordDrawIndexedRange(cmd, extent, main_world_offset, run.first_index, run.index_count, disp, .main);
             }
         }
         {
@@ -2071,7 +2097,7 @@ pub const Spark = struct {
             const all_images = dl.images.items;
             while (it.next()) |run| {
                 if (run.count == 0) continue;
-                self.image_pipeline.bind(cmd, extent);
+                self.image_pipeline.bind(cmd, extent, .main);
                 const subset = all_images[run.first .. run.first + run.count];
                 for (subset) |im| {
                     self.image_pipeline.recordOne(cmd, extent, main_world_offset, @ptrCast(@alignCast(im.descriptor_set)), im.dst_pos, im.dst_size, disp);
@@ -2081,13 +2107,13 @@ pub const Spark = struct {
         {
             var it = element.runs(dl.quad_targets.items, element.MAIN_TARGET);
             while (it.next()) |run| {
-                self.quad_pipeline.recordDrawRange(cmd, extent, main_world_offset, run.first, run.count, disp);
+                self.quad_pipeline.recordDrawRange(cmd, extent, main_world_offset, run.first, run.count, disp, .main);
             }
         }
         {
             var it = element.runs(dl.glyph_targets.items, element.MAIN_TARGET);
             while (it.next()) |run| {
-                self.text_pipeline.recordDrawRange(cmd, extent, main_world_offset, run.first, run.count, disp);
+                self.text_pipeline.recordDrawRange(cmd, extent, main_world_offset, run.first, run.count, disp, .main);
             }
         }
 
@@ -2254,6 +2280,7 @@ pub const Spark = struct {
             .allocator = allocator,
             .vk_ctx = undefined,
             .color_format = undefined,
+            .offscreen_format = undefined,
             .mono_atlas = undefined,
             .color_atlas = undefined,
             .text_pipeline = undefined,

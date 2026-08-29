@@ -46,6 +46,10 @@ const c = vk.c;
 
 const ShaderId = component.ShaderId;
 
+/// One shader's pipeline in each attachment format — shared with
+/// `pattern_pipeline.Variants`, which is the same idea for the other cache.
+pub const Variants = @import("pattern_pipeline.zig").Variants;
+
 pub const Error = error{
     ShaderModuleCreation,
     PipelineLayoutCreation,
@@ -59,6 +63,9 @@ pub const SingleSourcePipelineCache = struct {
     allocator: std.mem.Allocator,
     device: c.VkDevice,
     color_format: c.VkFormat,
+    /// See `vk.pickOffscreenFormat`. Equal to `color_format` when the
+    /// device or the host format makes a second variant pointless.
+    offscreen_format: c.VkFormat,
 
     /// One combined-image-sampler binding at set=0, binding=0
     /// (matches `copy.frag` and every B.5+ filter shader). Shared
@@ -91,12 +98,13 @@ pub const SingleSourcePipelineCache = struct {
     /// `shader_id` → `VkPipeline`. Populated eagerly from
     /// `Spark.init` via `compile()` per registered single-source
     /// filter shader.
-    pipelines: std.AutoHashMap(ShaderId, c.VkPipeline),
+    pipelines: std.AutoHashMap(ShaderId, Variants),
 
     pub fn init(
         allocator: std.mem.Allocator,
         vk_ctx: *const vk.Context,
         color_format: c.VkFormat,
+        offscreen_format: c.VkFormat,
         fullscreen_vert_spv: []align(4) const u8,
     ) !SingleSourcePipelineCache {
         const device = vk_ctx.device;
@@ -166,18 +174,20 @@ pub const SingleSourcePipelineCache = struct {
             .allocator = allocator,
             .device = device,
             .color_format = color_format,
+            .offscreen_format = offscreen_format,
             .descriptor_set_layout = dsl,
             .layout = layout,
             .sampler = sampler,
             .fullscreen_vert_module = vert_module,
-            .pipelines = std.AutoHashMap(ShaderId, c.VkPipeline).init(allocator),
+            .pipelines = std.AutoHashMap(ShaderId, Variants).init(allocator),
         };
     }
 
     pub fn deinit(self: *SingleSourcePipelineCache) void {
         var it = self.pipelines.iterator();
         while (it.next()) |entry| {
-            c.vkDestroyPipeline(self.device, entry.value_ptr.*, null);
+            c.vkDestroyPipeline(self.device, entry.value_ptr.main, null);
+            if (entry.value_ptr.offscreen) |off| c.vkDestroyPipeline(self.device, off, null);
         }
         self.pipelines.deinit();
         c.vkDestroyShaderModule(self.device, self.fullscreen_vert_module, null);
@@ -209,11 +219,26 @@ pub const SingleSourcePipelineCache = struct {
         );
         errdefer c.vkDestroyPipeline(dev, pipeline, null);
 
+        // The offscreen twin: same layout, same blend, same shaders, one
+        // attachment format apart. Built only when that format differs.
+        var offscreen: c.VkPipeline = null;
+        if (self.offscreen_format != self.color_format) {
+            offscreen = try buildPipeline(
+                dev,
+                self.layout,
+                self.offscreen_format,
+                self.fullscreen_vert_module,
+                frag_module,
+            );
+        }
+        errdefer if (offscreen) |off| c.vkDestroyPipeline(dev, off, null);
+
         const gop = try self.pipelines.getOrPut(shader_id);
         if (gop.found_existing) {
-            c.vkDestroyPipeline(dev, gop.value_ptr.*, null);
+            c.vkDestroyPipeline(dev, gop.value_ptr.main, null);
+            if (gop.value_ptr.offscreen) |off| c.vkDestroyPipeline(dev, off, null);
         }
-        gop.value_ptr.* = pipeline;
+        gop.value_ptr.* = .{ .main = pipeline, .offscreen = offscreen };
     }
 
     /// Constant-time lookup. Returns `null` for unregistered ids —
@@ -224,8 +249,10 @@ pub const SingleSourcePipelineCache = struct {
     pub fn lookup(
         self: *const SingleSourcePipelineCache,
         shader_id: ShaderId,
+        att: vk.Attachment,
     ) ?c.VkPipeline {
-        return self.pipelines.get(shader_id);
+        const v = self.pipelines.get(shader_id) orelse return null;
+        return v.forAttachment(att);
     }
 };
 
@@ -396,6 +423,7 @@ test "SingleSourcePipelineCache: init + compile(copy.frag) + lookup round-trips"
         allocator,
         &fx.ctx,
         fx.swapchain.format,
+        fx.swapchain.format, // one format: these tests are not about the twin
         &shaders.fullscreen_vert,
     );
     defer cache.deinit();
@@ -404,7 +432,7 @@ test "SingleSourcePipelineCache: init + compile(copy.frag) + lookup round-trips"
     const copy_id = resolver_mod.shaderIdFromName("copy.frag");
     try cache.compile(copy_id, &shaders.copy_frag);
 
-    const pipeline = cache.lookup(copy_id);
+    const pipeline = cache.lookup(copy_id, .main);
     try testing.expect(pipeline != null);
 }
 
@@ -418,11 +446,12 @@ test "SingleSourcePipelineCache: lookup misses return null" {
         allocator,
         &fx.ctx,
         fx.swapchain.format,
+        fx.swapchain.format, // one format: these tests are not about the twin
         &shaders.fullscreen_vert,
     );
     defer cache.deinit();
 
     const resolver_mod = @import("shader_resolver.zig");
     const missing_id = resolver_mod.shaderIdFromName("nonexistent.frag");
-    try testing.expectEqual(@as(?c.VkPipeline, null), cache.lookup(missing_id));
+    try testing.expectEqual(@as(?c.VkPipeline, null), cache.lookup(missing_id, .main));
 }

@@ -210,9 +210,13 @@ pub const ChainPass = struct {
     /// `pool[final_pool_local]`, writes to MAIN at `compose_region`.
     /// Same opaque 16-byte identifier shape as `SingleSourcePass.shader_id`.
     final_composite_shader_id: ShaderId,
-    /// RGBA16F ping-pong targets when true (Decision #7 — relaxed in
-    /// Phase C). Most chain effects operate in HDR; flip false only
-    /// for LDR-throughout consumers.
+    /// Effects-spec C.2 — SUPERSEDED, kept so the arm's shape does not
+    /// churn. Offscreen format is now one answer per Spark
+    /// (`vk.pickOffscreenFormat`, RGBA16F where the device allows), because
+    /// a chain and a single_source nested inside it render through pipelines
+    /// built for one format and cannot disagree about it. Nothing reads this
+    /// field; a consumer that genuinely needs a different format wants a
+    /// second pipeline variant, not a flag.
     hdr_target: bool = true,
     /// Effects-spec C.2 — same field, same meaning, same Decision #8
     /// resolve-once semantics as `SingleSourcePass.layout_inflation`. A

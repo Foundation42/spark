@@ -235,8 +235,8 @@ test "two Spark instances own independent pattern pipeline caches" {
     // Same shader_id resolves to distinct VkPipeline handles in each
     // Spark — each instance ran its own vkCreateGraphicsPipelines.
     const gradient_id = spark.pass.shaderIdFromName("gradient.frag");
-    const pipe_a = spark_a.pattern_pipelines.lookup(gradient_id);
-    const pipe_b = spark_b.pattern_pipelines.lookup(gradient_id);
+    const pipe_a = spark_a.pattern_pipelines.lookup(gradient_id, .main);
+    const pipe_b = spark_b.pattern_pipelines.lookup(gradient_id, .main);
     try testing.expect(pipe_a != null);
     try testing.expect(pipe_b != null);
     try testing.expect(pipe_a.? != pipe_b.?);

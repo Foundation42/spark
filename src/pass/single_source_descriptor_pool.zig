@@ -291,6 +291,7 @@ const Substrate = struct {
             allocator,
             &fx.ctx,
             fx.swapchain.format,
+            fx.swapchain.format, // one format: these tests are not about the twin
             &shaders.fullscreen_vert,
         );
         errdefer cache.deinit();

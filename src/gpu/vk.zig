@@ -421,3 +421,52 @@ fn deviceHasSwapchainExtension(allocator: std.mem.Allocator, pd: c.VkPhysicalDev
     }
     return false;
 }
+
+/// Which attachment a draw is being recorded into.
+///
+/// Not cosmetic: a Vulkan graphics pipeline bakes its colour attachment
+/// format (`VkPipelineRenderingCreateInfo.pColorAttachmentFormats`) and may
+/// only be bound inside a rendering scope whose attachment matches. spark
+/// renders into two different formats — the host's swapchain, and its own
+/// offscreen effect targets — so every pipeline exists twice and every draw
+/// has to say which one it is.
+///
+/// **Why the two formats differ, and why it is not optional.** The offscreen
+/// targets used to inherit the swapchain's format, which is fine until the
+/// host presents HDR10: `VK_FORMAT_A2B10G10R10_UNORM_PACK32` carries ten bits
+/// of colour and **two bits of alpha**. Coverage is alpha, so everything that
+/// round-trips through an effect target — a glyph's antialiasing, a drop
+/// shadow's falloff — quantised to four levels. It looked like blocky text and
+/// hard dark blobs around it, on the HDR swapchain only, with the same
+/// document rendering perfectly on SDR.
+///
+/// `display_mod.Push.offscreen` marks the same distinction for the display
+/// transform, and cannot be reused for this one: it is the DEFAULT push
+/// value, so an SDR host's main attachment is indistinguishable from an
+/// offscreen one by that field alone.
+pub const Attachment = enum { main, offscreen };
+
+/// The format spark renders its offscreen effect targets in.
+///
+/// `R16G16B16A16_SFLOAT` when the device can colour-attach, blend and
+/// linearly sample it — which is every desktop GPU — and the host's own
+/// format otherwise, so a device that cannot do it degrades to exactly the
+/// behaviour that shipped before this existed rather than failing to start.
+/// Sixteen-bit float is also what `ChainPass.hdr_target` always promised;
+/// this is where the promise gets kept.
+///
+/// Offscreen targets hold values BEFORE the display transform (effect passes
+/// pass `Push.offscreen`, and encoding twice is not encoding), so the extra
+/// range is not needed for the colour — it is needed for the alpha, and it
+/// costs nothing to take the range with it.
+pub fn pickOffscreenFormat(physical_device: c.VkPhysicalDevice, host_format: c.VkFormat) c.VkFormat {
+    const want: c.VkFormat = c.VK_FORMAT_R16G16B16A16_SFLOAT;
+    const need: c.VkFormatFeatureFlags = c.VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+        c.VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
+        c.VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+        c.VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    var props: c.VkFormatProperties = std.mem.zeroes(c.VkFormatProperties);
+    c.vkGetPhysicalDeviceFormatProperties(physical_device, want, &props);
+    if ((props.optimalTilingFeatures & need) == need) return want;
+    return host_format;
+}

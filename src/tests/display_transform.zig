@@ -192,6 +192,8 @@ const Readback = struct {
             0,
             1,
             disp,
+        
+            .main, // the harness renders straight into its readback target
         );
         c.vkCmdEndRendering(cmd);
 
@@ -301,7 +303,7 @@ const Harness = struct {
         errdefer self.fx.deinit();
         self.rb = try Readback.init(&self.fx.ctx);
         errdefer self.rb.deinit();
-        self.pipeline = try qp.QuadPipeline.init(&self.fx.ctx, TARGET_FORMAT, 16);
+        self.pipeline = try qp.QuadPipeline.init(&self.fx.ctx, TARGET_FORMAT, TARGET_FORMAT, 16);
     }
 
     fn deinit(self: *Harness) void {
@@ -393,4 +395,114 @@ test "gate: paperwhite reaches the shader — a brighter page renders brighter" 
     const dim = try h.rb.drawQuad(&h.pipeline, color, display.Push.from(.pq, 100.0));
     const bright = try h.rb.drawQuad(&h.pipeline, color, display.Push.from(.pq, 400.0));
     try testing.expect(bright[0] > dim[0] + 0.05);
+}
+
+// ── The offscreen attachment format ──────────────────────────────────
+
+/// `A2B10G10R10` is the HDR10 swapchain format, and the whole reason
+/// `pickOffscreenFormat` exists: ten bits of colour and **two bits of
+/// alpha**. Coverage is alpha, so anything that round-trips through an
+/// effect target on that format — a glyph's antialiasing, a drop shadow's
+/// falloff — comes back quantised to four levels.
+const HDR10_FORMAT: c.VkFormat = c.VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+
+test "gate: an offscreen target never inherits a two-bit alpha" {
+    // The bug, in one assertion. matryoshka's HUD on an HDR10 swapchain
+    // rendered blocky text with hard dark blobs around it and a drop shadow
+    // that vanished entirely past blur≈16 — while the identical document on
+    // the SDR swapchain was perfect. Everything OUTSIDE the effect block was
+    // crisp on both, because it never left the main attachment.
+    const allocator = testing.allocator;
+    var fx = try fixture.Fixture.init(allocator);
+    defer fx.deinit();
+
+    const picked = spark.vk.pickOffscreenFormat(fx.ctx.physical_device, HDR10_FORMAT);
+    if (picked == HDR10_FORMAT) {
+        // The honest degradation: a device that cannot colour-attach,
+        // blend and linearly sample RGBA16F gets the old behaviour rather
+        // than a start-up failure. No desktop GPU is in this bucket, so if
+        // this fires on a machine that has one, the query is wrong.
+        std.debug.print("\n  device declined RGBA16F for offscreen targets — falling back\n", .{});
+        return error.SkipZigTest;
+    }
+    try testing.expectEqual(@as(c.VkFormat, c.VK_FORMAT_R16G16B16A16_SFLOAT), picked);
+}
+
+test "gate: the two formats produce two pipelines, and one format produces one" {
+    // Rule 1 for the twin. `Variants.forAttachment` falling back to `main`
+    // is correct ONLY when the formats coincide; if it fell back always,
+    // every offscreen draw would bind a pipeline built for the host's
+    // format — undefined behaviour that the validation layers catch and a
+    // release build does not.
+    const allocator = testing.allocator;
+    var fx = try fixture.Fixture.init(allocator);
+    defer fx.deinit();
+
+    const shaders = @import("shaders");
+    const copy_id = spark.pass.shaderIdFromName("copy.frag");
+
+    // Two different formats: the twin is built, and the two attachments
+    // resolve to different pipelines.
+    var two = try spark.pass.SingleSourcePipelineCache.init(
+        allocator,
+        &fx.ctx,
+        fx.swapchain.format,
+        spark.vk.pickOffscreenFormat(fx.ctx.physical_device, fx.swapchain.format),
+        &shaders.fullscreen_vert,
+    );
+    defer two.deinit();
+    try two.compile(copy_id, &shaders.copy_frag);
+    const main_pipe = two.lookup(copy_id, .main) orelse return error.NoMainPipeline;
+    const off_pipe = two.lookup(copy_id, .offscreen) orelse return error.NoOffscreenPipeline;
+    try testing.expect(main_pipe != off_pipe);
+
+    // The same format twice: one pipeline serves both, and nothing is built
+    // or destroyed for nothing. (`deinit` destroying an alias twice is the
+    // failure this shape rules out by construction — `offscreen` is null,
+    // not a copy of `main`.)
+    var one = try spark.pass.SingleSourcePipelineCache.init(
+        allocator,
+        &fx.ctx,
+        fx.swapchain.format,
+        fx.swapchain.format,
+        &shaders.fullscreen_vert,
+    );
+    defer one.deinit();
+    try one.compile(copy_id, &shaders.copy_frag);
+    try testing.expectEqual(
+        one.lookup(copy_id, .main).?,
+        one.lookup(copy_id, .offscreen).?,
+    );
+}
+
+test "gate: a Spark renders its effect targets in the offscreen format" {
+    // The wiring, end to end: the format the pipelines were built for and
+    // the format the target pool allocates MUST be the same answer, or the
+    // first effect draw is a validation error. One field, read by both.
+    const allocator = testing.allocator;
+    var fx = try fixture.Fixture.init(allocator);
+    defer fx.deinit();
+
+    const fonts = try fixture.makeFonts(allocator, fx.ft);
+    const theme = fixture.makeTheme(fonts);
+    var state = spark.State.init(allocator);
+    defer state.deinit();
+
+    var sp = try spark.Spark.init(allocator, .{
+        .vk_ctx = &fx.ctx,
+        .color_format = fx.swapchain.format,
+        .theme = &theme,
+        .fonts = fonts.registry,
+        .host_state = &state,
+    });
+    defer {
+        sp.deinit();
+        allocator.destroy(fonts.registry);
+    }
+    try testing.expectEqual(
+        spark.vk.pickOffscreenFormat(fx.ctx.physical_device, fx.swapchain.format),
+        sp.offscreen_format,
+    );
+    try testing.expectEqual(sp.offscreen_format, sp.single_source_pipelines.offscreen_format);
+    try testing.expectEqual(sp.offscreen_format, sp.pattern_pipelines.offscreen_format);
 }

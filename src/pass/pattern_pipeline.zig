@@ -27,6 +27,25 @@ const c = vk.c;
 
 const ShaderId = component.ShaderId;
 
+/// One shader's pipeline in each attachment format.
+///
+/// `offscreen` is null when the host format and the offscreen format are the
+/// same — the SDR case, and any device that cannot colour-attach RGBA16F —
+/// so nothing is built or destroyed twice for nothing. See
+/// `vk.Attachment` for why two exist at all.
+pub const Variants = struct {
+    main: c.VkPipeline,
+    offscreen: c.VkPipeline = null,
+
+    pub fn forAttachment(self: Variants, att: vk.Attachment) c.VkPipeline {
+        return switch (att) {
+            .main => self.main,
+            .offscreen => self.offscreen orelse self.main,
+        };
+    }
+};
+
+
 pub const Error = error{
     ShaderModuleCreation,
     PipelineLayoutCreation,
@@ -38,6 +57,9 @@ pub const PatternPipelineCache = struct {
     allocator: std.mem.Allocator,
     device: c.VkDevice,
     color_format: c.VkFormat,
+    /// See `vk.pickOffscreenFormat`. Equal to `color_format` when the
+    /// device or the host format makes a second variant pointless.
+    offscreen_format: c.VkFormat,
 
     /// Shared pipeline layout for all pattern-pass pipelines. One
     /// push-constant range `[0..MAX_PASS_UNIFORM_BYTES] @ STAGE_FRAGMENT`,
@@ -52,12 +74,13 @@ pub const PatternPipelineCache = struct {
 
     /// `shader_id` → `VkPipeline`. Populated eagerly from
     /// `Spark.init` via `compile()` per registered pattern shader.
-    pipelines: std.AutoHashMap(ShaderId, c.VkPipeline),
+    pipelines: std.AutoHashMap(ShaderId, Variants),
 
     pub fn init(
         allocator: std.mem.Allocator,
         vk_ctx: *const vk.Context,
         color_format: c.VkFormat,
+        offscreen_format: c.VkFormat,
         fullscreen_vert_spv: []align(4) const u8,
     ) !PatternPipelineCache {
         const device = vk_ctx.device;
@@ -87,16 +110,18 @@ pub const PatternPipelineCache = struct {
             .allocator = allocator,
             .device = device,
             .color_format = color_format,
+            .offscreen_format = offscreen_format,
             .layout = layout,
             .fullscreen_vert_module = vert_module,
-            .pipelines = std.AutoHashMap(ShaderId, c.VkPipeline).init(allocator),
+            .pipelines = std.AutoHashMap(ShaderId, Variants).init(allocator),
         };
     }
 
     pub fn deinit(self: *PatternPipelineCache) void {
         var it = self.pipelines.iterator();
         while (it.next()) |entry| {
-            c.vkDestroyPipeline(self.device, entry.value_ptr.*, null);
+            c.vkDestroyPipeline(self.device, entry.value_ptr.main, null);
+            if (entry.value_ptr.offscreen) |off| c.vkDestroyPipeline(self.device, off, null);
         }
         self.pipelines.deinit();
         c.vkDestroyShaderModule(self.device, self.fullscreen_vert_module, null);
@@ -128,13 +153,28 @@ pub const PatternPipelineCache = struct {
         );
         errdefer c.vkDestroyPipeline(dev, pipeline, null);
 
+        // The offscreen twin: same layout, same blend, same shaders, one
+        // attachment format apart. Built only when that format differs.
+        var offscreen: c.VkPipeline = null;
+        if (self.offscreen_format != self.color_format) {
+            offscreen = try buildPipeline(
+                dev,
+                self.layout,
+                self.offscreen_format,
+                self.fullscreen_vert_module,
+                frag_module,
+            );
+        }
+        errdefer if (offscreen) |off| c.vkDestroyPipeline(dev, off, null);
+
         // Overwrite-on-conflict: destroy the prior pipeline before
         // replacing the map entry.
         const gop = try self.pipelines.getOrPut(shader_id);
         if (gop.found_existing) {
-            c.vkDestroyPipeline(dev, gop.value_ptr.*, null);
+            c.vkDestroyPipeline(dev, gop.value_ptr.main, null);
+            if (gop.value_ptr.offscreen) |off| c.vkDestroyPipeline(dev, off, null);
         }
-        gop.value_ptr.* = pipeline;
+        gop.value_ptr.* = .{ .main = pipeline, .offscreen = offscreen };
     }
 
     /// Constant-time lookup. Returns `null` for unregistered ids —
@@ -143,8 +183,9 @@ pub const PatternPipelineCache = struct {
     /// `Factory.create` should have caught the typo at doc-load
     /// time, so a missing pipeline here means something is wrong
     /// with the eager-registration path.
-    pub fn lookup(self: *const PatternPipelineCache, shader_id: ShaderId) ?c.VkPipeline {
-        return self.pipelines.get(shader_id);
+    pub fn lookup(self: *const PatternPipelineCache, shader_id: ShaderId, att: vk.Attachment) ?c.VkPipeline {
+        const v = self.pipelines.get(shader_id) orelse return null;
+        return v.forAttachment(att);
     }
 };
 

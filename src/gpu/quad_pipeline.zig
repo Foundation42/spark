@@ -80,6 +80,10 @@ pub const QuadPipeline = struct {
     descriptor_set: c.VkDescriptorSet,
     pipeline_layout: c.VkPipelineLayout,
     pipeline: c.VkPipeline,
+    /// The same pipeline, built for the offscreen effect-target format.
+    /// `null` when the two formats are the same and one pipeline serves
+    /// both — which keeps `deinit` from ever destroying an alias twice.
+    pipeline_offscreen: c.VkPipeline = null,
 
     quad_buffer: c.VkBuffer,
     quad_memory: c.VkDeviceMemory,
@@ -91,6 +95,7 @@ pub const QuadPipeline = struct {
     pub fn init(
         ctx: *const vk.Context,
         color_format: c.VkFormat,
+        offscreen_format: c.VkFormat,
         max_quads: u32,
     ) !QuadPipeline {
         const dev = ctx.device;
@@ -275,7 +280,28 @@ pub const QuadPipeline = struct {
         gpci.pDynamicState = &dys;
         gpci.layout = self.pipeline_layout;
         try vk.check(c.vkCreateGraphicsPipelines(dev, null, 1, &gpci, null, &self.pipeline));
+        // The offscreen twin. Only the attachment format differs — same
+        // layout, same blend, same shaders — so it is the identical
+        // create-info with one pointer swapped. Skipped entirely when the
+        // host's format already is the offscreen one.
+        if (offscreen_format != color_format) {
+            var off_fmt = offscreen_format;
+            rendering_info.pColorAttachmentFormats = &off_fmt;
+            var off_pipeline: c.VkPipeline = null;
+            try vk.check(c.vkCreateGraphicsPipelines(dev, null, 1, &gpci, null, &off_pipeline));
+            self.pipeline_offscreen = off_pipeline;
+        }
         return self;
+    }
+
+    /// The pipeline to bind for a draw into `att`. An offscreen draw falls
+    /// back to the main pipeline when the two formats coincide, which is the
+    /// SDR case and every device that cannot colour-attach RGBA16F.
+    pub fn pipelineFor(self: *const @This(), att: vk.Attachment) c.VkPipeline {
+        return switch (att) {
+            .main => self.pipeline,
+            .offscreen => self.pipeline_offscreen orelse self.pipeline,
+        };
     }
 
     pub fn deinit(self: *QuadPipeline) void {
@@ -284,6 +310,7 @@ pub const QuadPipeline = struct {
             c.vkFreeMemory(self.device, self.quad_memory, null);
         }
         if (self.quad_buffer != null) c.vkDestroyBuffer(self.device, self.quad_buffer, null);
+        if (self.pipeline_offscreen != null) c.vkDestroyPipeline(self.device, self.pipeline_offscreen, null);
         if (self.pipeline != null) c.vkDestroyPipeline(self.device, self.pipeline, null);
         if (self.pipeline_layout != null) c.vkDestroyPipelineLayout(self.device, self.pipeline_layout, null);
         if (self.descriptor_pool != null) c.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);
@@ -309,8 +336,9 @@ pub const QuadPipeline = struct {
         cmd: c.VkCommandBuffer,
         extent: c.VkExtent2D,
         n_quads: u32,
+        att: vk.Attachment,
     ) void {
-        self.recordDrawRange(cmd, extent, .{ 0, 0 }, 0, n_quads, .{});
+        self.recordDrawRange(cmd, extent, .{ 0, 0 }, 0, n_quads, .{}, att);
     }
 
     /// Bind + draw a contiguous subrange of the quad instance
@@ -333,9 +361,10 @@ pub const QuadPipeline = struct {
         first_instance: u32,
         instance_count: u32,
         disp: display_mod.Push,
+        att: vk.Attachment,
     ) void {
         if (instance_count == 0) return;
-        c.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipeline);
+        c.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipelineFor(att));
         c.vkCmdBindDescriptorSets(
             cmd,
             c.VK_PIPELINE_BIND_POINT_GRAPHICS,
