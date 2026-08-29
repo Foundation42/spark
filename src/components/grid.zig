@@ -103,6 +103,8 @@ const Component = struct {
     /// Captured at create time. `deinit_` reaches the registry
     /// through it to tear down child instances in this scope.
     spark: ?*spark_mod.Spark = null,
+    /// The body text this instance's `root` was parsed from.
+    body: component_mod.Body = .{},
 };
 
 /// One-time install. Call after registering the other factories
@@ -130,6 +132,7 @@ fn create(
     c.* = .{
         .tracks = undefined,
         .track_count = 0,
+        .body = .{},
         .row_gap = 0,
         .column_gap = 0,
         .arena = std.heap.ArenaAllocator.init(allocator),
@@ -145,6 +148,7 @@ fn create(
 
     applyAttrs(c, spec);
 
+    _ = c.body.adopt(spec.body);
     c.root = try markdown.parseWithStateAndScope(
         c.arena.allocator(),
         spec.body,
@@ -162,9 +166,35 @@ fn update(ctx: *anyopaque, spec: *const components.Spec) anyerror!void {
     const prev_version = c.version;
     applyAttrs(c, spec);
     c.version = prev_version +% 1;
-    // Phase F MVP: body changes don't re-parse — author bumps the
-    // #id to force destroy + recreate when content shape changes.
-    // Attribute changes (columns, gap) take effect immediately.
+    // The body is authored text too, and it can change under a live
+    // instance — a hot-reloaded document hands the same `#id` a new body.
+    // Re-parse when it does, and only then: an unchanged body must not
+    // throw away this subtree's layout cache on every `:::update`.
+    if (c.body.adopt(spec.body)) {
+        if (c.spark) |sp| {
+            // The block-layout cache is keyed by element ADDRESS
+            // (`layout_cache.elementIdentity`), which is sound while a
+            // parsed tree lives as long as its document — and false the
+            // instant one is re-parsed into the same arena, because the
+            // recycled allocations land on the same addresses and the new
+            // heading collides with the old one's cached draws. Dropping
+            // the cache is the honest price of a re-parse, and a re-parse
+            // is a human-scale event.
+            sp.layout_cache.clear();
+            // Empty first, so a parse that fails leaves a valid root
+            // rather than one pointing into the arena we just reset.
+            c.root = element.Element{ .paragraph = &[_]element.Element{} };
+            _ = c.arena.reset(.retain_capacity);
+            c.root = try markdown.parseWithStateAndScope(
+                c.arena.allocator(),
+                spec.body,
+                sp.theme,
+                sp.registry,
+                sp.host_state,
+                c.scope,
+            );
+        }
+    }
 }
 
 fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {

@@ -112,6 +112,8 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
             inflation: component_mod.Edges,
             uniforms: UniformsT,
             version: u64 = 0,
+            /// The body text this instance's `root` was parsed from.
+            body: component_mod.Body = .{},
         };
 
         pub const factory: component_mod.Factory = .{
@@ -156,12 +158,14 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
                 .inflation = inf,
                 .uniforms = config.apply_attrs(spec),
                 .version = 0,
+                .body = .{},
             };
             errdefer c.arena.deinit();
 
             c.scope = try allocator.dupe(u8, id_raw);
             errdefer allocator.free(c.scope);
 
+            _ = c.body.adopt(spec.body);
             c.root = try markdown.parseWithStateAndScope(
                 c.arena.allocator(),
                 spec.body,
@@ -182,6 +186,37 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
             // edge is fine; growing requires recreate via #id change.
             c.uniforms = config.apply_attrs(spec);
             c.version = prev_version +% 1;
+
+            // The body is authored text too, and it can change under a live
+            // instance — a hot-reloaded document hands the same `#id` a new
+            // body. Re-parse when it does, and only then: an unchanged body
+            // must not throw away this subtree's layout cache on every
+            // `:::update`.
+            if (c.body.adopt(spec.body)) {
+                if (c.spark) |sp| {
+                    // The block-layout cache is keyed by element ADDRESS
+                    // (`layout_cache.elementIdentity`), which is sound while a
+                    // parsed tree lives as long as its document — and false the
+                    // instant one is re-parsed into the same arena, because the
+                    // recycled allocations land on the same addresses and the new
+                    // heading collides with the old one's cached draws. Dropping
+                    // the cache is the honest price of a re-parse, and a re-parse
+                    // is a human-scale event.
+                    sp.layout_cache.clear();
+                    // Empty first, so a parse that fails leaves a valid root
+                    // rather than one pointing into the arena we just reset.
+                    c.root = element.Element{ .paragraph = &[_]element.Element{} };
+                    _ = c.arena.reset(.retain_capacity);
+                    c.root = try markdown.parseWithStateAndScope(
+                        c.arena.allocator(),
+                        spec.body,
+                        sp.theme,
+                        sp.registry,
+                        sp.host_state,
+                        c.scope,
+                    );
+                }
+            }
         }
 
         fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {

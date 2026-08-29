@@ -757,3 +757,97 @@ test "single_source determinism: :::liquid_glass" {
         spark.pass.shaderIdFromName("liquid_glass.frag"),
     );
 }
+
+// ── Hot reload: a component's body is authored text too ──────────────
+
+/// Two documents, same `#id`, same attributes, DIFFERENT body. That is
+/// exactly what a host hot-reloading an edited document hands the registry:
+/// the instance is found by id and `update`d rather than rebuilt, so
+/// everything the component parsed at create stays as it was unless the
+/// component notices. Until `component.Body` landed, none of them did.
+const reload_before =
+    \\:::drop_shadow {#panel blur=6 offset_x=3 offset_y=3}
+    \\
+    \\# Lab
+    \\
+    \\:::
+    \\
+;
+const reload_after =
+    \\:::drop_shadow {#panel blur=6 offset_x=3 offset_y=3}
+    \\
+    \\# Reloaded, and visibly longer
+    \\
+    \\:::
+    \\
+;
+
+fn renderOnce(sp: *spark.Spark, state: *spark.State, source: []const u8) !u64 {
+    var doc = try sp.loadDocument(source, .{ .shared_state = state });
+    defer doc.deinit();
+    try sp.beginFrame(
+        .{
+            .extent = .{ .width = 800, .height = 600 },
+            .zoom = 1.0,
+            .scroll_offset = .{ 0, 0 },
+        },
+        .{ .reset = true },
+    );
+    _ = try sp.layoutAndRender(&doc, .{ 40, 40 }, .{ .max_w = 720 });
+    return hashFrame(sp);
+}
+
+test "hot reload: an edited body re-parses, and an unedited one does not churn" {
+    const allocator = testing.allocator;
+    var fx = try fixture.Fixture.init(allocator);
+    defer fx.deinit();
+
+    const fonts = try fixture.makeFonts(allocator, fx.ft);
+    const theme = fixture.makeTheme(fonts);
+    var state = spark.State.init(allocator);
+    defer state.deinit();
+
+    var sp = try spark.Spark.init(allocator, .{
+        .vk_ctx = &fx.ctx,
+        .color_format = fx.swapchain.format,
+        .theme = &theme,
+        .fonts = fonts.registry,
+        .host_state = &state,
+    });
+    defer {
+        sp.deinit();
+        allocator.destroy(fonts.registry);
+    }
+    sp.attachToRegistry();
+    try spark.installCoreComponents(&sp);
+
+    // Load the same document twice into the SAME Spark. The second load
+    // finds `#panel` in the registry and updates it rather than building a
+    // new one — which is the whole reason the staleness was possible, and
+    // also the reason an unchanged body must cost nothing.
+    const first = try renderOnce(&sp, &state, reload_before);
+    const again = try renderOnce(&sp, &state, reload_before);
+    try testing.expectEqual(first, again);
+
+    // Now the edit. Same id, same attributes, different body: the frame
+    // MUST change. Before `component.Body`, this hash was identical to the
+    // two above — the component kept rendering the body it was created
+    // with, and every heading outside the block updated normally, so
+    // nothing about the picture suggested where to look.
+    const edited = try renderOnce(&sp, &state, reload_after);
+    try testing.expect(edited != first);
+
+    // And it settles: the reloaded body is now the one being kept, so a
+    // repeat of the SAME edited source matches. Without this, a `Body` that
+    // simply re-parsed on every update would pass the assertion above while
+    // throwing this subtree's layout cache away on every frame that carries
+    // a `:::update` — a fix that works and costs the thing it was meant to
+    // protect.
+    try testing.expectEqual(edited, try renderOnce(&sp, &state, reload_after));
+
+    // Rule 1: going BACK to the original body comes back to the original
+    // frame. That makes the assertions above claims about the body being
+    // read each time, rather than about a component that re-parses once and
+    // then latches on whatever it saw second.
+    try testing.expectEqual(first, try renderOnce(&sp, &state, reload_before));
+}

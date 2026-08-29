@@ -338,6 +338,40 @@ pub const Factory = struct {
     pass_shape: PassShape = .content,
 };
 
+/// A body-bearing component's record of the text it actually parsed.
+///
+/// Every component with children parses `spec.body` once in `create` and is
+/// then handed a fresh `Spec` on each re-parse of the enclosing document.
+/// Until now all of them ignored the body on that path — `flex`, `grid` and
+/// the `SingleSourceFactory` each said so in a comment: *"body changes don't
+/// trigger a re-parse — author bumps the #id to force destroy + recreate"*.
+///
+/// That is fine while a document is a constant, and wrong the moment one can
+/// be **edited**. A host that hot-reloads a document (matryoshka's HUD does,
+/// 2026-08-30) gets a picture where everything outside a `:::` block updates
+/// and everything inside one is frozen at the text it was first mounted with
+/// — and the staleness is invisible, because the parts around it move. The
+/// worked example was a Lab document whose `# Lab` heading lives inside a
+/// `:::drop_shadow`: editing the title did nothing, editing anything else
+/// worked, and neither half suggested the other was the explanation.
+///
+/// The digest is what makes the re-parse cost nothing when nothing changed,
+/// which is the ordinary case — a document is re-parsed after every
+/// `:::update`, and re-parsing every body each time would throw away the
+/// layout cache for whole subtrees that nobody touched.
+pub const Body = struct {
+    digest: u64 = 0,
+
+    /// True when `body` is not the text last adopted — and records it, so a
+    /// caller re-parses exactly once per change.
+    pub fn adopt(self: *Body, body: []const u8) bool {
+        const d = std.hash.Wyhash.hash(0, body);
+        if (d == self.digest) return false;
+        self.digest = d;
+        return true;
+    }
+};
+
 /// What a factory produces — the (vtable, ctx) pair the Element
 /// holds. `ctx` is whatever per-instance state the component
 /// allocates in `Factory.create`; the registry remembers it
