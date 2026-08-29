@@ -214,6 +214,12 @@ pub const ChainPass = struct {
     /// Phase C). Most chain effects operate in HDR; flip false only
     /// for LDR-throughout consumers.
     hdr_target: bool = true,
+    /// Effects-spec C.2 — same field, same meaning, same Decision #8
+    /// resolve-once semantics as `SingleSourcePass.layout_inflation`. A
+    /// chain effect can reserve halo room too: `:::drop_shadow` is a chain
+    /// now and still needs `blur` pixels on every side, because the blur
+    /// has to have somewhere to fall off into. `null` means no inflation.
+    layout_inflation: ?LayoutInflationSpec = null,
 };
 
 /// Host-slot dispatch contract — full doc lives at the producer

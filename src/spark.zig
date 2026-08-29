@@ -960,16 +960,14 @@ pub const Spark = struct {
                 // (the inner walk's while-condition handles the
                 // chain's own-index termination).
                 .chain => |nested_c| {
-                    _ = nested_c;
-                    @panic("Phase C: chain step compose path lands with C.2 :::bloom");
-                    // const pool_base = self.chain_pool_bases.items[j] orelse unreachable;
-                    // const final_target = self.acquired_targets.items[pool_base + nested_c.final_pool_local];
-                    // const nx: f32 = @floatFromInt(nested_c.compose_region.x - S.compose_region.x);
-                    // const ny: f32 = @floatFromInt(nested_c.compose_region.y - S.compose_region.y);
-                    // const nw: f32 = @floatFromInt(nested_c.compose_region.w);
-                    // const nh: f32 = @floatFromInt(nested_c.compose_region.h);
-                    // try self.recordChainFinalComposite(cmd, nested_c, final_target, nx, ny, nw, nh, &last_compose);
-                    // j = nested_c.subtree_dispatch_range[1];
+                    const inner_base = self.chain_pool_bases.items[j] orelse unreachable;
+                    const final_target = self.acquired_targets.items[inner_base + nested_c.final_pool_local];
+                    const nx: f32 = @floatFromInt(nested_c.compose_region.x - S.compose_region.x);
+                    const ny: f32 = @floatFromInt(nested_c.compose_region.y - S.compose_region.y);
+                    const nw: f32 = @floatFromInt(nested_c.compose_region.w);
+                    const nh: f32 = @floatFromInt(nested_c.compose_region.h);
+                    try self.recordChainFinalComposite(cmd, nested_c, final_target, nx, ny, nw, nh, &last_compose);
+                    j = nested_c.subtree_dispatch_range[1];
                 },
             }
         }
@@ -1175,20 +1173,19 @@ pub const Spark = struct {
     ///       After (3), pool[0] holds the content image that the
     ///       chain's steps[] will filter/blur/composite through the
     ///       remaining pool targets.
-    ///   (4) Walk `steps[]` (existing C.1 @panic — replaced by C.2).
-    ///       Each step samples source pool target, writes dest pool
-    ///       target; layout transitions also execute the WAR memory
-    ///       barrier between steps as a side effect.
+    ///   (4) Walk `steps[]` (Effects-spec C.2). Each step samples its
+    ///       source pool target and writes its dest pool target in a
+    ///       render-pass scope of its own; the layout transitions
+    ///       around each draw are also the read-after-write and
+    ///       write-after-read barriers that make the ping-pong safe.
     ///
-    /// **Substrate-only commit (C.1.5).** Subtree machinery now
-    /// ships end-to-end (pool[0] holds rendered content), but the
-    /// steps[] compose body still panics — first real chain
-    /// consumer (C.2 `:::bloom`) brings the actual shader bindings.
-    ///
-    /// **Substrate-only commit caveat.** This path runs only when a
-    /// chain factory is registered on the Spark; `installCoreComponents`
-    /// does NOT register one (no chain consumer exists yet) — so
-    /// production frames never enter this method until C.2.
+    /// **Live as of C.2.** `installCoreComponents` registers
+    /// `:::drop_shadow` as a chain factory, so production frames enter
+    /// this method whenever a document casts a shadow. The first
+    /// consumer arrived from the drop shadow rather than from the
+    /// `:::bloom` this substrate was drafted for — a separable Gaussian
+    /// is two passes and a composite, which is the same shape a bloom
+    /// cascade is, one rung down.
     fn phase1ProcessChain(
         self: *Spark,
         cmd: vk.c.VkCommandBuffer,
@@ -1335,12 +1332,14 @@ pub const Spark = struct {
                     j += 1;
                 },
                 .chain => |nested_c| {
-                    _ = nested_c;
-                    @panic("Phase C: chain step compose path lands with C.2 :::bloom");
-                    // const pool_base_inner = self.chain_pool_bases.items[j] orelse unreachable;
-                    // const final_target = self.acquired_targets.items[pool_base_inner + nested_c.final_pool_local];
-                    // ... recordChainFinalComposite at target-local coords ...
-                    // j = nested_c.subtree_dispatch_range[1];
+                    const inner_base = self.chain_pool_bases.items[j] orelse unreachable;
+                    const final_target = self.acquired_targets.items[inner_base + nested_c.final_pool_local];
+                    const nx: f32 = @floatFromInt(nested_c.compose_region.x - C.compose_region.x);
+                    const ny: f32 = @floatFromInt(nested_c.compose_region.y - C.compose_region.y);
+                    const nw: f32 = @floatFromInt(nested_c.compose_region.w);
+                    const nh: f32 = @floatFromInt(nested_c.compose_region.h);
+                    try self.recordChainFinalComposite(cmd, nested_c, final_target, nx, ny, nw, nh, &last_compose);
+                    j = nested_c.subtree_dispatch_range[1];
                 },
             }
         }
@@ -1408,16 +1407,16 @@ pub const Spark = struct {
             .new_layout = vk.c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         });
 
-        // (4) Walk steps[]. The compose body is deferred to C.2 —
-        // see function-level docstring.
+        // (4) Walk steps[] — Effects-spec C.2. Sequential by construction:
+        // each step's closing layout transition is the barrier the next one
+        // reads through, so ping-pong ordering needs no scheduling of its
+        // own. Pool-local indices resolve against `pool_base`, which is why
+        // the acquire above captured it before the first acquire rather
+        // than deriving it after.
         for (C.steps) |step| {
-            _ = step;
-            @panic("Phase C: chain step compose path lands with C.2 :::bloom");
-            // const source = self.acquired_targets.items[pool_base + step.source_pool_local];
-            // const dest = self.acquired_targets.items[pool_base + step.dest_pool_local];
-            // barrierImageLayout(cmd, dest.image(), SHADER_READ → COLOR_ATTACHMENT)
-            // recordChainStepCompose(cmd, step, source.view, dest.view, C.target_size)
-            // barrierImageLayout(cmd, dest.image(), COLOR_ATTACHMENT → SHADER_READ)
+            const source = self.acquired_targets.items[pool_base + step.source_pool_local];
+            const dest = self.acquired_targets.items[pool_base + step.dest_pool_local];
+            try self.recordChainStep(cmd, step, source, dest, C.target_size);
         }
 
         // Pool release happens in the same Phase 3 wholesale sweep
@@ -1613,6 +1612,193 @@ pub const Spark = struct {
             },
         };
         vk.c.vkCmdSetScissor(cmd, 0, 1, &scissor);
+        vk.c.vkCmdDraw(cmd, 3, 1, 0, 0);
+    }
+
+    /// Effects-spec C.2 — run one `.chain` step: sample `source`, write
+    /// `dest`, in a render-pass scope of its own.
+    ///
+    /// Every step is its own `vkCmdBeginRendering` / `vkCmdEndRendering`
+    /// pair, which is not a choice — dynamic rendering does not nest, and
+    /// Phase 1 has already closed the subtree's pass by the time steps run.
+    /// The two layout transitions around the draw ARE the ping-pong's
+    /// read-after-write and write-after-read barriers: a Vulkan image layout
+    /// transition executes a full execution + memory barrier as a side
+    /// effect, so a later "optimisation" that replaced either with a
+    /// same-layout move would silently let step N+1 sample step N's
+    /// unfinished writes. Same load-bearing sequencing the single_source and
+    /// host_slot paths depend on, said again here because a chain has one
+    /// per step rather than one per frame.
+    fn recordChainStep(
+        self: *Spark,
+        cmd: vk.c.VkCommandBuffer,
+        step: element.ChainPassStep,
+        source: pass_mod.TargetHandle,
+        dest: pass_mod.TargetHandle,
+        target_size: [2]u32,
+    ) !void {
+        const pipeline = self.single_source_pipelines.lookup(step.composite_shader_id) orelse return;
+
+        // A `.keep` step composites over what is already in `dest`, so the
+        // old contents must survive the transition — which means naming the
+        // real old layout rather than UNDEFINED. A `.clear` step is about to
+        // overwrite every pixel, so UNDEFINED is both legal and cheaper (it
+        // lets the driver discard rather than preserve).
+        const keep = step.load == .keep;
+        barrierImageLayout(cmd, dest.image(), .{
+            .src_stage = if (keep)
+                vk.c.VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
+            else
+                vk.c.VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+            .dst_stage = vk.c.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .src_access = if (keep) vk.c.VK_ACCESS_2_SHADER_SAMPLED_READ_BIT else 0,
+            .dst_access = vk.c.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            .old_layout = if (keep)
+                vk.c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+            else
+                vk.c.VK_IMAGE_LAYOUT_UNDEFINED,
+            .new_layout = vk.c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        });
+
+        var color_att = std.mem.zeroes(vk.c.VkRenderingAttachmentInfo);
+        color_att.sType = vk.c.VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        color_att.imageView = dest.view();
+        color_att.imageLayout = vk.c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        color_att.loadOp = if (keep)
+            vk.c.VK_ATTACHMENT_LOAD_OP_LOAD
+        else
+            vk.c.VK_ATTACHMENT_LOAD_OP_CLEAR;
+        color_att.storeOp = vk.c.VK_ATTACHMENT_STORE_OP_STORE;
+        color_att.clearValue = .{ .color = .{ .float32 = .{ 0, 0, 0, 0 } } };
+
+        const extent = vk.c.VkExtent2D{ .width = target_size[0], .height = target_size[1] };
+        var ri = std.mem.zeroes(vk.c.VkRenderingInfo);
+        ri.sType = vk.c.VK_STRUCTURE_TYPE_RENDERING_INFO;
+        ri.renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = extent };
+        ri.layerCount = 1;
+        ri.colorAttachmentCount = 1;
+        ri.pColorAttachments = &color_att;
+        vk.c.vkCmdBeginRendering(cmd, &ri);
+
+        vk.c.vkCmdBindPipeline(cmd, vk.c.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        const set = try self.single_source_descriptor_pool.acquire(
+            source.view(),
+            self.single_source_pipelines.sampler,
+        );
+        var set_local = set;
+        vk.c.vkCmdBindDescriptorSets(
+            cmd,
+            vk.c.VK_PIPELINE_BIND_POINT_GRAPHICS,
+            self.single_source_pipelines.layout,
+            0,
+            1,
+            &set_local,
+            0,
+            null,
+        );
+        // Whole target: a chain step is a full-image filter, so the viewport
+        // is the pool target and not a compose region. Region placement is
+        // Phase 2's job, once.
+        var viewport = vk.c.VkViewport{
+            .x = 0,
+            .y = 0,
+            .width = @floatFromInt(target_size[0]),
+            .height = @floatFromInt(target_size[1]),
+            .minDepth = 0,
+            .maxDepth = 1,
+        };
+        vk.c.vkCmdSetViewport(cmd, 0, 1, &viewport);
+        var scissor = vk.c.VkRect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = extent };
+        vk.c.vkCmdSetScissor(cmd, 0, 1, &scissor);
+        if (step.uniform_len > 0) {
+            vk.c.vkCmdPushConstants(
+                cmd,
+                self.single_source_pipelines.layout,
+                vk.c.VK_SHADER_STAGE_FRAGMENT_BIT,
+                0,
+                step.uniform_len,
+                &step.uniform_bytes,
+            );
+        }
+        vk.c.vkCmdDraw(cmd, 3, 1, 0, 0);
+        vk.c.vkCmdEndRendering(cmd);
+
+        barrierImageLayout(cmd, dest.image(), .{
+            .src_stage = vk.c.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .dst_stage = vk.c.VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .src_access = vk.c.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            .dst_access = vk.c.VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            .old_layout = vk.c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .new_layout = vk.c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        });
+    }
+
+    /// Effects-spec C.2 — bind + draw a chain's final composite. Mirrors
+    /// `recordSingleSourceCompose` exactly; the only differences are where
+    /// the shader id comes from (`final_composite_shader_id`) and that the
+    /// sampled target is `pool[final_pool_local]` rather than the chain's
+    /// single offscreen target.
+    fn recordChainFinalComposite(
+        self: *Spark,
+        cmd: vk.c.VkCommandBuffer,
+        ch: element.ChainStep,
+        target_handle: pass_mod.TargetHandle,
+        vx: f32,
+        vy: f32,
+        vw: f32,
+        vh: f32,
+        last_bound: *vk.c.VkPipeline,
+    ) !void {
+        const pipeline = self.single_source_pipelines.lookup(ch.final_composite_shader_id) orelse return;
+        if (pipeline != last_bound.*) {
+            vk.c.vkCmdBindPipeline(cmd, vk.c.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            last_bound.* = pipeline;
+        }
+        const set = try self.single_source_descriptor_pool.acquire(
+            target_handle.view(),
+            self.single_source_pipelines.sampler,
+        );
+        var set_local = set;
+        vk.c.vkCmdBindDescriptorSets(
+            cmd,
+            vk.c.VK_PIPELINE_BIND_POINT_GRAPHICS,
+            self.single_source_pipelines.layout,
+            0,
+            1,
+            &set_local,
+            0,
+            null,
+        );
+        var viewport = vk.c.VkViewport{
+            .x = vx,
+            .y = vy,
+            .width = vw,
+            .height = vh,
+            .minDepth = 0,
+            .maxDepth = 1,
+        };
+        vk.c.vkCmdSetViewport(cmd, 0, 1, &viewport);
+        var scissor = vk.c.VkRect2D{
+            .offset = .{
+                .x = @intFromFloat(@max(0, @round(vx))),
+                .y = @intFromFloat(@max(0, @round(vy))),
+            },
+            .extent = .{
+                .width = @intFromFloat(@max(0, @round(vw))),
+                .height = @intFromFloat(@max(0, @round(vh))),
+            },
+        };
+        vk.c.vkCmdSetScissor(cmd, 0, 1, &scissor);
+        if (ch.final_composite_uniforms_len > 0) {
+            vk.c.vkCmdPushConstants(
+                cmd,
+                self.single_source_pipelines.layout,
+                vk.c.VK_SHADER_STAGE_FRAGMENT_BIT,
+                0,
+                ch.final_composite_uniforms_len,
+                &ch.final_composite_uniforms,
+            );
+        }
         vk.c.vkCmdDraw(cmd, 3, 1, 0, 0);
     }
 
@@ -1823,20 +2009,18 @@ pub const Spark = struct {
                     // via `final_composite_shader_id`. No subtree, so
                     // advance is plain `i += 1`.
                     .chain => |c| {
-                        _ = c;
-                        @panic("Phase C: chain step compose path lands with C.2 :::bloom");
-                        // const pool_base = self.chain_pool_bases.items[i] orelse unreachable;
-                        // const final_target = self.acquired_targets.items[pool_base + c.final_pool_local];
-                        // const wx: f32 = @floatFromInt(c.compose_region.x);
-                        // const wy: f32 = @floatFromInt(c.compose_region.y);
-                        // const ww: f32 = @floatFromInt(c.compose_region.w);
-                        // const wh: f32 = @floatFromInt(c.compose_region.h);
-                        // const sxr = (wx - sx) * z;
-                        // const syr = (wy - sy) * z;
-                        // const swr = ww * z;
-                        // const shr = wh * z;
-                        // try self.recordChainFinalComposite(cmd, c, final_target, sxr, syr, swr, shr, &last_compose);
-                        // i += 1;
+                        const pool_base = self.chain_pool_bases.items[i] orelse unreachable;
+                        const final_target = self.acquired_targets.items[pool_base + c.final_pool_local];
+                        const wx: f32 = @floatFromInt(c.compose_region.x);
+                        const wy: f32 = @floatFromInt(c.compose_region.y);
+                        const ww: f32 = @floatFromInt(c.compose_region.w);
+                        const wh: f32 = @floatFromInt(c.compose_region.h);
+                        const sxr = (wx - sx) * z;
+                        const syr = (wy - sy) * z;
+                        const swr = ww * z;
+                        const shr = wh * z;
+                        try self.recordChainFinalComposite(cmd, c, final_target, sxr, syr, swr, shr, &last_compose);
+                        i += 1;
                     },
                 }
             }
@@ -2207,13 +2391,6 @@ fn registerEmbeddedPassShaders(
     try resolver.register("copy.frag", &shaders.copy_frag);
     try single_source.compile(pass_mod.shaderIdFromName("copy.frag"), &shaders.copy_frag);
 
-    // Effects-spec Phase B.5 — first user-facing single_source
-    // filter. Drop-shadow factory (`:::drop_shadow`) registers
-    // against this shader_id; substrate-side eager-compile here
-    // ensures the pipeline is ready before any doc loads.
-    try resolver.register("drop_shadow.frag", &shaders.drop_shadow_frag);
-    try single_source.compile(pass_mod.shaderIdFromName("drop_shadow.frag"), &shaders.drop_shadow_frag);
-
     // Effects-spec Phase B.6 — second user-facing single_source
     // filter. Frosted-glass factory (`:::frosted_glass`). Ratifies
     // the B.6.a cache substrate (no disable_cache workaround) and
@@ -2239,6 +2416,16 @@ fn registerEmbeddedPassShaders(
     // `:::3d-scene` real-scene composite shaders register alongside.
     try resolver.register("host_slot_passthrough.frag", &shaders.host_slot_passthrough_frag);
     try single_source.compile(pass_mod.shaderIdFromName("host_slot_passthrough.frag"), &shaders.host_slot_passthrough_frag);
+
+    // Effects-spec Phase C.2 — one axis of a separable Gaussian. Compiled
+    // into the single_source cache because a chain step has exactly the
+    // single_source pipeline shape (one combined-image-sampler, one
+    // push-constant range, a fullscreen triangle); what makes it a chain
+    // step is where its source and destination come from, not how it binds.
+    // Standing up a parallel ChainPipelineCache would be two caches with
+    // the same contents.
+    try resolver.register("gaussian_alpha.frag", &shaders.gaussian_alpha_frag);
+    try single_source.compile(pass_mod.shaderIdFromName("gaussian_alpha.frag"), &shaders.gaussian_alpha_frag);
 }
 
 fn dispatchHit(hit: element.Hit, event: element.InputEvent, default_state: *state_mod.State) !void {

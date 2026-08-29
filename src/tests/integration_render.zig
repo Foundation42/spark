@@ -41,8 +41,9 @@ const known_doc =
 /// Drift in either layer fails the determinism / fingerprint tests
 /// below with a one-line message.
 ///
-/// PassDispatch serialization protocol **v5** (Effects-spec C.1.5 —
-/// ChainStep gains subtree_dispatch_range). Must match the comment
+/// PassDispatch serialization protocol **v6** (Effects-spec C.2 —
+/// ChainPassStep gains `load`; ChainStep gains the final composite's
+/// shader id and push constants). Must match the comment
 /// on `element.PassDispatch` — both ends move together. Per dispatch
 /// the hasher writes an arm tag byte first, then arm-specific fields
 /// in canonical order:
@@ -74,19 +75,23 @@ const known_doc =
 ///     stable across builds/processes and would defeat determinism.
 ///     Same exclusion category as `*_uniforms` trailing zero padding.)
 ///
-///   ChainStep (arm 3) — Effects-spec C.1 + C.1.5:
+///   ChainStep (arm 3) — Effects-spec C.1 + C.1.5 + C.2:
 ///     target_size            — [2]u32 (w, h)
 ///     target_format          — u32 (raw VkFormat)
 ///     target_pool_count      — u16
 ///     compose_region         — PassRegion
 ///     final_pool_local       — u16
 ///     subtree_dispatch_range — [2]u32 (start, end) — C.1.5
+///     final_composite_shader_id       — 16 bytes — C.2
+///     final_composite_uniforms_len    — u32 — C.2
+///     final_composite_uniforms        — `len` bytes — C.2
 ///     sequence_index         — u32
 ///     steps_len              — u32 (slice length, NOT factory.max_steps)
 ///     for each step in steps[0..steps_len]:
 ///       composite_shader_id — 16 bytes
 ///       source_pool_local   — u16
 ///       dest_pool_local     — u16
+///       load                — u8 (0 = clear, 1 = keep) — C.2
 ///       uniform_len         — u32
 ///       uniform_bytes       — `uniform_len` bytes
 ///     (NOTE: `Spark.chain_pool_bases[i]` and
@@ -186,6 +191,12 @@ fn hashFrame(sp: *const spark.Spark) u64 {
                 // .{ N, N } hashes deterministically (both u32s),
                 // so chains-without-content emit a stable hash too.
                 h.update(std.mem.asBytes(&c.subtree_dispatch_range));
+                // C.2 — the Phase 2 composite moved onto the dispatch, so
+                // it is part of the frame's identity like the sibling
+                // arms' shader ids are.
+                h.update(&c.final_composite_shader_id);
+                h.update(std.mem.asBytes(&c.final_composite_uniforms_len));
+                h.update(c.final_composite_uniforms[0..c.final_composite_uniforms_len]);
                 h.update(std.mem.asBytes(&c.sequence_index));
                 const steps_len: u32 = @intCast(c.steps.len);
                 h.update(std.mem.asBytes(&steps_len));
@@ -193,6 +204,12 @@ fn hashFrame(sp: *const spark.Spark) u64 {
                     h.update(&step.composite_shader_id);
                     h.update(std.mem.asBytes(&step.source_pool_local));
                     h.update(std.mem.asBytes(&step.dest_pool_local));
+                    // C.2 — `load` decides whether a step clears its
+                    // target or composites over it, which is the whole
+                    // difference between a filter and a compositor. A
+                    // wire format that skipped it would call two visibly
+                    // different frames the same frame.
+                    h.update(&[_]u8{@intFromEnum(step.load)});
                     h.update(std.mem.asBytes(&step.uniform_len));
                     h.update(step.uniform_bytes[0..step.uniform_len]);
                 }
@@ -498,21 +515,27 @@ test "cache replay: cached drop_shadow subtree preserves target routing" {
     // replay path is never hit).
     try testing.expect(sp.layout_cache.hits > 0);
 
-    // (2) Find the single_source dispatch (drop_shadow) and assert
-    // at least one quad routes to its offscreen target. Pre-B.6,
-    // blitEntry would have re-tagged every cached quad to MAIN_TARGET
-    // and this count would be 0.
-    var ss_seq: ?u32 = null;
+    // (2) Find the effect's dispatch (drop_shadow — a `.chain` since
+    // Effects-spec C.2) and assert at least one quad routes to its
+    // offscreen target. Pre-B.6, blitEntry would have re-tagged every
+    // cached quad to MAIN_TARGET and this count would be 0; the routing
+    // machinery is shared, so the chain arm inherits both the property
+    // and the regression it guards against.
+    var effect_seq: ?u32 = null;
     for (sp.pass_dispatches.items) |d| {
         switch (d) {
             .single_source => |ss| {
-                ss_seq = ss.sequence_index;
+                effect_seq = ss.sequence_index;
+                break;
+            },
+            .chain => |ch| {
+                effect_seq = ch.sequence_index;
                 break;
             },
             else => {},
         }
     }
-    const seq = ss_seq orelse return error.NoSingleSourceDispatchEmitted;
+    const seq = effect_seq orelse return error.NoEffectDispatchEmitted;
 
     var routed_quad_count: u32 = 0;
     for (sp.drawlist.quad_targets.items) |t| {
@@ -713,19 +736,83 @@ fn assertSingleSourceDoc(
     try testing.expectEqual(expected_shader_id, shader_ids[0]);
 }
 
-test "single_source determinism: :::drop_shadow" {
-    var fx = try fixture.Fixture.init(testing.allocator);
+test "chain determinism: :::drop_shadow, and its three steps in order" {
+    // Effects-spec C.2. `:::drop_shadow` moved from the single_source arm
+    // to the chain arm, so this is the sibling of the two
+    // `assertSingleSourceDoc` tests below — same determinism property,
+    // one arm over.
+    const allocator = testing.allocator;
+    var fx = try fixture.Fixture.init(allocator);
     defer fx.deinit();
-    try assertSingleSourceDoc(
-        &fx,
+
+    const doc_src =
         \\:::drop_shadow {blur=8 offset_y=4 color=#000c}
         \\:::box {color=teal width=160 height=80 radius=8}
         \\:::
         \\:::
         \\
-        ,
-        spark.pass.shaderIdFromName("drop_shadow.frag"),
-    );
+    ;
+    const blur_id = spark.pass.shaderIdFromName("gaussian_alpha.frag");
+    const copy_id = spark.pass.shaderIdFromName("copy.frag");
+
+    var hashes: [2]u64 = undefined;
+    inline for (0..2) |i| {
+        const fonts = try fixture.makeFonts(allocator, fx.ft);
+        const theme = fixture.makeTheme(fonts);
+        var state = spark.State.init(allocator);
+        defer state.deinit();
+
+        var sp = try spark.Spark.init(allocator, .{
+            .vk_ctx = &fx.ctx,
+            .color_format = fx.swapchain.format,
+            .theme = &theme,
+            .fonts = fonts.registry,
+            .host_state = &state,
+        });
+        defer {
+            sp.deinit();
+            allocator.destroy(fonts.registry);
+        }
+        sp.attachToRegistry();
+        try spark.installCoreComponents(&sp);
+
+        var doc = try sp.loadDocument(doc_src, .{ .shared_state = &state });
+        defer doc.deinit();
+
+        try sp.beginFrame(
+            .{ .extent = .{ .width = 800, .height = 600 } },
+            .{ .reset = true },
+        );
+        _ = try sp.layoutAndRender(&doc, .{ 40, 40 }, .{ .max_w = 720 });
+        hashes[i] = hashFrame(&sp);
+
+        var chains: usize = 0;
+        for (sp.pass_dispatches.items) |d| switch (d) {
+            .chain => |ch| {
+                chains += 1;
+                // Blur, blur, composite — and the pool indices that make
+                // it separable. Asserted here as well as in the
+                // component's own unit tests because THIS is the copy
+                // that survived the walker, the cache, and the wire
+                // format; the unit test only proves what was built.
+                try testing.expectEqual(@as(usize, 3), ch.steps.len);
+                try testing.expectEqualSlices(u8, &blur_id, &ch.steps[0].composite_shader_id);
+                try testing.expectEqualSlices(u8, &blur_id, &ch.steps[1].composite_shader_id);
+                try testing.expectEqualSlices(u8, &copy_id, &ch.steps[2].composite_shader_id);
+                try testing.expectEqual(spark.element.ChainLoad.keep, ch.steps[2].load);
+                try testing.expectEqualSlices(u8, &copy_id, &ch.final_composite_shader_id);
+                try testing.expect(ch.final_composite_uniforms_len > 0);
+            },
+            else => {},
+        };
+        try testing.expectEqual(@as(usize, 1), chains);
+    }
+
+    // Two consecutive Sparks, same doc, same frame — every byte of the
+    // chain's wire format included. A step whose uniform tail was left
+    // uninitialised, or a shader id read off an unstable pointer, breaks
+    // here rather than in a capture six weeks later.
+    try testing.expectEqual(hashes[0], hashes[1]);
 }
 
 test "single_source determinism: :::frosted_glass" {

@@ -350,20 +350,25 @@ test "two Spark instances own independent effects substrate under effect-using d
     try testing.expectEqual(spark_a.pass_dispatches.items.len, spark_b.pass_dispatches.items.len);
     try testing.expect(spark_a.pass_dispatches.items.ptr != spark_b.pass_dispatches.items.ptr);
 
-    // At least one single_source dispatch in each — sanity that the
-    // doc actually emitted what we wanted to exercise.
-    var saw_ss_a = false;
+    // At least one effect dispatch in each — sanity that the doc
+    // actually emitted what we wanted to exercise. `:::drop_shadow` is a
+    // `.chain` since Effects-spec C.2, and a chain leans on MORE of the
+    // per-Spark substrate than a single_source does (the ping-pong pool
+    // acquires three targets, and `chain_pool_bases` is a second
+    // per-Spark parallel array) — so it is a better doc for this test
+    // than it was, not a worse one.
+    var saw_effect_a = false;
     for (spark_a.pass_dispatches.items) |d| switch (d) {
-        .single_source => saw_ss_a = true,
+        .single_source, .chain => saw_effect_a = true,
         else => {},
     };
-    var saw_ss_b = false;
+    var saw_effect_b = false;
     for (spark_b.pass_dispatches.items) |d| switch (d) {
-        .single_source => saw_ss_b = true,
+        .single_source, .chain => saw_effect_b = true,
         else => {},
     };
-    try testing.expect(saw_ss_a);
-    try testing.expect(saw_ss_b);
+    try testing.expect(saw_effect_a);
+    try testing.expect(saw_effect_b);
 
     // Defer order tears down spark_b first then spark_a. Both
     // deinits exercise the full effects substrate (target_pool

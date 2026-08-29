@@ -405,13 +405,22 @@ pub fn layoutAndRender(
                             .target_format = result.target_format,
                             .target_pool_count = result.target_pool_count,
                             .steps = result.steps,
-                            .compose_region = result.compose_region,
+                            // The element's own box, like every sibling
+                            // arm — see the note under `ChainHookResult`.
+                            .compose_region = region,
                             .final_pool_local = result.final_pool_local,
                             // Effects-spec C.1.5 — captures the
                             // dispatch range emitted by the child
                             // walk above. Mirrors single_source
                             // (case 2) exactly.
                             .subtree_dispatch_range = .{ dispatch_start, seq },
+                            // Effects-spec C.2 — `passShapeScalars` maps a
+                            // chain factory's `final_composite_shader_id`
+                            // onto `cu.shader_id`, the same way it maps
+                            // host_slot's composite shader (case 4 above).
+                            .final_composite_shader_id = cu.shader_id,
+                            .final_composite_uniforms = uniform_buf,
+                            .final_composite_uniforms_len = ulen,
                             .sequence_index = seq,
                         } };
                     },

@@ -796,19 +796,41 @@ pub const HostSlotStep = struct {
 pub const MAX_CHAIN_STEPS: u32 = 16;
 pub const MAX_CHAIN_POOL_TARGETS: u32 = 16;
 
+/// What a chain step does to its destination before it draws.
+///
+/// A chain is two kinds of operation wearing the same shape. A FILTER owns
+/// its target — blur, downsample, tone-map — and the previous contents are
+/// noise, so it clears. A COMPOSITE lays one pool target over another and
+/// the previous contents are the whole point, so it keeps them and lets the
+/// pipeline's premultiplied-over blend do the work.
+///
+/// One enum rather than a `loadOp` plus a blend mode, because the two always
+/// move together: nothing wants to clear and then blend over the clear, and
+/// nothing wants to keep and then overwrite. `:::drop_shadow` needs exactly
+/// one of each — two blur steps that clear, and a third that keeps, laying
+/// the child back over the shadow it cast.
+pub const ChainLoad = enum(u8) {
+    clear,
+    keep,
+};
+
 /// One step in a chain — sample `source_pool_local`, write to
 /// `dest_pool_local`, both indices resolved against the chain's
 /// `pool_base` (captured on Spark.chain_pool_bases at Phase 1 acquire
 /// time). Inline `uniform_bytes` matches PatternStep / SingleSourceStep
 /// — no per-step indirection, fits Vulkan push-constant range.
 ///
-/// **Wire format / hashing** (Effects-spec C.1, v4). Every field
+/// **Wire format / hashing** (Effects-spec C.2, v6). Every field
 /// participates — chains are walker-emitted, no per-instance pointer
 /// state to exclude. See `integration_render.zig` hashFrame protocol.
 pub const ChainPassStep = struct {
     composite_shader_id: [16]u8,
     source_pool_local: u16,
     dest_pool_local: u16,
+    /// Effects-spec C.2. Defaults to `.clear` — a step that says nothing
+    /// owns its target, which is what a filter wants and what every step
+    /// written before compositing existed assumed.
+    load: ChainLoad = .clear,
     uniform_bytes: [MAX_PASS_UNIFORM_BYTES]u8 = [_]u8{0} ** MAX_PASS_UNIFORM_BYTES,
     uniform_len: u32 = 0,
 };
@@ -828,8 +850,19 @@ pub const ChainHookResult = struct {
     target_format: u32,
     target_pool_count: u16,
     final_pool_local: u16,
-    compose_region: PassRegion,
 };
+
+// Effects-spec C.2 note on what this struct does NOT carry. C.1 drafted a
+// `compose_region` here, and it cannot be right: the hook is handed a
+// `target_size` and nothing else, so a component would have to remember its
+// own layout origin and hope the walker asked in the same order it laid
+// out. The compose region is a LAYOUT fact — the element's own box — so the
+// walker fills it from the box, exactly as it does for pattern,
+// single_source and host_slot, and `layout_cache`'s blit/snapshot rebase
+// has one owner to shift instead of two to reconcile. Same reasoning for
+// the final composite's push constants: they arrive through the ordinary
+// mandatory `snapshot_uniforms` hook that every non-content element already
+// implements, rather than through a second channel of their own.
 
 /// Chain-pass dispatch step (Effects-spec C.1). Phase 1 acquires
 /// `target_pool_count` ping-pong targets, runs `steps` sequentially
@@ -876,6 +909,17 @@ pub const ChainStep = struct {
     /// Empty range `.{ N, N }` is legal — a chain with no content
     /// subtree starts from a transparent pool[0].
     subtree_dispatch_range: [2]u32,
+    /// Effects-spec C.2 — the shader Phase 2 composites
+    /// `pool[final_pool_local]` into MAIN with, and its push constants.
+    /// Carried on the dispatch rather than looked up from the factory for
+    /// the same reason `SingleSourceStep.filter_shader_id` is: the record
+    /// path is then a pure function of the dispatch, with no registry
+    /// access inside a command-buffer walk. The walker copies it from the
+    /// element's resolved `shader_id`, which `passShapeScalars` already
+    /// maps to `ChainPass.final_composite_shader_id`.
+    final_composite_shader_id: [16]u8,
+    final_composite_uniforms: [MAX_PASS_UNIFORM_BYTES]u8 = [_]u8{0} ** MAX_PASS_UNIFORM_BYTES,
+    final_composite_uniforms_len: u32 = 0,
     sequence_index: u32,
 };
 

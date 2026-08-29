@@ -46,12 +46,25 @@ Fractal-Brownian-motion noise. `seed` picks the field, `scale` controls cell siz
 :::noise {seed=99 scale=24.0 octaves=6 width=320 height=80}
 :::
 
-## Drop shadow — single-source filter (Phase B)
+## Drop shadow — chain effect (Phase B.5, rebuilt at C.2)
 
-The first user-facing single_source factory. Wraps any child content, renders it into an offscreen target sized to the child plus an inflation halo, then composites a blurred + offset + tinted version of that target underneath the original. Inflation is `blur` pixels on every side plus `max(0, offset)` on the lower-right and `-min(0, offset)` on the upper-left — so a `blur=8 offset_x=4 offset_y=4` wrapping a 200×80 box reserves a 220×100 region with the box at (8, 8) inside.
+The first user-facing effect, and now the first CHAIN consumer. Wraps any child content, renders it into an offscreen target sized to the child plus an inflation halo, then runs a **separable two-pass Gaussian** over the child's silhouette and lays the child back over the result. Inflation is `blur` pixels on every side plus `max(0, offset)` on the lower-right and `-min(0, offset)` on the upper-left — so a `blur=8 offset_x=4 offset_y=4` wrapping a 200×80 box reserves a 220×100 region with the box at (8, 8) inside.
+
+`blur` is the shadow's visible reach in pixels; sigma is `blur / 3`, so three sigma lands exactly on that halo and a shadow cannot spill outside the region reserved for it. `spread` (0..0.95) is Photoshop's Spread — the blurred alpha is divided by `1 - spread` and clipped, which fattens the core.
+
+**What B.5 shipped, and why it changed.** The original was a 9-tap box blur with taps separated by the whole blur radius, which does not read as a blur — it reads as nine copies of the content. A capture of matryoshka's Lab at `blur=8` showed its heading three times across and three times down. A Gaussian of radius R costs O(R²) samples done directly and O(R) done as two 1D passes, and two passes means two images, which is exactly what the C.1 ping-pong pool was built for.
+
+The chain is three steps over three pool targets: horizontal Gaussian of the child's alpha (offset applied here, once), vertical Gaussian tinted into the shadow colour, then the child copied back over it with `load = .keep`. That third step is what `ChainLoad` exists for — a drop shadow ends in a composite, not a filter.
 
 :::drop_shadow {#shadow_demo offset_x=6 offset_y=6 blur=10 color=#000c}
 :::box {color=#0d9488 width=240 height=80 radius=8}
+:::
+:::
+
+Heavier blur with spread, for comparison — the falloff is smooth at any radius, which is the property the box blur never had:
+
+:::drop_shadow {#shadow_soft offset_x=0 offset_y=8 blur=24 spread=0.2 color=#0009}
+:::box {color=#16213e width=240 height=80 radius=12}
 :::
 :::
 

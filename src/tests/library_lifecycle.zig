@@ -221,7 +221,7 @@ test "beginFrame reset clears drawlist and pass_dispatches symmetrically" {
     try testing.expectEqual(@as(usize, 0), sp.pass_dispatches.items.len);
 }
 
-test ":::drop_shadow component lifecycle emits single_source dispatch" {
+test ":::drop_shadow component lifecycle emits a chain dispatch" {
     // Effects-spec Phase B.5 — first user-facing single_source
     // factory. Equivalent to the `:::gradient` test below but for
     // the single_source path: loads a `:::drop_shadow` wrapping a
@@ -276,24 +276,39 @@ test ":::drop_shadow component lifecycle emits single_source dispatch" {
     );
     _ = try sp.layoutAndRender(&doc, .{ 40, 40 }, .{ .max_w = 720 });
 
-    // One dispatch emitted, and it's the single_source arm.
+    // One dispatch emitted, and as of Effects-spec C.2 it is the CHAIN
+    // arm — `:::drop_shadow` is a separable two-pass Gaussian plus a
+    // composite, which is three images and therefore a ping-pong pool.
     try testing.expectEqual(@as(usize, 1), sp.pass_dispatches.items.len);
     switch (sp.pass_dispatches.items[0]) {
-        .single_source => |ss| {
-            // Uniforms populated.
-            try testing.expect(ss.filter_uniforms_len > 0);
-            // Target size = inflated child box. Child is 200×80;
-            // inflation = (8, 12, 8, 12) for blur=8 offset=(4,4).
-            // Inflated = (200+8+12, 80+8+12) = (220, 100).
-            try testing.expectEqual(@as(u32, 220), ss.target_size[0]);
-            try testing.expectEqual(@as(u32, 100), ss.target_size[1]);
-            try testing.expectEqual(@as(u32, 220), @as(u32, @intCast(ss.compose_region.w)));
-            try testing.expectEqual(@as(u32, 100), @as(u32, @intCast(ss.compose_region.h)));
+        .chain => |ch| {
+            // Three steps, three pool targets, final composite reads the
+            // last one. The topology IS the effect; a chain that emitted
+            // two steps would render a shadow blurred on one axis only.
+            try testing.expectEqual(@as(usize, 3), ch.steps.len);
+            try testing.expectEqual(@as(u16, 3), ch.target_pool_count);
+            try testing.expectEqual(@as(u16, 2), ch.final_pool_local);
+            try testing.expect(ch.final_composite_uniforms_len > 0);
+
+            // Target size = inflated child box, unchanged from B.5 and
+            // still the layout invariant. Child is 200×80; inflation =
+            // (8, 12, 8, 12) for blur=8 offset=(4,4) → (220, 100).
+            try testing.expectEqual(@as(u32, 220), ch.target_size[0]);
+            try testing.expectEqual(@as(u32, 100), ch.target_size[1]);
+            try testing.expectEqual(@as(u32, 220), @as(u32, @intCast(ch.compose_region.w)));
+            try testing.expectEqual(@as(u32, 100), @as(u32, @intCast(ch.compose_region.h)));
+            // The compose region is the element's BOX, filled by the
+            // walker — so it carries the layout origin and not (0,0).
+            // A chain composited at the window corner is the bug this
+            // catches, and it looks like "the shadow is somewhere else".
+            try testing.expectEqual(@as(i32, 40), ch.compose_region.x);
+            try testing.expectEqual(@as(i32, 40), ch.compose_region.y);
+
             // Subtree range — the wrapped box is content, not a
             // pass-shape variant, so the subtree emits zero
             // dispatches → empty range [0, 0).
-            try testing.expectEqual(@as(u32, 0), ss.subtree_dispatch_range[0]);
-            try testing.expectEqual(@as(u32, 0), ss.subtree_dispatch_range[1]);
+            try testing.expectEqual(@as(u32, 0), ch.subtree_dispatch_range[0]);
+            try testing.expectEqual(@as(u32, 0), ch.subtree_dispatch_range[1]);
         },
         else => unreachable,
     }
