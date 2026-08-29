@@ -1,4 +1,4 @@
-# text_engine — vision: live documents
+# spark — vision: live documents
 
 > Markdown isn't the document. It's the **declarative interface to a
 > live, component-driven runtime** that an LLM (or human) writes,
@@ -381,7 +381,7 @@ no virtual DOM, no framework lock-in. Just collaborative
 documents flowing and interacting with each other — local, remote,
 visible, headless — as free as the data itself.
 
-For text_engine specifically this means:
+For spark specifically this means:
 
 - **`:::embedded-document` is a real factory in the registry** —
   not magic. It opens a `src=` URL, parses with the same
@@ -408,19 +408,14 @@ leap (documents-as-components, headless documents, flywheel
 substrate) requires zero foundational changes — just another
 component factory and a state-scoping policy.
 
-## Naming
+## Naming — RESOLVED: spark
 
-`text_engine` is now visibly the wrong name. The destination is a
-**live-document runtime**. Renaming conversation belongs in a
-future stage — but it's no longer "when the contract is concrete
-enough to name what the library actually does." The contract is
-concrete; what's still moving is the runtime layer above it. Once
-stage 7c ships (first concrete component), the rename can land.
-
-Candidates that came up implicitly across sessions:
-- `glow` (live + glowing)
-- `forge` (matches the runtime/factory feel)
-- `litho` (printed page + dynamic)
-- something tied to matryoshka (sibling brand)
-
-Not naming yet. Just flagging that "text_engine" has a shelf life.
+`text_engine` was visibly the wrong name for a **live-document
+runtime**, and the section that used to live here said so and
+listed candidates (`glow`, `forge`, `litho`, something tied to the
+matryoshka sibling brand). The answer became **spark** — the
+mechanical rename landed in session 20 (module name, demo exe, env
+prefixes, cache and state paths, one commit; library-spec Phase 4
+row 11), and the repo identity followed on 2026-08-29 when it went
+upstream as `Foundation42/spark`. Historical journey docs keep the
+old name where it was true at the time of writing.

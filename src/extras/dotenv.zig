@@ -183,7 +183,7 @@ test "DotEnv: empty key is rejected" {
 test "DotEnv: loadFromPath on missing file is silent" {
     var env = DotEnv.init(testing.allocator);
     defer env.deinit();
-    try env.loadFromPath("/tmp/this-file-definitely-does-not-exist-text-engine.env");
+    try env.loadFromPath("/tmp/this-file-definitely-does-not-exist-spark.env");
 }
 
 test "DotEnv: value may contain = signs after the first" {

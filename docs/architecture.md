@@ -1,4 +1,4 @@
-# text_engine — architecture
+# spark — architecture
 
 A Zig + Vulkan rich-text rendering library with an in-tree CommonMark
 parser. Designed library-first as the foundation for matryoshka HUD,
@@ -15,7 +15,7 @@ all flowing through one Element contract.
 │  tier 2  layout engines: markdown ✅, ANSI terminal (next),       │
 │          syntax highlighter, valkyr token streams, ImGui widgets  │
 ├───────────────────────────────────────────────────────────────────┤
-│  tier 1  text_engine — Element contract + walker + rendering      │
+│  tier 1  spark — Element contract + walker + rendering      │
 │          Element tree → atlas-aware shaped glyphs → SSBO          │
 └───────────────────────────────────────────────────────────────────┘
 ```

@@ -6,7 +6,7 @@
 > each other.
 
 This document captures the architectural decision to base
-text_engine's layout on an incremental linear-constraint solver
+spark's layout on an incremental linear-constraint solver
 (Cassowary, via a pure-Zig port of kiwi). Drafted late session 10
 / early session 11 (2026-05-16) as the substrate-tier follow-up
 to crisp zoom. Load-bearing for every layout-shaped surface after
@@ -146,7 +146,7 @@ strength tier.
 
 ### Beyond the basics
 
-Three Solver methods earn their keep in the text_engine flow:
+Three Solver methods earn their keep in the spark flow:
 
 - **`removeVariable(VariableId)`** — explicit variable cleanup.
   Neither Rust port has this; both reap via internal refcount.
@@ -199,7 +199,7 @@ and rely on it — not to reinvent it.
 ### Port plan
 
 Pure-Zig port. Lives under `src/layout/kiwi/`, organised as a
-self-contained module with zero text_engine deps so the boundary
+self-contained module with zero spark deps so the boundary
 stays clean (and so the solver can be lifted out and reused later
 if it ever needs to be). Reasons:
 

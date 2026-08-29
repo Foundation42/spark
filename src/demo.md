@@ -8,7 +8,7 @@ state:
   config_hidden: "true"
 ---
 
-# text_engine 🚀✨
+# spark 🚀✨
 
 Live-document runtime — colour emoji 🎨 flows inline with text 🌸, mathematical signs ✓ ✗ ≈ ≠ ∞ ≤ ≥ pick up the body font, and rich glyphs (rocket 🚀, sparkles ✨, flower 🌸, palette 🎨, party 🎉, star ⭐, fire 🔥, heart ❤️) ride the colour atlas alongside everything else.
 
@@ -32,13 +32,13 @@ The book scored ::rating{value=4.5} on Goodreads, the sequel only ::rating{value
 
 Build status: ::dot{color=green} passing on main, ::dot{color=yellow} flaky on PR #42, ::dot{color=red} blocked on staging. Workers ::dot{color=green} ::dot{color=green} ::dot{color=yellow} ::dot{color=green} mostly fine.
 
-Fixed in ::commit{hash="acf8e7b"} (part of session 17), shipping alongside ::commit{hash="8d6e7a3c4d5e6f7a8b9c0d1e2f"} and ::commit{hash="d26d67d" repo="fdn42/text_engine"} in the next release.
+Fixed in ::commit{hash="acf8e7b"} (part of session 17), shipping alongside ::commit{hash="8d6e7a3c4d5e6f7a8b9c0d1e2f"} and ::commit{hash="d26d67d" repo="fdn42/spark"} in the next release.
 
 The Pro plan is ::price{value=29 currency=USD} per month, Enterprise bills annually at ::price{value=499 currency=USD} (~::price{value=499 currency=EUR} for European customers, or ::price{value=399 currency=GBP} sterling). Tokyo office runs ::price{value=4990 currency=JPY} per seat.
 
 Today's PR: ::diff{add=437 remove=17} across six files. Yesterday's churn: ::diff{add=72 remove=68}. The big rebase last month: ::diff{add=2840 remove=1402}. And the no-op cleanup: ::diff{add=0 remove=0}.
 
-Tracked in ::issue{n=247} and ::pr{n=1042} (part of the ::issue{n=89 repo="fdn42/text_engine"} epic). Shipped via ::pr{n=311 repo="fdn42/text_engine"} after a long review thread.
+Tracked in ::issue{n=247} and ::pr{n=1042} (part of the ::issue{n=89 repo="fdn42/spark"} epic). Shipped via ::pr{n=311 repo="fdn42/spark"} after a long review thread.
 
 Last deploy ::ago{value="3m"}, last incident ::ago{value="2d"}, last full outage ::ago{value="3w"} (touch wood). Build kicked off ::ago{value="just now"}.
 
@@ -75,7 +75,7 @@ fn render(elem: Element) !void {
 A `​```ansi` fence (stage 5b) hands its body to the ANSI parser and embeds the result back as `CodeContent.sub_block` — the layout walker recurses, so SGR foreground colours, **bold**, *italic*, underline (4/24), strikethrough (9/29), and reverse video (7/27) all render inside the same code-block chrome as raw fences:
 
 ```ansi
-[1mtext_engine [32m✓[0m[0m  build [36mok[0m
+[1mspark [32m✓[0m[0m  build [36mok[0m
 [31merror:[0m  out of [33mfuel[0m (recoverable)
 [38;5;141mloaded[0m  [1mglyph_cache[0m + [1matlas[0m + [1mshaper[0m
 [38;2;255;128;200mtruecolor[0m supported via SGR 38;2;R;G;B

@@ -3,7 +3,7 @@
 //! Owns per-frame command buffers + sync primitives and drives the
 //! acquire / record / submit / present loop. The actual draw work is
 //! a clear-color via `vkCmdBeginRendering` for Phase 1b — Phase 2
-//! and later replace `recordFrame` with text-engine library calls.
+//! and later replace `recordFrame` with spark library calls.
 //!
 //! Sync model:
 //!   * `image_acquired[MAX_FRAMES]` — binary, signaled by

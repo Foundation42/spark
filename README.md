@@ -8,12 +8,12 @@ game UI all flow through. **What we're building** is documented in
 interface to a live, component-driven runtime that an LLM can
 author, mutate, and stream updates into.
 
-End of session 5 the substrate is alive on every axis: a top
-markdown doc with chrome, an ANSI fixture, a rainbow SDF
-"ATTENTION", a live rounded box driven by frontmatter state + two
-sliders, a streaming `:::chart` fed at 60 Hz through the
-`:::update` wire format, a `:::embedded-document` loading
-`src/widgets/orbit_panel.md` recursively, **and** a second
+The demo substrate (session 5's showcase, still the dogfood
+surface) is alive on every axis: a top markdown doc with chrome, an
+ANSI fixture, a rainbow SDF "ATTENTION", a live rounded box driven
+by frontmatter state + two sliders, a streaming `:::chart` fed at
+60 Hz through the `:::update` wire format, a `:::embedded-document`
+loading `src/widgets/orbit_panel.md` recursively, **and** a second
 `:::embedded-document` loading `src/widgets/remote_panel.md` over
 HTTP from a localhost server the demo spins up at startup —
 parent reactive state crosses the network boundary so the first
@@ -23,6 +23,15 @@ local embed is
 [`src/widgets/orbit_panel.md`](src/widgets/orbit_panel.md); the
 remote embed is
 [`src/widgets/remote_panel.md`](src/widgets/remote_panel.md).
+
+Development ran on through session 24: the
+[`effects-spec`](docs/effects-spec.md) (factory-shaped shader
+effects — `:::liquid_glass`, `:::placeholder_scene`) closed its v1
+phases A/B with all four implementable `PassShape` arms dispatching
+end-to-end, and Phase C's chain machinery is where work paused. The
+`.host_slot` arm is the designed socket for a host engine's own
+render passes — Phase D's matryoshka `:::3d-scene` adoption can
+register a factory with no further spark-side changes.
 
 ```
        ┌───────────────────────────────────────────────────────┐
@@ -577,3 +586,12 @@ OpenAI gpt-image-1 — curl-first reconnaissance per
 coarse reset — evict the OLDEST size bucket on `AtlasFull` instead
 of resetting everything; no blink frames at all),
 **MCP / WASM provenance components**.
+
+## License
+
+Dual-licensed, like its siblings rill and struple: [Apache
+2.0](LICENSE-APACHE) or a [commercial
+license](LICENSE-COMMERCIAL.md) from
+[Foundation42](https://foundation42.org) / Entrained.ai — see
+[`LICENSE`](LICENSE) for the choice and what it covers. Vendored
+`cmark` and `stb_image` carry their own licenses in `vendor/`.

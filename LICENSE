@@ -1,0 +1,53 @@
+spark — dual-licensed
+======================
+
+spark is available under either of:
+
+  - the Apache License, Version 2.0 (see LICENSE-APACHE), OR
+  - a commercial license offered by Foundation42 / Entrained.ai
+    (see LICENSE-COMMERCIAL.md and contact chris@foundation42.org).
+
+You may pick whichever fits your use case. Open-source users, students,
+researchers, and most downstream projects should use Apache 2.0 — it
+imposes no copyleft and grants explicit patent rights.
+
+The commercial license is for organizations that want:
+
+  - a path free of Apache 2.0's attribution / NOTICE-file requirements,
+  - indemnification, support, or a contractual SLA,
+  - use without distributing the corresponding NOTICE.
+
+Both licenses cover the same code. There is no "open core" / "premium
+features" split — the entire spark library (Element contract, layout
+walker, markdown and ANSI producers, component registry, effects
+substrate, rendering pipeline, shaders, and tooling) is available
+under either license at the licensee's choice.
+
+Contact
+-------
+
+Christian Beaumont — chris@foundation42.org
+Foundation42 — https://foundation42.org
+Entrained.ai  — https://entrained.ai
+
+Third-party
+-----------
+
+Vendored dependencies carry their own licenses in this repository and
+are NOT covered by the licenses above:
+
+  - vendor/cmark — the CommonMark reference parser, under its own
+    license (see vendor/cmark/LICENSE).
+  - vendor/stb — stb_image, public domain (see the notice at the top
+    of vendor/stb/stb_image.h).
+
+Vulkan, FreeType, HarfBuzz, and glfw are linked by the HOST
+executable, not vendored or distributed here — their licenses travel
+with the host's link step. Fonts are loaded from the running system
+and are not distributed in this repository.
+
+The Apache 2.0 license file applies to all original source code and
+documentation in this repository (`src/`, `docs/`, `shaders/`,
+`examples/`, `build.zig`, `build.zig.zon`, `README.md`). It does not
+extend to documents that hosts or users feed through spark at runtime
+— those belong to their authors.

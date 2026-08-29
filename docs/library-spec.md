@@ -618,7 +618,7 @@ its own render pass; spark is self-contained inside one
 `@import("spark")`. No more direct imports of `element_layout.zig`,
 `markdown.zig`, etc. The host-side concerns (GLFW window, swapchain
 creation, frame pacing, key dispatch, GLFW → spark event
-translation) stay in `main.zig`; everything text-engine-shaped goes
+translation) stay in `main.zig`; everything spark-shaped goes
 through the lib.zig surface.
 
 If migrating reveals API gaps, surface them as additions to

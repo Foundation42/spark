@@ -1,4 +1,4 @@
-# text_engine — roadmap
+# spark — roadmap
 
 The destination crystallised end-of-session-3 into a **live-
 document runtime**: markdown source as the declarative interface,
@@ -568,7 +568,7 @@ overflow, atomic manifest writes (tmp + `rename` within the cache
 dir). `pruneOlderThan` / `pruneAll` / `setBudget` knobs for
 future CLI / debug surfaces.
 
-Lives at `${XDG_CACHE_HOME:-$HOME/.cache}/text_engine/assets`.
+Lives at `${XDG_CACHE_HOME:-$HOME/.cache}/spark/assets`.
 Each cacheable consumer derives its own key:
 `sha256(prefix | provider | endpoint | model | system | prompt | max_tokens)`.
 The prefix carries a schema version (`svg-stream:v1`,
@@ -610,7 +610,7 @@ leaves either the old file or the new one. New `persist_dirty`
 flag independent of `dirty` — host throttles disk writes on its
 own cadence without disturbing the renderer's repaint signal.
 
-Lives at `${XDG_STATE_HOME:-$HOME/.local/state}/text_engine/state.json`
+Lives at `${XDG_STATE_HOME:-$HOME/.local/state}/spark/state.json`
 (state is user data, not regenerable cache — XDG conventions put
 them under different roots so `rm -rf ~/.cache` doesn't lose
 slider positions).
@@ -812,7 +812,7 @@ Pure-Zig port of Chris Colbert's kiwi (modern Cassowary, BSD-3,
 ~3000 LOC C++). Incremental dual-simplex tableau, four-tier
 strengths (required / strong / medium / weak), edit variables for
 reactive inputs. Lives at `src/layout/kiwi/` as a self-contained
-module with zero text_engine deps — clean boundary, tested in
+module with zero spark deps — clean boundary, tested in
 isolation. ~3,000 LOC + 300+ unit tests (Zig translation of the
 canonical kiwi C++ test corpus, partial — translation is task #201,
 still pending). One session of recon (kiwi source map, Rust port
@@ -1141,15 +1141,12 @@ unblocked:
   `SgrState.bg` (currently parsed-and-discarded). Trivial once a
   demand surfaces.
 
-## Parked — naming
+## Naming — RESOLVED: spark
 
-`text_engine` is visibly the wrong name for what's becoming a
-live-document runtime. Rename when stage 7c ships (first concrete
-component) — at that point the runtime layer above the contract
-is real enough to anchor the name.
-
-Candidates that came up:
-- `glow` (live + glowing)
-- `forge` (runtime/factory feel)
-- `litho` (printed page + dynamic)
-- something tied to matryoshka (sibling brand)
+The rename landed in session 20 (mechanical: module, exe, env
+prefixes, cache/state paths — library-spec Phase 4 row 11), and the
+repo went upstream as `Foundation42/spark` on 2026-08-29. The
+candidates this section used to park (`glow`, `forge`, `litho`,
+something matryoshka-branded) lost to the name the project had
+already grown into. Journey docs keep `text_engine` where it was
+true at the time of writing.

@@ -329,7 +329,7 @@ right thing to do with markdown is *render it harder*, not
 The next sessions extend the substrate in directions the contract
 already anticipates. Two horizon items from the first writing of
 this manifesto have since landed — **persistent
-content-addressable cache** (session 10, `~/.cache/text_engine`)
+content-addressable cache** (session 10, `~/.cache/spark`)
 and **headless documents** (session 10, `headless=true` on any
 embed). What remains:
 
