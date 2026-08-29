@@ -1957,6 +1957,27 @@ pub const Spark = struct {
         }
     }
 
+    /// Does the document claim the pointer at `(x, y)`?
+    ///
+    /// True when some element has registered a hit box under that point —
+    /// i.e. when a press there would be routed into the document rather than
+    /// falling through to whatever is behind it. Only interactive elements
+    /// register hit boxes, so this is spark's own answer to "whose click is
+    /// this", and a host arbitrating between the document and a 3D scene
+    /// underneath should ask it rather than testing a rectangle of its own:
+    /// two region tests are two things that drift.
+    ///
+    /// Also true while a drag is CAPTURED, wherever the pointer has since
+    /// moved to. A slider grabbed at its edge and dragged past the document
+    /// is still being dragged, and a host that stopped yielding halfway
+    /// through would hand the rest of the gesture to the scene.
+    ///
+    /// Coordinates are world coords, the same ones `dispatchMouseMove` takes.
+    pub fn claimsPointer(self: *const Spark, x: f32, y: f32) bool {
+        if (self.captured != null) return true;
+        return findHit(self.drawlist.hits.items, x, y) != null;
+    }
+
     /// Dispatch a primary-button transition. `down=true` on press,
     /// `down=false` on release. Manages pointer capture + focus.
     pub fn dispatchMouseButton(self: *Spark, x: f32, y: f32, down: bool) !void {
@@ -2246,6 +2267,46 @@ fn findHit(hits: []const element.Hit, x: f32, y: f32) ?element.Hit {
 // ── Tests ──────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "claimsPointer: inside a hit box yes, outside no, and captured always" {
+    // The host's arbitration question, answered by the same `findHit` the
+    // dispatcher uses — which is the point of exposing it rather than letting
+    // a host keep its own rectangle.
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.captured = null;
+
+    // A vtable that is never called — `claimsPointer` only reads boxes.
+    const vtable = element.ElementVTable{
+        .layout_and_render = struct {
+            fn f(_: *anyopaque, _: [2]f32, _: element.Constraints, _: *element.LayoutCtx, _: *element.DrawList) anyerror!element.Box {
+                return .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+            }
+        }.f,
+    };
+    var dummy: u8 = 0;
+    try sp.drawlist.hits.append(.{
+        .box = .{ .x = 10, .y = 20, .w = 100, .h = 40 },
+        .vtable = &vtable,
+        .ctx = &dummy,
+    });
+
+    // Inside, and on the half-open edges the dispatcher itself uses.
+    try testing.expect(sp.claimsPointer(50, 40));
+    try testing.expect(sp.claimsPointer(10, 20));
+    // Rule 1: assert the NO before believing the yes — a predicate stuck at
+    // true would satisfy every other assertion in this test.
+    try testing.expect(!sp.claimsPointer(9, 40));
+    try testing.expect(!sp.claimsPointer(110, 40));
+    try testing.expect(!sp.claimsPointer(500, 500));
+
+    // A captured drag claims the pointer wherever it has wandered to. Without
+    // this a host yields for the first half of a slider drag and hands the
+    // rest to whatever is behind the document.
+    sp.captured = sp.drawlist.hits.items[0];
+    try testing.expect(sp.claimsPointer(500, 500));
+}
 
 test "Spark: testStub produces a usable shell for component tests" {
     // Sanity check that the stub-construction path compiles. The
