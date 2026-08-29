@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const vk = @import("vk.zig");
+const display_mod = @import("display.zig");
 const atlas_mod = @import("atlas.zig");
 const shaders = @import("shaders");
 
@@ -71,12 +72,23 @@ comptime {
 pub const TextPushConsts = extern struct {
     viewport_size: [2]f32,
     world_offset: [2]f32 = .{ 0, 0 },
+    /// Output display transform for THIS draw. Read by the fragment
+    /// stage — see shaders/display.glsl. No default on purpose: every
+    /// record call states whether it is painting the host's attachment
+    /// (which carries the host's mode) or an offscreen effect target
+    /// (which is always `.offscreen`, because encoding into an
+    /// intermediate would encode twice).
+    display: display_mod.Push,
 };
 
 comptime {
     // Lock the std430 push-constant block size — mirrors the GLSL
     // `PC` in text.vert.
-    std.debug.assert(@sizeOf(TextPushConsts) == 16);
+    std.debug.assert(@sizeOf(TextPushConsts) == 24);
+    // `display` is the tail of the block in the GLSL too. A drift here
+    // is silent GPU garbage, which is why it is pinned by offset and
+    // not only by total size.
+    std.debug.assert(@offsetOf(TextPushConsts, "display") == 16);
 }
 
 pub const TextPipeline = struct {
@@ -236,7 +248,9 @@ pub const TextPipeline = struct {
 
         // ── Pipeline layout: descriptor set + viewport push consts ──
         var pc_range = c.VkPushConstantRange{
-            .stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT,
+            // Both stages: the vertex stage reads viewport/offset, the
+            // fragment stage reads `display`. One range, one push.
+            .stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT,
             .offset = 0,
             .size = @sizeOf(TextPushConsts),
         };
@@ -369,7 +383,7 @@ pub const TextPipeline = struct {
         extent: c.VkExtent2D,
         n_glyphs: u32,
     ) void {
-        self.recordDrawRange(cmd, extent, .{ 0, 0 }, 0, n_glyphs);
+        self.recordDrawRange(cmd, extent, .{ 0, 0 }, 0, n_glyphs, .{});
     }
 
     /// Bind + draw a contiguous subrange of the glyph instance
@@ -389,6 +403,7 @@ pub const TextPipeline = struct {
         world_offset: [2]f32,
         first_instance: u32,
         instance_count: u32,
+        disp: display_mod.Push,
     ) void {
         if (instance_count == 0) return;
         c.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipeline);
@@ -414,14 +429,14 @@ pub const TextPipeline = struct {
         var scissor = c.VkRect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = extent };
         c.vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-        const pc = TextPushConsts{ .world_offset = world_offset, .viewport_size = .{
+        const pc = TextPushConsts{ .world_offset = world_offset, .display = disp, .viewport_size = .{
             @floatFromInt(extent.width),
             @floatFromInt(extent.height),
         } };
         c.vkCmdPushConstants(
             cmd,
             self.pipeline_layout,
-            c.VK_SHADER_STAGE_VERTEX_BIT,
+            c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT,
             0,
             @sizeOf(TextPushConsts),
             &pc,

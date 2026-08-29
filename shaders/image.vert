@@ -21,6 +21,11 @@ layout(push_constant) uniform PC {
     vec2 world_offset;
     vec2 dst_pos;
     vec2 dst_size;
+    // x = display mode (0 = passthrough, 1 = PQ), y = paperwhite nits.
+    // Declared in BOTH stages of every pipeline that uses it: a push
+    // constant block is one range shared by the stages, and the fragment
+    // shader is where it is read. See shaders/display.glsl.
+    vec2 display;
 } pc;
 
 layout(location = 0) out vec2 v_uv;

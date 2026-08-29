@@ -81,6 +81,7 @@ pub const pass = @import("pass/root.zig");
 pub const Spec = @import("markdown_components.zig").Spec;
 pub const Attr = @import("markdown_components.zig").Attr;
 pub const params = @import("params.zig");
+pub const display = @import("gpu/display.zig");
 pub const state = @import("state.zig");
 pub const State = state.State;
 pub const Subscriber = state.Subscriber;

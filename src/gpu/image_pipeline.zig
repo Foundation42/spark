@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const vk = @import("vk.zig");
+const display_mod = @import("display.zig");
 const c = vk.c;
 const shaders = @import("shaders");
 
@@ -38,12 +39,23 @@ pub const ImagePushConsts = extern struct {
     world_offset: [2]f32 = .{ 0, 0 },
     dst_pos: [2]f32,
     dst_size: [2]f32,
+    /// Output display transform for THIS draw. Read by the fragment
+    /// stage — see shaders/display.glsl. No default on purpose: every
+    /// record call states whether it is painting the host's attachment
+    /// (which carries the host's mode) or an offscreen effect target
+    /// (which is always `.offscreen`, because encoding into an
+    /// intermediate would encode twice).
+    display: display_mod.Push,
 };
 
 comptime {
     // Lock the std430 push-constant block size — mirrors the GLSL
     // `PC` in image.vert.
-    std.debug.assert(@sizeOf(ImagePushConsts) == 32);
+    std.debug.assert(@sizeOf(ImagePushConsts) == 40);
+    // `display` is the tail of the block in the GLSL too. A drift here
+    // is silent GPU garbage, which is why it is pinned by offset and
+    // not only by total size.
+    std.debug.assert(@offsetOf(ImagePushConsts, "display") == 32);
     std.debug.assert(@offsetOf(ImagePushConsts, "world_offset") == 8);
     std.debug.assert(@offsetOf(ImagePushConsts, "dst_pos") == 16);
     std.debug.assert(@offsetOf(ImagePushConsts, "dst_size") == 24);
@@ -106,7 +118,9 @@ pub const ImagePipeline = struct {
 
         // ── Pipeline layout: 1 descriptor set + push constants ──
         var pc_range = c.VkPushConstantRange{
-            .stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT,
+            // Both stages: the vertex stage reads viewport/offset, the
+            // fragment stage reads `display`. One range, one push.
+            .stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT,
             .offset = 0,
             .size = @sizeOf(ImagePushConsts),
         };
@@ -282,17 +296,19 @@ pub const ImagePipeline = struct {
         ds: c.VkDescriptorSet,
         dst_pos: [2]f32,
         dst_size: [2]f32,
+        disp: display_mod.Push,
     ) void {
         const pc = ImagePushConsts{
             .viewport_size = .{ @floatFromInt(extent.width), @floatFromInt(extent.height) },
             .world_offset = world_offset,
             .dst_pos = dst_pos,
             .dst_size = dst_size,
+            .display = disp,
         };
         c.vkCmdPushConstants(
             cmd,
             self.pipeline_layout,
-            c.VK_SHADER_STAGE_VERTEX_BIT,
+            c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT,
             0,
             @sizeOf(ImagePushConsts),
             &pc,

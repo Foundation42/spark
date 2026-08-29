@@ -53,6 +53,7 @@ const tp = @import("gpu/text_pipeline.zig");
 const qp = @import("gpu/quad_pipeline.zig");
 const tri_pipeline_mod = @import("gpu/tri_pipeline.zig");
 const image_pipeline_mod = @import("gpu/image_pipeline.zig");
+const display_mod = @import("gpu/display.zig");
 const element_layout = @import("element_layout.zig");
 const document_mod = @import("document.zig");
 const pass_mod = @import("pass/root.zig");
@@ -74,6 +75,31 @@ pub const FrameInfo = struct {
     /// surface aligned with the matryoshka contract.
     target_image: vk.c.VkImage = null,
     target_view: vk.c.VkImageView = null,
+
+    /// What the host's attachment wants out of the fragment stage.
+    ///
+    /// `.sdr` (the default) is passthrough — spark writes the display-
+    /// referred values it always wrote, so a host that never sets this
+    /// renders byte-identically to one built before the transform existed.
+    /// A host presenting to an HDR10 / ST 2084 swapchain sets `.pq`, and
+    /// spark's chrome is mapped to `paperwhite_nits` rather than blazing at
+    /// PQ's 10000-nit ceiling.
+    ///
+    /// Per-frame rather than baked into the pipelines at init: one pipeline
+    /// set serves both swapchain families, and a host can change its mind (a
+    /// display handoff, a user toggling HDR) without spark rebuilding
+    /// anything. Matches how matryoshka pushes `display` to its own overlay
+    /// chrome each frame — see `shaders/display.glsl`.
+    display: display_mod.Mode = .sdr,
+
+    /// Diffuse-white luminance for the `.pq` arm; ignored under `.sdr`.
+    /// BT.2408's reference graphics white by default.
+    paperwhite_nits: f32 = display_mod.REFERENCE_PAPERWHITE_NITS,
+
+    /// The pair, as the pipelines take it.
+    pub fn displayPush(self: FrameInfo) display_mod.Push {
+        return display_mod.Push.from(self.display, self.paperwhite_nits);
+    }
 };
 
 /// Construction options for `Spark.init`. Raw Vulkan handles +
@@ -996,7 +1022,7 @@ pub const Spark = struct {
         {
             var it = element.triRuns(dl_p1.tri_targets.items, dl_p1.tri_indices.items, dispatch_index_u32);
             while (it.next()) |run| {
-                self.tri_pipeline.recordDrawIndexedRange(cmd, target_extent_render, world_offset_target, run.first_index, run.index_count);
+                self.tri_pipeline.recordDrawIndexedRange(cmd, target_extent_render, world_offset_target, run.first_index, run.index_count, display_mod.Push.offscreen);
             }
         }
         {
@@ -1007,20 +1033,20 @@ pub const Spark = struct {
                 self.image_pipeline.bind(cmd, target_extent_render);
                 const subset = all_images[run.first .. run.first + run.count];
                 for (subset) |im| {
-                    self.image_pipeline.recordOne(cmd, target_extent_render, world_offset_target, @ptrCast(@alignCast(im.descriptor_set)), im.dst_pos, im.dst_size);
+                    self.image_pipeline.recordOne(cmd, target_extent_render, world_offset_target, @ptrCast(@alignCast(im.descriptor_set)), im.dst_pos, im.dst_size, display_mod.Push.offscreen);
                 }
             }
         }
         {
             var it = element.runs(dl_p1.quad_targets.items, dispatch_index_u32);
             while (it.next()) |run| {
-                self.quad_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count);
+                self.quad_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen);
             }
         }
         {
             var it = element.runs(dl_p1.glyph_targets.items, dispatch_index_u32);
             while (it.next()) |run| {
-                self.text_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count);
+                self.text_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen);
             }
         }
 
@@ -1340,7 +1366,7 @@ pub const Spark = struct {
         {
             var it = element.triRuns(dl_p1.tri_targets.items, dl_p1.tri_indices.items, dispatch_index_u32);
             while (it.next()) |run| {
-                self.tri_pipeline.recordDrawIndexedRange(cmd, target_extent_render, world_offset_target, run.first_index, run.index_count);
+                self.tri_pipeline.recordDrawIndexedRange(cmd, target_extent_render, world_offset_target, run.first_index, run.index_count, display_mod.Push.offscreen);
             }
         }
         {
@@ -1351,20 +1377,20 @@ pub const Spark = struct {
                 self.image_pipeline.bind(cmd, target_extent_render);
                 const subset = all_images[run.first .. run.first + run.count];
                 for (subset) |im| {
-                    self.image_pipeline.recordOne(cmd, target_extent_render, world_offset_target, @ptrCast(@alignCast(im.descriptor_set)), im.dst_pos, im.dst_size);
+                    self.image_pipeline.recordOne(cmd, target_extent_render, world_offset_target, @ptrCast(@alignCast(im.descriptor_set)), im.dst_pos, im.dst_size, display_mod.Push.offscreen);
                 }
             }
         }
         {
             var it = element.runs(dl_p1.quad_targets.items, dispatch_index_u32);
             while (it.next()) |run| {
-                self.quad_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count);
+                self.quad_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen);
             }
         }
         {
             var it = element.runs(dl_p1.glyph_targets.items, dispatch_index_u32);
             while (it.next()) |run| {
-                self.text_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count);
+                self.text_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen);
             }
         }
 
@@ -1843,10 +1869,17 @@ pub const Spark = struct {
         // single-shader-path work for both attachments without
         // branching (Phase B.5 substrate).
         const main_world_offset: [2]f32 = .{ 0, 0 };
+        // The display transform applies HERE and nowhere else. This is the
+        // composition point — the one place spark writes to the surface the
+        // host will present. Phase 1's offscreen target renders pass
+        // `.offscreen` because an effect target is an intermediate that gets
+        // composited through these same pipelines later; encoding into one
+        // would encode twice, and PQ twice is not PQ.
+        const disp = self.frame_info.displayPush();
         {
             var it = element.triRuns(dl.tri_targets.items, dl.tri_indices.items, element.MAIN_TARGET);
             while (it.next()) |run| {
-                self.tri_pipeline.recordDrawIndexedRange(cmd, extent, main_world_offset, run.first_index, run.index_count);
+                self.tri_pipeline.recordDrawIndexedRange(cmd, extent, main_world_offset, run.first_index, run.index_count, disp);
             }
         }
         {
@@ -1857,20 +1890,20 @@ pub const Spark = struct {
                 self.image_pipeline.bind(cmd, extent);
                 const subset = all_images[run.first .. run.first + run.count];
                 for (subset) |im| {
-                    self.image_pipeline.recordOne(cmd, extent, main_world_offset, @ptrCast(@alignCast(im.descriptor_set)), im.dst_pos, im.dst_size);
+                    self.image_pipeline.recordOne(cmd, extent, main_world_offset, @ptrCast(@alignCast(im.descriptor_set)), im.dst_pos, im.dst_size, disp);
                 }
             }
         }
         {
             var it = element.runs(dl.quad_targets.items, element.MAIN_TARGET);
             while (it.next()) |run| {
-                self.quad_pipeline.recordDrawRange(cmd, extent, main_world_offset, run.first, run.count);
+                self.quad_pipeline.recordDrawRange(cmd, extent, main_world_offset, run.first, run.count, disp);
             }
         }
         {
             var it = element.runs(dl.glyph_targets.items, element.MAIN_TARGET);
             while (it.next()) |run| {
-                self.text_pipeline.recordDrawRange(cmd, extent, main_world_offset, run.first, run.count);
+                self.text_pipeline.recordDrawRange(cmd, extent, main_world_offset, run.first, run.count, disp);
             }
         }
 

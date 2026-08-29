@@ -20,6 +20,16 @@ layout(location = 3) flat in float v_radius;
 
 layout(location = 0) out vec4 out_color;
 
+#include "display.glsl"
+
+// Same push-constant block as the vertex stage — one range, both stages.
+// Only `display` is read here; the layout must still match exactly.
+layout(push_constant) uniform PC {
+    vec2 viewport_size;
+    vec2 world_offset;
+    vec2 display;
+} pc;
+
 float roundedBoxSDF(vec2 p, vec2 half_size, float r) {
     vec2 q = abs(p) - half_size + r;
     return length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - r;
@@ -36,6 +46,11 @@ void main() {
         float d = roundedBoxSDF(p, v_size * 0.5, v_radius);
         coverage = 1.0 - smoothstep(-0.5, 0.5, d);
     }
+    // Display transform BEFORE the premultiply — PQ is not linear, so
+    // encoding the premultiplied value would darken every anti-aliased
+    // corner as a function of its own coverage. See display.glsl.
+    vec3 rgb = sparkDisplay(v_color.rgb, pc.display);
     // Premultiply at output so srcFactor = ONE blend works.
-    out_color = vec4(v_color.rgb * v_color.a * coverage, v_color.a * coverage);
+    float a = v_color.a * coverage;
+    out_color = vec4(rgb * a, a);
 }

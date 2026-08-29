@@ -16,6 +16,11 @@
 layout(push_constant) uniform PC {
     vec2 viewport_size;
     vec2 world_offset;
+    // x = display mode (0 = passthrough, 1 = PQ), y = paperwhite nits.
+    // Declared in BOTH stages of every pipeline that uses it: a push
+    // constant block is one range shared by the stages, and the fragment
+    // shader is where it is read. See shaders/display.glsl.
+    vec2 display;
 } pc;
 
 struct GlyphInstance {

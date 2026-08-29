@@ -75,4 +75,5 @@ test {
     _ = @import("tests/integration_render.zig");
     _ = @import("tests/single_source_dispatch.zig");
     _ = @import("tests/placeholder_scene.zig");
+    _ = @import("tests/display_transform.zig");
 }

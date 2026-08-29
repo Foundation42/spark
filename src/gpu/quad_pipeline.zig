@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const vk = @import("vk.zig");
+const display_mod = @import("display.zig");
 const shaders = @import("shaders");
 
 const c = vk.c;
@@ -53,13 +54,24 @@ comptime {
 pub const QuadPushConsts = extern struct {
     viewport_size: [2]f32,
     world_offset: [2]f32 = .{ 0, 0 },
+    /// Output display transform for THIS draw. Read by the fragment
+    /// stage — see shaders/display.glsl. No default on purpose: every
+    /// record call states whether it is painting the host's attachment
+    /// (which carries the host's mode) or an offscreen effect target
+    /// (which is always `.offscreen`, because encoding into an
+    /// intermediate would encode twice).
+    display: display_mod.Push,
 };
 
 comptime {
     // Lock the std430 push-constant block size — mirrors the GLSL
     // `PC` in quad.vert. Reordering or adding fields without
     // updating the shader produces silent GPU garbage.
-    std.debug.assert(@sizeOf(QuadPushConsts) == 16);
+    std.debug.assert(@sizeOf(QuadPushConsts) == 24);
+    // `display` is the tail of the block in the GLSL too. A drift here
+    // is silent GPU garbage, which is why it is pinned by offset and
+    // not only by total size.
+    std.debug.assert(@offsetOf(QuadPushConsts, "display") == 16);
 }
 
 pub const QuadPipeline = struct {
@@ -171,7 +183,9 @@ pub const QuadPipeline = struct {
 
         // ── Pipeline layout ────────────────────────────────────────
         var pc_range = c.VkPushConstantRange{
-            .stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT,
+            // Both stages: the vertex stage reads viewport/offset, the
+            // fragment stage reads `display`. One range, one push.
+            .stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT,
             .offset = 0,
             .size = @sizeOf(QuadPushConsts),
         };
@@ -296,7 +310,7 @@ pub const QuadPipeline = struct {
         extent: c.VkExtent2D,
         n_quads: u32,
     ) void {
-        self.recordDrawRange(cmd, extent, .{ 0, 0 }, 0, n_quads);
+        self.recordDrawRange(cmd, extent, .{ 0, 0 }, 0, n_quads, .{});
     }
 
     /// Bind + draw a contiguous subrange of the quad instance
@@ -318,6 +332,7 @@ pub const QuadPipeline = struct {
         world_offset: [2]f32,
         first_instance: u32,
         instance_count: u32,
+        disp: display_mod.Push,
     ) void {
         if (instance_count == 0) return;
         c.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipeline);
@@ -343,14 +358,14 @@ pub const QuadPipeline = struct {
         var scissor = c.VkRect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = extent };
         c.vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-        const pc = QuadPushConsts{ .world_offset = world_offset, .viewport_size = .{
+        const pc = QuadPushConsts{ .world_offset = world_offset, .display = disp, .viewport_size = .{
             @floatFromInt(extent.width),
             @floatFromInt(extent.height),
         } };
         c.vkCmdPushConstants(
             cmd,
             self.pipeline_layout,
-            c.VK_SHADER_STAGE_VERTEX_BIT,
+            c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT,
             0,
             @sizeOf(QuadPushConsts),
             &pc,
