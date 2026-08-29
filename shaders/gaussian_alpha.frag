@@ -44,6 +44,13 @@ layout(set = 0, binding = 0) uniform sampler2D u_source;
 // vec2s pack into the first 16 bytes, each vec4 takes its own 16, and the
 // two trailing floats share the last slot.
 layout(push_constant) uniform Params {
+    // The display head every effect block carries, so one record path can
+    // write push constants for all of them. This shader NEVER encodes: a
+    // chain step's destination is a ping-pong pool target, and the encode
+    // belongs at the composition point exactly once. The record path sends
+    // it `Push.offscreen` (passthrough) and the member goes unread.
+    vec2 display;      //  0..8
+    vec2 _display_pad; //  8..16
     vec2 direction;   // (1,0) for the horizontal pass, (0,1) for vertical
     vec2 offset;      // where the shadow sits relative to the caster, pixels
     vec4 channel;     // dot-product mask: (0,0,0,1) alpha, (1,0,0,0) red

@@ -1450,6 +1450,52 @@ pub const Spark = struct {
     /// supplies world-local coords. `last_bound` is the bind-on-
     /// change cursor — null on entry forces a fresh bind, mutated
     /// in place so successive calls only re-bind on shader change.
+    /// The display push a draw into `att` should carry.
+    ///
+    /// The encode belongs at the composition point and happens exactly once:
+    /// a pass writing an intermediate target gets passthrough, and the one
+    /// writing the host's attachment gets the frame's real transform. Same
+    /// rule the four content pipelines follow, said once here for the effect
+    /// path — which did not follow it at all until now, and on an HDR
+    /// swapchain composited its content raw into a PQ surface. A mid-grey
+    /// card measured 128 outside an effect and 179 inside one.
+    fn displayFor(self: *const Spark, att: vk.Attachment) display_mod.Push {
+        return switch (att) {
+            .main => self.frame_info.displayPush(),
+            .offscreen => display_mod.Push.offscreen,
+        };
+    }
+
+    /// Push an effect's uniforms plus the display head, in the layout
+    /// `element.PASS_UNIFORM_OFFSET` describes. Two ranges, one call site
+    /// shape, so no record path can forget the head.
+    fn pushEffectUniforms(
+        cmd: vk.c.VkCommandBuffer,
+        layout: vk.c.VkPipelineLayout,
+        disp: display_mod.Push,
+        bytes: []const u8,
+    ) void {
+        var d = disp;
+        vk.c.vkCmdPushConstants(
+            cmd,
+            layout,
+            vk.c.VK_SHADER_STAGE_FRAGMENT_BIT,
+            0,
+            @sizeOf(display_mod.Push),
+            &d,
+        );
+        if (bytes.len > 0) {
+            vk.c.vkCmdPushConstants(
+                cmd,
+                layout,
+                vk.c.VK_SHADER_STAGE_FRAGMENT_BIT,
+                element.PASS_UNIFORM_OFFSET,
+                @intCast(bytes.len),
+                bytes.ptr,
+            );
+        }
+    }
+
     fn recordPatternStep(
         self: *const Spark,
         cmd: vk.c.VkCommandBuffer,
@@ -1491,13 +1537,11 @@ pub const Spark = struct {
             },
         };
         vk.c.vkCmdSetScissor(cmd, 0, 1, &scissor);
-        vk.c.vkCmdPushConstants(
+        pushEffectUniforms(
             cmd,
             self.pattern_pipelines.layout,
-            vk.c.VK_SHADER_STAGE_FRAGMENT_BIT,
-            0,
-            pattern_step.uniform_len,
-            &pattern_step.uniform_bytes,
+            self.displayFor(att),
+            pattern_step.uniform_bytes[0..pattern_step.uniform_len],
         );
         vk.c.vkCmdDraw(cmd, 3, 1, 0, 0);
     }
@@ -1563,13 +1607,11 @@ pub const Spark = struct {
             },
         };
         vk.c.vkCmdSetScissor(cmd, 0, 1, &scissor);
-        vk.c.vkCmdPushConstants(
+        pushEffectUniforms(
             cmd,
             self.single_source_pipelines.layout,
-            vk.c.VK_SHADER_STAGE_FRAGMENT_BIT,
-            0,
-            ss.filter_uniforms_len,
-            &ss.filter_uniforms,
+            self.displayFor(att),
+            ss.filter_uniforms[0..ss.filter_uniforms_len],
         );
         vk.c.vkCmdDraw(cmd, 3, 1, 0, 0);
     }
@@ -1635,6 +1677,10 @@ pub const Spark = struct {
             },
         };
         vk.c.vkCmdSetScissor(cmd, 0, 1, &scissor);
+        // v1's host_slot composite shader has no uniforms of its own, but it
+        // does have the display head — a scene composited raw into a PQ
+        // swapchain is the same bug as everything else on this path.
+        pushEffectUniforms(cmd, self.single_source_pipelines.layout, self.displayFor(att), &.{});
         vk.c.vkCmdDraw(cmd, 3, 1, 0, 0);
     }
 
@@ -1735,16 +1781,12 @@ pub const Spark = struct {
         vk.c.vkCmdSetViewport(cmd, 0, 1, &viewport);
         var scissor = vk.c.VkRect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = extent };
         vk.c.vkCmdSetScissor(cmd, 0, 1, &scissor);
-        if (step.uniform_len > 0) {
-            vk.c.vkCmdPushConstants(
-                cmd,
-                self.single_source_pipelines.layout,
-                vk.c.VK_SHADER_STAGE_FRAGMENT_BIT,
-                0,
-                step.uniform_len,
-                &step.uniform_bytes,
-            );
-        }
+        pushEffectUniforms(
+            cmd,
+            self.single_source_pipelines.layout,
+            display_mod.Push.offscreen,
+            step.uniform_bytes[0..step.uniform_len],
+        );
         vk.c.vkCmdDraw(cmd, 3, 1, 0, 0);
         vk.c.vkCmdEndRendering(cmd);
 
@@ -1815,16 +1857,12 @@ pub const Spark = struct {
             },
         };
         vk.c.vkCmdSetScissor(cmd, 0, 1, &scissor);
-        if (ch.final_composite_uniforms_len > 0) {
-            vk.c.vkCmdPushConstants(
-                cmd,
-                self.single_source_pipelines.layout,
-                vk.c.VK_SHADER_STAGE_FRAGMENT_BIT,
-                0,
-                ch.final_composite_uniforms_len,
-                &ch.final_composite_uniforms,
-            );
-        }
+        pushEffectUniforms(
+            cmd,
+            self.single_source_pipelines.layout,
+            self.displayFor(att),
+            ch.final_composite_uniforms[0..ch.final_composite_uniforms_len],
+        );
         vk.c.vkCmdDraw(cmd, 3, 1, 0, 0);
     }
 

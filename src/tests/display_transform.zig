@@ -197,6 +197,14 @@ const Readback = struct {
         );
         c.vkCmdEndRendering(cmd);
 
+        return try self.finishAndRead(cmd);
+    }
+
+    /// Close the command buffer, copy the attachment into the host-visible
+    /// buffer, submit, wait, and read the centre pixel. Shared by both draw
+    /// paths so they cannot differ in anything but the draw.
+    fn finishAndRead(self: *Readback, cmd: c.VkCommandBuffer) ![4]f32 {
+        const dev = self.ctx.device;
         barrier(
             cmd,
             self.image,
@@ -241,6 +249,95 @@ const Readback = struct {
         var out: [4]f32 = undefined;
         for (0..4) |i| out[i] = @as(f32, @floatFromInt(px[centre + i])) / 255.0;
         return out;
+    }
+
+    /// The composite half of the harness: bind a single_source pipeline,
+    /// sample `src_view`, draw the fullscreen triangle into the readback
+    /// target. Mirrors `Spark.recordSingleSourceCompose`'s push layout
+    /// exactly — display at 0, the effect's own uniforms at
+    /// `element.PASS_UNIFORM_OFFSET` — because that layout is the thing
+    /// under test.
+    fn drawComposite(
+        self: *Readback,
+        cache: *spark.pass.SingleSourcePipelineCache,
+        dpool: *spark.pass.SingleSourceDescriptorPool,
+        shader_id: [16]u8,
+        src_view: c.VkImageView,
+        disp: display.Push,
+    ) ![4]f32 {
+        const dev = self.ctx.device;
+        const pipeline = cache.lookup(shader_id, .main) orelse return error.NoPipeline;
+
+        var ai = std.mem.zeroes(c.VkCommandBufferAllocateInfo);
+        ai.sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        ai.commandPool = self.pool;
+        ai.level = c.VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = 1;
+        var cmd: c.VkCommandBuffer = null;
+        try vk.check(c.vkAllocateCommandBuffers(dev, &ai, &cmd));
+        defer c.vkFreeCommandBuffers(dev, self.pool, 1, &cmd);
+
+        var bi = std.mem.zeroes(c.VkCommandBufferBeginInfo);
+        bi.sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        try vk.check(c.vkBeginCommandBuffer(cmd, &bi));
+
+        barrier(
+            cmd,
+            self.image,
+            c.VK_IMAGE_LAYOUT_UNDEFINED,
+            c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            0,
+            c.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        );
+
+        var att = std.mem.zeroes(c.VkRenderingAttachmentInfo);
+        att.sType = c.VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        att.imageView = self.view;
+        att.imageLayout = c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        att.loadOp = c.VK_ATTACHMENT_LOAD_OP_CLEAR;
+        att.storeOp = c.VK_ATTACHMENT_STORE_OP_STORE;
+        att.clearValue = .{ .color = .{ .float32 = .{ 0, 0, 0, 0 } } };
+
+        var ri = std.mem.zeroes(c.VkRenderingInfo);
+        ri.sType = c.VK_STRUCTURE_TYPE_RENDERING_INFO;
+        ri.renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = TARGET_W, .height = TARGET_H } };
+        ri.layerCount = 1;
+        ri.colorAttachmentCount = 1;
+        ri.pColorAttachments = &att;
+        c.vkCmdBeginRendering(cmd, &ri);
+
+        c.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        var set = try dpool.acquire(src_view, cache.sampler);
+        c.vkCmdBindDescriptorSets(cmd, c.VK_PIPELINE_BIND_POINT_GRAPHICS, cache.layout, 0, 1, &set, 0, null);
+        var viewport = c.VkViewport{
+            .x = 0,
+            .y = 0,
+            .width = @floatFromInt(TARGET_W),
+            .height = @floatFromInt(TARGET_H),
+            .minDepth = 0,
+            .maxDepth = 1,
+        };
+        c.vkCmdSetViewport(cmd, 0, 1, &viewport);
+        var scissor = c.VkRect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = TARGET_W, .height = TARGET_H } };
+        c.vkCmdSetScissor(cmd, 0, 1, &scissor);
+        var d = disp;
+        c.vkCmdPushConstants(cmd, cache.layout, c.VK_SHADER_STAGE_FRAGMENT_BIT, 0, @sizeOf(display.Push), &d);
+        var alpha: f32 = 1.0;
+        c.vkCmdPushConstants(
+            cmd,
+            cache.layout,
+            c.VK_SHADER_STAGE_FRAGMENT_BIT,
+            spark.element.PASS_UNIFORM_OFFSET,
+            @sizeOf(f32),
+            &alpha,
+        );
+        c.vkCmdDraw(cmd, 3, 1, 0, 0);
+        c.vkCmdEndRendering(cmd);
+
+        return try self.finishAndRead(cmd);
     }
 };
 
@@ -505,4 +602,181 @@ test "gate: a Spark renders its effect targets in the offscreen format" {
     );
     try testing.expectEqual(sp.offscreen_format, sp.single_source_pipelines.offscreen_format);
     try testing.expectEqual(sp.offscreen_format, sp.pattern_pipelines.offscreen_format);
+}
+
+// ── The composite path takes the transform too ───────────────────────
+
+/// A small image the composite gate samples: cleared to a known
+/// PREMULTIPLIED colour and left in `SHADER_READ_ONLY_OPTIMAL`, which is
+/// exactly the state an effect's offscreen target is in when Phase 2 reaches
+/// it. Cleared rather than rendered so this fixture has no opinion about the
+/// pipeline that would have filled it.
+const Source = struct {
+    ctx: *const vk.Context,
+    image: c.VkImage = null,
+    memory: c.VkDeviceMemory = null,
+    view: c.VkImageView = null,
+
+    fn init(ctx: *const vk.Context, pool: c.VkCommandPool, premul: [4]f32) !Source {
+        var self = Source{ .ctx = ctx };
+        errdefer self.deinit();
+        const dev = ctx.device;
+
+        var ici = std.mem.zeroes(c.VkImageCreateInfo);
+        ici.sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ici.imageType = c.VK_IMAGE_TYPE_2D;
+        ici.format = c.VK_FORMAT_R16G16B16A16_SFLOAT;
+        ici.extent = .{ .width = TARGET_W, .height = TARGET_H, .depth = 1 };
+        ici.mipLevels = 1;
+        ici.arrayLayers = 1;
+        ici.samples = c.VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = c.VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = c.VK_IMAGE_USAGE_TRANSFER_DST_BIT | c.VK_IMAGE_USAGE_SAMPLED_BIT;
+        ici.sharingMode = c.VK_SHARING_MODE_EXCLUSIVE;
+        ici.initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED;
+        try vk.check(c.vkCreateImage(dev, &ici, null, &self.image));
+
+        var req: c.VkMemoryRequirements = undefined;
+        c.vkGetImageMemoryRequirements(dev, self.image, &req);
+        var mai = std.mem.zeroes(c.VkMemoryAllocateInfo);
+        mai.sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = try findMemoryType(ctx, req.memoryTypeBits, c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        try vk.check(c.vkAllocateMemory(dev, &mai, null, &self.memory));
+        try vk.check(c.vkBindImageMemory(dev, self.image, self.memory, 0));
+
+        var vci = std.mem.zeroes(c.VkImageViewCreateInfo);
+        vci.sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        vci.image = self.image;
+        vci.viewType = c.VK_IMAGE_VIEW_TYPE_2D;
+        vci.format = c.VK_FORMAT_R16G16B16A16_SFLOAT;
+        vci.subresourceRange = .{
+            .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        };
+        try vk.check(c.vkCreateImageView(dev, &vci, null, &self.view));
+
+        // Clear + settle into the layout a compose samples from.
+        var ai = std.mem.zeroes(c.VkCommandBufferAllocateInfo);
+        ai.sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        ai.commandPool = pool;
+        ai.level = c.VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = 1;
+        var cmd: c.VkCommandBuffer = null;
+        try vk.check(c.vkAllocateCommandBuffers(dev, &ai, &cmd));
+        defer c.vkFreeCommandBuffers(dev, pool, 1, &cmd);
+
+        var bi = std.mem.zeroes(c.VkCommandBufferBeginInfo);
+        bi.sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        try vk.check(c.vkBeginCommandBuffer(cmd, &bi));
+        barrier(
+            cmd,
+            self.image,
+            c.VK_IMAGE_LAYOUT_UNDEFINED,
+            c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            0,
+            c.VK_ACCESS_TRANSFER_WRITE_BIT,
+            c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            c.VK_PIPELINE_STAGE_TRANSFER_BIT,
+        );
+        var cv = c.VkClearColorValue{ .float32 = premul };
+        var range = c.VkImageSubresourceRange{
+            .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        };
+        c.vkCmdClearColorImage(cmd, self.image, c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cv, 1, &range);
+        barrier(
+            cmd,
+            self.image,
+            c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            c.VK_ACCESS_TRANSFER_WRITE_BIT,
+            c.VK_ACCESS_SHADER_READ_BIT,
+            c.VK_PIPELINE_STAGE_TRANSFER_BIT,
+            c.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        );
+        try vk.check(c.vkEndCommandBuffer(cmd));
+
+        var si = std.mem.zeroes(c.VkSubmitInfo);
+        si.sType = c.VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmd;
+        try vk.check(c.vkQueueSubmit(ctx.queue, 1, &si, null));
+        try vk.check(c.vkQueueWaitIdle(ctx.queue));
+        return self;
+    }
+
+    fn deinit(self: *Source) void {
+        const dev = self.ctx.device;
+        if (self.view != null) c.vkDestroyImageView(dev, self.view, null);
+        if (self.image != null) c.vkDestroyImage(dev, self.image, null);
+        if (self.memory != null) c.vkFreeMemory(dev, self.memory, null);
+        self.* = undefined;
+    }
+};
+
+test "gate: a colour composited through an effect matches the same colour drawn directly" {
+    // The property in one sentence, and the one the HDR bench found broken:
+    // **content that goes through an effect must look like content that does
+    // not.** The composite path skipped the display transform entirely, so a
+    // mid-grey card measured 128 outside an effect and 179 inside one on a PQ
+    // surface — the same document, six pixels apart.
+    //
+    // Both halves render the same authored colour with the same push, one
+    // through the quad rasterizer and one through `copy.frag` sampling an
+    // offscreen target. Neither is the authority; the gate is that they
+    // AGREE, which is the shape the rest of this file already uses.
+    const allocator = testing.allocator;
+    var h: Harness = undefined;
+    try h.init(allocator);
+    defer h.deinit();
+
+    const authored = [4]f32{ 0.25, 0.5, 0.75, 1.0 };
+    const pq = display.Push.from(.pq, display.REFERENCE_PAPERWHITE_NITS);
+
+    const shaders = @import("shaders");
+    var cache = try spark.pass.SingleSourcePipelineCache.init(
+        allocator,
+        &h.fx.ctx,
+        TARGET_FORMAT,
+        TARGET_FORMAT,
+        &shaders.fullscreen_vert,
+    );
+    defer cache.deinit();
+    const copy_id = spark.pass.shaderIdFromName("copy.frag");
+    try cache.compile(copy_id, &shaders.copy_frag);
+
+    var dpool = try spark.pass.SingleSourceDescriptorPool.init(allocator, &h.fx.ctx, cache.descriptor_set_layout);
+    defer dpool.deinit();
+
+    // Alpha 1, so premultiplied and authored are the same numbers and the
+    // gate is about the transform rather than about premultiplication.
+    var src = try Source.init(&h.fx.ctx, h.rb.pool, authored);
+    defer src.deinit();
+
+    const direct = try h.rb.drawQuad(&h.pipeline, authored, pq);
+    const through = try h.rb.drawComposite(&cache, &dpool, copy_id, src.view, pq);
+    for (0..4) |i| try testing.expectApproxEqAbs(direct[i], through[i], TOL);
+
+    // Rule 1: the PQ pixel is not the authored one, so the agreement above
+    // is two encodes agreeing rather than two passthroughs agreeing. Without
+    // this, a composite that ignored `display` entirely would pass whenever
+    // the quad did too.
+    try testing.expect(@abs(direct[0] - authored[0]) > TOL * 4);
+
+    // And on SDR both are the authored colour — the identity that makes this
+    // safe under every existing embedder.
+    const direct_sdr = try h.rb.drawQuad(&h.pipeline, authored, .{});
+    const through_sdr = try h.rb.drawComposite(&cache, &dpool, copy_id, src.view, .{});
+    for (0..3) |i| {
+        try testing.expectApproxEqAbs(authored[i], direct_sdr[i], TOL);
+        try testing.expectApproxEqAbs(authored[i], through_sdr[i], TOL);
+    }
 }

@@ -10,7 +10,16 @@ layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 out_color;
 
 // Push-constant block — see gradient.frag for the policy comment.
+#include "display.glsl"
+
+// The display transform's per-frame push, at a FIXED offset so ONE record
+// path can write it for every effect whatever its own uniforms look like.
+// `element.PASS_UNIFORM_OFFSET` (16) is where each effect's own block
+// starts; the Zig struct it mirrors describes the bytes from there on, and
+// its offsets are relative to it rather than to this block.
 layout(push_constant) uniform Params {
+    vec2 display;      //  0..8   mode, paperwhite — see display.glsl
+    vec2 _display_pad; //  8..16
     uint pattern_type;  // 0=checker, 1=stripes, 2=grid, 3=dots
     uint seed;          // perturbs the cell count
 } u;
@@ -34,5 +43,5 @@ void main() {
         vec2 c = f - 0.5;
         v = (length(c) < 0.3) ? 1.0 : 0.0;
     }
-    out_color = vec4(vec3(v), 1.0);
+    out_color = vec4(sparkDisplay(vec3(v), u.display), 1.0);
 }

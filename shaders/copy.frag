@@ -36,10 +36,29 @@ layout(set = 0, binding = 0) uniform sampler2D u_target;
 // Push-constant block mirrors `CopyUniforms` on the Zig side.
 // One f32, padded to 4 bytes; substrate test sets `alpha = 1.0`
 // to exercise the bind without altering the sampled value.
+#include "display.glsl"
+
+// The display transform's per-frame push, at a FIXED offset so ONE record
+// path can write it for every effect whatever its own uniforms look like.
+// `element.PASS_UNIFORM_OFFSET` (16) is where each effect's own block
+// starts; the Zig struct named below describes the bytes from there on and
+// its offsets are relative to it, not to this block.
 layout(push_constant) uniform Params {
-    float alpha;
+    vec2 display;      //  0..8   mode, paperwhite — see display.glsl
+    vec2 _display_pad; //  8..16
+    float alpha;       // 16..20  `CopyUniforms` on the Zig side
 } u_params;
 
 void main() {
-    out_color = texture(u_target, v_uv) * u_params.alpha;
+    vec4 src = texture(u_target, v_uv);
+    // The sampled target is PREMULTIPLIED — it was rendered by pipelines
+    // that premultiply at output. PQ is not linear, so `pq(rgb * a)` is not
+    // `pq(rgb) * a`; encoding the premultiplied value darkens every
+    // antialiased edge as a function of its own coverage. Undo, encode,
+    // redo. See display.glsl's note, which says the same thing for the
+    // shaders that own their colour rather than sampling it.
+    vec3 straight = src.a > 0.0 ? src.rgb / src.a : src.rgb;
+    vec3 rgb = sparkDisplay(straight, u_params.display);
+    float a = src.a * u_params.alpha;
+    out_color = vec4(rgb * a, a);
 }

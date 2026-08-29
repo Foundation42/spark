@@ -42,7 +42,23 @@ layout(set = 0, binding = 0) uniform sampler2D u_target;
 // liquid_glass.zig exactly. Four scalars pack into the first vec4
 // slot (offset 0..16); vec4 `tint` lands at offset 16..32. Total
 // 32 bytes.
+#include "display.glsl"
+
+// The display transform's per-frame push, at a FIXED offset so ONE record
+// path can write it for every effect whatever its own uniforms look like.
+// `element.PASS_UNIFORM_OFFSET` (16) is where each effect's own block
+// starts; the Zig struct it mirrors describes the bytes from there on, and
+// its offsets are relative to it rather than to this block.
+// NOTE on premultiplication. This shader composites its own blur/tint and
+// writes `vec4(rgb, alpha)` with rgb NOT divided by alpha, while the
+// pipeline blends with srcFactor = ONE. That predates the display transform
+// and is left exactly as it was: the encode below is applied to the value
+// this shader already produced, so an SDR frame is byte-identical and an
+// HDR one is finally in the right luminance. Straightening the
+// premultiplication is its own change, with its own before/after.
 layout(push_constant) uniform Params {
+    vec2 display;      //  0..8   mode, paperwhite — see display.glsl
+    vec2 _display_pad; //  8..16
     float radius;          // corner radius, normalized [0..0.5]
     float refraction;      // bend strength [0..0.5]
     float edge_softness;   // smoothstep width at edge [0..0.05]
@@ -109,5 +125,5 @@ void main() {
     // tint is invisible; tint.a = 1 means tint fully replaces.
     rgb = rgb * (1.0 - u_params.tint.a) + u_params.tint.rgb * u_params.tint.a;
 
-    out_color = vec4(rgb, alpha);
+    out_color = vec4(sparkDisplay(rgb, u_params.display), alpha);
 }

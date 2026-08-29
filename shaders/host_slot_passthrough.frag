@@ -28,6 +28,23 @@ layout(location = 0) out vec4 out_color;
 
 layout(set = 0, binding = 0) uniform sampler2D u_target;
 
+#include "display.glsl"
+
+// The display transform's per-frame push, at a FIXED offset so ONE record
+// path can write it for every effect whatever its own uniforms look like.
+// `element.PASS_UNIFORM_OFFSET` (16) is where each effect's own block
+// starts; the Zig struct named below describes the bytes from there on and
+// its offsets are relative to it, not to this block.
+// This shader has no uniforms of its own, so the block is the head alone.
+layout(push_constant) uniform Params {
+    vec2 display;      // 0..8
+    vec2 _display_pad; // 8..16
+} u_params;
+
 void main() {
-    out_color = texture(u_target, v_uv);
+    vec4 src = texture(u_target, v_uv);
+    // Premultiplied source — see copy.frag for why the round trip.
+    vec3 straight = src.a > 0.0 ? src.rgb / src.a : src.rgb;
+    vec3 rgb = sparkDisplay(straight, u_params.display);
+    out_color = vec4(rgb * src.a, src.a);
 }

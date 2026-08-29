@@ -98,8 +98,10 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
     const SHADER_ID: component_mod.ShaderId = shader_resolver.shaderIdFromName(config.shader);
 
     comptime {
-        if (@sizeOf(UniformsT) > element.MAX_PASS_UNIFORM_BYTES) {
-            @compileError("SingleSourceFactory: Uniforms exceeds MAX_PASS_UNIFORM_BYTES");
+        // The budget is the range MINUS the display head every effect
+        // block carries — see `element.PASS_UNIFORM_OFFSET`.
+        if (@sizeOf(UniformsT) > element.MAX_PASS_UNIFORM_BYTES - element.PASS_UNIFORM_OFFSET) {
+            @compileError("SingleSourceFactory: Uniforms exceeds the per-effect push budget");
         }
     }
 

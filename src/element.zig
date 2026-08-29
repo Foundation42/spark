@@ -625,6 +625,23 @@ pub const PassRegion = extern struct {
 /// real target GPU should heap ownership enter the design.
 pub const MAX_PASS_UNIFORM_BYTES: u32 = 256;
 
+/// Where an effect's own push constants start, and therefore where every
+/// `*_uniform_bytes` slice in this file is pushed to.
+///
+/// Bytes `[0, 16)` are reserved for the display transform's per-frame push
+/// (`display_mod.Push`, two floats, padded to a vec4 boundary). It lives at
+/// a FIXED offset rather than at the tail of each effect's own block —
+/// which is where the four content pipelines put it — because those
+/// pipelines build their whole push at record time, and an effect's does not
+/// exist until a component has snapshotted it. One fixed head lets a single
+/// record path write the display for every effect without knowing the size
+/// or shape of what follows it.
+///
+/// Every effect fragment shader declares the head; the Zig `Uniforms` struct
+/// each one mirrors describes the bytes from `PASS_UNIFORM_OFFSET` onward,
+/// so its `@offsetOf` lock-in tests are unchanged and relative to itself.
+pub const PASS_UNIFORM_OFFSET: u32 = 16;
+
 /// Pattern-pass dispatch step — fragment shader drawn directly into
 /// the main color attachment at `layout_region`, no offscreen target,
 /// no descriptor sets. Effects-spec Phase A.6.a was the original

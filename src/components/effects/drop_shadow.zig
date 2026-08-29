@@ -472,7 +472,7 @@ test "GaussianUniforms: std140 layout offsets" {
     try testing.expectEqual(@as(usize, 48), @offsetOf(GaussianUniforms, "sigma"));
     try testing.expectEqual(@as(usize, 52), @offsetOf(GaussianUniforms, "spread"));
     try testing.expectEqual(@as(usize, 64), @sizeOf(GaussianUniforms));
-    try testing.expect(@sizeOf(GaussianUniforms) <= element.MAX_PASS_UNIFORM_BYTES);
+    try testing.expect(@sizeOf(GaussianUniforms) <= element.MAX_PASS_UNIFORM_BYTES - element.PASS_UNIFORM_OFFSET);
 }
 
 test "computeInflation: positive offset extends right + bottom" {

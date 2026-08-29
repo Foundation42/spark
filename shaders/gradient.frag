@@ -11,10 +11,19 @@ layout(location = 0) out vec4 out_color;
 // Push-constant block per Phase A.6.b pipeline layout. std430-style
 // tightly packed (matches `extern struct GradientUniforms` exactly).
 // No descriptor set — uniforms ride in `vkCmdPushConstants` directly.
+#include "display.glsl"
+
+// The display transform's per-frame push, at a FIXED offset so ONE record
+// path can write it for every effect whatever its own uniforms look like.
+// `element.PASS_UNIFORM_OFFSET` (16) is where each effect's own block
+// starts; the Zig struct it mirrors describes the bytes from there on, and
+// its offsets are relative to it rather than to this block.
 layout(push_constant) uniform Params {
-    vec4 from;       // 0..16
-    vec4 to;         // 16..32
-    uint direction;  // 32..36 — 0=vertical, 1=horizontal, 2=diagonal
+    vec2 display;      //  0..8   mode, paperwhite — see display.glsl
+    vec2 _display_pad; //  8..16
+    vec4 from;       // 16..32
+    vec4 to;         // 32..48
+    uint direction;  // 48..52 — 0=vertical, 1=horizontal, 2=diagonal
     // Zig-side struct pads with `_pad: [3]u32` so sizeof is 48 and
     // every subsequent push-constant range starts at a vec4 boundary
     // if effects grow more fields.
@@ -29,5 +38,7 @@ void main() {
     } else {                        // diagonal — (x+y)/2
         t = (v_uv.x + v_uv.y) * 0.5;
     }
-    out_color = mix(u.from, u.to, t);
+    vec4 col = mix(u.from, u.to, t);
+    // Unpremultiplied by construction — encode the colour, keep the alpha.
+    out_color = vec4(sparkDisplay(col.rgb, u.display), col.a);
 }
