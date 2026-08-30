@@ -140,14 +140,29 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     allocator.destroy(c);
 }
 
+/// The thumb's position IS `value`, so the value is the version.
+///
+/// This used to set `disable_cache = true` instead, on the reasoning that
+/// "the value isn't captured in any component-owned counter". It is —
+/// `Component.value`, which `update` refreshes from `${state.target}` on
+/// every reactive fire. And `disable_cache` was not enough anyway: it stops
+/// the slider caching ITSELF, but a cached ANCESTOR still snapshots the
+/// slider's output and replays it. So a slider inside `:::drop_shadow` or
+/// `:::frosted_glass` was frozen at its create-time position — it drove the
+/// plane, the scene changed, and the thumb never moved. Found by Chris at
+/// the bench with a backdrop panel; `src/hud/lab.md` only escaped it because
+/// its sliders sit outside the shadow block.
+///
+/// A version fixes both, because it is what the ancestors already aggregate.
+fn contentVersion(ctx: *anyopaque) u64 {
+    const c: *const Component = @ptrCast(@alignCast(ctx));
+    return @as(u64, @as(u32, @bitCast(c.value)));
+}
+
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .on_input = onInput,
-    // Slider reads `state.${target}` at layout time to position its
-    // thumb — the value isn't captured in any component-owned counter,
-    // so the cache key can't see it move. Bypass the cache; the slider
-    // is cheap to walk anyway (two quads + a hit).
-    .disable_cache = true,
+    .content_version = contentVersion,
 };
 
 // ── Visual constants — local, not theme yet ───────────────────────

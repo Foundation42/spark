@@ -336,6 +336,30 @@ pub fn aggregateChildVersions(children: []const element.Element) u64 {
     return v;
 }
 
+/// `aggregateChildVersions` for a component that holds ONE root element
+/// rather than a child slice — which is every effect: `:::drop_shadow`,
+/// `:::frosted_glass`, and everything the `SingleSourceFactory` generates
+/// parse their body into a single `root`.
+///
+/// **The bug this exists for.** Those effects returned only their OWN
+/// version from `content_version`, so a slider inside one was frozen at the
+/// value it was created with: dragging it moved the plane and changed the
+/// scene, and the knob never moved, because the effect's cached drawlist
+/// was replayed unchanged. It looked like a broken slider and was a stale
+/// cache. `:::flex` and `:::grid` had aggregated since Stage 15 Phase C.5;
+/// the effects were simply never given the same treatment, and no shipped
+/// document had an interactive control inside an effect until backdrop
+/// panels made that the obvious thing to write.
+pub fn aggregateRootVersion(root: element.Element) u64 {
+    return switch (root) {
+        .container => |co| aggregateChildVersions(co.children),
+        .paragraph => |kids| aggregateChildVersions(kids),
+        // A root that is itself the component (an effect wrapping a single
+        // `:::box`) still has a version worth folding in.
+        else => versionFor(root),
+    };
+}
+
 /// Blit a cached entry into `out`, translating every position by
 /// `origin`. Triangle indices are rebased against the current vertex
 /// count of `out.tris`. Returns the `Box` at `origin`.
@@ -883,4 +907,39 @@ test "aggregateChildVersions: child bumps flip the aggregated value" {
     State.ver_b = 7;
     const v_diff = aggregateChildVersions(&children);
     try testing.expect(v_same != v_diff);
+}
+
+test "aggregateRootVersion: a child's bump reaches the wrapper" {
+    // The bug: `:::drop_shadow` / `:::frosted_glass` / everything from
+    // `SingleSourceFactory` returned only their own version, so a cached
+    // ancestor replayed a stale snapshot and any interactive control inside
+    // an effect was frozen at its create-time appearance.
+    var v: u64 = 7;
+    const Fake = struct {
+        fn version(ctx: *anyopaque) u64 {
+            return @as(*const u64, @ptrCast(@alignCast(ctx))).*;
+        }
+        const vt: element.ElementVTable = .{
+            .layout_and_render = undefined,
+            .content_version = version,
+        };
+    };
+    const child = element.Element{ .custom = .{ .ctx = @ptrCast(&v), .vtable = &Fake.vt } };
+    const kids = [_]element.Element{child};
+    const root = element.Element{ .paragraph = &kids };
+
+    const before = aggregateRootVersion(root);
+    v = 8;
+    const after = aggregateRootVersion(root);
+
+    // Rule 1: the child's version really did move, so "the aggregate moved"
+    // is about propagation rather than about nothing having happened.
+    try std.testing.expect(before != after);
+
+    // And a root with no versioned children is stable — otherwise every
+    // wrapper would miss its cache every frame and the aggregate would be a
+    // very expensive way of disabling the cache.
+    const plain = [_]element.Element{.{ .line_break = {} }};
+    const plain_root = element.Element{ .paragraph = &plain };
+    try std.testing.expectEqual(aggregateRootVersion(plain_root), aggregateRootVersion(plain_root));
 }
