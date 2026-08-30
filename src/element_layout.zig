@@ -34,7 +34,7 @@ const text_layout = @import("text/layout.zig");
 const shape = @import("font/shape.zig");
 const qp = @import("gpu/quad_pipeline.zig");
 const layout_cache = @import("layout_cache.zig");
-const jobs_mod = @import("jobs.zig");
+const jobs_mod = @import("common").jobs;
 
 /// Stage 14b — parallel stack_v walk thresholds. The dispatcher falls
 /// back to serial when these aren't met; dispatch overhead dominates

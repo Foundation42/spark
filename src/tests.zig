@@ -51,7 +51,9 @@ test {
     _ = @import("extras/dotenv.zig");
     _ = @import("extras/embedded_document_http.zig");
     _ = @import("io_channel.zig");
-    _ = @import("jobs.zig");
+    // jobs moved to `common`, which runs its own suite (`zig build test`
+    // there). Re-importing it here would run those tests twice and report
+    // coverage this repo does not own.
     _ = @import("layout_cache.zig");
     _ = @import("layout/kiwi/strength.zig");
     _ = @import("layout/kiwi/term.zig");

@@ -46,7 +46,7 @@
 
 const std = @import("std");
 const svg = @import("svg.zig");
-const jobs_mod = @import("jobs.zig");
+const jobs_mod = @import("common").jobs;
 
 pub const Point = svg.Point;
 

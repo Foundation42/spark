@@ -1625,7 +1625,7 @@ const atlas_mod = @import("gpu/atlas.zig");
 const qp = @import("gpu/quad_pipeline.zig");
 const tri_pipeline = @import("gpu/tri_pipeline.zig");
 const layout_cache_mod = @import("layout_cache.zig");
-const jobs_mod = @import("jobs.zig");
+const jobs_mod = @import("common").jobs;
 const layout_context_mod = @import("layout/context.zig");
 
 // ── Tests ──────────────────────────────────────────────────────────

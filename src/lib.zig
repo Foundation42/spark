@@ -32,6 +32,13 @@
 const std = @import("std");
 
 // ── Spark + Document lifecycle ─────────────────────────────────────
+/// The shared job system, re-exported so a host can name the SAME type
+/// spark uses. This is what makes `SparkOptions.compute_jobs: ?*JobSystem`
+/// expressible: before `common`, spark and its host each compiled their own
+/// copy of `jobs.zig` and the two `*JobSystem` types did not unify, so the
+/// argument could not typecheck no matter how the API was written.
+pub const jobs = @import("common").jobs;
+
 pub const Spark = @import("spark.zig").Spark;
 pub const InitOptions = @import("spark.zig").InitOptions;
 pub const FrameInfo = @import("spark.zig").FrameInfo;

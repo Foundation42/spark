@@ -137,6 +137,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     spark_mod.addImport("shaders", shaders_module);
+    // `common` — the shared job system, and whatever else siblings must
+    // agree on. Resolved once here; Zig deduplicates it across the diamond,
+    // so a host that also depends on `common` sees the SAME JobSystem type
+    // and can eventually pass spark its own pool.
+    const common_dep = b.dependency("common", .{ .target = target, .optimize = optimize });
+    const common_mod = common_dep.module("common");
+    spark_mod.addImport("common", common_mod);
     // The library module's source files `@cImport` freetype +
     // harfbuzz + cmark + stb_image headers (FreeType library handle,
     // HB face/font, cmark parser, image decode). The compiler runs
@@ -313,6 +320,7 @@ pub fn build(b: *std.Build) void {
         .filters = if (test_filter) |f| &.{f} else &.{},
     });
     t.root_module.addImport("shaders", shaders_module);
+    t.root_module.addImport("common", common_mod);
     if (target.result.os.tag == .windows) {
         t.linkSystemLibrary("vulkan-1");
     } else {

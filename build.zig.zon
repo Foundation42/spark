@@ -10,5 +10,11 @@
         "shaders",
         "vendor",
     },
-    .dependencies = .{},
+    .dependencies = .{
+        // Shared primitives every Foundation42 sibling agrees on. `jobs.zig`
+        // lived here as a byte-identical copy in seven repos, which made one
+        // concurrency bug seven bugs and made a process-wide job system
+        // impossible to express: two copies of a file are two Zig types.
+        .common = .{ .path = "../common" },
+    },
 }

@@ -50,7 +50,7 @@
 //! does not interpret `user_data`; it only round-trips it.
 
 const std = @import("std");
-const jobs_mod = @import("jobs.zig");
+const jobs_mod = @import("common").jobs;
 
 pub const Error = error{
     HttpStatusNotOk,
