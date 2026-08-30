@@ -43,6 +43,19 @@ pub const LoadOpts = struct {
     /// When non-null, layout uses this Theme instead of
     /// `spark.theme`. Null = inherit the Spark default.
     theme: ?*const element.Theme = null,
+    /// Namespace for this document's component instances in the
+    /// Spark's shared Registry. Null keeps the historical
+    /// single-global-namespace behaviour, which is correct while
+    /// there is only ever one document.
+    ///
+    /// **A host mounting more than one document must set it**, and
+    /// must keep it stable across that document's reloads — the key
+    /// is what a hot reload matches on to keep a slider where the
+    /// author left it. Without a scope, two documents share one flat
+    /// namespace: matching `#id`s resolve to a single instance drawn
+    /// in both, and every document's first unnamed directive is
+    /// `auto:0`. See `tests/two_documents.zig`.
+    scope: ?[]const u8 = null,
 };
 
 pub const Document = struct {
@@ -151,13 +164,16 @@ pub fn buildDocument(
     // body bytes only, frontmatter is state-only.
     const body: []const u8 = if (state_mod.extractFrontmatter(source)) |fm| fm.rest else source;
 
-    const root = try markdown.parseWithStateAndScope(
+    // Outermost — so this is the parse that ages the registry's
+    // instances for `gc` — but optionally scoped, so a second
+    // document's components do not land on the first's cache keys.
+    const root = try markdown.parseRootWithScope(
         arena.allocator(),
         body,
         theme,
         registry,
         doc_state.?,
-        null, // no scope at the root — embedded docs prefix theirs
+        opts.scope,
     );
 
     return .{

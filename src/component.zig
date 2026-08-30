@@ -50,7 +50,7 @@
 //! The host must NOT call `gc()` while any Element tree referencing
 //! cached instance ctx pointers is still alive. The intended flow:
 //!
-//!     registry.beginParse();
+//!     registry.beginParse(null);
 //!     const tree = try markdown.parse(arena, src, theme, &registry);
 //!     // ... swap tree pointer, free previous tree's arena ...
 //!     registry.gc();   // safe now — no live Element points at any
@@ -615,12 +615,39 @@ pub const Registry = struct {
         gop.value_ptr.* = factory;
     }
 
-    /// Bump `parses_unused` on every cached instance. `resolve` will
-    /// reset it for the ones touched during this parse; `gc` (called
-    /// after the parse tree swap) destroys the still-untouched.
-    pub fn beginParse(self: *Registry) void {
+    /// Bump `parses_unused` on the cached instances THIS parse is
+    /// responsible for. `resolve` will reset it for the ones the
+    /// parse touches; `gc` (called after the parse tree swap)
+    /// destroys the still-untouched.
+    ///
+    /// `scope` is the parsing document's namespace, and ageing is
+    /// confined to it — only keys under `"{scope}/"`. `null` ages
+    /// everything, which is what a lone unscoped document wants and
+    /// is exactly the behaviour this had before scopes reached the
+    /// root.
+    ///
+    /// **Why it has to be confined.** Ageing is the front half of a
+    /// sweep, and `gc`'s licence — *"no live Element points at any
+    /// instance the registry is about to free"* — is only true for
+    /// the document that just re-parsed. With two documents sharing
+    /// one Registry, an unconfined bump ages panel A's instances
+    /// every time panel B reloads; A touches nothing, and
+    /// `sweep_threshold` reloads later `gc` frees components A's
+    /// live element tree still points at. Confining the bump makes
+    /// the licence true again per document.
+    pub fn beginParse(self: *Registry, scope: ?[]const u8) void {
+        const s = scope orelse {
+            var all = self.instances.iterator();
+            while (all.next()) |entry| entry.value_ptr.parses_unused += 1;
+            return;
+        };
+        var sep_buf: [192]u8 = undefined;
+        const prefix = std.fmt.bufPrint(&sep_buf, "{s}/", .{s}) catch return;
         var it = self.instances.iterator();
-        while (it.next()) |entry| entry.value_ptr.parses_unused += 1;
+        while (it.next()) |entry| {
+            if (std.mem.startsWith(u8, entry.key_ptr.*, prefix))
+                entry.value_ptr.parses_unused += 1;
+        }
     }
 
     /// Resolve a `:::` block to an Instance. Returns null when no
@@ -1166,7 +1193,7 @@ test "register + resolve creates instance once" {
     try testing.expectEqual(@as(u32, 1), t_creates);
     try testing.expectEqual(@as(u32, 0), t_updates);
 
-    registry.beginParse();
+    registry.beginParse(null);
     const r2 = try registry.resolve(&spec, 0, null, null);
     try testing.expect(r2 != null);
     try testing.expectEqual(r1.?.ctx, r2.?.ctx);
@@ -1195,7 +1222,7 @@ test "auto-id is order-based" {
 
     const a: components.Spec = .{ .name = "box" }; // no id → auto:5
     const r1 = try registry.resolve(&a, 5, null, null);
-    registry.beginParse();
+    registry.beginParse(null);
     const r2 = try registry.resolve(&a, 5, null, null);
     try testing.expectEqual(r1.?.ctx, r2.?.ctx);
 
@@ -1219,13 +1246,13 @@ test "gc destroys after sweep_threshold consecutive unused parses" {
     try testing.expectEqual(@as(u32, 1), t_creates);
 
     // Threshold=2 → instance dies on the third unused parse.
-    registry.beginParse();
+    registry.beginParse(null);
     registry.gc();
     try testing.expectEqual(@as(u32, 0), t_deinits);
-    registry.beginParse();
+    registry.beginParse(null);
     registry.gc();
     try testing.expectEqual(@as(u32, 0), t_deinits);
-    registry.beginParse();
+    registry.beginParse(null);
     registry.gc();
     try testing.expectEqual(@as(u32, 1), t_deinits);
 
@@ -1249,7 +1276,7 @@ test "factory name change destroys old + recreates" {
     try testing.expectEqual(@as(u32, 1), t_creates);
     try testing.expectEqual(@as(u32, 0), t_deinits);
 
-    registry.beginParse();
+    registry.beginParse(null);
     const as_chart: components.Spec = .{ .name = "chart" };
     _ = try registry.resolve(&as_chart, 0, null, null);
     try testing.expectEqual(@as(u32, 2), t_creates);
@@ -1272,7 +1299,7 @@ test "update sees latest spec attrs" {
         try testing.expectEqualStrings("red", state.last_color);
     }
 
-    registry.beginParse();
+    registry.beginParse(null);
     const attrs_blue = [_]components.Attr{.{ .key = "color", .value = "blue" }};
     const spec_blue: components.Spec = .{ .name = "box", .id = "bx", .attrs = &attrs_blue };
     _ = try registry.resolve(&spec_blue, 0, null, null);
@@ -1487,7 +1514,7 @@ test "scoped resolve namespaces cache keys" {
     try testing.expect(r_a.?.ctx != r_b.?.ctx);
 
     // Cache hit within the same scope reuses.
-    registry.beginParse();
+    registry.beginParse(null);
     const r_a_again = try registry.resolve(&spec, 0, null, "embed:a");
     try testing.expectEqual(@as(u32, 3), t_creates);
     try testing.expectEqual(r_a.?.ctx, r_a_again.?.ctx);
@@ -1622,7 +1649,7 @@ test "reactive: gc unsubscribes the binding" {
 
     // Parse without re-resolving → entry hits sweep, gc destroys it
     // including the binding (and its subscription).
-    registry.beginParse();
+    registry.beginParse(null);
     registry.gc();
     try testing.expectEqual(@as(u32, 1), t_deinits);
 

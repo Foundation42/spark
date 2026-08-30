@@ -122,10 +122,29 @@ pub fn parse(
     return parseWithState(arena, source, theme, registry, null);
 }
 
+/// Whether this parse is the outermost one for its source, or a
+/// nested re-entry from a factory that is itself mid-parse.
+///
+/// It decides exactly one thing: who calls `Registry.beginParse`.
+/// The outermost parse bumps every cached instance's unused counter
+/// so `gc` can sweep what this parse does not touch; a nested parse
+/// must NOT, because it is running *inside* that cycle and would
+/// double-age its siblings.
+///
+/// This used to be inferred from `scope == null`, which held only
+/// while a scope implied nesting. A mounted panel is scoped (so its
+/// `#id`s do not collide with the next panel's) *and* outermost, so
+/// the two questions came apart and are now asked separately.
+pub const Nesting = enum { root, nested };
+
 /// Same as `parseWithState` but also takes a `scope` prefix for the
 /// registry's instance cache (stage 9). Embedded-document factories
 /// call this with their own `#id` as the scope so child components
 /// don't collide with the parent's in the same Registry.
+///
+/// Nested by definition — every caller is a factory reached from an
+/// enclosing parse. A top-level document that wants a scope wants
+/// `parseRootWithScope`.
 pub fn parseWithStateAndScope(
     arena: std.mem.Allocator,
     source: []const u8,
@@ -134,7 +153,25 @@ pub fn parseWithStateAndScope(
     state: ?*state_mod.State,
     scope: ?[]const u8,
 ) anyerror!element.Element {
-    return parseInternal(arena, source, theme, registry, state, scope);
+    return parseInternal(arena, source, theme, registry, state, scope, .nested);
+}
+
+/// An outermost parse that still namespaces its components.
+///
+/// The shape a host wants for a second, third, Nth document in one
+/// Spark: `Document`s are independent but the Registry behind them
+/// is shared, so without a scope two panels holding `:::slider
+/// {#exposure}` resolve to ONE instance drawn twice, and every
+/// document's first unnamed directive is `auto:0`.
+pub fn parseRootWithScope(
+    arena: std.mem.Allocator,
+    source: []const u8,
+    theme: *const element.Theme,
+    registry: ?*component_mod.Registry,
+    state: ?*state_mod.State,
+    scope: ?[]const u8,
+) anyerror!element.Element {
+    return parseInternal(arena, source, theme, registry, state, scope, .root);
 }
 
 /// Same as `parse` but with an explicit `?*const State` to use for
@@ -157,7 +194,7 @@ pub fn parseWithState(
     registry: ?*component_mod.Registry,
     state: ?*state_mod.State,
 ) anyerror!element.Element {
-    return parseInternal(arena, source, theme, registry, state, null);
+    return parseInternal(arena, source, theme, registry, state, null, .root);
 }
 
 fn parseInternal(
@@ -167,6 +204,7 @@ fn parseInternal(
     registry: ?*component_mod.Registry,
     state: ?*state_mod.State,
     scope: ?[]const u8,
+    nesting: Nesting,
 ) anyerror!element.Element {
     var body: []const u8 = source;
     var local_state: ?state_mod.State = null;
@@ -202,8 +240,9 @@ fn parseInternal(
     // re-invoke the embedded-doc factory which re-enters here; the
     // embedded children get touched via scoped resolve and stay
     // alive through the outer beginParse cycle naturally.
-    if (scope == null) {
-        if (registry) |r| r.beginParse();
+    if (nesting == .root) {
+        // Aged within this document's own scope — see `beginParse`.
+        if (registry) |r| r.beginParse(scope);
     }
 
     const mc: MapCtx = .{
