@@ -888,197 +888,212 @@ pub const Spark = struct {
         try self.acquired_targets.append(target_handle);
         self.dispatch_target_map.items[dispatch_index] = target_handle;
 
-        // Transition the freshly-acquired target from UNDEFINED to
-        // COLOR_ATTACHMENT_OPTIMAL. The target may have come back
-        // from the free list with `SHADER_READ_ONLY_OPTIMAL` from
-        // a previous frame's last use; UNDEFINED as `old_layout`
-        // is correct in both cases (Vulkan spec — old contents are
-        // discarded, which is what we want here since we'll
-        // LOAD_OP_CLEAR anyway).
-        barrierImageLayout(cmd, target_handle.image(), .{
-            .src_stage = vk.c.VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
-            .dst_stage = vk.c.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-            .src_access = 0,
-            .dst_access = vk.c.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-            .old_layout = vk.c.VK_IMAGE_LAYOUT_UNDEFINED,
-            .new_layout = vk.c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        });
-
-        // Begin S's offscreen render pass — clear to transparent
-        // black so unwritten regions don't poison the compose
-        // sample. Render area covers the full target.
-        var color_att = std.mem.zeroes(vk.c.VkRenderingAttachmentInfo);
-        color_att.sType = vk.c.VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        color_att.imageView = target_handle.view();
-        color_att.imageLayout = vk.c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        color_att.loadOp = vk.c.VK_ATTACHMENT_LOAD_OP_CLEAR;
-        color_att.storeOp = vk.c.VK_ATTACHMENT_STORE_OP_STORE;
-        color_att.clearValue = .{ .color = .{ .float32 = .{ 0, 0, 0, 0 } } };
-
-        const target_extent = vk.c.VkExtent2D{
-            .width = S.target_size[0],
-            .height = S.target_size[1],
-        };
-        var ri = std.mem.zeroes(vk.c.VkRenderingInfo);
-        ri.sType = vk.c.VK_STRUCTURE_TYPE_RENDERING_INFO;
-        ri.renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = target_extent };
-        ri.layerCount = 1;
-        ri.colorAttachmentCount = 1;
-        ri.pColorAttachments = &color_att;
-        vk.c.vkCmdBeginRendering(cmd, &ri);
-
-        // Walk subtree dispatches and record pattern + nested
-        // single_source composes target-locally. All viewports
-        // here are in target-space coords (origin at S's
-        // compose_region top-left, no zoom — target_size ==
-        // compose_region.size by construction).
-        var last_pattern: vk.c.VkPipeline = null;
-        var last_compose: vk.c.VkPipeline = null;
-        var j: u32 = S.subtree_dispatch_range[0];
-        while (j < S.subtree_dispatch_range[1]) {
-            switch (self.pass_dispatches.items[j]) {
-                .pattern => |p| {
-                    const px: f32 = @floatFromInt(p.layout_region.x - S.compose_region.x);
-                    const py: f32 = @floatFromInt(p.layout_region.y - S.compose_region.y);
-                    const pw: f32 = @floatFromInt(p.layout_region.w);
-                    const ph: f32 = @floatFromInt(p.layout_region.h);
-                    self.recordPatternStep(cmd, p, px, py, pw, ph, &last_pattern, .offscreen);
-                    j += 1;
-                },
-                .single_source => |nested| {
-                    const nested_target = self.dispatch_target_map.items[j] orelse unreachable;
-                    const nx: f32 = @floatFromInt(nested.compose_region.x - S.compose_region.x);
-                    const ny: f32 = @floatFromInt(nested.compose_region.y - S.compose_region.y);
-                    const nw: f32 = @floatFromInt(nested.compose_region.w);
-                    const nh: f32 = @floatFromInt(nested.compose_region.h);
-                    try self.recordSingleSourceCompose(cmd, nested, nested_target, nx, ny, nw, nh, &last_compose, .offscreen);
-                    j = nested.subtree_dispatch_range[1];
-                },
-                // host_slot nested inside this single_source's
-                // subtree. Same compose shape as top-level host_slot
-                // (Phase 2 below); rendered into target-local coords
-                // rebased against S.compose_region.
-                .host_slot => |nested_hs| {
-                    const nested_target = self.dispatch_target_map.items[j] orelse unreachable;
-                    const nx: f32 = @floatFromInt(nested_hs.compose_region.x - S.compose_region.x);
-                    const ny: f32 = @floatFromInt(nested_hs.compose_region.y - S.compose_region.y);
-                    const nw: f32 = @floatFromInt(nested_hs.compose_region.w);
-                    const nh: f32 = @floatFromInt(nested_hs.compose_region.h);
-                    try self.recordHostSlotCompose(cmd, nested_hs, nested_target, nx, ny, nw, nh, &last_compose, .offscreen);
-                    j += 1;
-                },
-                // Effects-spec C.1 + C.1.5 — chain nested inside
-                // this single_source's subtree. Phase 1 already
-                // populated the chain's pool; final-composite-into-
-                // parent-target is the same compose shape as nested
-                // single_source / host_slot, just sourced from
-                // `acquired_targets[pool_base + final_pool_local]`.
-                // C.1.5 advance mirrors nested single_source's
-                // no-+1 shape: `j = nested.subtree_dispatch_range[1]`
-                // (the inner walk's while-condition handles the
-                // chain's own-index termination).
-                .chain => |nested_c| {
-                    const inner_base = self.chain_pool_bases.items[j] orelse unreachable;
-                    const final_target = self.acquired_targets.items[inner_base + nested_c.final_pool_local];
-                    const nx: f32 = @floatFromInt(nested_c.compose_region.x - S.compose_region.x);
-                    const ny: f32 = @floatFromInt(nested_c.compose_region.y - S.compose_region.y);
-                    const nw: f32 = @floatFromInt(nested_c.compose_region.w);
-                    const nh: f32 = @floatFromInt(nested_c.compose_region.h);
-                    try self.recordChainFinalComposite(cmd, nested_c, final_target, nx, ny, nw, nh, &last_compose, .offscreen);
-                    j = nested_c.subtree_dispatch_range[1];
-                },
-            }
-        }
-
-        // Per-target drawlist routing (Phase B.4.b.4). Render every
-        // drawlist primitive whose target_dispatch_index equals
-        // this dispatch's index into S's offscreen target. By walker
-        // construction every primitive type yields exactly one
-        // contiguous run for an offscreen target (push target on
-        // enter, primitives append with that tag, pop on exit). The
-        // run iterator still tolerates zero or multiple runs as a
-        // generality; for offscreen the loop runs at most once per
-        // pipeline.
+        // Fill the target — the subtree, or the attachment behind it.
         //
-        // The order — tri, image, quad, text — mirrors Phase 2 and
-        // the host's main pass so paint order inside an effect's
-        // target matches paint order against the main attachment.
-        // SVG fills sit behind chrome; backgrounds sit under glyphs.
-        const target_extent_render = vk.c.VkExtent2D{
-            .width = S.target_size[0],
-            .height = S.target_size[1],
-        };
-        // Screen-space rebase to target-local. **Subtle SSBO timing
-        // bit, worth pinning.** Phase 1 RECORDS draws here in
-        // preDrawCb, but the actual SSBO upload happens later (in
-        // endFrame's `writeQuads/writeMesh/writeGlyphs`, after the
-        // world→screen transform on the drawlist). Vulkan executes
-        // recorded draws in submission order with the SSBO state at
-        // submit time — so by the time Phase 1's draws actually
-        // execute on GPU, each instance's `dst_pos` is already in
-        // SCREEN coords `(world - scroll) * zoom`, NOT the WORLD
-        // coords the walker emitted. `world_offset` must live in the
-        // SAME coord space — so it's SCREEN compose too, computed
-        // here from world compose + scroll + zoom.
-        //
-        // TODO(zoom): target_size + per-target viewport are still
-        // WORLD-sized. At zoom != 1 the box's screen extent exceeds
-        // the offscreen target's framebuffer extent and clips. Wire
-        // a zoom-scaled `acquire(target_key)` when zoom-on-effects
-        // is exercised; current demo runs at zoom=1.
-        const sx = self.frame_info.scroll_offset[0];
-        const sy = self.frame_info.scroll_offset[1];
-        const z = self.frame_info.zoom;
-        const world_offset_target: [2]f32 = .{
-            (@as(f32, @floatFromInt(S.compose_region.x)) - sx) * z,
-            (@as(f32, @floatFromInt(S.compose_region.y)) - sy) * z,
-        };
-        const dl_p1 = &self.drawlist;
-        const dispatch_index_u32: u32 = @intCast(dispatch_index);
-        {
-            var it = element.triRuns(dl_p1.tri_targets.items, dl_p1.tri_indices.items, dispatch_index_u32);
-            while (it.next()) |run| {
-                self.tri_pipeline.recordDrawIndexedRange(cmd, target_extent_render, world_offset_target, run.first_index, run.index_count, display_mod.Push.offscreen, .offscreen);
-            }
-        }
-        {
-            var it = element.runs(dl_p1.image_targets.items, dispatch_index_u32);
-            const all_images = dl_p1.images.items;
-            while (it.next()) |run| {
-                if (run.count == 0) continue;
-                self.image_pipeline.bind(cmd, target_extent_render, .offscreen);
-                const subset = all_images[run.first .. run.first + run.count];
-                for (subset) |im| {
-                    self.image_pipeline.recordOne(cmd, target_extent_render, world_offset_target, @ptrCast(@alignCast(im.descriptor_set)), im.dst_pos, im.dst_size, display_mod.Push.offscreen);
+        // A `.backdrop` single_source copies the region of the host's
+        // attachment this element covers instead of rendering its children
+        // into it, and the children are left on MAIN to be drawn over the
+        // composited result. Same idea and the same helper as a backdrop
+        // chain — which is why `PassSource` is not called `ChainSource` any
+        // more. For `:::liquid_glass` it is the difference between
+        // refracting its own content and refracting the scene behind the
+        // panel, the "see-through" look its header used to say needed a
+        // second sampler. It does not: the backdrop IS the one sampler.
+        if (S.source == .backdrop) {
+            try self.fillTargetFromMain(cmd, target_handle, S.compose_region, S.target_size);
+        } else {
+            // Transition the freshly-acquired target from UNDEFINED to
+            // COLOR_ATTACHMENT_OPTIMAL. The target may have come back
+            // from the free list with `SHADER_READ_ONLY_OPTIMAL` from
+            // a previous frame's last use; UNDEFINED as `old_layout`
+            // is correct in both cases (Vulkan spec — old contents are
+            // discarded, which is what we want here since we'll
+            // LOAD_OP_CLEAR anyway).
+            barrierImageLayout(cmd, target_handle.image(), .{
+                .src_stage = vk.c.VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                .dst_stage = vk.c.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .src_access = 0,
+                .dst_access = vk.c.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                .old_layout = vk.c.VK_IMAGE_LAYOUT_UNDEFINED,
+                .new_layout = vk.c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            });
+
+            // Begin S's offscreen render pass — clear to transparent
+            // black so unwritten regions don't poison the compose
+            // sample. Render area covers the full target.
+            var color_att = std.mem.zeroes(vk.c.VkRenderingAttachmentInfo);
+            color_att.sType = vk.c.VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+            color_att.imageView = target_handle.view();
+            color_att.imageLayout = vk.c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            color_att.loadOp = vk.c.VK_ATTACHMENT_LOAD_OP_CLEAR;
+            color_att.storeOp = vk.c.VK_ATTACHMENT_STORE_OP_STORE;
+            color_att.clearValue = .{ .color = .{ .float32 = .{ 0, 0, 0, 0 } } };
+
+            const target_extent = vk.c.VkExtent2D{
+                .width = S.target_size[0],
+                .height = S.target_size[1],
+            };
+            var ri = std.mem.zeroes(vk.c.VkRenderingInfo);
+            ri.sType = vk.c.VK_STRUCTURE_TYPE_RENDERING_INFO;
+            ri.renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = target_extent };
+            ri.layerCount = 1;
+            ri.colorAttachmentCount = 1;
+            ri.pColorAttachments = &color_att;
+            vk.c.vkCmdBeginRendering(cmd, &ri);
+
+            // Walk subtree dispatches and record pattern + nested
+            // single_source composes target-locally. All viewports
+            // here are in target-space coords (origin at S's
+            // compose_region top-left, no zoom — target_size ==
+            // compose_region.size by construction).
+            var last_pattern: vk.c.VkPipeline = null;
+            var last_compose: vk.c.VkPipeline = null;
+            var j: u32 = S.subtree_dispatch_range[0];
+            while (j < S.subtree_dispatch_range[1]) {
+                switch (self.pass_dispatches.items[j]) {
+                    .pattern => |p| {
+                        const px: f32 = @floatFromInt(p.layout_region.x - S.compose_region.x);
+                        const py: f32 = @floatFromInt(p.layout_region.y - S.compose_region.y);
+                        const pw: f32 = @floatFromInt(p.layout_region.w);
+                        const ph: f32 = @floatFromInt(p.layout_region.h);
+                        self.recordPatternStep(cmd, p, px, py, pw, ph, &last_pattern, .offscreen);
+                        j += 1;
+                    },
+                    .single_source => |nested| {
+                        const nested_target = self.dispatch_target_map.items[j] orelse unreachable;
+                        const nx: f32 = @floatFromInt(nested.compose_region.x - S.compose_region.x);
+                        const ny: f32 = @floatFromInt(nested.compose_region.y - S.compose_region.y);
+                        const nw: f32 = @floatFromInt(nested.compose_region.w);
+                        const nh: f32 = @floatFromInt(nested.compose_region.h);
+                        try self.recordSingleSourceCompose(cmd, nested, nested_target, nx, ny, nw, nh, &last_compose, .offscreen);
+                        j = nested.subtree_dispatch_range[1];
+                    },
+                    // host_slot nested inside this single_source's
+                    // subtree. Same compose shape as top-level host_slot
+                    // (Phase 2 below); rendered into target-local coords
+                    // rebased against S.compose_region.
+                    .host_slot => |nested_hs| {
+                        const nested_target = self.dispatch_target_map.items[j] orelse unreachable;
+                        const nx: f32 = @floatFromInt(nested_hs.compose_region.x - S.compose_region.x);
+                        const ny: f32 = @floatFromInt(nested_hs.compose_region.y - S.compose_region.y);
+                        const nw: f32 = @floatFromInt(nested_hs.compose_region.w);
+                        const nh: f32 = @floatFromInt(nested_hs.compose_region.h);
+                        try self.recordHostSlotCompose(cmd, nested_hs, nested_target, nx, ny, nw, nh, &last_compose, .offscreen);
+                        j += 1;
+                    },
+                    // Effects-spec C.1 + C.1.5 — chain nested inside
+                    // this single_source's subtree. Phase 1 already
+                    // populated the chain's pool; final-composite-into-
+                    // parent-target is the same compose shape as nested
+                    // single_source / host_slot, just sourced from
+                    // `acquired_targets[pool_base + final_pool_local]`.
+                    // C.1.5 advance mirrors nested single_source's
+                    // no-+1 shape: `j = nested.subtree_dispatch_range[1]`
+                    // (the inner walk's while-condition handles the
+                    // chain's own-index termination).
+                    .chain => |nested_c| {
+                        const inner_base = self.chain_pool_bases.items[j] orelse unreachable;
+                        const final_target = self.acquired_targets.items[inner_base + nested_c.final_pool_local];
+                        const nx: f32 = @floatFromInt(nested_c.compose_region.x - S.compose_region.x);
+                        const ny: f32 = @floatFromInt(nested_c.compose_region.y - S.compose_region.y);
+                        const nw: f32 = @floatFromInt(nested_c.compose_region.w);
+                        const nh: f32 = @floatFromInt(nested_c.compose_region.h);
+                        try self.recordChainFinalComposite(cmd, nested_c, final_target, nx, ny, nw, nh, &last_compose, .offscreen);
+                        j = nested_c.subtree_dispatch_range[1];
+                    },
                 }
             }
-        }
-        {
-            var it = element.runs(dl_p1.quad_targets.items, dispatch_index_u32);
-            while (it.next()) |run| {
-                self.quad_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen, .offscreen);
-            }
-        }
-        {
-            var it = element.runs(dl_p1.glyph_targets.items, dispatch_index_u32);
-            while (it.next()) |run| {
-                self.text_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen, .offscreen);
-            }
-        }
 
-        vk.c.vkCmdEndRendering(cmd);
+            // Per-target drawlist routing (Phase B.4.b.4). Render every
+            // drawlist primitive whose target_dispatch_index equals
+            // this dispatch's index into S's offscreen target. By walker
+            // construction every primitive type yields exactly one
+            // contiguous run for an offscreen target (push target on
+            // enter, primitives append with that tag, pop on exit). The
+            // run iterator still tolerates zero or multiple runs as a
+            // generality; for offscreen the loop runs at most once per
+            // pipeline.
+            //
+            // The order — tri, image, quad, text — mirrors Phase 2 and
+            // the host's main pass so paint order inside an effect's
+            // target matches paint order against the main attachment.
+            // SVG fills sit behind chrome; backgrounds sit under glyphs.
+            const target_extent_render = vk.c.VkExtent2D{
+                .width = S.target_size[0],
+                .height = S.target_size[1],
+            };
+            // Screen-space rebase to target-local. **Subtle SSBO timing
+            // bit, worth pinning.** Phase 1 RECORDS draws here in
+            // preDrawCb, but the actual SSBO upload happens later (in
+            // endFrame's `writeQuads/writeMesh/writeGlyphs`, after the
+            // world→screen transform on the drawlist). Vulkan executes
+            // recorded draws in submission order with the SSBO state at
+            // submit time — so by the time Phase 1's draws actually
+            // execute on GPU, each instance's `dst_pos` is already in
+            // SCREEN coords `(world - scroll) * zoom`, NOT the WORLD
+            // coords the walker emitted. `world_offset` must live in the
+            // SAME coord space — so it's SCREEN compose too, computed
+            // here from world compose + scroll + zoom.
+            //
+            // TODO(zoom): target_size + per-target viewport are still
+            // WORLD-sized. At zoom != 1 the box's screen extent exceeds
+            // the offscreen target's framebuffer extent and clips. Wire
+            // a zoom-scaled `acquire(target_key)` when zoom-on-effects
+            // is exercised; current demo runs at zoom=1.
+            const sx = self.frame_info.scroll_offset[0];
+            const sy = self.frame_info.scroll_offset[1];
+            const z = self.frame_info.zoom;
+            const world_offset_target: [2]f32 = .{
+                (@as(f32, @floatFromInt(S.compose_region.x)) - sx) * z,
+                (@as(f32, @floatFromInt(S.compose_region.y)) - sy) * z,
+            };
+            const dl_p1 = &self.drawlist;
+            const dispatch_index_u32: u32 = @intCast(dispatch_index);
+            {
+                var it = element.triRuns(dl_p1.tri_targets.items, dl_p1.tri_indices.items, dispatch_index_u32);
+                while (it.next()) |run| {
+                    self.tri_pipeline.recordDrawIndexedRange(cmd, target_extent_render, world_offset_target, run.first_index, run.index_count, display_mod.Push.offscreen, .offscreen);
+                }
+            }
+            {
+                var it = element.runs(dl_p1.image_targets.items, dispatch_index_u32);
+                const all_images = dl_p1.images.items;
+                while (it.next()) |run| {
+                    if (run.count == 0) continue;
+                    self.image_pipeline.bind(cmd, target_extent_render, .offscreen);
+                    const subset = all_images[run.first .. run.first + run.count];
+                    for (subset) |im| {
+                        self.image_pipeline.recordOne(cmd, target_extent_render, world_offset_target, @ptrCast(@alignCast(im.descriptor_set)), im.dst_pos, im.dst_size, display_mod.Push.offscreen);
+                    }
+                }
+            }
+            {
+                var it = element.runs(dl_p1.quad_targets.items, dispatch_index_u32);
+                while (it.next()) |run| {
+                    self.quad_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen, .offscreen);
+                }
+            }
+            {
+                var it = element.runs(dl_p1.glyph_targets.items, dispatch_index_u32);
+                while (it.next()) |run| {
+                    self.text_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen, .offscreen);
+                }
+            }
 
-        // Barrier target → SHADER_READ_ONLY_OPTIMAL for Phase 2's
-        // sampling pass (and any enclosing single_source's compose
-        // in this same Phase 1 stack).
-        barrierImageLayout(cmd, target_handle.image(), .{
-            .src_stage = vk.c.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-            .dst_stage = vk.c.VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-            .src_access = vk.c.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-            .dst_access = vk.c.VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-            .old_layout = vk.c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .new_layout = vk.c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        });
+            vk.c.vkCmdEndRendering(cmd);
+
+            // Barrier target → SHADER_READ_ONLY_OPTIMAL for Phase 2's
+            // sampling pass (and any enclosing single_source's compose
+            // in this same Phase 1 stack).
+            barrierImageLayout(cmd, target_handle.image(), .{
+                .src_stage = vk.c.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .dst_stage = vk.c.VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                .src_access = vk.c.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                .dst_access = vk.c.VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                .old_layout = vk.c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .new_layout = vk.c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            });
+        }
     }
 
     /// Effects-spec B.7 — Phase 1 step for a `.host_slot` dispatch.
@@ -1297,7 +1312,7 @@ pub const Spark = struct {
         // It also fixes what a backdrop can see — whatever the host drew
         // before calling spark, and nothing spark itself draws this frame.
         if (C.source == .backdrop) {
-            try self.fillPoolZeroFromMain(cmd, pool_zero, C);
+            try self.fillTargetFromMain(cmd, pool_zero, C.compose_region, C.target_size);
         } else {
             // (3) Render subtree into pool[0]. SHADER_READ_ONLY →
             // COLOR_ATTACHMENT_OPTIMAL barrier opens write access.
@@ -1624,10 +1639,17 @@ pub const Spark = struct {
             },
         };
         vk.c.vkCmdSetScissor(cmd, 0, 1, &scissor);
+        // A backdrop's pixels were COPIED off the host's attachment and
+        // already carry the display transform; encoding again would push a
+        // PQ code through the PQ curve twice. Same rule as the chain arm.
+        const disp = switch (ss.source) {
+            .subtree => self.displayFor(att),
+            .backdrop => display_mod.Push.offscreen,
+        };
         pushEffectUniforms(
             cmd,
             self.single_source_pipelines.layout,
-            self.displayFor(att),
+            disp,
             ss.filter_uniforms[0..ss.filter_uniforms_len],
         );
         vk.c.vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -1701,9 +1723,10 @@ pub const Spark = struct {
         vk.c.vkCmdDraw(cmd, 3, 1, 0, 0);
     }
 
-    /// Fill a backdrop chain's `pool[0]` with the region of the host's
-    /// attachment that the element covers — what is already on screen behind
-    /// the panel.
+    /// Fill a backdrop effect's offscreen target with the region of the
+    /// host's attachment that the element covers — what is already on screen
+    /// behind the panel. Shared by the chain arm (where the target is
+    /// pool[0]) and the single_source arm (where it is the only target).
     ///
     /// **Why a blit and not a shader.** The source and destination differ in
     /// both format (a swapchain 8- or 10-bit UNORM into the pool's RGBA16F)
@@ -1719,11 +1742,12 @@ pub const Spark = struct {
     /// pixels already carry it. `recordChainFinalComposite` passes
     /// `Push.offscreen` for a backdrop chain for exactly that reason; PQ
     /// twice is not PQ, and we have paid for that lesson once already.
-    fn fillPoolZeroFromMain(
+    fn fillTargetFromMain(
         self: *Spark,
         cmd: vk.c.VkCommandBuffer,
-        pool_zero: pass_mod.TargetHandle,
-        C: element.ChainStep,
+        target: pass_mod.TargetHandle,
+        compose_region: element.PassRegion,
+        target_size: [2]u32,
     ) !void {
         const src_image = self.frame_info.target_image orelse return error.BackdropNeedsTargetImage;
 
@@ -1733,10 +1757,10 @@ pub const Spark = struct {
         const sx = self.frame_info.scroll_offset[0];
         const sy = self.frame_info.scroll_offset[1];
         const z = self.frame_info.zoom;
-        const fx = (@as(f32, @floatFromInt(C.compose_region.x)) - sx) * z;
-        const fy = (@as(f32, @floatFromInt(C.compose_region.y)) - sy) * z;
-        const fw = @as(f32, @floatFromInt(C.compose_region.w)) * z;
-        const fh = @as(f32, @floatFromInt(C.compose_region.h)) * z;
+        const fx = (@as(f32, @floatFromInt(compose_region.x)) - sx) * z;
+        const fy = (@as(f32, @floatFromInt(compose_region.y)) - sy) * z;
+        const fw = @as(f32, @floatFromInt(compose_region.w)) * z;
+        const fh = @as(f32, @floatFromInt(compose_region.h)) * z;
 
         // Clamp to the attachment. A panel hanging off the edge would
         // otherwise ask the driver to read outside the image, and the
@@ -1747,7 +1771,7 @@ pub const Spark = struct {
         const y0 = std.math.clamp(@as(i32, @intFromFloat(@round(fy))), 0, ext_h);
         const x1 = std.math.clamp(@as(i32, @intFromFloat(@round(fx + fw))), x0, ext_w);
         const y1 = std.math.clamp(@as(i32, @intFromFloat(@round(fy + fh))), y0, ext_h);
-        if (x1 <= x0 or y1 <= y0) return; // fully offscreen — pool[0] stays cleared
+        if (x1 <= x0 or y1 <= y0) return; // fully offscreen — the target stays cleared
 
         barrierImageLayout(cmd, src_image, .{
             .src_stage = vk.c.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -1759,7 +1783,7 @@ pub const Spark = struct {
             .old_layout = vk.c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             .new_layout = vk.c.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         });
-        barrierImageLayout(cmd, pool_zero.image(), .{
+        barrierImageLayout(cmd, target.image(), .{
             .src_stage = vk.c.VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
             .dst_stage = vk.c.VK_PIPELINE_STAGE_2_TRANSFER_BIT,
             .src_access = vk.c.VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
@@ -1783,14 +1807,14 @@ pub const Spark = struct {
             .dstSubresource = sub,
             .dstOffsets = .{
                 .{ .x = 0, .y = 0, .z = 0 },
-                .{ .x = @intCast(C.target_size[0]), .y = @intCast(C.target_size[1]), .z = 1 },
+                .{ .x = @intCast(target_size[0]), .y = @intCast(target_size[1]), .z = 1 },
             },
         };
         vk.c.vkCmdBlitImage(
             cmd,
             src_image,
             vk.c.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            pool_zero.image(),
+            target.image(),
             vk.c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             1,
             &blit,
@@ -1798,7 +1822,8 @@ pub const Spark = struct {
         );
 
         // Hand both images back: the attachment to the host, which is about
-        // to open its rendering scope on it, and pool[0] to the steps.
+        // to open its rendering scope on it, and the target to whatever
+        // samples it next (a chain's steps, or Phase 2's compose).
         barrierImageLayout(cmd, src_image, .{
             .src_stage = vk.c.VK_PIPELINE_STAGE_2_TRANSFER_BIT,
             .dst_stage = vk.c.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -1807,7 +1832,7 @@ pub const Spark = struct {
             .old_layout = vk.c.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             .new_layout = vk.c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         });
-        barrierImageLayout(cmd, pool_zero.image(), .{
+        barrierImageLayout(cmd, target.image(), .{
             .src_stage = vk.c.VK_PIPELINE_STAGE_2_TRANSFER_BIT,
             .dst_stage = vk.c.VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
             .src_access = vk.c.VK_ACCESS_2_TRANSFER_WRITE_BIT,
@@ -2127,9 +2152,14 @@ pub const Spark = struct {
             for (self.pass_dispatches.items) |d| {
                 switch (d) {
                     .single_source => |ss| {
-                        var k = ss.subtree_dispatch_range[0];
-                        while (k < ss.subtree_dispatch_range[1]) : (k += 1) {
-                            is_nested[k] = true;
+                        // Same rule as the chain arm: a BACKDROP fills its
+                        // target from the attachment, so the children were
+                        // never routed into it and are ordinary MAIN content.
+                        if (ss.source == .subtree) {
+                            var k = ss.subtree_dispatch_range[0];
+                            while (k < ss.subtree_dispatch_range[1]) : (k += 1) {
+                                is_nested[k] = true;
+                            }
                         }
                     },
                     // Effects-spec C.1.5 — chain joins single_source
@@ -2172,18 +2202,28 @@ pub const Spark = struct {
             // own children. Two backdrops stack by document order; a
             // backdrop cannot be composited over a sibling drop shadow.
             for (self.pass_dispatches.items, 0..) |d, bi| {
-                const c = switch (d) {
-                    .chain => |ch| ch,
+                switch (d) {
+                    .chain => |c| {
+                        if (c.source != .backdrop) continue;
+                        const pool_base = self.chain_pool_bases.items[bi] orelse unreachable;
+                        const final_target = self.acquired_targets.items[pool_base + c.final_pool_local];
+                        const bx = (@as(f32, @floatFromInt(c.compose_region.x)) - sx) * z;
+                        const by = (@as(f32, @floatFromInt(c.compose_region.y)) - sy) * z;
+                        const bw = @as(f32, @floatFromInt(c.compose_region.w)) * z;
+                        const bh = @as(f32, @floatFromInt(c.compose_region.h)) * z;
+                        try self.recordChainFinalComposite(cmd, c, final_target, bx, by, bw, bh, &last_compose, .main);
+                    },
+                    .single_source => |ss| {
+                        if (ss.source != .backdrop) continue;
+                        const target = self.dispatch_target_map.items[bi] orelse unreachable;
+                        const bx = (@as(f32, @floatFromInt(ss.compose_region.x)) - sx) * z;
+                        const by = (@as(f32, @floatFromInt(ss.compose_region.y)) - sy) * z;
+                        const bw = @as(f32, @floatFromInt(ss.compose_region.w)) * z;
+                        const bh = @as(f32, @floatFromInt(ss.compose_region.h)) * z;
+                        try self.recordSingleSourceCompose(cmd, ss, target, bx, by, bw, bh, &last_compose, .main);
+                    },
                     else => continue,
-                };
-                if (c.source != .backdrop) continue;
-                const pool_base = self.chain_pool_bases.items[bi] orelse unreachable;
-                const final_target = self.acquired_targets.items[pool_base + c.final_pool_local];
-                const bx = (@as(f32, @floatFromInt(c.compose_region.x)) - sx) * z;
-                const by = (@as(f32, @floatFromInt(c.compose_region.y)) - sy) * z;
-                const bw = @as(f32, @floatFromInt(c.compose_region.w)) * z;
-                const bh = @as(f32, @floatFromInt(c.compose_region.h)) * z;
-                try self.recordChainFinalComposite(cmd, c, final_target, bx, by, bw, bh, &last_compose, .main);
+                }
             }
 
             var i: usize = 0;
@@ -2213,6 +2253,11 @@ pub const Spark = struct {
                         i += 1;
                     },
                     .single_source => |ss| {
+                        // Backdrops were composited in the pre-pass above.
+                        if (ss.source == .backdrop) {
+                            i = ss.subtree_dispatch_range[1] + 1;
+                            continue;
+                        }
                         // Top-level compose. Phase 1 already
                         // populated the target and barriered it to
                         // SHADER_READ_ONLY_OPTIMAL; dispatch_target_map

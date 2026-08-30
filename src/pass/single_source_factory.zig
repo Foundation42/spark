@@ -104,6 +104,22 @@ pub const Error = error{
 
 /// Returns a struct exposing `.factory` and `.install(spark)` for a
 /// single_source effect. See module doc for usage.
+/// A bare `{backdrop}` means true, `{backdrop=false}` means false, absent
+/// means false. `params.resolve` cannot express this — a valueless attribute
+/// trims to empty, which it reports as unparseable and answers with the
+/// caller's default, so the bare flag read as OFF and the effect silently
+/// filtered its own children instead.
+fn readFlag(spec: *const components.Spec, key: []const u8) bool {
+    for (spec.attrs) |a| {
+        if (!std.mem.eql(u8, a.key, key)) continue;
+        const t = std.mem.trim(u8, a.value, " \t");
+        if (t.len == 0) return true; // bare — presence is the value
+        if (std.ascii.eqlIgnoreCase(t, "true")) return true;
+        return false;
+    }
+    return false;
+}
+
 pub fn SingleSourceFactory(comptime config: anytype) type {
     const UniformsT = config.Uniforms;
     const SHADER_ID: component_mod.ShaderId = shader_resolver.shaderIdFromName(config.shader);
@@ -127,6 +143,8 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
             version: u64 = 0,
             /// The body text this instance's `root` was parsed from.
             body: component_mod.Body = .{},
+            /// Resolve-once: see `passSource`.
+            source: element.PassSource = .subtree,
         };
 
         pub const factory: component_mod.Factory = .{
@@ -172,6 +190,7 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
                 .uniforms = config.apply_attrs(spec),
                 .version = 0,
                 .body = .{},
+                .source = if (readFlag(spec, "backdrop")) .backdrop else .subtree,
             };
             errdefer c.arena.deinit();
 
@@ -295,6 +314,20 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
         /// A slider inside `:::liquid_glass` drove the plane and never drew
         /// its own new position — the same freeze the hand-written effects
         /// had, arrived at by a shorter route.
+        /// `{backdrop}` — filter what is BEHIND the element instead of what
+        /// it wraps, and let the children draw over the result on MAIN. See
+        /// `element.PassSource`.
+        ///
+        /// Answered BEFORE layout, which is why it cannot ride on the
+        /// uniforms hook: the walker needs it to decide where the children's
+        /// drawlist primitives go. Resolved once at create — flipping it
+        /// mid-frame would route the children one way and fill the target the
+        /// other.
+        fn passSource(ctx: *anyopaque) element.PassSource {
+            const c: *const Component = @ptrCast(@alignCast(ctx));
+            return c.source;
+        }
+
         fn contentVersion(ctx: *anyopaque) u64 {
             const c: *const Component = @ptrCast(@alignCast(ctx));
             return c.version ^ layout_cache.aggregateRootVersion(c.root);
@@ -304,6 +337,7 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
             .layout_and_render = layoutAndRender,
             .snapshot_uniforms = snapshotUniforms,
             .content_version = contentVersion,
+            .pass_source = passSource,
             // Cacheable as of Phase B.6.a — substrate handles primitive
             // routing tags through cache via replay-with-offset.
         };

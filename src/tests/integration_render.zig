@@ -873,7 +873,7 @@ test "chain determinism: :::frosted_glass {backdrop}, source survives the walker
         ,
         struct {
             fn f(ch: spark.element.ChainStep) anyerror!void {
-                try testing.expectEqual(spark.element.ChainSource.backdrop, ch.source);
+                try testing.expectEqual(spark.element.PassSource.backdrop, ch.source);
                 // Still the same two-step blur — backdrop changes where
                 // pool[0] comes from, not what the chain does to it.
                 try testing.expectEqual(@as(usize, 2), ch.steps.len);
@@ -932,6 +932,62 @@ test "chain determinism: :::frosted_glass, two blurs that ping-pong" {
             }
         }.f,
     );
+}
+
+test "single_source determinism: :::liquid_glass {backdrop}" {
+    // C.4 generalised `backdrop` from the chain arm to the single_source
+    // arm, which is what lets `:::liquid_glass` refract the SCENE rather
+    // than its own children — the "see-through" look its own header used to
+    // say needed a second sampler bound to MAIN. It does not: with a
+    // backdrop source, the backdrop IS what the one sampler holds.
+    //
+    // The attribute has to reach the DISPATCH. Phase 1 reads it to decide
+    // whether to render the subtree into the target or copy the attachment
+    // into it; Phase 2 reads it to decide whether to composite in the
+    // backdrop pre-pass and whether to apply the display transform.
+    var fx = try fixture.Fixture.init(testing.allocator);
+    defer fx.deinit();
+
+    const allocator = testing.allocator;
+    const fonts = try fixture.makeFonts(allocator, fx.ft);
+    const theme = fixture.makeTheme(fonts);
+    var state = spark.State.init(allocator);
+    defer state.deinit();
+
+    var sp = try spark.Spark.init(allocator, .{
+        .vk_ctx = &fx.ctx,
+        .color_format = fx.swapchain.format,
+        .theme = &theme,
+        .fonts = fonts.registry,
+        .host_state = &state,
+    });
+    defer {
+        sp.deinit();
+        allocator.destroy(fonts.registry);
+    }
+    sp.attachToRegistry();
+    try spark.installCoreComponents(&sp);
+
+    var doc = try sp.loadDocument(
+        \\:::liquid_glass {backdrop radius=0.1 refraction=0.2}
+        \\Sharp text over a refracted scene.
+        \\:::
+        \\
+    , .{ .shared_state = &state });
+    defer doc.deinit();
+
+    try sp.beginFrame(.{ .extent = .{ .width = 800, .height = 600 } }, .{ .reset = true });
+    _ = try sp.layoutAndRender(&doc, .{ 40, 40 }, .{ .max_w = 720 });
+
+    var seen: usize = 0;
+    for (sp.pass_dispatches.items) |d| switch (d) {
+        .single_source => |ss| {
+            seen += 1;
+            try testing.expectEqual(spark.element.PassSource.backdrop, ss.source);
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 1), seen);
 }
 
 test "single_source determinism: :::liquid_glass" {

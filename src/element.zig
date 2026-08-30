@@ -476,14 +476,14 @@ pub const ElementVTable = struct {
         ctx: *anyopaque,
         target_size: [2]u32,
     ) ChainHookResult = null,
-    /// Optional, chain elements only. Answers `ChainSource` BEFORE layout
+    /// Optional, chain elements only. Answers `PassSource` BEFORE layout
     /// runs, which is why it cannot ride on `snapshot_chain_steps`: that
     /// hook needs the element's box, so it is called after
     /// `layout_and_render`, and by then the walker has already decided
     /// whether to route the children's drawlist primitives into pool[0].
     /// That decision is the whole difference between a backdrop and a
     /// filter. `null` means `.subtree`.
-    chain_source: ?*const fn (ctx: *anyopaque) ChainSource = null,
+    pass_source: ?*const fn (ctx: *anyopaque) PassSource = null,
     /// Optional. Reports how this component participates in its
     /// parent stack's flow (stage 15 Phase E text exclusion). `null`
     /// (the default) means `.normal` — the component flows in
@@ -699,6 +699,13 @@ pub const SingleSourceStep = struct {
     filter_shader_id: [16]u8,
     filter_uniforms: [MAX_PASS_UNIFORM_BYTES]u8 = [_]u8{0} ** MAX_PASS_UNIFORM_BYTES,
     filter_uniforms_len: u32 = 0,
+    /// See `PassSource`. A `.backdrop` single_source fills its offscreen
+    /// target by COPYING the attachment region the element covers instead of
+    /// rendering the children into it — so `:::liquid_glass` refracts the
+    /// scene behind the panel rather than its own content, which is the
+    /// "see-through" look its header said needed a second sampler. It does
+    /// not: the backdrop IS what the one sampler holds.
+    source: PassSource = .subtree,
     /// Where the composed filter output lands on the main color
     /// attachment.
     compose_region: PassRegion,
@@ -862,7 +869,7 @@ pub const MAX_CHAIN_POOL_TARGETS: u32 = 16;
 /// cannot see other spark content from this frame, because none of it has
 /// been drawn yet. A backdrop panel blurs the scene; it does not blur
 /// another panel.
-pub const ChainSource = enum(u8) {
+pub const PassSource = enum(u8) {
     subtree,
     backdrop,
 };
@@ -910,7 +917,7 @@ pub const ChainHookResult = struct {
     final_pool_local: u16,
     /// Where pool[0] comes from. Defaults to `.subtree`, so a chain
     /// written before backdrops existed keeps its behaviour.
-    source: ChainSource = .subtree,
+    source: PassSource = .subtree,
 };
 
 // Effects-spec C.2 note on what this struct does NOT carry. C.1 drafted a
@@ -945,10 +952,10 @@ pub const ChainStep = struct {
     target_size: [2]u32,
     target_format: u32, // raw VkFormat — promotion to TargetFormat enum tracked for C.2
     target_pool_count: u16,
-    /// See `ChainSource`. Hashed by the frame fingerprint like every other
+    /// See `PassSource`. Hashed by the frame fingerprint like every other
     /// dispatch field, so a document that toggles `backdrop` is a different
     /// frame rather than a silently identical one.
-    source: ChainSource = .subtree,
+    source: PassSource = .subtree,
     /// Slice into component-owned scratch. Length = active step
     /// count. Walker enforces `len <= MAX_CHAIN_STEPS` at emission.
     steps: []const ChainPassStep,

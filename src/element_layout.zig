@@ -267,8 +267,7 @@ pub fn layoutAndRender(
             // after every pass composite — so they land on top of the
             // blurred backdrop, sharp, with no extra machinery.
             const routes_children_offscreen = switch (cu.pass_kind) {
-                2 => true,
-                3 => if (cu.vtable.chain_source) |f| f(cu.ctx) == .subtree else true,
+                2, 3 => if (cu.vtable.pass_source) |f| f(cu.ctx) == .subtree else true,
                 else => false,
             };
             if (routes_children_offscreen and ctx.pass_dispatches != null) {
@@ -347,6 +346,7 @@ pub fn layoutAndRender(
                         .filter_shader_id = cu.shader_id,
                         .filter_uniforms = uniform_buf,
                         .filter_uniforms_len = ulen,
+                        .source = if (cu.vtable.pass_source) |f| f(cu.ctx) else .subtree,
                         .compose_region = region,
                         .subtree_dispatch_range = .{ dispatch_start, seq },
                         .sequence_index = seq,

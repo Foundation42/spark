@@ -90,7 +90,7 @@
 //!
 //! The layering costs nothing: Phase 2 records every pass composite before
 //! any MAIN drawlist primitive, which is the same reason `:::pattern` is a
-//! background. See `element.ChainSource` for what a backdrop can and cannot
+//! background. See `element.PassSource` for what a backdrop can and cannot
 //! see, and `Spark.fillPoolZeroFromMain` for why the copy is legal only in
 //! Phase 1.
 //!
@@ -225,7 +225,7 @@ const Component = struct {
     /// Resolve-once, like inflation. `update` may animate blur and tint
     /// freely; flipping `backdrop` needs a new instance (an `#id` change),
     /// because the walker has already routed this frame's children.
-    source: element.ChainSource = .subtree,
+    source: element.PassSource = .subtree,
 };
 
 pub const factory: component_mod.Factory = .{
@@ -361,12 +361,12 @@ fn snapshotChainSteps(ctx: *anyopaque, target_size: [2]u32) element.ChainHookRes
     };
 }
 
-/// Answered BEFORE layout — see `ElementVTable.chain_source`. Resolved once
+/// Answered BEFORE layout — see `ElementVTable.pass_source`. Resolved once
 /// at create, in the spirit of Decision #8: the walker asks this to decide
 /// where the children's drawlist primitives go, and Phase 1 asks the step
 /// hook where pool[0] comes from. If the two could disagree within a frame,
 /// the children would render into a target nothing composites.
-fn chainSource(ctx: *anyopaque) element.ChainSource {
+fn passSource(ctx: *anyopaque) element.PassSource {
     const c: *const Component = @ptrCast(@alignCast(ctx));
     return c.source;
 }
@@ -388,7 +388,7 @@ const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .snapshot_uniforms = snapshotUniforms,
     .snapshot_chain_steps = snapshotChainSteps,
-    .chain_source = chainSource,
+    .pass_source = passSource,
     .content_version = contentVersion,
 };
 
@@ -523,7 +523,7 @@ test "backdrop: bare flag, explicit value, and absent" {
 
 test "backdrop: the chain reports where pool[0] comes from" {
     // Two hooks must agree, and they are asked at different times: the
-    // walker calls `chain_source` BEFORE layout to decide where the
+    // walker calls `pass_source` BEFORE layout to decide where the
     // children's drawlist primitives go, and Phase 1 reads
     // `ChainHookResult.source` to decide how to fill pool[0]. If they could
     // disagree, the children would render into a target nothing composites
@@ -538,12 +538,12 @@ test "backdrop: the chain reports where pool[0] comes from" {
     };
     defer c.arena.deinit();
 
-    try testing.expectEqual(element.ChainSource.backdrop, chainSource(@ptrCast(&c)));
-    try testing.expectEqual(element.ChainSource.backdrop, snapshotChainSteps(@ptrCast(&c), .{ 100, 100 }).source);
+    try testing.expectEqual(element.PassSource.backdrop, passSource(@ptrCast(&c)));
+    try testing.expectEqual(element.PassSource.backdrop, snapshotChainSteps(@ptrCast(&c), .{ 100, 100 }).source);
 
     // Rule 1: the default must be the other value, or "it reports backdrop"
     // is a statement about a field that is always backdrop.
     c.source = .subtree;
-    try testing.expectEqual(element.ChainSource.subtree, chainSource(@ptrCast(&c)));
-    try testing.expectEqual(element.ChainSource.subtree, snapshotChainSteps(@ptrCast(&c), .{ 100, 100 }).source);
+    try testing.expectEqual(element.PassSource.subtree, passSource(@ptrCast(&c)));
+    try testing.expectEqual(element.PassSource.subtree, snapshotChainSteps(@ptrCast(&c), .{ 100, 100 }).source);
 }
