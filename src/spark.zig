@@ -127,6 +127,26 @@ pub const HostSurfaceImage = struct {
 /// the render thread, inside the frame.
 pub const HostSurfaceFn = *const fn (ctx: *anyopaque, name: []const u8) ?HostSurfaceImage;
 
+/// Where a `:::button {cmd="..."}` sends its line.
+///
+/// spark does not parse, validate or interpret the string — it does not
+/// know what a command IS. The host owns the vocabulary, and a document
+/// that names a verb this host has never heard of gets whatever the
+/// host says about that, in the host's own words.
+///
+/// **The sink must not act immediately.** It is called from inside the
+/// button's `on_input`, which is inside the pointer dispatch, which is
+/// inside the frame — so a line like `hud unmount debug` would free the
+/// very component whose click is still being handled. Queue the line
+/// and run it at a point where nothing is mid-walk; matryoshka drains
+/// after the pointer block, the same way it drains the mount inbox.
+///
+/// Takes no error: a button is a person clicking, and there is nothing
+/// useful to propagate a failure INTO. The host reports what happened
+/// through its own channels (a console log line), where a person will
+/// actually see it.
+pub const CommandSink = *const fn (ctx: *anyopaque, line: []const u8) void;
+
 /// Construction options for `Spark.init`. Raw Vulkan handles +
 /// theme + fonts (Spark takes ownership) + borrowed host state +
 /// optional sizing knobs. Defaults match the demo's historical
@@ -312,6 +332,13 @@ pub const Spark = struct {
     /// is an empty frame with working buttons rather than a crash.
     host_surface_fn: ?HostSurfaceFn = null,
     host_surface_ctx: ?*anyopaque = null,
+
+    /// Where `:::button {cmd="..."}` sends its line. Null until
+    /// `setCommandSink`, and a `cmd=` button on a host that installed
+    /// none does nothing at all — visibly a button, inertly a button,
+    /// which is the right shape for a document carried between hosts.
+    command_sink_fn: ?CommandSink = null,
+    command_sink_ctx: ?*anyopaque = null,
 
     // ── Per-frame state (set by attachCmd + beginFrame) ─────────────
     /// Bound command buffer for the current frame. Set by `attachCmd`,
@@ -613,6 +640,21 @@ pub const Spark = struct {
     pub fn setHostSurfaceResolver(self: *Spark, ctx: *anyopaque, f: HostSurfaceFn) void {
         self.host_surface_ctx = ctx;
         self.host_surface_fn = f;
+    }
+
+    /// Install the sink a `:::button {cmd="..."}` sends its line to.
+    /// See `CommandSink` — in particular, why it must queue.
+    pub fn setCommandSink(self: *Spark, ctx: *anyopaque, f: CommandSink) void {
+        self.command_sink_ctx = ctx;
+        self.command_sink_fn = f;
+    }
+
+    /// Hand a command line to the host, if one is listening.
+    pub fn sendCommand(self: *Spark, line: []const u8) void {
+        if (line.len == 0) return;
+        const sink = self.command_sink_fn orelse return;
+        const ctx = self.command_sink_ctx orelse return;
+        sink(ctx, line);
     }
 
     /// The host's image for `name`, or null.

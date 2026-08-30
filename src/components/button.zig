@@ -74,6 +74,10 @@ const Component = struct {
     target: []u8, // stripped of leading `#`
     action: []u8,
     body: []u8,
+    /// A host console line, run on click. See the `cmd=` arm in
+    /// `onInput` — this is the third target kind, and the only one
+    /// that reaches outside the document.
+    cmd: []u8,
     width: ?box_helpers.Length, // null = intrinsic
     height: f32,
     last_box: element.Box = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
@@ -90,6 +94,7 @@ const Component = struct {
         var target_raw: ?[]const u8 = null;
         var action_raw: ?[]const u8 = null;
         var body_raw: []const u8 = "";
+        var cmd_raw: []const u8 = "";
         var width_opt: ?box_helpers.Length = self.width;
         var height_opt: f32 = self.height;
 
@@ -102,6 +107,8 @@ const Component = struct {
                 action_raw = attr.value;
             } else if (std.mem.eql(u8, attr.key, "body")) {
                 body_raw = attr.value;
+            } else if (std.mem.eql(u8, attr.key, "cmd")) {
+                cmd_raw = attr.value;
             } else if (std.mem.eql(u8, attr.key, "width")) {
                 if (box_helpers.parseLength(attr.value)) |l| width_opt = l;
             } else if (std.mem.eql(u8, attr.key, "height")) {
@@ -115,7 +122,12 @@ const Component = struct {
         }
 
         const label = label_raw orelse return Error.ButtonMissingLabel;
-        const target_full = target_raw orelse return Error.ButtonMissingTarget;
+        // `cmd=` is a target in its own right, so it satisfies the
+        // requirement that a button DO something. A button with neither
+        // is still refused — it looks like a control and is not one,
+        // which is worse than a parse error.
+        const target_full = target_raw orelse
+            (if (cmd_raw.len > 0) "" else return Error.ButtonMissingTarget);
 
         const target = if (target_full.len > 0 and target_full[0] == '#')
             target_full[1..]
@@ -128,7 +140,7 @@ const Component = struct {
         // body into state.path) — so leave it as a courtesy empty
         // string when absent.
         const is_state_target = std.mem.startsWith(u8, target, "state.");
-        const action = if (is_state_target)
+        const action = if (is_state_target or target.len == 0)
             action_raw orelse ""
         else
             action_raw orelse return Error.ButtonMissingAction;
@@ -141,16 +153,20 @@ const Component = struct {
         errdefer a.free(new_action);
         const new_body = try a.dupe(u8, body_raw);
         errdefer a.free(new_body);
+        const new_cmd = try a.dupe(u8, cmd_raw);
+        errdefer a.free(new_cmd);
 
         // Old field cleanup — only after every new dupe succeeded.
         a.free(self.label);
         a.free(self.target);
         a.free(self.action);
         a.free(self.body);
+        a.free(self.cmd);
         self.label = new_label;
         self.target = new_target;
         self.action = new_action;
         self.body = new_body;
+        self.cmd = new_cmd;
         self.width = width_opt;
         self.height = height_opt;
         self.version +%= 1;
@@ -167,6 +183,7 @@ fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const co
         .target = try allocator.dupe(u8, ""),
         .action = try allocator.dupe(u8, ""),
         .body = try allocator.dupe(u8, ""),
+        .cmd = try allocator.dupe(u8, ""),
         .width = null,
         .height = 36,
     };
@@ -185,6 +202,7 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     allocator.free(c.target);
     allocator.free(c.action);
     allocator.free(c.body);
+    allocator.free(c.cmd);
     allocator.destroy(c);
 }
 
@@ -301,6 +319,26 @@ fn onInput(
     switch (event) {
         .mouse_up => |m| {
             if (m.button != 0) return; // primary only
+
+            // `cmd=` — a HOST console line, run on click. The third
+            // target kind, and the only one that reaches outside the
+            // document: `hud mount`, `rill mount`, `write`, anything
+            // the host's own console takes.
+            //
+            // FIRST, and deliberately so: a button may carry both a
+            // `cmd` and a state write (light a "selected" flag while
+            // also doing the thing), and the state write must not be
+            // skipped because the command arm returned. They compose.
+            //
+            // spark hands the line over and stops caring — it does not
+            // know what a command is. `Spark.sendCommand` is a no-op on
+            // a host that installed no sink, so a document carried
+            // somewhere else has visibly-a-button that inertly does
+            // nothing, rather than a crash.
+            if (c.cmd.len > 0) {
+                if (c.spark) |sp| sp.sendCommand(c.cmd);
+            }
+
             if (c.target.len == 0) return;
 
             // State-target: `target=state.path` writes `body` into the
@@ -456,4 +494,166 @@ test "button: state-target ignores right-mouse and key events" {
     // Right button shouldn't fire.
     try onInput(inst.ctx, .{ .mouse_up = .{ .local = .{ 0, 0 }, .button = 1, .button_down = false } }, @ptrCast(&state));
     try testing.expect(state.get("foo") == null);
+}
+
+// ── `cmd=` — a button that runs a host console line ─────────────────
+// The third target kind, and the only one reaching outside the
+// document. What makes it safe is that spark HANDS THE LINE OVER and
+// stops: the host queues it and runs it where nothing is mid-walk. See
+// `spark.CommandSink`.
+
+/// A sink that records what it was handed, so a test can assert on it.
+const CmdProbe = struct {
+    var seen: [4][128]u8 = undefined;
+    var seen_len: [4]usize = .{ 0, 0, 0, 0 };
+    var count: usize = 0;
+
+    fn reset() void {
+        count = 0;
+        seen_len = .{ 0, 0, 0, 0 };
+    }
+
+    fn sink(ctx: *anyopaque, line: []const u8) void {
+        _ = ctx;
+        if (count >= seen.len) return;
+        const n = @min(line.len, seen[count].len);
+        @memcpy(seen[count][0..n], line[0..n]);
+        seen_len[count] = n;
+        count += 1;
+    }
+
+    fn last() []const u8 {
+        if (count == 0) return "";
+        return seen[count - 1][0..seen_len[count - 1]];
+    }
+};
+
+test "button: cmd= hands its line to the host's sink, verbatim" {
+    // Verbatim matters. spark does not parse, validate, normalise or
+    // even trim a command — it does not know what a command IS. A line
+    // that arrives at the host altered is a line the host's own console
+    // would have taken and this path would not, which is exactly the
+    // kind of divergence that makes a control surface untrustworthy.
+    CmdProbe.reset();
+    var sp = spark_mod.Spark.testStub(testing.allocator);
+    sp.setCommandSink(@ptrCast(&sp), CmdProbe.sink);
+
+    const attrs = [_]components.Attr{
+        .{ .key = "label", .value = "Normals" },
+        .{ .key = "cmd", .value = "write hud/panels/0/x 0.5" },
+    };
+    const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
+    const inst = try create(&sp, testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+
+    var state = state_mod.State.init(testing.allocator);
+    defer state.deinit();
+    try onInput(inst.ctx, .{ .mouse_up = .{ .local = .{ 0, 0 }, .button = 0, .button_down = false } }, @ptrCast(&state));
+
+    try testing.expectEqual(@as(usize, 1), CmdProbe.count);
+    try testing.expectEqualStrings("write hud/panels/0/x 0.5", CmdProbe.last());
+}
+
+test "button: cmd= alone is a complete button — no target, no action" {
+    // `target=` used to be mandatory, and `action=` mandatory after it.
+    // A command button has neither and must still build; the failure
+    // this guards is a create() that returns ButtonMissingTarget and
+    // leaves the author with a placeholder where their button was.
+    CmdProbe.reset();
+    var sp = spark_mod.Spark.testStub(testing.allocator);
+    sp.setCommandSink(@ptrCast(&sp), CmdProbe.sink);
+
+    const attrs = [_]components.Attr{
+        .{ .key = "label", .value = "Unmount" },
+        .{ .key = "cmd", .value = "hud unmount debug" },
+    };
+    const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
+    const inst = try create(&sp, testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+    var state = state_mod.State.init(testing.allocator);
+    defer state.deinit();
+    try onInput(inst.ctx, .{ .mouse_up = .{ .local = .{ 0, 0 }, .button = 0, .button_down = false } }, @ptrCast(&state));
+    try testing.expectEqualStrings("hud unmount debug", CmdProbe.last());
+
+    // ...and a button with NEITHER is still refused. Rule 1: the
+    // relaxation above must not have relaxed everything, or a typo'd
+    // attribute name produces a control that looks live and is inert.
+    const bare = [_]components.Attr{.{ .key = "label", .value = "Nothing" }};
+    const bare_spec: components.Spec = .{ .name = "button", .attrs = &bare };
+    try testing.expectError(Error.ButtonMissingTarget, create(&sp, testing.allocator, &bare_spec));
+}
+
+test "button: cmd= and a state write COMPOSE — one click does both" {
+    // A button that lights its own "selected" flag while also running
+    // the command. The command arm returns early in the obvious
+    // implementation, and then the state write silently never happens —
+    // which reads as a button that works but never looks pressed.
+    CmdProbe.reset();
+    var sp = spark_mod.Spark.testStub(testing.allocator);
+    sp.setCommandSink(@ptrCast(&sp), CmdProbe.sink);
+
+    const attrs = [_]components.Attr{
+        .{ .key = "label", .value = "Albedo" },
+        .{ .key = "cmd", .value = "hud mount gb demos/hud-lab/gbuffer-albedo.md" },
+        .{ .key = "target", .value = "state.surface" },
+        .{ .key = "body", .value = "albedo" },
+    };
+    const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
+    const inst = try create(&sp, testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+
+    var state = state_mod.State.init(testing.allocator);
+    defer state.deinit();
+    try onInput(inst.ctx, .{ .mouse_up = .{ .local = .{ 0, 0 }, .button = 0, .button_down = false } }, @ptrCast(&state));
+
+    try testing.expectEqualStrings("hud mount gb demos/hud-lab/gbuffer-albedo.md", CmdProbe.last());
+    try testing.expectEqualStrings("albedo", state.get("surface").?);
+}
+
+test "button: a cmd on a host with NO sink does nothing and does not crash" {
+    // The portability claim. A `debug.md` written for matryoshka opened
+    // on a host that installed no sink is a visible button that inertly
+    // does nothing — not a null-call, and not a refusal to parse the
+    // document it sits in.
+    CmdProbe.reset();
+    var sp = spark_mod.Spark.testStub(testing.allocator);
+    // No setCommandSink.
+    const attrs = [_]components.Attr{
+        .{ .key = "label", .value = "Go" },
+        .{ .key = "cmd", .value = "hud unmount debug" },
+    };
+    const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
+    const inst = try create(&sp, testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+    var state = state_mod.State.init(testing.allocator);
+    defer state.deinit();
+    try onInput(inst.ctx, .{ .mouse_up = .{ .local = .{ 0, 0 }, .button = 0, .button_down = false } }, @ptrCast(&state));
+    try testing.expectEqual(@as(usize, 0), CmdProbe.count);
+}
+
+test "button: a cmd fires on RELEASE only, and only for the primary button" {
+    // A command button reaches outside the document, so the discipline
+    // the other arms already keep matters more here: a right-click or a
+    // press-without-release must not mount a document or unmount one.
+    CmdProbe.reset();
+    var sp = spark_mod.Spark.testStub(testing.allocator);
+    sp.setCommandSink(@ptrCast(&sp), CmdProbe.sink);
+    const attrs = [_]components.Attr{
+        .{ .key = "label", .value = "Go" },
+        .{ .key = "cmd", .value = "hud unmount debug" },
+    };
+    const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
+    const inst = try create(&sp, testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+    var state = state_mod.State.init(testing.allocator);
+    defer state.deinit();
+
+    try onInput(inst.ctx, .{ .mouse_down = .{ .local = .{ 0, 0 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try testing.expectEqual(@as(usize, 0), CmdProbe.count);
+    try onInput(inst.ctx, .{ .mouse_up = .{ .local = .{ 0, 0 }, .button = 1, .button_down = false } }, @ptrCast(&state));
+    try testing.expectEqual(@as(usize, 0), CmdProbe.count);
+    // ...and the release that SHOULD fire, so this is not passing on a
+    // button that never fires at all.
+    try onInput(inst.ctx, .{ .mouse_up = .{ .local = .{ 0, 0 }, .button = 0, .button_down = false } }, @ptrCast(&state));
+    try testing.expectEqual(@as(usize, 1), CmdProbe.count);
 }
