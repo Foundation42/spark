@@ -324,3 +324,68 @@ test "each document keeps its own State, and a stream update lands in the one it
     try testing.expectEqualStrings("0.75", host.state.get("warm").?);
     try testing.expectEqual(@as(?[]const u8, null), b.state.?.get("warm"));
 }
+
+test "closing one panel's scope leaves the other panel's components standing" {
+    // What an unmount has to do, and the reason it cannot simply be
+    // `gc`. A panel that goes away must take ITS components with it —
+    // the Spark outlives the panel, so leaving them behind leaks every
+    // component that panel ever held and a remount under the same name
+    // inherits the corpse — while touching nothing the panels still on
+    // screen are pointing at.
+    //
+    // Gated HERE, deterministically, rather than by comparing two
+    // captures in matryoshka's `repro-hud`. That comparison was tried
+    // and it SURVIVED the mutation: tearing down the wrong scope leaves
+    // the live document holding a dangling ctx whose freed bytes still
+    // read as the old component, so the picture is identical and the
+    // gate sees nothing. A use-after-free is not a pixel question.
+    const allocator = testing.allocator;
+    var host: Host = undefined;
+    try Host.init(allocator, &host);
+    defer host.deinit(allocator);
+
+    var a = try host.inst.loadDocument(panel_a, .{ .shared_state = &host.state, .scope = "lab" });
+    defer a.deinit();
+    var b = try host.inst.loadDocument(panel_b, .{ .shared_state = &host.state, .scope = "debug" });
+    defer b.deinit();
+
+    // Rule 1: both really are in the cache, under distinct keys, before
+    // anything is destroyed.
+    try testing.expect(host.inst.registry.instances.contains("lab/exposure"));
+    try testing.expect(host.inst.registry.instances.contains("debug/exposure"));
+    const ctx_a = onlyInstance(a.root) orelse return error.NoComponentInA;
+
+    host.inst.registry.deinitScope("debug");
+
+    // Gone, and only it.
+    try testing.expect(!host.inst.registry.instances.contains("debug/exposure"));
+    try testing.expect(host.inst.registry.instances.contains("lab/exposure"));
+    // And the survivor is the SAME instance the live tree points at —
+    // not merely a key that still exists.
+    try testing.expect(onlyInstance(a.root).? == ctx_a);
+}
+
+test "a panel's scope prefix does not swallow another whose name starts the same" {
+    // `deinitScope` matches on `"{prefix}/"`, and the trailing slash is
+    // the whole guard: closing `debug` must not take `debug2` with it.
+    // Panel names come from a human typing `hud mount`, so `lab` and
+    // `lab2` open on screen together the first time anybody wants to
+    // compare two versions of a document — which is precisely when
+    // losing one of them would be most confusing.
+    const allocator = testing.allocator;
+    var host: Host = undefined;
+    try Host.init(allocator, &host);
+    defer host.deinit(allocator);
+
+    var a = try host.inst.loadDocument(panel_a, .{ .shared_state = &host.state, .scope = "lab" });
+    defer a.deinit();
+    var b = try host.inst.loadDocument(panel_b, .{ .shared_state = &host.state, .scope = "lab2" });
+    defer b.deinit();
+
+    try testing.expect(host.inst.registry.instances.contains("lab/exposure"));
+    try testing.expect(host.inst.registry.instances.contains("lab2/exposure"));
+
+    host.inst.registry.deinitScope("lab");
+    try testing.expect(!host.inst.registry.instances.contains("lab/exposure"));
+    try testing.expect(host.inst.registry.instances.contains("lab2/exposure"));
+}
