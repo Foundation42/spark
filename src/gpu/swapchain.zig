@@ -79,7 +79,13 @@ pub const Swapchain = struct {
         sci.imageColorSpace = picked_fmt.colorSpace;
         sci.imageExtent = extent;
         sci.imageArrayLayers = 1;
-        sci.imageUsage = c.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        // TRANSFER_SRC as well as COLOR_ATTACHMENT: a `.backdrop` chain
+        // copies the region of the presented image that its panel covers
+        // into pool[0], which is what lets frosted glass blur what is
+        // BEHIND it rather than its own children. Universally supported
+        // alongside COLOR_ATTACHMENT, and free when nothing asks for it.
+        // matryoshka's swapchain already carried it, for `shot ui`.
+        sci.imageUsage = c.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | c.VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         sci.imageSharingMode = c.VK_SHARING_MODE_EXCLUSIVE;
         sci.preTransform = caps.currentTransform;
         sci.compositeAlpha = c.VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;

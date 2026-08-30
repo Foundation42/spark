@@ -74,17 +74,39 @@
 //! edges stay solid instead of fading out. An author who wants a soft edge
 //! asks for one by wrapping in `:::box`.
 //!
-//! ## What this is NOT
+//! ## `{backdrop}` — blurring what is BEHIND the panel
 //!
-//! The blur is of the CHILD's content, not of what is behind the panel.
-//! Sampling MAIN needs a second sampler the v1 chain layout does not expose
-//! — the same limit `:::liquid_glass` documents. A real backdrop blur is its
-//! own change.
+//! By default the blur is of the CHILD's content: wrap a pattern, get a
+//! blurred pattern. `{backdrop}` inverts that. pool[0] stops being a render
+//! of the children and becomes a COPY of the region of the host's attachment
+//! the panel covers, so the effect blurs the scene behind it, and the
+//! children are left on MAIN to be drawn over the result — sharp.
+//!
+//!     :::frosted_glass {backdrop blur=24 tint=#0b122870}
+//!     ### Exposure
+//!     :::slider {target=exposure min=0.1 max=4 value=${state.exposure}}
+//!     :::
+//!     :::
+//!
+//! The layering costs nothing: Phase 2 records every pass composite before
+//! any MAIN drawlist primitive, which is the same reason `:::pattern` is a
+//! background. See `element.ChainSource` for what a backdrop can and cannot
+//! see, and `Spark.fillPoolZeroFromMain` for why the copy is legal only in
+//! Phase 1.
+//!
+//! Resolve-once, like inflation: `blur` and `tint` animate freely through
+//! `update`, but flipping `backdrop` needs a new instance (an `#id` change),
+//! because the walker has already routed this frame's children by the time
+//! anything could change its mind.
+//!
+//! `:::liquid_glass` still refracts only its own content — the same limit
+//! this used to document, now true of one effect rather than two.
 
 const std = @import("std");
 const component_mod = @import("../../component.zig");
 const components = @import("../../markdown_components.zig");
 const element = @import("../../element.zig");
+const layout_cache = @import("../../layout_cache.zig");
 const element_layout = @import("../../element_layout.zig");
 const gaussian = @import("gaussian.zig");
 const markdown = @import("../../markdown.zig");
@@ -111,14 +133,36 @@ const Attrs = struct {
     blur: f32,
     /// Straight (non-premultiplied) RGBA, as authored.
     tint: [4]f32,
+    /// `backdrop` — blur what is BEHIND the panel instead of what is inside
+    /// it, and let the children draw on top, sharp. The macOS/iOS look.
+    backdrop: bool,
 
     fn read(spec: *const components.Spec) Attrs {
         return .{
             .blur = @max(0, params.resolve(f32, spec, "blur", 12.0)),
             .tint = params.resolve([4]f32, spec, "tint", .{ 1, 1, 1, 0.0625 }),
+            .backdrop = readFlag(spec, "backdrop"),
         };
     }
 };
+
+/// A bare `{backdrop}` means true, `{backdrop=false}` means false, and an
+/// absent one means false.
+///
+/// `params.resolve` cannot express this: a valueless attribute trims to the
+/// empty string, which it reports as "unparseable" and answers with the
+/// caller's default — so `{backdrop}` read as OFF and the panel silently
+/// blurred its own children instead. Presence is the signal for a flag, and
+/// only a flag; every other attribute here stays `key=value`.
+fn readFlag(spec: *const components.Spec, key: []const u8) bool {
+    for (spec.attrs) |a| {
+        if (!std.mem.eql(u8, a.key, key)) continue;
+        const t = std.mem.trim(u8, a.value, " \t");
+        if (t.len == 0) return true; // bare — presence is the value
+        return params.resolve(bool, spec, key, false);
+    }
+    return false;
+}
 
 /// The two steps, written into the instance's own scratch.
 ///
@@ -178,6 +222,10 @@ const Component = struct {
     /// Spark, because a chain and a single_source nested inside it render
     /// through pipelines built for one format and cannot disagree.
     target_format: u32 = 0,
+    /// Resolve-once, like inflation. `update` may animate blur and tint
+    /// freely; flipping `backdrop` needs a new instance (an `#id` change),
+    /// because the walker has already routed this frame's children.
+    source: element.ChainSource = .subtree,
 };
 
 pub const factory: component_mod.Factory = .{
@@ -222,6 +270,7 @@ fn create(
         .body = .{},
         .steps = undefined,
         .target_format = @intCast(spark.offscreen_format),
+        .source = if (Attrs.read(spec).backdrop) .backdrop else .subtree,
     };
     errdefer c.arena.deinit();
 
@@ -278,7 +327,12 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
 
 fn contentVersion(ctx: *anyopaque) u64 {
     const c: *const Component = @ptrCast(@alignCast(ctx));
-    return c.version;
+    // Fold in the children. Without this an interactive control inside the
+    // effect is frozen at its create-time value: the effect's cached
+    // drawlist is replayed because its own version never moved, so a slider
+    // drives the plane and never draws its own new position. See
+    // `layout_cache.aggregateRootVersion`.
+    return c.version ^ layout_cache.aggregateRootVersion(c.root);
 }
 
 /// The mandatory per-element uniform hook. For a chain it is the FINAL
@@ -303,7 +357,18 @@ fn snapshotChainSteps(ctx: *anyopaque, target_size: [2]u32) element.ChainHookRes
         .target_format = c.target_format,
         .target_pool_count = 2,
         .final_pool_local = 0,
+        .source = c.source,
     };
+}
+
+/// Answered BEFORE layout — see `ElementVTable.chain_source`. Resolved once
+/// at create, in the spirit of Decision #8: the walker asks this to decide
+/// where the children's drawlist primitives go, and Phase 1 asks the step
+/// hook where pool[0] comes from. If the two could disagree within a frame,
+/// the children would render into a target nothing composites.
+fn chainSource(ctx: *anyopaque) element.ChainSource {
+    const c: *const Component = @ptrCast(@alignCast(ctx));
+    return c.source;
 }
 
 /// No inflation: the child's box IS the effect's box, and the walker reads
@@ -323,6 +388,7 @@ const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .snapshot_uniforms = snapshotUniforms,
     .snapshot_chain_steps = snapshotChainSteps,
+    .chain_source = chainSource,
     .content_version = contentVersion,
 };
 
@@ -358,7 +424,7 @@ test "steps: two axes, and the second writes back over the child" {
     // below would render a plausible-looking wrong picture if it flipped,
     // and none of them would fail to compile.
     var steps: [2]element.ChainPassStep = undefined;
-    buildSteps(&steps, .{ .blur = 12, .tint = .{ 1, 0, 0, 0.5 } });
+    buildSteps(&steps, .{ .blur = 12, .tint = .{ 1, 0, 0, 0.5 }, .backdrop = false });
 
     // The ping-pong: 0→1, then 1→0. This is the property that separates
     // this chain from the drop shadow's, and it is what
@@ -408,7 +474,7 @@ test "steps: the default wash is nearly invisible, which is why it is not the ga
     // but one that still looks like "a faint white wash" either way on
     // screen. The saturated case above is the one that fails loudly.
     var steps: [2]element.ChainPassStep = undefined;
-    buildSteps(&steps, Attrs{ .blur = 12, .tint = .{ 1, 1, 1, 0.0625 } });
+    buildSteps(&steps, Attrs{ .blur = 12, .tint = .{ 1, 1, 1, 0.0625 }, .backdrop = false });
     const v = readRgba(steps[1]);
     try testing.expectApproxEqAbs(@as(f32, 0.0625), v.tint[0], 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 0.0625), v.tint[3], 1e-6);
@@ -419,7 +485,7 @@ test "steps: blur is clamped at zero, and a zero blur still emits a chain" {
     // zero, the shader clamps it, and the panel comes through sharp — which
     // is a picture, rather than a hang or a NaN.
     var steps: [2]element.ChainPassStep = undefined;
-    buildSteps(&steps, .{ .blur = -4, .tint = .{ 1, 1, 1, 0.0625 } });
+    buildSteps(&steps, .{ .blur = -4, .tint = .{ 1, 1, 1, 0.0625 }, .backdrop = false });
     try testing.expectEqual(@as(f32, 0), readRgba(steps[0]).sigma);
     try testing.expectEqual(@as(u32, @sizeOf(gaussian.RgbaUniforms)), steps[0].uniform_len);
 }
@@ -429,8 +495,55 @@ test "steps: uniform_len names exactly the bytes that were written" {
     // actually copied in — see the same gate in `drop_shadow.zig`, and the
     // poisoned-slot gate in [[gaussian]] for `writeUniforms` itself.
     var steps: [2]element.ChainPassStep = undefined;
-    buildSteps(&steps, .{ .blur = 8, .tint = .{ 0, 0, 0, 1 } });
+    buildSteps(&steps, .{ .blur = 8, .tint = .{ 0, 0, 0, 1 }, .backdrop = false });
     for (steps) |s| {
         for (s.uniform_bytes[s.uniform_len..]) |b| try testing.expectEqual(@as(u8, 0), b);
     }
+}
+
+test "backdrop: bare flag, explicit value, and absent" {
+    // `{backdrop}` with no value is how an author naturally writes a flag,
+    // and it is what this file's own docstring shows. `params.resolve`
+    // answers `false` for it — an empty value is unparseable, so it returns
+    // the default — which made the attribute silently do nothing.
+    const bare = [_]components.Attr{.{ .key = "backdrop", .value = "" }};
+    try testing.expect(readFlag(&components.Spec{ .name = "frosted_glass", .attrs = &bare }, "backdrop"));
+
+    // Rule 1: an explicit false must still be false, or "presence means
+    // true" would have swallowed it.
+    const off = [_]components.Attr{.{ .key = "backdrop", .value = "false" }};
+    try testing.expect(!readFlag(&components.Spec{ .name = "frosted_glass", .attrs = &off }, "backdrop"));
+
+    const on = [_]components.Attr{.{ .key = "backdrop", .value = "true" }};
+    try testing.expect(readFlag(&components.Spec{ .name = "frosted_glass", .attrs = &on }, "backdrop"));
+
+    const none = [_]components.Attr{.{ .key = "blur", .value = "12" }};
+    try testing.expect(!readFlag(&components.Spec{ .name = "frosted_glass", .attrs = &none }, "backdrop"));
+}
+
+test "backdrop: the chain reports where pool[0] comes from" {
+    // Two hooks must agree, and they are asked at different times: the
+    // walker calls `chain_source` BEFORE layout to decide where the
+    // children's drawlist primitives go, and Phase 1 reads
+    // `ChainHookResult.source` to decide how to fill pool[0]. If they could
+    // disagree, the children would render into a target nothing composites
+    // — an empty panel, with no error anywhere.
+    var c = Component{
+        .arena = std.heap.ArenaAllocator.init(testing.allocator),
+        .root = element.Element{ .paragraph = &[_]element.Element{} },
+        .scope = undefined,
+        .attrs = .{ .blur = 12, .tint = .{ 1, 1, 1, 0.0625 }, .backdrop = true },
+        .steps = undefined,
+        .source = .backdrop,
+    };
+    defer c.arena.deinit();
+
+    try testing.expectEqual(element.ChainSource.backdrop, chainSource(@ptrCast(&c)));
+    try testing.expectEqual(element.ChainSource.backdrop, snapshotChainSteps(@ptrCast(&c), .{ 100, 100 }).source);
+
+    // Rule 1: the default must be the other value, or "it reports backdrop"
+    // is a statement about a field that is always backdrop.
+    c.source = .subtree;
+    try testing.expectEqual(element.ChainSource.subtree, chainSource(@ptrCast(&c)));
+    try testing.expectEqual(element.ChainSource.subtree, snapshotChainSteps(@ptrCast(&c), .{ 100, 100 }).source);
 }

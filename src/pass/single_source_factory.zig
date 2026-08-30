@@ -90,6 +90,7 @@
 
 const std = @import("std");
 const element = @import("../element.zig");
+const layout_cache = @import("../layout_cache.zig");
 const element_layout = @import("../element_layout.zig");
 const component_mod = @import("../component.zig");
 const components = @import("../markdown_components.zig");
@@ -287,9 +288,22 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
             };
         }
 
+        /// Generated effects had NO `content_version`, which meant
+        /// `layout_cache.versionFor` answered a constant 0 for them and the
+        /// cached drawlist was replayed forever: neither an attribute change
+        /// on the effect nor a state change in a child could invalidate it.
+        /// A slider inside `:::liquid_glass` drove the plane and never drew
+        /// its own new position — the same freeze the hand-written effects
+        /// had, arrived at by a shorter route.
+        fn contentVersion(ctx: *anyopaque) u64 {
+            const c: *const Component = @ptrCast(@alignCast(ctx));
+            return c.version ^ layout_cache.aggregateRootVersion(c.root);
+        }
+
         const vtable: element.ElementVTable = .{
             .layout_and_render = layoutAndRender,
             .snapshot_uniforms = snapshotUniforms,
+            .content_version = contentVersion,
             // Cacheable as of Phase B.6.a — substrate handles primitive
             // routing tags through cache via replay-with-offset.
         };

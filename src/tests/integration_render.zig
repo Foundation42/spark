@@ -41,7 +41,9 @@ const known_doc =
 /// Drift in either layer fails the determinism / fingerprint tests
 /// below with a one-line message.
 ///
-/// PassDispatch serialization protocol **v6** (Effects-spec C.2 —
+/// PassDispatch serialization protocol **v7** (Effects-spec C.4 —
+/// ChainStep gains `source`, which selects whether pool[0] is a render
+/// of the subtree or a copy of the host's attachment. v6 was C.2:
 /// ChainPassStep gains `load`; ChainStep gains the final composite's
 /// shader id and push constants). Must match the comment
 /// on `element.PassDispatch` — both ends move together. Per dispatch
@@ -79,6 +81,7 @@ const known_doc =
 ///     target_size            — [2]u32 (w, h)
 ///     target_format          — u32 (raw VkFormat)
 ///     target_pool_count      — u16
+///     source                 — u8 (0 = subtree, 1 = backdrop) — C.4
 ///     compose_region         — PassRegion
 ///     final_pool_local       — u16
 ///     subtree_dispatch_range — [2]u32 (start, end) — C.1.5
@@ -117,6 +120,11 @@ const known_doc =
 /// would shift fingerprint vs. v3. Existing Phase A/B docs that
 /// produce only pattern/single_source/host_slot dispatches hash
 /// IDENTICALLY under v4 — the new arm is purely additive.
+///
+/// **v7 mint.** `source` decides where a chain's pool[0] comes from, so
+/// two documents differing only in `{backdrop}` render differently and
+/// must not hash the same. Every chain shipped before C.4 is `.subtree`,
+/// which hashes as a zero byte — additive, so no existing value moves.
 ///
 /// **v5 mint.** ChainStep gained `subtree_dispatch_range: [2]u32`
 /// at C.1.5 (chain now wraps content via subtree, mirroring
@@ -185,6 +193,7 @@ fn hashFrame(sp: *const spark.Spark) u64 {
                 h.update(std.mem.asBytes(&c.target_size));
                 h.update(std.mem.asBytes(&c.target_format));
                 h.update(std.mem.asBytes(&c.target_pool_count));
+                h.update(std.mem.asBytes(&c.source));
                 h.update(std.mem.asBytes(&c.compose_region));
                 h.update(std.mem.asBytes(&c.final_pool_local));
                 // C.1.5 — subtree_dispatch_range. Empty range
@@ -840,6 +849,35 @@ test "chain determinism: :::drop_shadow, and its three steps in order" {
                 try testing.expectEqual(@as(u16, 2), ch.final_pool_local);
                 try testing.expectEqualSlices(u8, &copy_id, &ch.final_composite_shader_id);
                 try testing.expect(ch.final_composite_uniforms_len > 0);
+            }
+        }.f,
+    );
+}
+
+test "chain determinism: :::frosted_glass {backdrop}, source survives the walker" {
+    // The attribute has to reach the DISPATCH, not just the component: Phase
+    // 1 reads `ChainStep.source` to decide whether to render the subtree into
+    // pool[0] or copy the attachment into it, and Phase 2 reads it again to
+    // decide whether to composite in the backdrop pre-pass and whether to
+    // apply the display transform. A component that knew it was a backdrop
+    // while the dispatch did not would blur its own children and look like
+    // the attribute had simply been ignored.
+    var fx = try fixture.Fixture.init(testing.allocator);
+    defer fx.deinit();
+    try assertChainDoc(
+        &fx,
+        \\:::frosted_glass {backdrop blur=20 tint=#ffffff14}
+        \\Sharp text over a blurred scene.
+        \\:::
+        \\
+        ,
+        struct {
+            fn f(ch: spark.element.ChainStep) anyerror!void {
+                try testing.expectEqual(spark.element.ChainSource.backdrop, ch.source);
+                // Still the same two-step blur — backdrop changes where
+                // pool[0] comes from, not what the chain does to it.
+                try testing.expectEqual(@as(usize, 2), ch.steps.len);
+                try testing.expectEqual(@as(u16, 0), ch.final_pool_local);
             }
         }.f,
     );

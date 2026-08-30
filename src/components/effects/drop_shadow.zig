@@ -83,6 +83,7 @@ const std = @import("std");
 const component_mod = @import("../../component.zig");
 const components = @import("../../markdown_components.zig");
 const element = @import("../../element.zig");
+const layout_cache = @import("../../layout_cache.zig");
 const element_layout = @import("../../element_layout.zig");
 const gaussian = @import("gaussian.zig");
 const markdown = @import("../../markdown.zig");
@@ -345,7 +346,12 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
 
 fn contentVersion(ctx: *anyopaque) u64 {
     const c: *const Component = @ptrCast(@alignCast(ctx));
-    return c.version;
+    // Fold in the children. Without this an interactive control inside the
+    // effect is frozen at its create-time value: the effect's cached
+    // drawlist is replayed because its own version never moved, so a slider
+    // drives the plane and never draws its own new position. See
+    // `layout_cache.aggregateRootVersion`.
+    return c.version ^ layout_cache.aggregateRootVersion(c.root);
 }
 
 /// The mandatory per-element uniform hook. For a chain it is the FINAL

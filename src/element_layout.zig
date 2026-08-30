@@ -260,7 +260,18 @@ pub fn layoutAndRender(
             // (the chain's source image, written by the subtree
             // before steps[] process it through the ping-pong pool).
             // Same routing mechanism, no chain-specific path needed.
-            if ((cu.pass_kind == 2 or cu.pass_kind == 3) and ctx.pass_dispatches != null) {
+            // A BACKDROP chain is the exception: its pool[0] is a copy of
+            // what is already on the host's attachment, not a render of its
+            // children, so the children must NOT be routed into it. Left on
+            // MAIN they are drawn in Phase 2's drawlist pass, which runs
+            // after every pass composite — so they land on top of the
+            // blurred backdrop, sharp, with no extra machinery.
+            const routes_children_offscreen = switch (cu.pass_kind) {
+                2 => true,
+                3 => if (cu.vtable.chain_source) |f| f(cu.ctx) == .subtree else true,
+                else => false,
+            };
+            if (routes_children_offscreen and ctx.pass_dispatches != null) {
                 ctx.current_target_dispatch_index = dispatch_start;
             }
             defer ctx.current_target_dispatch_index = saved_target;
@@ -406,6 +417,7 @@ pub fn layoutAndRender(
                             // arm — see the note under `ChainHookResult`.
                             .compose_region = region,
                             .final_pool_local = result.final_pool_local,
+                            .source = result.source,
                             // Effects-spec C.1.5 — captures the
                             // dispatch range emitted by the child
                             // walk above. Mirrors single_source

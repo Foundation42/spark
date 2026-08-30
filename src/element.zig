@@ -476,6 +476,14 @@ pub const ElementVTable = struct {
         ctx: *anyopaque,
         target_size: [2]u32,
     ) ChainHookResult = null,
+    /// Optional, chain elements only. Answers `ChainSource` BEFORE layout
+    /// runs, which is why it cannot ride on `snapshot_chain_steps`: that
+    /// hook needs the element's box, so it is called after
+    /// `layout_and_render`, and by then the walker has already decided
+    /// whether to route the children's drawlist primitives into pool[0].
+    /// That decision is the whole difference between a backdrop and a
+    /// filter. `null` means `.subtree`.
+    chain_source: ?*const fn (ctx: *anyopaque) ChainSource = null,
     /// Optional. Reports how this component participates in its
     /// parent stack's flow (stage 15 Phase E text exclusion). `null`
     /// (the default) means `.normal` — the component flows in
@@ -828,6 +836,37 @@ pub const MAX_CHAIN_POOL_TARGETS: u32 = 16;
 /// nothing wants to keep and then overwrite. `:::drop_shadow` needs exactly
 /// one of each — two blur steps that clear, and a third that keeps, laying
 /// the child back over the shadow it cast.
+/// Where a chain's `pool[0]` — its source image — comes from.
+///
+/// `.subtree` is the original and the default: the walker renders the
+/// element's children into pool[0], and the chain filters what it wraps.
+/// That is `:::drop_shadow` and `:::frosted_glass` blurring their own
+/// content.
+///
+/// `.backdrop` fills pool[0] by COPYING the region of the host's
+/// attachment that the element covers — what is already on screen behind
+/// the panel — and the children are not rendered into it at all. They draw
+/// to MAIN afterwards, sharp, on top of the composited result. That is the
+/// macOS/iOS frosted panel: the scene behind is blurred, the text over it
+/// is not.
+///
+/// The layering needs no new machinery. Phase 2 records every pass
+/// composite BEFORE any MAIN drawlist primitive — which is exactly why
+/// `.pattern` is "always-background of the parent region" (Decision #12) —
+/// so a chain that stops routing its children into pool[0] gets them drawn
+/// over its own output for free.
+///
+/// **What a backdrop can and cannot see.** Phase 1 runs before the host
+/// opens its rendering scope, so the copy captures whatever the host drew
+/// before calling spark: the ray-traced scene, in matryoshka's case. It
+/// cannot see other spark content from this frame, because none of it has
+/// been drawn yet. A backdrop panel blurs the scene; it does not blur
+/// another panel.
+pub const ChainSource = enum(u8) {
+    subtree,
+    backdrop,
+};
+
 pub const ChainLoad = enum(u8) {
     clear,
     keep,
@@ -869,6 +908,9 @@ pub const ChainHookResult = struct {
     target_format: u32,
     target_pool_count: u16,
     final_pool_local: u16,
+    /// Where pool[0] comes from. Defaults to `.subtree`, so a chain
+    /// written before backdrops existed keeps its behaviour.
+    source: ChainSource = .subtree,
 };
 
 // Effects-spec C.2 note on what this struct does NOT carry. C.1 drafted a
@@ -903,6 +945,10 @@ pub const ChainStep = struct {
     target_size: [2]u32,
     target_format: u32, // raw VkFormat — promotion to TargetFormat enum tracked for C.2
     target_pool_count: u16,
+    /// See `ChainSource`. Hashed by the frame fingerprint like every other
+    /// dispatch field, so a document that toggles `backdrop` is a different
+    /// frame rather than a silently identical one.
+    source: ChainSource = .subtree,
     /// Slice into component-owned scratch. Length = active step
     /// count. Walker enforces `len <= MAX_CHAIN_STEPS` at emission.
     steps: []const ChainPassStep,
