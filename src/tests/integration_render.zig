@@ -657,10 +657,16 @@ test "PassDispatch: :::placeholder_scene emits one host_slot dispatch determinis
     try testing.expectEqual(hashes[0], hashes[1]);
 }
 
-// Effects-spec Phase B.8 — per-single-source-effect determinism
-// docs. One test per shipped single_source factory (drop_shadow /
-// frosted_glass / liquid_glass), each loading a minimal doc that
-// exercises the factory's emission path and asserting:
+// Effects-spec Phase B.8 — per-effect determinism docs. One test per
+// shipped factory, each loading a minimal doc that exercises the factory's
+// emission path.
+//
+// The list has thinned as effects grew a second pass: `:::drop_shadow` (C.2)
+// and `:::frosted_glass` (C.3) are chains now, and use `assertChainDoc`
+// below. `:::liquid_glass` is the last single_source effect standing —
+// it genuinely is one filter over one image.
+//
+// What the single_source form asserts:
 //
 //   * Hash equality across two consecutive Sparks (catches drift in
 //     uniform encoding, std140 padding, region quantisation,
@@ -736,26 +742,22 @@ fn assertSingleSourceDoc(
     try testing.expectEqual(expected_shader_id, shader_ids[0]);
 }
 
-test "chain determinism: :::drop_shadow, and its three steps in order" {
-    // Effects-spec C.2. `:::drop_shadow` moved from the single_source arm
-    // to the chain arm, so this is the sibling of the two
-    // `assertSingleSourceDoc` tests below — same determinism property,
-    // one arm over.
+/// The chain-arm sibling of `assertSingleSourceDoc`: same determinism
+/// property, one `PassShape` over. `verify` runs against the single emitted
+/// `.chain` dispatch on both passes, and is where each effect says what its
+/// own step sequence should be.
+///
+/// The steps are asserted HERE, and not only in each component's unit tests,
+/// because this is the copy that survived the walker, the cache and the wire
+/// format. A unit test only proves what was built.
+fn assertChainDoc(
+    fx: *fixture.Fixture,
+    doc_src: []const u8,
+    comptime verify: fn (ch: spark.element.ChainStep) anyerror!void,
+) !void {
     const allocator = testing.allocator;
-    var fx = try fixture.Fixture.init(allocator);
-    defer fx.deinit();
-
-    const doc_src =
-        \\:::drop_shadow {blur=8 offset_y=4 color=#000c}
-        \\:::box {color=teal width=160 height=80 radius=8}
-        \\:::
-        \\:::
-        \\
-    ;
-    const blur_id = spark.pass.shaderIdFromName("gaussian_alpha.frag");
-    const copy_id = spark.pass.shaderIdFromName("copy.frag");
-
     var hashes: [2]u64 = undefined;
+
     inline for (0..2) |i| {
         const fonts = try fixture.makeFonts(allocator, fx.ft);
         const theme = fixture.makeTheme(fonts);
@@ -790,21 +792,12 @@ test "chain determinism: :::drop_shadow, and its three steps in order" {
         for (sp.pass_dispatches.items) |d| switch (d) {
             .chain => |ch| {
                 chains += 1;
-                // Blur, blur, composite — and the pool indices that make
-                // it separable. Asserted here as well as in the
-                // component's own unit tests because THIS is the copy
-                // that survived the walker, the cache, and the wire
-                // format; the unit test only proves what was built.
-                try testing.expectEqual(@as(usize, 3), ch.steps.len);
-                try testing.expectEqualSlices(u8, &blur_id, &ch.steps[0].composite_shader_id);
-                try testing.expectEqualSlices(u8, &blur_id, &ch.steps[1].composite_shader_id);
-                try testing.expectEqualSlices(u8, &copy_id, &ch.steps[2].composite_shader_id);
-                try testing.expectEqual(spark.element.ChainLoad.keep, ch.steps[2].load);
-                try testing.expectEqualSlices(u8, &copy_id, &ch.final_composite_shader_id);
-                try testing.expect(ch.final_composite_uniforms_len > 0);
+                try verify(ch);
             },
             else => {},
         };
+        // Exactly one — the wrapped child must not have contributed a chain
+        // of its own, which is how a nested effect would go unnoticed.
         try testing.expectEqual(@as(usize, 1), chains);
     }
 
@@ -815,10 +808,50 @@ test "chain determinism: :::drop_shadow, and its three steps in order" {
     try testing.expectEqual(hashes[0], hashes[1]);
 }
 
-test "single_source determinism: :::frosted_glass" {
+test "chain determinism: :::drop_shadow, and its three steps in order" {
+    // Effects-spec C.2. `:::drop_shadow` moved from the single_source arm
+    // to the chain arm when its 9-tap box blur became a real Gaussian.
     var fx = try fixture.Fixture.init(testing.allocator);
     defer fx.deinit();
-    try assertSingleSourceDoc(
+    try assertChainDoc(
+        &fx,
+        \\:::drop_shadow {blur=8 offset_y=4 color=#000c}
+        \\:::box {color=teal width=160 height=80 radius=8}
+        \\:::
+        \\:::
+        \\
+        ,
+        struct {
+            fn f(ch: spark.element.ChainStep) anyerror!void {
+                const blur_id = spark.pass.shaderIdFromName("gaussian_alpha.frag");
+                const copy_id = spark.pass.shaderIdFromName("copy.frag");
+                // Blur, blur, composite.
+                try testing.expectEqual(@as(usize, 3), ch.steps.len);
+                try testing.expectEqualSlices(u8, &blur_id, &ch.steps[0].composite_shader_id);
+                try testing.expectEqualSlices(u8, &blur_id, &ch.steps[1].composite_shader_id);
+                try testing.expectEqualSlices(u8, &copy_id, &ch.steps[2].composite_shader_id);
+                // The composite KEEPS: it lays the child back over the
+                // shadow it cast, which is the whole reason ChainLoad exists.
+                try testing.expectEqual(spark.element.ChainLoad.keep, ch.steps[2].load);
+                // MAIN is composited from the target the last step wrote.
+                // Naming any other pool renders an intermediate — the
+                // half-blurred smear, or the bare child — and the effect
+                // silently does nothing.
+                try testing.expectEqual(@as(u16, 2), ch.final_pool_local);
+                try testing.expectEqualSlices(u8, &copy_id, &ch.final_composite_shader_id);
+                try testing.expect(ch.final_composite_uniforms_len > 0);
+            }
+        }.f,
+    );
+}
+
+test "chain determinism: :::frosted_glass, two blurs that ping-pong" {
+    // Effects-spec C.3. The second chain, and the FIRST to reuse a pool
+    // target it has already read — see `frosted_glass.zig`'s header and the
+    // barrier note in `recordChainStep`.
+    var fx = try fixture.Fixture.init(testing.allocator);
+    defer fx.deinit();
+    try assertChainDoc(
         &fx,
         \\:::frosted_glass {blur=12 tint=#ffffff14}
         \\:::box {color=#1a1a2e width=200 height=80 radius=8}
@@ -826,7 +859,40 @@ test "single_source determinism: :::frosted_glass" {
         \\:::
         \\
         ,
-        spark.pass.shaderIdFromName("frosted_glass.frag"),
+        struct {
+            fn f(ch: spark.element.ChainStep) anyerror!void {
+                const blur_id = spark.pass.shaderIdFromName("gaussian_rgba.frag");
+                const copy_id = spark.pass.shaderIdFromName("copy.frag");
+                // Two blurs and no composite step: the wash rides on the
+                // second pass, and Phase 2 does the one draw to MAIN.
+                try testing.expectEqual(@as(usize, 2), ch.steps.len);
+                try testing.expectEqualSlices(u8, &blur_id, &ch.steps[0].composite_shader_id);
+                try testing.expectEqualSlices(u8, &blur_id, &ch.steps[1].composite_shader_id);
+
+                // 0→1, then 1→0. This is the property the whole barrier fix
+                // is for, asserted on the walker's copy rather than the
+                // component's: a chain that stopped ping-ponging would still
+                // render correctly and quietly cost a third full-panel
+                // RGBA16F target, which no picture would ever show.
+                try testing.expectEqual(@as(u16, 0), ch.steps[0].source_pool_local);
+                try testing.expectEqual(@as(u16, 1), ch.steps[0].dest_pool_local);
+                try testing.expectEqual(@as(u16, 1), ch.steps[1].source_pool_local);
+                try testing.expectEqual(@as(u16, 0), ch.steps[1].dest_pool_local);
+
+                // Both clear. A `.keep` would composite this frame's blur
+                // over whatever the recycled pool target still held.
+                try testing.expectEqual(spark.element.ChainLoad.clear, ch.steps[0].load);
+                try testing.expectEqual(spark.element.ChainLoad.clear, ch.steps[1].load);
+
+                // MAIN comes from pool[0], where the vertical pass landed.
+                // Pointing at pool[1] would composite the horizontally
+                // blurred intermediate — a picture smeared along one axis,
+                // which reads as motion blur rather than as a bug.
+                try testing.expectEqual(@as(u16, 0), ch.final_pool_local);
+                try testing.expectEqualSlices(u8, &copy_id, &ch.final_composite_shader_id);
+                try testing.expect(ch.final_composite_uniforms_len > 0);
+            }
+        }.f,
     );
 }
 

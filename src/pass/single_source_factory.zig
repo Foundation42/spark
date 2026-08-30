@@ -6,6 +6,14 @@
 //! struct, create/update/deinit_, snapshot_uniforms, layoutAndRender,
 //! vtable.
 //!
+//! **Scope, as of C.3.** One effect ships against this: `:::liquid_glass`.
+//! `:::drop_shadow` and `:::frosted_glass` were both generated here once and
+//! both left, because a separable Gaussian is two images and a single_source
+//! pass owns one offscreen target. The generator is right for what it covers
+//! — one filter over one image — and a chain is a different shape, not a
+//! richer version of this one. There is no ChainFactory generator yet and
+//! two hand-written chains is not enough evidence for one.
+//!
 //! What stays per-effect (the call site provides):
 //!   - **`Uniforms` extern struct** — std140-padded, ABI-mirrors the
 //!     GLSL push_constant block. The offset/size lock-in test stays
@@ -17,8 +25,8 @@
 //!     the Uniforms value.
 //!   - **`layout_inflation` + `compute_inflation`** — optional. Pass
 //!     a callback when the effect reserves halo room around the
-//!     child (drop_shadow); leave null when it renders within child
-//!     bounds (frosted_glass). Both fields are populated with the
+//!     child; leave null when it renders within child bounds, which
+//!     `:::liquid_glass` does. Both fields are populated with the
 //!     same function (Factory's `.from_params` for the spec table;
 //!     Component's stored inflation for layoutAndRender's child
 //!     constraint clamp + return-box compute).
@@ -47,22 +55,26 @@
 //!
 //! ```zig
 //! const Uniforms = extern struct {
-//!     blur_radius: f32,
-//!     _pad: [3]f32 = .{ 0, 0, 0 },
-//!     tint_color: [4]f32,
+//!     radius: f32,
+//!     refraction: f32,
+//!     edge_softness: f32,
+//!     rim_brightness: f32,
+//!     tint: [4]f32,
 //! };
 //!
 //! fn applyAttrs(spec: *const components.Spec) Uniforms {
 //!     return .{
-//!         .blur_radius = params.resolve(f32, spec, "blur", 12.0),
-//!         .tint_color = params.resolve([4]f32, spec, "tint",
-//!             .{ 1, 1, 1, 0.0625 }),
+//!         .radius = params.resolve(f32, spec, "radius", 0.15),
+//!         .refraction = params.resolve(f32, spec, "refraction", 0.15),
+//!         .edge_softness = params.resolve(f32, spec, "edge_softness", 0.005),
+//!         .rim_brightness = params.resolve(f32, spec, "rim_brightness", 0.3),
+//!         .tint = params.resolve([4]f32, spec, "tint", .{ 1, 1, 1, 0.05 }),
 //!     };
 //! }
 //!
 //! pub const Effect = single_source_factory.SingleSourceFactory(.{
-//!     .name = "frosted_glass",
-//!     .shader = "frosted_glass.frag",
+//!     .name = "liquid_glass",
+//!     .shader = "liquid_glass.frag",
 //!     .Uniforms = Uniforms,
 //!     .apply_attrs = applyAttrs,
 //! });
@@ -70,10 +82,8 @@
 //! pub const install = Effect.install;
 //!
 //! test "Uniforms: std140 layout offsets" {
-//!     try testing.expectEqual(@as(usize, 0),
-//!         @offsetOf(Uniforms, "blur_radius"));
-//!     try testing.expectEqual(@as(usize, 16),
-//!         @offsetOf(Uniforms, "tint_color"));
+//!     try testing.expectEqual(@as(usize, 0), @offsetOf(Uniforms, "radius"));
+//!     try testing.expectEqual(@as(usize, 16), @offsetOf(Uniforms, "tint"));
 //!     try testing.expectEqual(@as(usize, 32), @sizeOf(Uniforms));
 //! }
 //! ```

@@ -44,11 +44,6 @@ pub fn build(b: *std.Build) void {
     // validates the SingleSourcePipelineCache eager-compile path
     // before B.5 ships the first real filter (`:::drop_shadow`).
     const copy_frag_spv = compileShaderStage(b, glslc_path, "copy", "frag", optimize);
-    // Effects-spec Phase B.6 — second user-facing single_source
-    // filter. 9-tap box blur + tint overlay (modern-OS panel look).
-    // First consumer to land cleanly on the post-B.6.a cache substrate
-    // (no disable_cache workaround needed).
-    const frosted_glass_frag_spv = compileShaderStage(b, glslc_path, "frosted_glass", "frag", optimize);
     // Effects-spec Phase B.6.d — third single_source filter. Rounded-
     // box SDF refraction + chromatic aberration + rim highlight +
     // tint, Apple-Liquid-Glass-inspired. First effect authored via
@@ -60,11 +55,15 @@ pub fn build(b: *std.Build) void {
     // Distinct from `copy.frag` (the B.4.b SingleSourcePipelineCache
     // substrate test shader) which declares a push-constant `alpha`.
     const host_slot_passthrough_frag_spv = compileShaderStage(b, glslc_path, "host_slot_passthrough", "frag", optimize);
-    // Effects-spec Phase C.2 — one axis of a separable Gaussian over a
-    // selectable channel, tinted on output. The first shader written to run
-    // as a CHAIN step rather than as a whole effect; `:::drop_shadow` runs
-    // it twice, horizontally then vertically.
+    // Effects-spec Phase C.2 — the two blur shaders. Same separable kernel
+    // (`shaders/gaussian.glsl`), different endings: `_alpha` reduces to one
+    // channel and tints by the coverage (`:::drop_shadow`), `_rgba` keeps
+    // the colour and lays a wash over it (`:::frosted_glass`). Both run as
+    // CHAIN steps, twice each — horizontally, then vertically. Neither has a
+    // `.frag` of its own effect any more; `frosted_glass.frag` was a 9-tap
+    // box blur and was deleted along with `drop_shadow.frag` before it.
     const gaussian_alpha_frag_spv = compileShaderStage(b, glslc_path, "gaussian_alpha", "frag", optimize);
+    const gaussian_rgba_frag_spv = compileShaderStage(b, glslc_path, "gaussian_rgba", "frag", optimize);
 
     // ── Bundle SPIR-V into a generated Zig module ──────────────────
     // The compiled blobs need `align(4)` because Vulkan's `pCode` field
@@ -85,10 +84,10 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(pattern_frag_spv, "pattern.frag.spv");
     _ = wf.addCopyFile(noise_frag_spv, "noise.frag.spv");
     _ = wf.addCopyFile(copy_frag_spv, "copy.frag.spv");
-    _ = wf.addCopyFile(frosted_glass_frag_spv, "frosted_glass.frag.spv");
     _ = wf.addCopyFile(liquid_glass_frag_spv, "liquid_glass.frag.spv");
     _ = wf.addCopyFile(host_slot_passthrough_frag_spv, "host_slot_passthrough.frag.spv");
     _ = wf.addCopyFile(gaussian_alpha_frag_spv, "gaussian_alpha.frag.spv");
+    _ = wf.addCopyFile(gaussian_rgba_frag_spv, "gaussian_rgba.frag.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const text_vert align(4) = @embedFile("text.vert.spv").*;
         \\pub const text_frag align(4) = @embedFile("text.frag.spv").*;
@@ -103,10 +102,10 @@ pub fn build(b: *std.Build) void {
         \\pub const pattern_frag align(4) = @embedFile("pattern.frag.spv").*;
         \\pub const noise_frag align(4) = @embedFile("noise.frag.spv").*;
         \\pub const copy_frag align(4) = @embedFile("copy.frag.spv").*;
-        \\pub const frosted_glass_frag align(4) = @embedFile("frosted_glass.frag.spv").*;
         \\pub const liquid_glass_frag align(4) = @embedFile("liquid_glass.frag.spv").*;
         \\pub const host_slot_passthrough_frag align(4) = @embedFile("host_slot_passthrough.frag.spv").*;
         \\pub const gaussian_alpha_frag align(4) = @embedFile("gaussian_alpha.frag.spv").*;
+        \\pub const gaussian_rgba_frag align(4) = @embedFile("gaussian_rgba.frag.spv").*;
         \\
     );
 

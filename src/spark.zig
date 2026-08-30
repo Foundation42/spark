@@ -1715,12 +1715,24 @@ pub const Spark = struct {
         // real old layout rather than UNDEFINED. A `.clear` step is about to
         // overwrite every pixel, so UNDEFINED is both legal and cheaper (it
         // lets the driver discard rather than preserve).
+        //
+        // **Both cases wait on the FRAGMENT SHADER, and that is what makes
+        // the pool a ping-pong pool.** The `.clear` arm used to name
+        // TOP_OF_PIPE, which waits for nothing: correct while every step
+        // wrote a target no earlier step had read, and a write-after-read
+        // hazard the moment one writes back into a target it just sampled —
+        // which is exactly what ping-ponging between two targets IS. The
+        // discard does not save us; UNDEFINED throws away the contents, but
+        // the transition itself still races the previous step's reads, and
+        // the corruption would be driver-dependent and intermittent. A WAR
+        // needs an execution dependency only, so `src_access` stays 0 on the
+        // clear path — reads leave nothing to flush — and the cost of the
+        // fix is a scoreboard wait the ping-pong could not be correct
+        // without. `:::frosted_glass` is the first step sequence to rely on
+        // it (pool[0] → pool[1] → pool[0]).
         const keep = step.load == .keep;
         barrierImageLayout(cmd, dest.image(), .{
-            .src_stage = if (keep)
-                vk.c.VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
-            else
-                vk.c.VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+            .src_stage = vk.c.VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
             .dst_stage = vk.c.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
             .src_access = if (keep) vk.c.VK_ACCESS_2_SHADER_SAMPLED_READ_BIT else 0,
             .dst_access = vk.c.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
@@ -2456,14 +2468,6 @@ fn registerEmbeddedPassShaders(
     try resolver.register("copy.frag", &shaders.copy_frag);
     try single_source.compile(pass_mod.shaderIdFromName("copy.frag"), &shaders.copy_frag);
 
-    // Effects-spec Phase B.6 — second user-facing single_source
-    // filter. Frosted-glass factory (`:::frosted_glass`). Ratifies
-    // the B.6.a cache substrate (no disable_cache workaround) and
-    // shares the drop_shadow descriptor-layout shape — same
-    // pipeline cache, same eager-compile discipline.
-    try resolver.register("frosted_glass.frag", &shaders.frosted_glass_frag);
-    try single_source.compile(pass_mod.shaderIdFromName("frosted_glass.frag"), &shaders.frosted_glass_frag);
-
     // Effects-spec Phase B.6.d — third single_source filter.
     // Liquid-glass factory (`:::liquid_glass`). Rounded-box SDF
     // refraction + chromatic aberration + rim + tint. First effect
@@ -2482,15 +2486,21 @@ fn registerEmbeddedPassShaders(
     try resolver.register("host_slot_passthrough.frag", &shaders.host_slot_passthrough_frag);
     try single_source.compile(pass_mod.shaderIdFromName("host_slot_passthrough.frag"), &shaders.host_slot_passthrough_frag);
 
-    // Effects-spec Phase C.2 — one axis of a separable Gaussian. Compiled
-    // into the single_source cache because a chain step has exactly the
-    // single_source pipeline shape (one combined-image-sampler, one
-    // push-constant range, a fullscreen triangle); what makes it a chain
-    // step is where its source and destination come from, not how it binds.
-    // Standing up a parallel ChainPipelineCache would be two caches with
-    // the same contents.
+    // Effects-spec Phase C.2 — the two blur shaders, one axis of a separable
+    // Gaussian each. Compiled into the single_source cache because a chain
+    // step has exactly the single_source pipeline shape (one
+    // combined-image-sampler, one push-constant range, a fullscreen
+    // triangle); what makes it a chain step is where its source and
+    // destination come from, not how it binds. Standing up a parallel
+    // ChainPipelineCache would be two caches with the same contents.
+    //
+    // `_alpha` is `:::drop_shadow`'s, `_rgba` is `:::frosted_glass`'s. They
+    // share `shaders/gaussian.glsl` and differ only in what they do with the
+    // blurred value — a coverage times a tint, versus a colour under a wash.
     try resolver.register("gaussian_alpha.frag", &shaders.gaussian_alpha_frag);
     try single_source.compile(pass_mod.shaderIdFromName("gaussian_alpha.frag"), &shaders.gaussian_alpha_frag);
+    try resolver.register("gaussian_rgba.frag", &shaders.gaussian_rgba_frag);
+    try single_source.compile(pass_mod.shaderIdFromName("gaussian_rgba.frag"), &shaders.gaussian_rgba_frag);
 }
 
 fn dispatchHit(hit: element.Hit, event: element.InputEvent, default_state: *state_mod.State) !void {

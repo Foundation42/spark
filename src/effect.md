@@ -70,9 +70,15 @@ Heavier blur with spread, for comparison — the falloff is smooth at any radius
 :::
 :::
 
-## Frosted glass — single-source filter (Phase B.6)
+## Frosted glass — separable Gaussian chain (Phase B.6, rebuilt at C.3)
 
-Second single_source consumer. Renders the wrapped child into an offscreen target, then a single-pass 9-tap box blur smears the contents and a tint colour composites over the result — the modern-OS panel look. No inflation: the effect stays within the child's natural bounds. The pipeline shape (combined-image-sampler + push-constant uniforms) mirrors drop_shadow; the post-B.6.a cache substrate handles both factories without per-factory workaround flags. The blur shows convincingly only when the child has spatial-frequency content to smear — solid-colour children only show edge softening, so the four panels below escalate from flat fill to high-frequency pattern + noise.
+Renders the wrapped child into `pool[0]`, blurs it horizontally into `pool[1]`, then vertically back over `pool[0]` with the tint laid on. Two steps, two pool targets — and the first chain in spark that writes back into a target it has already read, which is what the ping-pong pool was named for and what `recordChainStep`'s barrier had to start waiting on the fragment stage to make safe.
+
+**What B.6 shipped, and why it changed.** A 9-tap box blur, sharing `drop_shadow`'s tap shape — the shape that turned out to render nine legible copies of its content rather than a blur. It read as less obviously wrong here because the thing being ghosted is usually a flat panel, and three copies of a flat colour is that colour. The `blur=28` panel below is where the old shader was worst. Both effects now run the same kernel (`shaders/gaussian.glsl`) and differ only in the ending: a coverage times a tint, versus a colour under a wash.
+
+`blur` is the softness's reach in pixels and sigma is `blur / 3`, the same conversion `:::drop_shadow` uses — one word, one meaning. No inflation: a blur does not grow the panel, it softens what is already there. The sampler is CLAMP_TO_EDGE, so taps reaching past the edge repeat the edge texel and the panel's own borders stay solid rather than fading into the cleared border.
+
+The blur shows convincingly only when the child has spatial-frequency content to smear — solid-colour children only show edge softening, so the four panels below escalate from flat fill to high-frequency pattern + noise.
 
 Subtle tint over a solid panel — baseline. Edge softening visible; interior is flat by construction.
 
@@ -104,7 +110,7 @@ FBM noise wrapped in frosted glass — the per-pixel jitter blurs into a soft cl
 
 ## Liquid glass — rounded-box refraction (Phase B.6.d)
 
-Third single_source factory, and the first authored via the B.6.c `SingleSourceFactory` generator (~100 LOC for the whole factory file). Rounded-box SDF defines the panel; sampling UV bends back toward center near the edges, simulating a curved-glass lens; chromatic aberration adds a prismatic flash at corners; a thin rim highlight traces the edge; an optional tint washes over. Refraction works on the child's content (not on what's behind the panel) — the Apple "see-through" look needs MAIN sampling, which is Phase D territory.
+The last single_source factory standing — `:::drop_shadow` and `:::frosted_glass` both left for the chain arm when their blurs became separable — and the first authored via the B.6.c `SingleSourceFactory` generator (~100 LOC for the whole factory file). It genuinely is one filter over one image, which is what that arm is for. Rounded-box SDF defines the panel; sampling UV bends back toward center near the edges, simulating a curved-glass lens; chromatic aberration adds a prismatic flash at corners; a thin rim highlight traces the edge; an optional tint washes over. Refraction works on the child's content (not on what's behind the panel) — the Apple "see-through" look needs MAIN sampling, which is Phase D territory.
 
 A checker pattern through liquid glass — high-contrast input shows the corner refraction + chromatic aberration clearly:
 

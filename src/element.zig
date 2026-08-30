@@ -605,9 +605,11 @@ pub const PassRegion = extern struct {
 };
 
 /// Inline uniform-bytes cap on `PassDispatch`. v1 fits every Phase A
-/// canary (gradient 48, pattern 16, noise 16) and every Phase B
-/// effect with room to spare (drop_shadow / frosted_glass / blur all
-/// fit in 64).
+/// canary (gradient 48, pattern 16, noise 16) and every effect since
+/// with room to spare — the widest is the drop shadow's Gaussian
+/// block at 64, and the budget is this cap less
+/// `PASS_UNIFORM_OFFSET`, which the blur blocks assert against in
+/// `components/effects/gaussian.zig`.
 ///
 /// **Sizing rationale.** 256 matches Vulkan's common push-constant
 /// range on desktop GPUs (the spec's guaranteed minimum is 128, but

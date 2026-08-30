@@ -91,11 +91,15 @@ pub const Error = error{
 // (spark.zig's PassDispatch). Both halves serialize via the same
 // A.0-locked wire-format protocol; ShaderId is the shared currency.
 
-/// 4-sided pixel inflation applied to a single-source pass's child
-/// layout region — the breathing room a `:::drop_shadow` or
-/// `:::frosted_glass` needs around the rasterized child for the
-/// effect's spatial spread (blur radius + offset) to render without
+/// 4-sided pixel inflation applied to an effect's child layout region — the
+/// breathing room a `:::drop_shadow` needs around the rasterized child for
+/// the shadow's spatial spread (blur radius + offset) to render without
 /// clipping at the child's natural bounds.
+///
+/// Not every blurring effect wants it: `:::frosted_glass` blurs IN PLACE and
+/// leaves this null, because a blur does not grow the panel — it softens
+/// what is already there. Inflating it would move every sibling in the
+/// document, which is a layout change wearing a rendering change's clothes.
 pub const Edges = extern struct {
     left: f32 = 0,
     right: f32 = 0,
@@ -147,8 +151,12 @@ pub const PatternPass = struct {
 
 /// `.single_source` arm payload — child renders to an offscreen
 /// target, shader filters that target, result composites back at the
-/// child's region + inflation. Phase B canaries: `:::drop_shadow`,
-/// `:::frosted_glass`, `:::blur`.
+/// child's region + inflation.
+///
+/// `:::liquid_glass` is the last effect on this arm. `:::drop_shadow` (C.2)
+/// and `:::frosted_glass` (C.3) both moved to `.chain` when their blurs
+/// became separable Gaussians: a separable blur is two images, and one
+/// offscreen target cannot hold two.
 pub const SingleSourcePass = struct {
     shader_id: ShaderId,
     /// Decision #7 — v1 asserts `false`.

@@ -84,6 +84,7 @@ const component_mod = @import("../../component.zig");
 const components = @import("../../markdown_components.zig");
 const element = @import("../../element.zig");
 const element_layout = @import("../../element_layout.zig");
+const gaussian = @import("gaussian.zig");
 const markdown = @import("../../markdown.zig");
 const params = @import("../../params.zig");
 const spark_mod = @import("../../spark.zig");
@@ -93,32 +94,19 @@ pub const Error = error{
     DropShadowShaderNotRegistered,
 };
 
-const BLUR_SHADER: component_mod.ShaderId = shader_resolver.shaderIdFromName("gaussian_alpha.frag");
+const BLUR_SHADER = gaussian.ALPHA_SHADER;
 const COMPOSITE_SHADER: component_mod.ShaderId = shader_resolver.shaderIdFromName("copy.frag");
 
-/// Three sigma is the kernel's practical width, so a `blur` of N pixels is
-/// a sigma of N/3 and the shadow dies exactly at the halo the layout
-/// reserved. Naming the constant keeps the shader, the inflation maths and
-/// this comment from drifting apart.
-const SIGMA_PER_BLUR: f32 = 1.0 / 3.0;
-
-/// std140-compatible uniform block for `shaders/gaussian_alpha.frag`.
-///
-///   direction : vec2  —  0..8    axis of this pass, in texels
-///   offset    : vec2  —  8..16   shadow displacement, pixels
-///   channel   : vec4  — 16..32   dot mask selecting the channel to blur
-///   tint      : vec4  — 32..48   premultiplied output colour
-///   sigma     : f32   — 48..52
-///   spread    : f32   — 52..56
-const GaussianUniforms = extern struct {
-    direction: [2]f32,
-    offset: [2]f32,
-    channel: [4]f32,
-    tint: [4]f32,
-    sigma: f32,
-    spread: f32,
-    _pad: [2]f32 = .{ 0, 0 },
-};
+/// The blur vocabulary is shared with `:::frosted_glass` — see [[gaussian]].
+/// `blur` is the shadow's visible reach and sigma is `blur / 3`, which is
+/// exactly what makes the inflation below the halo the kernel needs: three
+/// sigma covers 99.7% of a Gaussian, so the tail dies where the layout stops
+/// reserving room for it. The constant lives in the shared module because
+/// two effects that both take a `blur` attribute must mean the same thing by
+/// it, and a second copy is how they stop.
+const GaussianUniforms = gaussian.AlphaUniforms;
+const premultiply = gaussian.premultiply;
+const writeUniforms = gaussian.writeUniforms;
 
 /// `copy.frag`'s push-constant block: one float, and we want it at 1.0.
 const CopyUniforms = extern struct {
@@ -164,27 +152,11 @@ fn computeInflationFromSpec(spec: *const components.Spec) component_mod.Edges {
     return computeInflation(a.offset[0], a.offset[1], a.blur);
 }
 
-/// Straight RGBA → premultiplied. The shader scales this by a scalar
-/// coverage and the pipeline blends premultiplied; handing it straight
-/// colour makes a coloured shadow glow.
-fn premultiply(c: [4]f32) [4]f32 {
-    const a = std.math.clamp(c[3], 0, 1);
-    return .{ c[0] * a, c[1] * a, c[2] * a, a };
-}
-
-/// Zero the whole slot before copying. The uniform block is hashed whole by
-/// the frame fingerprint, so uninitialised tail bytes would make an
-/// otherwise-identical frame hash differently run to run.
-fn writeUniforms(out: *[element.MAX_PASS_UNIFORM_BYTES]u8, bytes: []const u8) void {
-    @memset(out, 0);
-    @memcpy(out[0..bytes.len], bytes);
-}
-
 /// The three steps, written into the instance's own scratch.
 ///
 /// Called from `snapshot_chain_steps` on every walk.
 fn buildSteps(steps: *[3]element.ChainPassStep, a: Attrs) void {
-    const sigma = @max(a.blur * SIGMA_PER_BLUR, 0.0);
+    const sigma = gaussian.sigmaFor(a.blur);
 
     // Step 0 — horizontal, over the child's alpha, shifted by the offset.
     // Output is greyscale coverage in every channel so the second pass can
@@ -450,29 +422,12 @@ const vtable: element.ElementVTable = .{
 
 const testing = std.testing;
 
-/// `uniform_bytes` is a byte array with no alignment guarantee, so it is
-/// COPIED out rather than pointer-cast — an `@alignCast` here panics, which
-/// is a test failing for a reason that has nothing to do with the effect.
+/// The std140 offsets of `GaussianUniforms`, and the behaviour of
+/// `premultiply`, are locked in by [[gaussian]]'s own tests now that both are
+/// shared with `:::frosted_glass`. What is left here is what only the drop
+/// shadow can assert: the inflation maths, and the three-step shape.
 fn readGaussian(step: element.ChainPassStep) GaussianUniforms {
-    var out: GaussianUniforms = undefined;
-    @memcpy(std.mem.asBytes(&out), step.uniform_bytes[0..@sizeOf(GaussianUniforms)]);
-    return out;
-}
-
-test "GaussianUniforms: std140 layout offsets" {
-    // Lock-in test. These offsets ARE the GLSL push_constant block's
-    // contract; an "innocent" field reorder that compiles cleanly would
-    // push misaligned uniforms to the GPU and render garbage. See
-    // [[feedback-std140-offset-lockin]] — the explicit per-effect test is
-    // the load-bearing part, and a generator cannot supply it.
-    try testing.expectEqual(@as(usize, 0), @offsetOf(GaussianUniforms, "direction"));
-    try testing.expectEqual(@as(usize, 8), @offsetOf(GaussianUniforms, "offset"));
-    try testing.expectEqual(@as(usize, 16), @offsetOf(GaussianUniforms, "channel"));
-    try testing.expectEqual(@as(usize, 32), @offsetOf(GaussianUniforms, "tint"));
-    try testing.expectEqual(@as(usize, 48), @offsetOf(GaussianUniforms, "sigma"));
-    try testing.expectEqual(@as(usize, 52), @offsetOf(GaussianUniforms, "spread"));
-    try testing.expectEqual(@as(usize, 64), @sizeOf(GaussianUniforms));
-    try testing.expect(@sizeOf(GaussianUniforms) <= element.MAX_PASS_UNIFORM_BYTES - element.PASS_UNIFORM_OFFSET);
+    return gaussian.readUniforms(GaussianUniforms, step);
 }
 
 test "computeInflation: positive offset extends right + bottom" {
@@ -585,21 +540,14 @@ test "steps: two blurs that clear, then one composite that keeps" {
     try testing.expectApproxEqAbs(@as(f32, 0.5), v.tint[3], 1e-6);
 }
 
-test "steps: a black shadow is the case premultiplication hides in" {
-    // Rule 1 for the assertion above. `premultiply` on the DEFAULT colour
-    // changes nothing at all — black times anything is black — so a gate
-    // that only ever used the default would pass against no
-    // premultiplication whatsoever.
-    const black = premultiply(.{ 0, 0, 0, 0.5 });
-    try testing.expectEqualSlices(f32, &.{ 0, 0, 0, 0.5 }, &black);
-    const white = premultiply(.{ 1, 1, 1, 0.5 });
-    try testing.expectApproxEqAbs(@as(f32, 0.5), white[0], 1e-6);
-}
-
-test "steps: the tail of every uniform slot is zeroed" {
-    // The frame fingerprint hashes the whole `uniform_bytes` array, so a
-    // slot left `undefined` past the struct makes two identical frames hash
-    // differently — a determinism failure that reads as a rendering bug.
+test "steps: uniform_len names exactly the bytes that were written" {
+    // What this watches is the AGREEMENT between `uniform_len` and the block
+    // actually copied in: declare a length longer than the struct and the
+    // tail stops being zero here, which is a push of stale bytes to the GPU.
+    //
+    // It does NOT gate `writeUniforms`' `@memset` — `uniform_bytes` defaults
+    // to all-zeros, so a step built from a struct literal has a clean tail
+    // regardless. The poisoned-slot gate for that lives in [[gaussian]].
     var steps: [3]element.ChainPassStep = undefined;
     buildSteps(&steps, .{ .offset = .{ 1, 2 }, .blur = 4, .spread = 0, .color = .{ 0, 0, 0, 1 } });
     for (steps) |s| {
