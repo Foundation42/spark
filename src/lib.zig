@@ -42,6 +42,10 @@ pub const jobs = @import("common").jobs;
 pub const Spark = @import("spark.zig").Spark;
 pub const InitOptions = @import("spark.zig").InitOptions;
 pub const FrameInfo = @import("spark.zig").FrameInfo;
+/// A host image offered to a `:::gbuffer` panel, and the resolver that
+/// answers for one. See `element.PassSource.host_named`.
+pub const HostSurfaceImage = @import("spark.zig").HostSurfaceImage;
+pub const HostSurfaceFn = @import("spark.zig").HostSurfaceFn;
 pub const document = @import("document.zig");
 pub const Document = document.Document;
 pub const LoadOpts = document.LoadOpts;
@@ -173,6 +177,7 @@ pub const components = struct {
         pub const drop_shadow = @import("components/effects/drop_shadow.zig");
         pub const frosted_glass = @import("components/effects/frosted_glass.zig");
         pub const liquid_glass = @import("components/effects/liquid_glass.zig");
+        pub const gbuffer = @import("components/effects/gbuffer.zig");
     };
 };
 
@@ -217,6 +222,7 @@ pub fn installCoreComponents(spark: *Spark) !void {
     try components.effects.frosted_glass.install(spark);
     // Effects-spec Phase B.6.d — third single_source filter.
     try components.effects.liquid_glass.install(spark);
+    try components.effects.gbuffer.install(spark);
 }
 
 /// Compiled SPIR-V blobs. Anonymous module wired in by `build.zig`;

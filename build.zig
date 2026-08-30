@@ -64,6 +64,12 @@ pub fn build(b: *std.Build) void {
     // box blur and was deleted along with `drop_shadow.frag` before it.
     const gaussian_alpha_frag_spv = compileShaderStage(b, glslc_path, "gaussian_alpha", "frag", optimize);
     const gaussian_rgba_frag_spv = compileShaderStage(b, glslc_path, "gaussian_rgba", "frag", optimize);
+    // The panels campaign's Northstar — a window onto a surface the HOST
+    // owns (a G-buffer normal, an albedo, a depth) rather than onto
+    // anything spark rendered. A shader and not a blit because every one
+    // of those surfaces needs its VALUES remapped to be looked at, and a
+    // blit converts only the format.
+    const gbuffer_frag_spv = compileShaderStage(b, glslc_path, "gbuffer", "frag", optimize);
 
     // ── Bundle SPIR-V into a generated Zig module ──────────────────
     // The compiled blobs need `align(4)` because Vulkan's `pCode` field
@@ -88,6 +94,7 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(host_slot_passthrough_frag_spv, "host_slot_passthrough.frag.spv");
     _ = wf.addCopyFile(gaussian_alpha_frag_spv, "gaussian_alpha.frag.spv");
     _ = wf.addCopyFile(gaussian_rgba_frag_spv, "gaussian_rgba.frag.spv");
+    _ = wf.addCopyFile(gbuffer_frag_spv, "gbuffer.frag.spv");
     const shader_mod = wf.add("shaders.zig",
         \\pub const text_vert align(4) = @embedFile("text.vert.spv").*;
         \\pub const text_frag align(4) = @embedFile("text.frag.spv").*;
@@ -106,6 +113,7 @@ pub fn build(b: *std.Build) void {
         \\pub const host_slot_passthrough_frag align(4) = @embedFile("host_slot_passthrough.frag.spv").*;
         \\pub const gaussian_alpha_frag align(4) = @embedFile("gaussian_alpha.frag.spv").*;
         \\pub const gaussian_rgba_frag align(4) = @embedFile("gaussian_rgba.frag.spv").*;
+        \\pub const gbuffer_frag align(4) = @embedFile("gbuffer.frag.spv").*;
         \\
     );
 

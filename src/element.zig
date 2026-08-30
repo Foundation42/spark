@@ -484,6 +484,12 @@ pub const ElementVTable = struct {
     /// That decision is the whole difference between a backdrop and a
     /// filter. `null` means `.subtree`.
     pass_source: ?*const fn (ctx: *anyopaque) PassSource = null,
+    /// Optional. Which host surface a `.host_named` pass samples — read
+    /// beside `pass_source` and for the same reason, so the walker can
+    /// put both on the dispatch step in one place. `null` (or an empty
+    /// answer) on a `.host_named` element is a document asking for a
+    /// surface it never named, and the composite is skipped.
+    host_surface: ?*const fn (ctx: *anyopaque) HostSurface = null,
     /// Optional. Reports how this component participates in its
     /// parent stack's flow (stage 15 Phase E text exclusion). `null`
     /// (the default) means `.normal` — the component flows in
@@ -706,6 +712,11 @@ pub const SingleSourceStep = struct {
     /// "see-through" look its header said needed a second sampler. It does
     /// not: the backdrop IS what the one sampler holds.
     source: PassSource = .subtree,
+    /// Which host-owned image a `.host_named` pass samples. Empty for
+    /// every other source — the field is inert unless `source` says
+    /// otherwise, and hashing it always keeps the fingerprint honest
+    /// about a document that changed only the surface name.
+    host_surface: HostSurface = .{},
     /// Where the composed filter output lands on the main color
     /// attachment.
     compose_region: PassRegion,
@@ -869,10 +880,106 @@ pub const MAX_CHAIN_POOL_TARGETS: u32 = 16;
 /// cannot see other spark content from this frame, because none of it has
 /// been drawn yet. A backdrop panel blurs the scene; it does not blur
 /// another panel.
+/// `.host_named` is the same idea reaching one step further out: the
+/// source is an image the HOST owns and answers for by name — a
+/// G-buffer surface, a depth pyramid, a shadow atlas — and the panel
+/// becomes a window onto it, showing the part of that surface its own
+/// box covers. Children draw over it exactly as they draw over a
+/// backdrop, so a `:::gbuffer` panel gets its buttons for free.
+///
+/// **It is not a copy, and that is the whole difference.** A backdrop
+/// blits, because a swapchain being used as an attachment cannot also
+/// be sampled. A host surface has no such problem, so `.host_named`
+/// BINDS the host's view as the filter's sampler and never allocates a
+/// target at all. That is not merely cheaper — it is what makes the
+/// effect possible: a blit converts formats without remapping values,
+/// and every one of these surfaces needs remapping to be looked at
+/// (a normal is signed, a depth is non-linear, a motion vector has a
+/// direction). Remapping is a shader's job, so the pixels have to
+/// arrive through a sampler.
+///
+/// The panel then has to say WHICH part of a full-screen surface it is
+/// looking at, since it no longer owns a target cut to its own size.
+/// That is `SingleSourceStep.host_surface` plus the window transform
+/// spark writes into the filter's uniforms at record time — see
+/// `HOST_WINDOW_BYTES`.
 pub const PassSource = enum(u8) {
     subtree,
     backdrop,
+    host_named,
+
+    /// Does this source make the effect a BACKGROUND to its own
+    /// children rather than a filter over them?
+    ///
+    /// True for everything that does not draw its subtree into its own
+    /// target. Those elements' children stay on MAIN and must be drawn
+    /// over the composite, which has three consequences Phase 2 reads
+    /// off this one answer: the subtree is not marked nested, the
+    /// composite runs in the pre-pass (the walker emits post-order, so
+    /// composing in the main loop would lay the panel over the very
+    /// content it belongs behind), and the children then land on top
+    /// with no extra machinery.
+    ///
+    /// Named rather than written out as `!= .subtree` at each site
+    /// because the three sites have to agree: a source that is a
+    /// background in one of them and not in another produces a panel
+    /// drawn over its own buttons, or one composited twice.
+    pub fn isBackground(self: PassSource) bool {
+        return switch (self) {
+            .subtree => false,
+            .backdrop, .host_named => true,
+        };
+    }
 };
+
+/// Which host surface a `.host_named` pass samples.
+///
+/// A fixed-size buffer rather than a slice, for two reasons that both
+/// bite. It is copied into a dispatch step that outlives the walk, so
+/// a slice into a component's arena would dangle the moment that
+/// component re-parsed; and the frame fingerprint hashes dispatch
+/// steps BY VALUE, so a pointer would make two identical frames hash
+/// differently and the determinism gates would go off.
+///
+/// The names themselves are the host's vocabulary, not spark's —
+/// spark never interprets one, it only carries it back to the
+/// resolver the host installed.
+pub const HostSurface = struct {
+    pub const MAX = 24;
+    buf: [MAX]u8 = [_]u8{0} ** MAX,
+    len: u8 = 0,
+
+    pub fn from(name: []const u8) HostSurface {
+        var self = HostSurface{};
+        // Truncates rather than errors: a name too long to carry is a
+        // name the resolver will not match, which surfaces as "this
+        // host has no surface called that" — the same message a typo
+        // gets, at the same place, instead of a parse-time failure in
+        // a different file.
+        self.len = @intCast(@min(name.len, MAX));
+        @memcpy(self.buf[0..self.len], name[0..self.len]);
+        return self;
+    }
+
+    pub fn slice(self: *const HostSurface) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+/// How many bytes at the head of a `.host_named` filter's uniform
+/// block spark OVERWRITES with the window transform.
+///
+/// Two `vec2`s — scale then offset — mapping the compose quad's own
+/// `[0,1]` UV onto the region of the host surface the panel covers.
+/// The effect cannot compute these itself: they need the element's
+/// laid-out box and the host surface's dimensions, and neither is
+/// known when `apply_attrs` runs.
+///
+/// So the contract is stated rather than negotiated: **a host_named
+/// filter's Uniforms must begin with `vec4 window` (scale.xy,
+/// offset.xy), and whatever the component writes there is discarded.**
+/// `gbuffer.frag` is the worked example.
+pub const HOST_WINDOW_BYTES: usize = 16;
 
 pub const ChainLoad = enum(u8) {
     clear,

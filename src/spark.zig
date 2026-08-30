@@ -102,6 +102,31 @@ pub const FrameInfo = struct {
     }
 };
 
+/// An image the HOST owns, handed to a `.host_named` pass.
+///
+/// Borrowed for the duration of the frame and nothing more: spark
+/// binds the view into a descriptor set and draws. It never
+/// transitions the image, never writes it, and never keeps it — the
+/// host owns the lifetime and the layout, and must have it in one a
+/// fragment shader can sample (`SHADER_READ_ONLY_OPTIMAL`, or
+/// `GENERAL`, which many compute-written surfaces are already sitting
+/// in) at the moment it calls into spark.
+pub const HostSurfaceImage = struct {
+    view: vk.c.VkImageView,
+    /// The surface's own dimensions, which are NOT the panel's and
+    /// usually not the screen's either — a render target at 70% scale
+    /// is 70% of the window. The window transform is computed from
+    /// these, so getting them wrong slides the picture rather than
+    /// failing.
+    width: u32,
+    height: u32,
+};
+
+/// Answers a surface name with an image, or null when the host has
+/// nothing by that name. Called once per `.host_named` composite, on
+/// the render thread, inside the frame.
+pub const HostSurfaceFn = *const fn (ctx: *anyopaque, name: []const u8) ?HostSurfaceImage;
+
 /// Construction options for `Spark.init`. Raw Vulkan handles +
 /// theme + fonts (Spark takes ownership) + borrowed host state +
 /// optional sizing knobs. Defaults match the demo's historical
@@ -278,6 +303,15 @@ pub const Spark = struct {
     dotenv: ?*const dotenv_mod.DotEnv = null,
     asset_cache: ?*asset_cache_mod.AssetCache = null,
     embedded_http: ?*embedded_document_http_mod.EmbeddedDocumentHttp = null,
+
+    /// Answers a `.host_named` pass's surface name with an image the
+    /// host owns. Null until `setHostSurfaceResolver`, and a document
+    /// asking for a surface on a host that installed none simply does
+    /// not composite — the panel's children still draw, so a
+    /// `:::gbuffer` in a document running on a host without G-buffers
+    /// is an empty frame with working buttons rather than a crash.
+    host_surface_fn: ?HostSurfaceFn = null,
+    host_surface_ctx: ?*anyopaque = null,
 
     // ── Per-frame state (set by attachCmd + beginFrame) ─────────────
     /// Bound command buffer for the current frame. Set by `attachCmd`,
@@ -568,6 +602,52 @@ pub const Spark = struct {
     /// is committed).
     pub fn attachToRegistry(self: *Spark) void {
         self.registry.attachSpark(self);
+    }
+
+    /// Install the resolver a `.host_named` pass asks for its image.
+    ///
+    /// Optional, and a host that never calls this simply has no
+    /// surfaces: a `:::gbuffer` in one of its documents lays out and
+    /// draws its children, and composites nothing. That is the right
+    /// failure for a debug panel carried between hosts.
+    pub fn setHostSurfaceResolver(self: *Spark, ctx: *anyopaque, f: HostSurfaceFn) void {
+        self.host_surface_ctx = ctx;
+        self.host_surface_fn = f;
+    }
+
+    /// The host's image for `name`, or null.
+    fn hostSurface(self: *Spark, name: []const u8) ?HostSurfaceImage {
+        if (name.len == 0) return null;
+        const f = self.host_surface_fn orelse return null;
+        const ctx = self.host_surface_ctx orelse return null;
+        return f(ctx, name);
+    }
+
+    /// The window transform for a panel looking at part of a host
+    /// surface: `(scale.xy, offset.xy)` such that a compose quad's own
+    /// `[0,1]` UV maps onto the region of the surface the panel covers.
+    ///
+    /// Pure, and separated from the record path so it can be gated
+    /// without a device — this is the arithmetic that decides whether
+    /// a magnifying glass shows what is under it or something a few
+    /// hundred pixels away, and it is not visible in a unit test any
+    /// other way.
+    ///
+    /// The surface is not the screen: at `render_scale_pct < 100` a
+    /// G-buffer is smaller than the window, so the panel's screen
+    /// rectangle is divided by the SURFACE's dimensions and lands in
+    /// the same fraction of a smaller image. Dividing by the window
+    /// instead would work perfectly at 100% and slide the picture at
+    /// every other setting — which is why the surface carries its own
+    /// size rather than spark assuming the frame's.
+    pub fn hostWindow(region: element.PassRegion, surface_w: u32, surface_h: u32) [4]f32 {
+        const sw: f32 = @floatFromInt(@max(1, surface_w));
+        const sh: f32 = @floatFromInt(@max(1, surface_h));
+        const rw: f32 = @floatFromInt(region.w);
+        const rh: f32 = @floatFromInt(region.h);
+        const rx: f32 = @floatFromInt(region.x);
+        const ry: f32 = @floatFromInt(region.y);
+        return .{ rw / sw, rh / sh, rx / sw, ry / sh };
     }
 
     // ── Extras install methods ──────────────────────────────────────
@@ -876,6 +956,20 @@ pub const Spark = struct {
             }
         }
 
+        // A `.host_named` pass owns NO target. Its source is an image
+        // the host already holds, bound straight into the compose's
+        // sampler — so there is nothing to acquire, nothing to render
+        // into, and nothing to release. `dispatch_target_map` stays
+        // null at this index and Phase 2 reads the host's view
+        // instead. The children were left on MAIN by the walker (the
+        // same routing a backdrop gets) and draw over the composite.
+        //
+        // Returning here rather than acquiring-and-ignoring is the
+        // point: a pool target per magnifying glass per frame, never
+        // written and never read, is exactly the kind of cost that
+        // hides until somebody opens eight panels.
+        if (S.source == .host_named) return;
+
         // Acquire S's target. Record it in dispatch_target_map at
         // S's position (Phase 2 reads from there) and in
         // acquired_targets (Phase 3 releases from there).
@@ -960,7 +1054,13 @@ pub const Spark = struct {
                         j += 1;
                     },
                     .single_source => |nested| {
-                        const nested_target = self.dispatch_target_map.items[j] orelse unreachable;
+                        // Optional: a `.host_named` nested pass owns no
+                        // target — the compose resolves the host's view
+                        // itself, and its window is computed from the
+                        // SCREEN-space compose_region, so it samples the
+                        // right part of the surface even while being
+                        // drawn into a parent's offscreen target.
+                        const nested_target = self.dispatch_target_map.items[j];
                         const nx: f32 = @floatFromInt(nested.compose_region.x - S.compose_region.x);
                         const ny: f32 = @floatFromInt(nested.compose_region.y - S.compose_region.y);
                         const nw: f32 = @floatFromInt(nested.compose_region.w);
@@ -1365,7 +1465,13 @@ pub const Spark = struct {
                         j += 1;
                     },
                     .single_source => |nested| {
-                        const nested_target = self.dispatch_target_map.items[j] orelse unreachable;
+                        // Optional: a `.host_named` nested pass owns no
+                        // target — the compose resolves the host's view
+                        // itself, and its window is computed from the
+                        // SCREEN-space compose_region, so it samples the
+                        // right part of the surface even while being
+                        // drawn into a parent's offscreen target.
+                        const nested_target = self.dispatch_target_map.items[j];
                         const nx: f32 = @floatFromInt(nested.compose_region.x - C.compose_region.x);
                         const ny: f32 = @floatFromInt(nested.compose_region.y - C.compose_region.y);
                         const nw: f32 = @floatFromInt(nested.compose_region.w);
@@ -1588,7 +1694,7 @@ pub const Spark = struct {
         self: *Spark,
         cmd: vk.c.VkCommandBuffer,
         ss: element.SingleSourceStep,
-        target_handle: pass_mod.TargetHandle,
+        target_handle: ?pass_mod.TargetHandle,
         vx: f32,
         vy: f32,
         vw: f32,
@@ -1596,13 +1702,34 @@ pub const Spark = struct {
         last_bound: *vk.c.VkPipeline,
         att: vk.Attachment,
     ) !void {
+        // Where the one sampler's pixels come from, and — for a
+        // `.host_named` pass — the window onto them.
+        //
+        // `window` is null for every other source, because they sample
+        // a target cut to the panel's own size and the quad's `[0,1]`
+        // UV already IS the panel. Only a host surface is bigger than
+        // what is being shown of it.
+        var window: ?[4]f32 = null;
+        const source_view: vk.c.VkImageView = blk: {
+            if (ss.source == .host_named) {
+                // No surface, or a name this host does not answer for:
+                // composite NOTHING and let the children draw. A
+                // document that asks for `surface=nrmal` shows an
+                // empty panel with working buttons, which is a legible
+                // wrong rather than a validation error on a null view.
+                const img = self.hostSurface(ss.host_surface.slice()) orelse return;
+                window = hostWindow(ss.compose_region, img.width, img.height);
+                break :blk img.view;
+            }
+            break :blk (target_handle orelse return).view();
+        };
         const pipeline = self.single_source_pipelines.lookup(ss.filter_shader_id, att) orelse return;
         if (pipeline != last_bound.*) {
             vk.c.vkCmdBindPipeline(cmd, vk.c.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
             last_bound.* = pipeline;
         }
         const set = try self.single_source_descriptor_pool.acquire(
-            target_handle.view(),
+            source_view,
             self.single_source_pipelines.sampler,
         );
         var set_local = set; // pDescriptorSets wants a pointer
@@ -1643,14 +1770,30 @@ pub const Spark = struct {
         // already carry the display transform; encoding again would push a
         // PQ code through the PQ curve twice. Same rule as the chain arm.
         const disp = switch (ss.source) {
-            .subtree => self.displayFor(att),
+            // A host surface holds DATA, not a picture — a world-space
+            // normal, a raw albedo, a depth. The filter turns that into
+            // a colour it authored, so it encodes like anything else
+            // spark draws. Only a backdrop skips the transform, because
+            // only a backdrop's pixels arrived already carrying it.
+            .subtree, .host_named => self.displayFor(att),
             .backdrop => display_mod.Push.offscreen,
         };
+        // The window transform is spark's to write, not the component's:
+        // it needs the laid-out box and the host surface's dimensions,
+        // and neither exists when `apply_attrs` runs. It overwrites the
+        // head of the effect's own block — see `element.HOST_WINDOW_BYTES`,
+        // where the contract is stated.
+        var uniforms = ss.filter_uniforms;
+        var ulen = ss.filter_uniforms_len;
+        if (window) |w| {
+            ulen = @max(ulen, element.HOST_WINDOW_BYTES);
+            @memcpy(uniforms[0..element.HOST_WINDOW_BYTES], std.mem.asBytes(&w));
+        }
         pushEffectUniforms(
             cmd,
             self.single_source_pipelines.layout,
             disp,
-            ss.filter_uniforms[0..ss.filter_uniforms_len],
+            uniforms[0..ulen],
         );
         vk.c.vkCmdDraw(cmd, 3, 1, 0, 0);
     }
@@ -2035,7 +2178,17 @@ pub const Spark = struct {
         // `pq(pq(x))` is a searchlight. Passthrough, for the one case where
         // the source is the destination's own encoding.
         const disp = switch (ch.source) {
-            .subtree => self.displayFor(att),
+            // `.host_named` has no chain arm. A chain's pool[0] is
+            // FILLED — rendered into, or blitted into — and a host
+            // surface is neither: it is bound as a sampler and never
+            // copied, which is the whole reason the effect can remap
+            // values a blit could not. A chain that wanted one would
+            // have to sample the host image in its first step rather
+            // than adopt it as pool[0], and nothing has asked. Grouped
+            // with `.subtree` rather than left unreachable because if
+            // it ever arrives it will be authored colour, like every
+            // other filter output, and this is the answer it wants.
+            .subtree, .host_named => self.displayFor(att),
             .backdrop => display_mod.Push.offscreen,
         };
         pushEffectUniforms(
@@ -2155,7 +2308,7 @@ pub const Spark = struct {
                         // Same rule as the chain arm: a BACKDROP fills its
                         // target from the attachment, so the children were
                         // never routed into it and are ordinary MAIN content.
-                        if (ss.source == .subtree) {
+                        if (!ss.source.isBackground()) {
                             var k = ss.subtree_dispatch_range[0];
                             while (k < ss.subtree_dispatch_range[1]) : (k += 1) {
                                 is_nested[k] = true;
@@ -2171,7 +2324,7 @@ pub const Spark = struct {
                         // is a copy of the attachment, and the children were
                         // never routed into it. They are ordinary MAIN
                         // content and must be dispatched, not skipped.
-                        if (c.source == .subtree) {
+                        if (!c.source.isBackground()) {
                             var k = c.subtree_dispatch_range[0];
                             while (k < c.subtree_dispatch_range[1]) : (k += 1) {
                                 is_nested[k] = true;
@@ -2214,8 +2367,15 @@ pub const Spark = struct {
                         try self.recordChainFinalComposite(cmd, c, final_target, bx, by, bw, bh, &last_compose, .main);
                     },
                     .single_source => |ss| {
-                        if (ss.source != .backdrop) continue;
-                        const target = self.dispatch_target_map.items[bi] orelse unreachable;
+                        // Backdrops AND host-named surfaces: both are
+                        // backgrounds to their own children, and both
+                        // need the pre-pass for the same post-order
+                        // reason. A host_named pass owns no target —
+                        // its sampler is the host's image — so the
+                        // handle is legitimately null here and the
+                        // compose resolves the view itself.
+                        if (!ss.source.isBackground()) continue;
+                        const target = self.dispatch_target_map.items[bi];
                         const bx = (@as(f32, @floatFromInt(ss.compose_region.x)) - sx) * z;
                         const by = (@as(f32, @floatFromInt(ss.compose_region.y)) - sy) * z;
                         const bw = @as(f32, @floatFromInt(ss.compose_region.w)) * z;
@@ -2253,8 +2413,11 @@ pub const Spark = struct {
                         i += 1;
                     },
                     .single_source => |ss| {
-                        // Backdrops were composited in the pre-pass above.
-                        if (ss.source == .backdrop) {
+                        // Every background source was composited in the
+                        // pre-pass above — compositing again here would
+                        // draw the panel twice, the second time over its
+                        // own children.
+                        if (ss.source.isBackground()) {
                             i = ss.subtree_dispatch_range[1] + 1;
                             continue;
                         }
@@ -2749,6 +2912,15 @@ fn registerEmbeddedPassShaders(
     try single_source.compile(pass_mod.shaderIdFromName("gaussian_alpha.frag"), &shaders.gaussian_alpha_frag);
     try resolver.register("gaussian_rgba.frag", &shaders.gaussian_rgba_frag);
     try single_source.compile(pass_mod.shaderIdFromName("gaussian_rgba.frag"), &shaders.gaussian_rgba_frag);
+
+    // The panels campaign's Northstar — `:::gbuffer`, a window onto an
+    // image the HOST owns. Same pipeline shape as every other
+    // single_source filter (one combined-image-sampler, one push range,
+    // a fullscreen triangle); what makes it different is only where the
+    // sampler's image comes from, which is a record-time question and
+    // not a pipeline one.
+    try resolver.register("gbuffer.frag", &shaders.gbuffer_frag);
+    try single_source.compile(pass_mod.shaderIdFromName("gbuffer.frag"), &shaders.gbuffer_frag);
 }
 
 fn dispatchHit(hit: element.Hit, event: element.InputEvent, default_state: *state_mod.State) !void {
@@ -2825,4 +2997,65 @@ test "Spark: testStub produces a usable shell for component tests" {
     const s = Spark.testStub(testing.allocator);
     try testing.expect(@sizeOf(@TypeOf(s)) > 0);
     // `glyph_cache_lock` is real (Mutex has no resources to free).
+}
+
+// ── The host window (panels campaign, beat 3) ───────────────────────
+// The arithmetic that decides whether a `:::gbuffer` panel shows what
+// is genuinely under it or something a few hundred pixels away. Pure,
+// so it is gated here rather than by looking at a capture — the
+// difference between a correct window and one off by a scale factor is
+// a picture that looks plausible either way.
+
+test "hostWindow: a panel maps onto the fraction of the surface it covers" {
+    // A 240x160 panel at (576, 115) on a 960x540 surface. The window is
+    // its rectangle expressed as fractions, and nothing else.
+    const w = Spark.hostWindow(.{ .x = 576, .y = 115, .w = 240, .h = 160 }, 960, 540);
+    try testing.expectApproxEqAbs(@as(f32, 0.25), w[0], 1e-6); // 240/960
+    try testing.expectApproxEqAbs(@as(f32, 160.0 / 540.0), w[1], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.6), w[2], 1e-6); // 576/960
+    try testing.expectApproxEqAbs(@as(f32, 115.0 / 540.0), w[3], 1e-6);
+}
+
+test "hostWindow: a panel covering the whole surface is the identity" {
+    // The case that says the transform has no hidden constant in it. If
+    // a full-surface panel is not (1, 1, 0, 0), every other window is
+    // wrong by the same factor — and a slightly-wrong window still
+    // produces a plausible-looking picture, which is why this is
+    // asserted rather than eyeballed.
+    const w = Spark.hostWindow(.{ .x = 0, .y = 0, .w = 1920, .h = 1080 }, 1920, 1080);
+    try testing.expectApproxEqAbs(@as(f32, 1), w[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1), w[1], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0), w[2], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0), w[3], 1e-6);
+}
+
+test "hostWindow: the SURFACE's size is the divisor, not the screen's" {
+    // The one that would pass at 100% render scale and slide the picture
+    // at every other setting. A surface smaller than the window is the
+    // same panel landing in the same FRACTION of a smaller image — so
+    // halving the surface doubles every component.
+    //
+    // Rule 1: the two answers must differ, or this is asserting that a
+    // number equals itself.
+    const region = element.PassRegion{ .x = 480, .y = 270, .w = 240, .h = 160 };
+    const full = Spark.hostWindow(region, 960, 540);
+    const half = Spark.hostWindow(region, 480, 270);
+    try testing.expect(full[0] != half[0]);
+    try testing.expectApproxEqAbs(full[0] * 2, half[0], 1e-6);
+    try testing.expectApproxEqAbs(full[2] * 2, half[2], 1e-6);
+    // Concretely: a panel whose left edge is at the screen's midpoint
+    // reads as 0.5 of a full-size surface and 1.0 of a half-size one.
+    // Same panel, same place on screen, different fraction — which is
+    // the whole reason the surface carries its own dimensions.
+    try testing.expectApproxEqAbs(@as(f32, 0.5), full[2], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), half[2], 1e-6);
+}
+
+test "hostWindow: a zero-sized surface does not divide by zero" {
+    // A resize can hand a frame a surface with no extent, and a NaN
+    // window samples nothing and paints the panel with whatever the
+    // sampler does at NaN — a black box that looks like a missing
+    // surface rather than a bad divisor.
+    const w = Spark.hostWindow(.{ .x = 10, .y = 10, .w = 100, .h = 100 }, 0, 0);
+    for (w) |v| try testing.expect(!std.math.isNan(v));
 }

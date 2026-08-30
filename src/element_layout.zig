@@ -347,6 +347,7 @@ pub fn layoutAndRender(
                         .filter_uniforms = uniform_buf,
                         .filter_uniforms_len = ulen,
                         .source = if (cu.vtable.pass_source) |f| f(cu.ctx) else .subtree,
+                        .host_surface = if (cu.vtable.host_surface) |f| f(cu.ctx) else .{},
                         .compose_region = region,
                         .subtree_dispatch_range = .{ dispatch_start, seq },
                         .sequence_index = seq,

@@ -109,6 +109,20 @@ pub const Error = error{
 /// trims to empty, which it reports as unparseable and answers with the
 /// caller's default, so the bare flag read as OFF and the effect silently
 /// filtered its own children instead.
+/// `surface=<name>` — the host image this effect is a window onto.
+///
+/// A raw attribute read rather than `params.resolve`, because the
+/// value is a NAME and not a number: `resolve` parses toward a type
+/// and answers a default when it cannot, which for a string would
+/// mean silently substituting one surface for another.
+fn surfaceName(spec: *const components.Spec) []const u8 {
+    for (spec.attrs) |a| {
+        if (!std.mem.eql(u8, a.key, "surface")) continue;
+        return std.mem.trim(u8, a.value, " \t");
+    }
+    return "";
+}
+
 fn readFlag(spec: *const components.Spec, key: []const u8) bool {
     for (spec.attrs) |a| {
         if (!std.mem.eql(u8, a.key, key)) continue;
@@ -145,6 +159,18 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
             body: component_mod.Body = .{},
             /// Resolve-once: see `passSource`.
             source: element.PassSource = .subtree,
+            /// Which host image a `.host_named` effect samples. Empty
+            /// otherwise. Resolved once at create, beside `source`, and
+            /// for the same reason.
+            surface: element.HostSurface = .{},
+            /// The effect's own minimum box, when it declares one.
+            ///
+            /// Resolved ONCE at create from the spec, exactly as
+            /// `inflation` is and for the same reason: a size that
+            /// changed on update would cascade through layout. Zero
+            /// means "take the child's size", which is what every
+            /// filter effect wants.
+            min_size: [2]f32 = .{ 0, 0 },
         };
 
         pub const factory: component_mod.Factory = .{
@@ -188,9 +214,25 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
                 .spark = spark,
                 .inflation = inf,
                 .uniforms = config.apply_attrs(spec),
+                .min_size = if (@hasField(@TypeOf(config), "compute_min_size"))
+                    config.compute_min_size(spec)
+                else
+                    .{ 0, 0 },
                 .version = 0,
                 .body = .{},
-                .source = if (readFlag(spec, "backdrop")) .backdrop else .subtree,
+                // `surface=` wins over `{backdrop}` when both are
+                // written, because it is the more specific request:
+                // one names an image, the other says "whatever is
+                // behind me". An effect asking for both is a document
+                // being edited, and answering the named one keeps the
+                // panel showing what its author last typed.
+                .source = if (surfaceName(spec).len > 0)
+                    .host_named
+                else if (readFlag(spec, "backdrop"))
+                    .backdrop
+                else
+                    .subtree,
+                .surface = element.HostSurface.from(surfaceName(spec)),
             };
             errdefer c.arena.deinit();
 
@@ -298,11 +340,34 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
                 out,
             );
 
+            var w = child_box.w + inf.left + inf.right;
+            var h = child_box.h + inf.top + inf.bottom;
+
+            // The MINIMUM this effect declared for itself (zero for a
+            // filter, which takes its child's size).
+            //
+            // Every effect until now wrapped something, so taking the
+            // child's size was the only sensible answer. `:::gbuffer` is
+            // a WINDOW: its body is usually empty, so the child box is
+            // zero and the pass would composite into a rectangle with no
+            // area — a panel that runs, allocates nothing, reports no
+            // error and shows nothing at all, which is a long afternoon.
+            //
+            // Clamped up rather than overridden, so a window with content
+            // in it still grows to fit.
+            w = @max(w, c.min_size[0]);
+            h = @max(h, c.min_size[1]);
+            // The parent's constraint still wins — a declared size is
+            // what the effect WANTS, not a licence to overflow the
+            // column it was placed in.
+            if (std.math.isFinite(constraints.max_w)) w = @min(w, constraints.max_w);
+            if (std.math.isFinite(constraints.max_h)) h = @min(h, constraints.max_h);
+
             return .{
                 .x = origin[0],
                 .y = origin[1],
-                .w = child_box.w + inf.left + inf.right,
-                .h = child_box.h + inf.top + inf.bottom,
+                .w = w,
+                .h = h,
                 .baseline = 0,
             };
         }
@@ -328,6 +393,14 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
             return c.source;
         }
 
+        /// Which host image a `.host_named` effect samples. Read
+        /// beside `passSource` and answered from the same resolve-once
+        /// field, so the two can never disagree about what this pass is.
+        fn hostSurface(ctx: *anyopaque) element.HostSurface {
+            const c: *const Component = @ptrCast(@alignCast(ctx));
+            return c.surface;
+        }
+
         fn contentVersion(ctx: *anyopaque) u64 {
             const c: *const Component = @ptrCast(@alignCast(ctx));
             return c.version ^ layout_cache.aggregateRootVersion(c.root);
@@ -338,6 +411,7 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
             .snapshot_uniforms = snapshotUniforms,
             .content_version = contentVersion,
             .pass_source = passSource,
+            .host_surface = hostSurface,
             // Cacheable as of Phase B.6.a — substrate handles primitive
             // routing tags through cache via replay-with-offset.
         };
