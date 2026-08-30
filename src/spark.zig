@@ -2536,13 +2536,32 @@ pub const Spark = struct {
     }
 
     /// Apply an LM-style update directive (the `:::update` wire
-    /// format). Re-parses, dispatches against the registry, returns
-    /// the number of directives applied.
+    /// format) to the Spark's root State. Re-parses, dispatches
+    /// against the registry, returns the number of directives
+    /// applied.
     pub fn applyUpdate(self: *Spark, source: []const u8) !usize {
+        return self.applyUpdateTo(self.host_state, source);
+    }
+
+    /// `applyUpdate`, against a state the caller names.
+    ///
+    /// A host drawing several Documents in one Spark gives each its
+    /// own State — otherwise two panels that both bind `warm` are one
+    /// value, the same collision `LoadOpts.scope` fixes for component
+    /// instances. `Spark.layoutAndRender` already prefers
+    /// `doc.state`, and the walker already stamps it onto every Hit,
+    /// so a panel's slider reads and writes its own state on the
+    /// input path. This is the ingress side of that: a stream update
+    /// aimed at one panel must land in that panel's State rather than
+    /// in whichever State the Spark happens to hold as root.
+    ///
+    /// Pass `doc.state orelse spark.host_state` — the same fallback
+    /// layout uses.
+    pub fn applyUpdateTo(self: *Spark, state: *state_mod.State, source: []const u8) !usize {
         const update_mod = @import("update.zig");
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        return update_mod.applyAll(arena.allocator(), self.host_state, self.registry, source);
+        return update_mod.applyAll(arena.allocator(), state, self.registry, source);
     }
 
     // ── Test stub ───────────────────────────────────────────────────

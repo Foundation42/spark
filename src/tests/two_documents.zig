@@ -269,3 +269,58 @@ test "a reload of one panel does not age the other's components toward the sweep
     host.inst.registry.gc();
     try testing.expect(!host.inst.registry.instances.contains("lab/exposure"));
 }
+
+test "each document keeps its own State, and a stream update lands in the one it names" {
+    // The state half of the same shared-Spark question. Component
+    // instances collide on the Registry; state values collide on
+    // `Spark.host_state`, and the fix is symmetric — each Document
+    // gets its own State (the `loadDocument` default) and every path
+    // that touches state has to honour that rather than reaching for
+    // the root.
+    //
+    // Layout and input already did: `layoutAndRender` prefers
+    // `doc.state`, and the walker stamps it onto every Hit. The
+    // ingress did NOT — `applyUpdate` always wrote `host_state`, so a
+    // stream binding feeding panel B's chart wrote into whatever
+    // State the Spark held as root.
+    const allocator = testing.allocator;
+    var host: Host = undefined;
+    try Host.init(allocator, &host);
+    defer host.deinit(allocator);
+
+    // No `shared_state`: each document owns its State, which is what a
+    // host with two panels wants.
+    var a = try host.inst.loadDocument(panel_a, .{ .scope = "lab" });
+    defer a.deinit();
+    var b = try host.inst.loadDocument(panel_b, .{ .scope = "debug" });
+    defer b.deinit();
+
+    // ── The inequality (rule 1) ──────────────────────────────────
+    // Three distinct States, or everything below is asserting that
+    // one State equals itself.
+    try testing.expect(a.state.? != b.state.?);
+    try testing.expect(a.state.? != &host.state);
+    try testing.expect(b.state.? != &host.state);
+
+    const update =
+        \\:::update {target=state.warm}
+        \\0.75
+        \\:::
+        \\
+    ;
+
+    // Aimed at A, it lands in A — and in NEITHER of the other two.
+    // The "neither" half is the whole test: `applyUpdate` would have
+    // put this in `host_state` and passed a check that only asked
+    // whether the value arrived somewhere.
+    try testing.expectEqual(@as(usize, 1), try host.inst.applyUpdateTo(a.state.?, update));
+    try testing.expectEqualStrings("0.75", a.state.?.get("warm").?);
+    try testing.expectEqual(@as(?[]const u8, null), b.state.?.get("warm"));
+    try testing.expectEqual(@as(?[]const u8, null), host.state.get("warm"));
+
+    // And the root path still goes to the root, unchanged — the new
+    // function is a widening, not a redirection.
+    try testing.expectEqual(@as(usize, 1), try host.inst.applyUpdate(update));
+    try testing.expectEqualStrings("0.75", host.state.get("warm").?);
+    try testing.expectEqual(@as(?[]const u8, null), b.state.?.get("warm"));
+}
