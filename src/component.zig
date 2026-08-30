@@ -460,6 +460,10 @@ const Binding = struct {
     /// `allocator`. The Subscriber callback re-substitutes against
     /// the current state on every mutation.
     templated_attrs: []components.Attr,
+    /// The body this instance was created from, duped into
+    /// `allocator`. A reactive fire changes ATTRS and nothing else, so
+    /// the body has to be handed back UNCHANGED — see `refire`.
+    body: []u8,
     /// Subscription handles, one per distinct path referenced by
     /// `templated_attrs`. Owned by the State; we hold the pointers
     /// so we can `unsubscribe` at gc.
@@ -481,11 +485,32 @@ const Binding = struct {
                 .value = try components.substituteState(a, t.value, self.state),
             };
         }
+        // **The body is the real one, not `""`.** This spec is
+        // synthetic — nothing here parsed a document — and it used to
+        // carry an empty body on the reasoning that a reactive fire is
+        // about attributes. That was true until `Body` landed: a
+        // body-bearing factory now compares what it is handed against
+        // what it holds, and an empty body reads as "the author
+        // deleted the children", so the first state mutation re-parsed
+        // the subtree as nothing and the block rendered empty.
+        //
+        // Found with `:::frosted_glass {blur=${state.speed}}` around a
+        // pattern: it drew correctly until the plane wrote the path,
+        // and then the panel and everything in it vanished. `:::flex`,
+        // `:::grid`, `SingleSourceFactory` and both chain effects all
+        // carry `Body`, so all of them had it, and only an effect with
+        // a bound ATTRIBUTE could reach it — which is why no shipped
+        // document ever did.
+        //
+        // `name` and `id` stay empty: no `update` reads them, and a
+        // factory that starts to would be asking a question this spec
+        // cannot answer. The body is different — it is content, the
+        // factory owns it, and it must not appear to have changed.
         const fresh_spec = components.Spec{
             .name = "",
             .id = null,
             .attrs = fresh_attrs,
-            .body = "",
+            .body = self.body,
         };
         if (self.factory.update) |u| try u(self.instance_ctx, &fresh_spec);
     }
@@ -503,6 +528,7 @@ const Binding = struct {
             self.allocator.free(attr.value);
         }
         self.allocator.free(self.templated_attrs);
+        self.allocator.free(self.body);
         const alloc = self.allocator;
         alloc.destroy(self);
     }
@@ -673,8 +699,27 @@ pub const Registry = struct {
             // `parses_unused`.
             const ctx_stable = entry_ptr.instance.ctx;
             const vtable_stable = entry_ptr.instance.vtable;
+            // The Binding holds its own copy of the templated attrs and
+            // the body, so a re-parse that changed either leaves it
+            // describing a document that no longer exists — and its
+            // next fire would hand the factory the OLD body, undoing a
+            // hot-reload edit the author has already seen land. The
+            // heap pointer is stable across `invokeUpdate` even though
+            // `entry_ptr` is not, so it is read here and written back
+            // through a re-acquired entry below.
+            const old_binding = entry_ptr.binding;
+            const rebind = if (old_binding) |b| !bindingMatches(b, spec) else false;
+            const new_binding: ?*Binding = if (rebind)
+                try self.buildBinding(factory, spec, state, ctx_stable)
+            else
+                old_binding;
+            if (rebind) if (old_binding) |b| b.destroy();
+
             try self.invokeUpdate(factory, ctx_stable, spec, state);
-            if (self.instances.getPtr(id)) |reaq| reaq.parses_unused = 0;
+            if (self.instances.getPtr(id)) |reaq| {
+                reaq.parses_unused = 0;
+                reaq.binding = new_binding;
+            }
             const ps = passShapeScalars(factory.pass_shape);
             return .{
                 .vtable = vtable_stable,
@@ -749,18 +794,29 @@ pub const Registry = struct {
             .factory_name = self.factories.getKey(spec.name).?,
             .binding = null,
         };
+        entry.binding = try self.buildBinding(factory, spec, state, inst.ctx);
+        return entry;
+    }
 
-        // If the spec has no `${}` references — or no state to
-        // resolve against — we're done. Static directives skip the
-        // entire reactive plumbing.
-        if (state == null) return entry;
+    /// The reactive half of `buildEntry`, on its own so the cache-hit
+    /// path can rebuild it. Returns null when there is nothing to
+    /// subscribe to — no state, or no `${path}` in the attrs — and a
+    /// static directive then skips the entire reactive plumbing.
+    fn buildBinding(
+        self: *Registry,
+        factory: Factory,
+        spec: *const components.Spec,
+        state: ?*state_mod.State,
+        instance_ctx: *anyopaque,
+    ) !?*Binding {
+        if (state == null) return null;
 
         // Inspect templated attrs for `${path}` references; only
         // build a Binding if there's at least one.
         var path_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer path_arena.deinit();
         const paths = try components.collectReferencedPaths(path_arena.allocator(), spec.attrs);
-        if (paths.len == 0) return entry;
+        if (paths.len == 0) return null;
 
         // Dupe templated attrs into long-lived registry storage so
         // the subscriber callback can re-substitute on any future
@@ -774,13 +830,21 @@ pub const Registry = struct {
             };
         }
 
+        // The body rides along so a reactive fire can hand it back
+        // unchanged. Duped rather than borrowed: `spec.body` points
+        // into the parse arena, which is reset on the next parse,
+        // and a fire can happen at any time after that.
+        const body_copy = try self.allocator.dupe(u8, spec.body);
+        errdefer self.allocator.free(body_copy);
+
         const binding = try self.allocator.create(Binding);
         binding.* = .{
             .allocator = self.allocator,
             .state = state.?,
             .factory = factory,
-            .instance_ctx = inst.ctx,
+            .instance_ctx = instance_ctx,
             .templated_attrs = templated,
+            .body = body_copy,
             .subscriptions = &.{},
         };
 
@@ -794,9 +858,23 @@ pub const Registry = struct {
             subs[i] = try state.?.subscribe(paths[i], Binding.callback, @ptrCast(binding));
         }
         binding.subscriptions = subs;
+        return binding;
+    }
 
-        entry.binding = binding;
-        return entry;
+    /// Does this binding still describe `spec`? A hot-reloaded document
+    /// hands the same `#id` a new body and possibly new templated
+    /// attrs, and a binding built from the old ones would hand the OLD
+    /// body back on its next fire — reverting an edit the author has
+    /// already seen land. Cheap to check and rare to fail, so the
+    /// cache-hit path checks every parse and rebuilds only on a change.
+    fn bindingMatches(b: *const Binding, spec: *const components.Spec) bool {
+        if (!std.mem.eql(u8, b.body, spec.body)) return false;
+        if (b.templated_attrs.len != spec.attrs.len) return false;
+        for (b.templated_attrs, spec.attrs) |held, incoming| {
+            if (!std.mem.eql(u8, held.key, incoming.key)) return false;
+            if (!std.mem.eql(u8, held.value, incoming.value)) return false;
+        }
+        return true;
     }
 
     /// Look up a cached instance by explicit id. Returns null when no
@@ -988,6 +1066,10 @@ var t_last_action_buf: [64]u8 = undefined;
 var t_last_action_len: usize = 0;
 var t_last_body_buf: [256]u8 = undefined;
 var t_last_body_len: usize = 0;
+/// The body handed to the most recent `factory.update`, recorded
+/// separately from `t_last_body_buf` (which is `handleUpdate`'s).
+var t_update_body_buf: [256]u8 = undefined;
+var t_update_body_len: usize = 0;
 
 const TestState = struct {
     allocator: std.mem.Allocator,
@@ -1021,6 +1103,13 @@ fn testCreate(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *cons
 }
 fn testUpdate(ctx: *anyopaque, spec: *const components.Spec) anyerror!void {
     t_updates += 1;
+    // Record the BODY every update is handed. A real body-bearing
+    // factory compares this against what it holds (`Body.adopt`) and
+    // re-parses its children when it differs, so what arrives here is
+    // the difference between an effect keeping its content and
+    // silently emptying itself.
+    t_update_body_len = @min(spec.body.len, t_update_body_buf.len);
+    @memcpy(t_update_body_buf[0..t_update_body_len], spec.body[0..t_update_body_len]);
     const state: *TestState = @ptrCast(@alignCast(ctx));
     if (pickColor(spec)) |c| {
         state.allocator.free(state.last_color);
@@ -1060,6 +1149,7 @@ fn resetCounters() void {
     t_handle_updates = 0;
     t_last_action_len = 0;
     t_last_body_len = 0;
+    t_update_body_len = 0;
 }
 
 test "register + resolve creates instance once" {
@@ -1228,6 +1318,154 @@ test "reactive: state.set fires factory.update on bound component" {
     // An unrelated path mutation doesn't fire.
     try st.set("unrelated", "x");
     try testing.expectEqual(@as(u32, 1), t_updates);
+}
+
+test "reactive: a fire hands back the BODY, not an empty one" {
+    // The bug this exists for. A reactive fire changes attrs, so the
+    // synthetic spec it builds used to carry `body = ""`. That was
+    // harmless while no factory looked at the body — and became a
+    // content-eraser the moment `Body` landed, because a body-bearing
+    // factory reads an empty body as "the author deleted the
+    // children" and re-parses its subtree as nothing.
+    //
+    // Seen as: `:::frosted_glass {blur=${state.speed}}` wrapped around
+    // a pattern drew correctly until the plane wrote that path, and
+    // then the whole panel vanished. Every body-bearing factory had it
+    // (`:::flex`, `:::grid`, SingleSourceFactory, both chain effects)
+    // and only a bound ATTRIBUTE could reach it, which is why no
+    // shipped document ever did.
+    resetCounters();
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    try st.set("box_color", "red");
+
+    var registry = Registry.init(testing.allocator);
+    defer registry.deinit();
+    var test_spark = spark_mod.Spark.testStub(testing.allocator);
+    registry.attachSpark(&test_spark);
+    try registry.register("box", test_factory);
+
+    const attrs = [_]components.Attr{.{ .key = "color", .value = "${state.box_color}" }};
+    const spec: components.Spec = .{
+        .name = "box",
+        .id = "bx",
+        .attrs = &attrs,
+        .body = "the children that must survive",
+    };
+    _ = try registry.resolve(&spec, 0, &st, null);
+
+    // Rule 1: the body must be non-empty going in, or "it came back
+    // non-empty" is a statement about nothing.
+    try testing.expect(spec.body.len > 0);
+
+    try st.set("box_color", "green");
+    try testing.expectEqual(@as(u32, 1), t_updates);
+    try testing.expectEqualStrings(
+        "the children that must survive",
+        t_update_body_buf[0..t_update_body_len],
+    );
+}
+
+test "reactive: a re-parse with a new body rebinds, so the next fire carries it" {
+    // The other half, and the one hot reload walks into. The Binding
+    // keeps its OWN copy of the body — it has to, because `spec.body`
+    // points into a parse arena that is reset on the next parse. So an
+    // edited document that reuses the same `#id` leaves the binding
+    // describing a document that no longer exists, and its next fire
+    // would hand the factory the PRE-EDIT body: the author sees their
+    // change land, touches a slider, and watches it revert.
+    resetCounters();
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    try st.set("box_color", "red");
+
+    var registry = Registry.init(testing.allocator);
+    defer registry.deinit();
+    var test_spark = spark_mod.Spark.testStub(testing.allocator);
+    registry.attachSpark(&test_spark);
+    try registry.register("box", test_factory);
+
+    const attrs = [_]components.Attr{.{ .key = "color", .value = "${state.box_color}" }};
+    const before: components.Spec = .{ .name = "box", .id = "bx", .attrs = &attrs, .body = "before" };
+    const after: components.Spec = .{ .name = "box", .id = "bx", .attrs = &attrs, .body = "after" };
+
+    _ = try registry.resolve(&before, 0, &st, null);
+    // Rule 1: the two bodies must actually differ, or the assertion
+    // below passes against a binding that was never rebuilt.
+    try testing.expect(!std.mem.eql(u8, before.body, after.body));
+
+    // The edit: same id, same attrs, new body — the cache-hit path.
+    _ = try registry.resolve(&after, 0, &st, null);
+    try testing.expectEqual(@as(u32, 1), t_creates); // reused, not rebuilt
+    try testing.expectEqualStrings("after", t_update_body_buf[0..t_update_body_len]);
+
+    // Now the fire. It must carry the EDITED body.
+    try st.set("box_color", "green");
+    try testing.expectEqualStrings("after", t_update_body_buf[0..t_update_body_len]);
+
+    // And the rebound binding still watches the same path — a rebuild
+    // that dropped the subscription would leave the component deaf,
+    // which looks identical to "the state did not change".
+    try st.set("box_color", "blue");
+    {
+        const found = registry.lookup("bx") orelse return error.InstanceGone;
+        const tst: *TestState = @ptrCast(@alignCast(found.ctx));
+        try testing.expectEqualStrings("blue", tst.last_color);
+    }
+}
+
+test "reactive: re-pointing an attr at another path moves the subscription" {
+    // The other thing a re-parse can change, and the one the body
+    // comparison alone does not catch: same id, same body, but the
+    // attr now names a DIFFERENT `${path}`. A binding that is not
+    // rebuilt keeps its old subscription, so the new path goes
+    // unwatched — the author repoints a slider, drags it, and nothing
+    // moves, which reads as a broken slider rather than a stale
+    // binding.
+    resetCounters();
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    try st.set("first", "red");
+    try st.set("second", "teal");
+
+    var registry = Registry.init(testing.allocator);
+    defer registry.deinit();
+    var test_spark = spark_mod.Spark.testStub(testing.allocator);
+    registry.attachSpark(&test_spark);
+    try registry.register("box", test_factory);
+
+    const attrs_a = [_]components.Attr{.{ .key = "color", .value = "${state.first}" }};
+    const attrs_b = [_]components.Attr{.{ .key = "color", .value = "${state.second}" }};
+    const spec_a: components.Spec = .{ .name = "box", .id = "bx", .attrs = &attrs_a, .body = "same" };
+    const spec_b: components.Spec = .{ .name = "box", .id = "bx", .attrs = &attrs_b, .body = "same" };
+
+    _ = try registry.resolve(&spec_a, 0, &st, null);
+    // Rule 1: the binding must genuinely be watching `first` to begin
+    // with, or "it stopped watching it" proves nothing.
+    try st.set("first", "green");
+    {
+        const found = registry.lookup("bx") orelse return error.InstanceGone;
+        const tst: *TestState = @ptrCast(@alignCast(found.ctx));
+        try testing.expectEqualStrings("green", tst.last_color);
+    }
+
+    // The edit: bodies identical, only the referenced path differs.
+    _ = try registry.resolve(&spec_b, 0, &st, null);
+    try testing.expectEqual(@as(u32, 1), t_creates);
+
+    // The NEW path now drives it…
+    try st.set("second", "navy");
+    {
+        const found = registry.lookup("bx") orelse return error.InstanceGone;
+        const tst: *TestState = @ptrCast(@alignCast(found.ctx));
+        try testing.expectEqualStrings("navy", tst.last_color);
+    }
+
+    // …and the OLD one no longer does. Without this half, a binding
+    // that had subscribed to BOTH would pass the assertion above.
+    const updates_before = t_updates;
+    try st.set("first", "magenta");
+    try testing.expectEqual(updates_before, t_updates);
 }
 
 test "scoped resolve namespaces cache keys" {
