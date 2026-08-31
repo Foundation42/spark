@@ -28,6 +28,7 @@ test {
     _ = @import("components/flex.zig");
     _ = @import("components/grid.zig");
     _ = @import("components/handle.zig");
+    _ = @import("components/grip.zig");
     _ = @import("components/input.zig");
     _ = @import("components/kbd.zig");
     _ = @import("components/progress.zig");
