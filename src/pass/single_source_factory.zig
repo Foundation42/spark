@@ -97,6 +97,7 @@ const components = @import("../markdown_components.zig");
 const spark_mod = @import("../spark.zig");
 const markdown = @import("../markdown.zig");
 const shader_resolver = @import("shader_resolver.zig");
+const params = @import("../params.zig");
 
 pub const Error = error{
     SingleSourceShaderNotRegistered,
@@ -189,6 +190,14 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
             /// means "take the child's size", which is what every
             /// filter effect wants.
             min_size: [2]f32 = .{ 0, 0 },
+            /// This instance's composite corner radius, in pixels.
+            ///
+            /// Re-read on every ingest rather than resolved once like
+            /// `min_size`, because a radius does not cascade through
+            /// layout — it only changes what the composite is poured
+            /// into — so `radius=${state.r}` is a reasonable thing for a
+            /// document to write.
+            corner_radius: f32 = 0,
         };
 
         pub const factory: component_mod.Factory = .{
@@ -236,6 +245,7 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
                     config.compute_min_size(spec)
                 else
                     .{ 0, 0 },
+                .corner_radius = params.resolve(f32, spec, "radius", 0),
                 .version = 0,
                 .body = .{},
                 // `surface=` wins over `{backdrop}` when both are
@@ -277,6 +287,10 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
             // touches only uniforms — animating within the reserved
             // edge is fine; growing requires recreate via #id change.
             c.uniforms = config.apply_attrs(spec);
+            // A radius changes what the composite is poured into and
+            // nothing about layout, so unlike `inflation` and
+            // `min_size` it is safe to re-read here.
+            c.corner_radius = params.resolve(f32, spec, "radius", 0);
             c.version = prev_version +% 1;
 
             // **The surface NAME can change under a live instance; the
@@ -451,12 +465,18 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
             return c.version ^ layout_cache.aggregateRootVersion(c.root);
         }
 
+        fn cornerRadius(ctx: *anyopaque) f32 {
+            const c: *const Component = @ptrCast(@alignCast(ctx));
+            return c.corner_radius;
+        }
+
         const vtable: element.ElementVTable = .{
             .layout_and_render = layoutAndRender,
             .snapshot_uniforms = snapshotUniforms,
             .content_version = contentVersion,
             .pass_source = passSource,
             .host_surface = hostSurface,
+            .corner_radius = cornerRadius,
             // Cacheable as of Phase B.6.a — substrate handles primitive
             // routing tags through cache via replay-with-offset.
         };

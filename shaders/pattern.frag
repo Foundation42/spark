@@ -11,6 +11,7 @@ layout(location = 0) out vec4 out_color;
 
 // Push-constant block — see gradient.frag for the policy comment.
 #include "display.glsl"
+#include "corner.glsl"
 
 // The display transform's per-frame push, at a FIXED offset so ONE record
 // path can write it for every effect whatever its own uniforms look like.
@@ -20,6 +21,9 @@ layout(location = 0) out vec4 out_color;
 layout(push_constant) uniform Params {
     vec2 display;      //  0..8   mode, paperwhite — see display.glsl
     vec2 _display_pad; //  8..16
+    vec2 corner_size;  // 16..24  the composite region, in pixels
+    float corner_radius; // 24..28  corner radius, in pixels
+    float _corner_pad;   // 28..32  — see element.CornerPush
     uint pattern_type;  // 0=checker, 1=stripes, 2=grid, 3=dots
     uint seed;          // perturbs the cell count
 } u;
@@ -43,5 +47,6 @@ void main() {
         vec2 c = f - 0.5;
         v = (length(c) < 0.3) ? 1.0 : 0.0;
     }
-    out_color = vec4(sparkDisplay(vec3(v), u.display), 1.0);
+    out_color = vec4(sparkDisplay(vec3(v), u.display),
+                     sparkCornerCoverage(v_uv, u.corner_size, u.corner_radius));
 }

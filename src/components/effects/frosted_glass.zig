@@ -136,12 +136,18 @@ const Attrs = struct {
     /// `backdrop` — blur what is BEHIND the panel instead of what is inside
     /// it, and let the children draw on top, sharp. The macOS/iOS look.
     backdrop: bool,
+    /// Composite corner radius in pixels. Lives on the fixed push head
+    /// rather than in this effect's own uniforms, so `radius=` means the
+    /// same thing here, on `:::box`, and on every other effect. See
+    /// `element.CornerPush`.
+    radius: f32,
 
     fn read(spec: *const components.Spec) Attrs {
         return .{
             .blur = @max(0, params.resolve(f32, spec, "blur", 12.0)),
             .tint = params.resolve([4]f32, spec, "tint", .{ 1, 1, 1, 0.0625 }),
             .backdrop = readFlag(spec, "backdrop"),
+            .radius = @max(0, params.resolve(f32, spec, "radius", 0)),
         };
     }
 };
@@ -384,12 +390,18 @@ fn layoutAndRender(
     return element_layout.layoutAndRenderCached(c.root, origin, constraints, lc, out);
 }
 
+fn cornerRadius(ctx: *anyopaque) f32 {
+    const c: *const Component = @ptrCast(@alignCast(ctx));
+    return c.attrs.radius;
+}
+
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .snapshot_uniforms = snapshotUniforms,
     .snapshot_chain_steps = snapshotChainSteps,
     .pass_source = passSource,
     .content_version = contentVersion,
+    .corner_radius = cornerRadius,
 };
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -424,7 +436,7 @@ test "steps: two axes, and the second writes back over the child" {
     // below would render a plausible-looking wrong picture if it flipped,
     // and none of them would fail to compile.
     var steps: [2]element.ChainPassStep = undefined;
-    buildSteps(&steps, .{ .blur = 12, .tint = .{ 1, 0, 0, 0.5 }, .backdrop = false });
+    buildSteps(&steps, .{ .blur = 12, .tint = .{ 1, 0, 0, 0.5 }, .backdrop = false, .radius = 0 });
 
     // The ping-pong: 0→1, then 1→0. This is the property that separates
     // this chain from the drop shadow's, and it is what
@@ -474,7 +486,7 @@ test "steps: the default wash is nearly invisible, which is why it is not the ga
     // but one that still looks like "a faint white wash" either way on
     // screen. The saturated case above is the one that fails loudly.
     var steps: [2]element.ChainPassStep = undefined;
-    buildSteps(&steps, Attrs{ .blur = 12, .tint = .{ 1, 1, 1, 0.0625 }, .backdrop = false });
+    buildSteps(&steps, Attrs{ .blur = 12, .tint = .{ 1, 1, 1, 0.0625 }, .backdrop = false, .radius = 0 });
     const v = readRgba(steps[1]);
     try testing.expectApproxEqAbs(@as(f32, 0.0625), v.tint[0], 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 0.0625), v.tint[3], 1e-6);
@@ -485,7 +497,7 @@ test "steps: blur is clamped at zero, and a zero blur still emits a chain" {
     // zero, the shader clamps it, and the panel comes through sharp — which
     // is a picture, rather than a hang or a NaN.
     var steps: [2]element.ChainPassStep = undefined;
-    buildSteps(&steps, .{ .blur = -4, .tint = .{ 1, 1, 1, 0.0625 }, .backdrop = false });
+    buildSteps(&steps, .{ .blur = -4, .tint = .{ 1, 1, 1, 0.0625 }, .backdrop = false, .radius = 0 });
     try testing.expectEqual(@as(f32, 0), readRgba(steps[0]).sigma);
     try testing.expectEqual(@as(u32, @sizeOf(gaussian.RgbaUniforms)), steps[0].uniform_len);
 }
@@ -495,7 +507,7 @@ test "steps: uniform_len names exactly the bytes that were written" {
     // actually copied in — see the same gate in `drop_shadow.zig`, and the
     // poisoned-slot gate in [[gaussian]] for `writeUniforms` itself.
     var steps: [2]element.ChainPassStep = undefined;
-    buildSteps(&steps, .{ .blur = 8, .tint = .{ 0, 0, 0, 1 }, .backdrop = false });
+    buildSteps(&steps, .{ .blur = 8, .tint = .{ 0, 0, 0, 1 }, .backdrop = false, .radius = 0 });
     for (steps) |s| {
         for (s.uniform_bytes[s.uniform_len..]) |b| try testing.expectEqual(@as(u8, 0), b);
     }
@@ -532,7 +544,7 @@ test "backdrop: the chain reports where pool[0] comes from" {
         .arena = std.heap.ArenaAllocator.init(testing.allocator),
         .root = element.Element{ .paragraph = &[_]element.Element{} },
         .scope = undefined,
-        .attrs = .{ .blur = 12, .tint = .{ 1, 1, 1, 0.0625 }, .backdrop = true },
+        .attrs = .{ .blur = 12, .tint = .{ 1, 1, 1, 0.0625 }, .backdrop = true, .radius = 0 },
         .steps = undefined,
         .source = .backdrop,
     };

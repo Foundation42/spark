@@ -80,6 +80,11 @@ const Component = struct {
     cmd: []u8,
     width: ?box_helpers.Length, // null = intrinsic
     height: f32,
+    /// Corner radius in pixels, same unit as `:::box` and every effect.
+    /// Was a hardcoded constant until 2026-08-31, which made the button
+    /// the one panel-ish thing in the vocabulary whose corners a document
+    /// could not name.
+    radius: f32 = BUTTON_RADIUS,
     last_box: element.Box = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     /// Bumped on every spec ingest so the retained layout cache
     /// re-walks the button when its attrs change.
@@ -97,6 +102,7 @@ const Component = struct {
         var cmd_raw: []const u8 = "";
         var width_opt: ?box_helpers.Length = self.width;
         var height_opt: f32 = self.height;
+        var radius_opt: f32 = self.radius;
 
         for (spec.attrs) |attr| {
             if (std.mem.eql(u8, attr.key, "label")) {
@@ -116,6 +122,13 @@ const Component = struct {
                     height_opt = switch (l) {
                         .pixels => |p| p,
                         else => height_opt,
+                    };
+                }
+            } else if (std.mem.eql(u8, attr.key, "radius")) {
+                if (box_helpers.parseLength(attr.value)) |l| {
+                    radius_opt = switch (l) {
+                        .pixels => |p| @max(0, p),
+                        else => radius_opt,
                     };
                 }
             }
@@ -169,6 +182,7 @@ const Component = struct {
         self.cmd = new_cmd;
         self.width = width_opt;
         self.height = height_opt;
+        self.radius = radius_opt;
         self.version +%= 1;
     }
 };
@@ -257,13 +271,13 @@ fn layoutAndRender(
         .dst_pos = .{ origin[0], origin[1] },
         .dst_size = .{ w, h },
         .color = BUTTON_BORDER,
-        .radius = BUTTON_RADIUS,
+        .radius = c.radius,
     });
     try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0] + BUTTON_BORDER_PX, origin[1] + BUTTON_BORDER_PX },
         .dst_size = .{ w - 2 * BUTTON_BORDER_PX, h - 2 * BUTTON_BORDER_PX },
         .color = BUTTON_BG,
-        .radius = @max(0, BUTTON_RADIUS - BUTTON_BORDER_PX),
+        .radius = @max(0, c.radius - BUTTON_BORDER_PX),
     });
 
     // Label centred

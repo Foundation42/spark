@@ -35,6 +35,7 @@ layout(location = 0) out vec4 out_color;
 layout(set = 0, binding = 0) uniform sampler2D u_surface;
 
 #include "display.glsl"
+#include "corner.glsl"
 
 // Modes. Kept as a float because the whole push block is scalars and
 // an int would be the only one — see `GbufferUniforms` in
@@ -50,6 +51,9 @@ const int MODE_HDR     = 6; // radiance past 1.0 -> a picture, via exposure and 
 layout(push_constant) uniform Params {
     vec2 display;      //  0..8   mode, paperwhite — see display.glsl
     vec2 _display_pad; //  8..16
+    vec2 corner_size;  // 16..24  the composite region, in pixels
+    float corner_radius; // 24..28  corner radius, in pixels
+    float _corner_pad;   // 28..32  — see element.CornerPush
     // The effect's own block starts here (element.PASS_UNIFORM_OFFSET).
     vec4 window;       // 16..32  scale.xy, offset.xy — WRITTEN BY SPARK
     float mode;        // 32..36
@@ -175,7 +179,8 @@ void main() {
     // arrived already carrying it. `spark.zig` picks `displayFor(att)`
     // for `.host_named` for this reason.
     rgb = sparkDisplay(clamp(rgb, 0.0, 1.0), u_params.display);
-    float a = u_params.alpha;
+    float a = u_params.alpha
+        * sparkCornerCoverage(v_uv, u_params.corner_size, u_params.corner_radius);
     // Premultiplied out, like every other compose on this path.
     out_color = vec4(rgb * a, a);
 }

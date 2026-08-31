@@ -330,12 +330,17 @@ pub fn layoutAndRender(
                     .h = @intFromFloat(@round(box.h)),
                 };
                 const seq: u32 = @intCast(pd.items.len);
+                // One question, asked once, for every arm below: what
+                // shape is this composite poured into? Null and zero both
+                // mean square, and the shaders early-out on zero.
+                const corner: f32 = if (cu.vtable.corner_radius) |f| f(cu.ctx) else 0;
                 const dispatch: element.PassDispatch = switch (cu.pass_kind) {
                     1 => .{ .pattern = .{
                         .shader_id = cu.shader_id,
                         .layout_region = region,
                         .uniform_bytes = uniform_buf,
                         .uniform_len = ulen,
+                        .corner_radius = corner,
                         .sequence_index = seq,
                     } },
                     2 => .{ .single_source = .{
@@ -350,6 +355,7 @@ pub fn layoutAndRender(
                         .host_surface = if (cu.vtable.host_surface) |f| f(cu.ctx) else .{},
                         .compose_region = region,
                         .subtree_dispatch_range = .{ dispatch_start, seq },
+                        .corner_radius = corner,
                         .sequence_index = seq,
                     } },
                     // Effects-spec B.7 — host_slot. Invocation is
@@ -375,6 +381,7 @@ pub fn layoutAndRender(
                                 return error.HostSlotElementMissingInvokeHook;
                             break :blk hook(cu.ctx);
                         },
+                        .corner_radius = corner,
                         .sequence_index = seq,
                     } },
                     // Effects-spec C.1 — chain. Per-instance topology
@@ -431,6 +438,7 @@ pub fn layoutAndRender(
                             .final_composite_shader_id = cu.shader_id,
                             .final_composite_uniforms = uniform_buf,
                             .final_composite_uniforms_len = ulen,
+                            .corner_radius = corner,
                             .sequence_index = seq,
                         } };
                     },

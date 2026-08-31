@@ -57,6 +57,9 @@ layout(push_constant) uniform Params {
     // it `Push.offscreen` (passthrough) and the member goes unread.
     vec2 display;      //  0..8
     vec2 _display_pad; //  8..16
+    vec2 corner_size;  // 16..24  the composite region, in pixels
+    float corner_radius; // 24..28  corner radius, in pixels
+    float _corner_pad;   // 28..32  — see element.CornerPush
     vec2 direction;   // (1,0) for the horizontal pass, (0,1) for vertical
     vec2 offset;      // where the shadow sits relative to the caster, pixels
     vec4 channel;     // dot-product mask: (0,0,0,1) alpha, (1,0,0,0) red

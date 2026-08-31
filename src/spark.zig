@@ -1731,13 +1731,35 @@ pub const Spark = struct {
         };
     }
 
-    /// Push an effect's uniforms plus the display head, in the layout
-    /// `element.PASS_UNIFORM_OFFSET` describes. Two ranges, one call site
+    /// Where `element.CornerPush` sits in the head: after the display
+    /// transform's two floats, rounded up to the vec4 boundary the shaders
+    /// declare as `vec2 display; vec2 _display_pad;`. Named rather than
+    /// spelled inline because getting it wrong writes the corner over the
+    /// paperwhite value and every effect goes dark on an HDR surface.
+    const CORNER_PUSH_OFFSET: u32 = 16;
+
+    comptime {
+        if (CORNER_PUSH_OFFSET + @sizeOf(element.CornerPush) != element.PASS_UNIFORM_OFFSET) {
+            @compileError("the fixed head and PASS_UNIFORM_OFFSET disagree: an effect's own uniforms would land on top of the corner block");
+        }
+        if (@sizeOf(display_mod.Push) > CORNER_PUSH_OFFSET) {
+            @compileError("display_mod.Push has outgrown its slot in the head");
+        }
+    }
+
+    /// Push an effect's uniforms plus the fixed head, in the layout
+    /// `element.PASS_UNIFORM_OFFSET` describes. Three ranges, one call-site
     /// shape, so no record path can forget the head.
+    ///
+    /// The head is the display transform and the composite's geometry, and
+    /// both belong to the RECORD path: the display is per-frame, and the
+    /// corner needs the region in physical pixels. A component snapshotting
+    /// its uniforms at layout time has neither.
     fn pushEffectUniforms(
         cmd: vk.c.VkCommandBuffer,
         layout: vk.c.VkPipelineLayout,
         disp: display_mod.Push,
+        corner: element.CornerPush,
         bytes: []const u8,
     ) void {
         var d = disp;
@@ -1748,6 +1770,15 @@ pub const Spark = struct {
             0,
             @sizeOf(display_mod.Push),
             &d,
+        );
+        var cn = corner;
+        vk.c.vkCmdPushConstants(
+            cmd,
+            layout,
+            vk.c.VK_SHADER_STAGE_FRAGMENT_BIT,
+            CORNER_PUSH_OFFSET,
+            @sizeOf(element.CornerPush),
+            &cn,
         );
         if (bytes.len > 0) {
             vk.c.vkCmdPushConstants(
@@ -1806,6 +1837,7 @@ pub const Spark = struct {
             cmd,
             self.pattern_pipelines.layout,
             self.displayFor(att),
+            .{ .size_px = .{ vw, vh }, .radius_px = pattern_step.corner_radius },
             pattern_step.uniform_bytes[0..pattern_step.uniform_len],
         );
         vk.c.vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -1927,6 +1959,7 @@ pub const Spark = struct {
             cmd,
             self.single_source_pipelines.layout,
             disp,
+            .{ .size_px = .{ vw, vh }, .radius_px = ss.corner_radius },
             uniforms[0..ulen],
         );
         vk.c.vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -1998,7 +2031,13 @@ pub const Spark = struct {
         // v1's host_slot composite shader has no uniforms of its own, but it
         // does have the display head — a scene composited raw into a PQ
         // swapchain is the same bug as everything else on this path.
-        pushEffectUniforms(cmd, self.single_source_pipelines.layout, self.displayFor(att), &.{});
+        pushEffectUniforms(
+            cmd,
+            self.single_source_pipelines.layout,
+            self.displayFor(att),
+            .{ .size_px = .{ vw, vh }, .radius_px = hs.corner_radius },
+            &.{},
+        );
         vk.c.vkCmdDraw(cmd, 3, 1, 0, 0);
     }
 
@@ -2232,10 +2271,15 @@ pub const Spark = struct {
         vk.c.vkCmdSetViewport(cmd, 0, 1, &viewport);
         var scissor = vk.c.VkRect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = extent };
         vk.c.vkCmdSetScissor(cmd, 0, 1, &scissor);
+        // A chain STEP is a full-image filter into a pool target, and the
+        // rounding belongs to the final composite that lands on the host's
+        // attachment. Rounding here would carve the corner out of an
+        // intermediate the next step is about to blur back over.
         pushEffectUniforms(
             cmd,
             self.single_source_pipelines.layout,
             display_mod.Push.offscreen,
+            .{},
             step.uniform_bytes[0..step.uniform_len],
         );
         vk.c.vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -2335,6 +2379,7 @@ pub const Spark = struct {
             cmd,
             self.single_source_pipelines.layout,
             disp,
+            .{ .size_px = .{ vw, vh }, .radius_px = ch.corner_radius },
             ch.final_composite_uniforms[0..ch.final_composite_uniforms_len],
         );
         vk.c.vkCmdDraw(cmd, 3, 1, 0, 0);

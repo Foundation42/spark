@@ -12,6 +12,7 @@ layout(location = 0) out vec4 out_color;
 // tightly packed (matches `extern struct GradientUniforms` exactly).
 // No descriptor set — uniforms ride in `vkCmdPushConstants` directly.
 #include "display.glsl"
+#include "corner.glsl"
 
 // The display transform's per-frame push, at a FIXED offset so ONE record
 // path can write it for every effect whatever its own uniforms look like.
@@ -21,6 +22,9 @@ layout(location = 0) out vec4 out_color;
 layout(push_constant) uniform Params {
     vec2 display;      //  0..8   mode, paperwhite — see display.glsl
     vec2 _display_pad; //  8..16
+    vec2 corner_size;  // 16..24  the composite region, in pixels
+    float corner_radius; // 24..28  corner radius, in pixels
+    float _corner_pad;   // 28..32  — see element.CornerPush
     vec4 from;       // 16..32
     vec4 to;         // 32..48
     uint direction;  // 48..52 — 0=vertical, 1=horizontal, 2=diagonal
@@ -40,5 +44,6 @@ void main() {
     }
     vec4 col = mix(u.from, u.to, t);
     // Unpremultiplied by construction — encode the colour, keep the alpha.
-    out_color = vec4(sparkDisplay(col.rgb, u.display), col.a);
+    float a = col.a * sparkCornerCoverage(v_uv, u.corner_size, u.corner_radius);
+    out_color = vec4(sparkDisplay(col.rgb, u.display), a);
 }

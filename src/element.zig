@@ -447,6 +447,18 @@ pub const ElementVTable = struct {
     /// declare `pass_shape != .content` MUST implement this and
     /// return their std140-padded uniform bytes.
     snapshot_uniforms: ?*const fn (ctx: *anyopaque, out: []u8) usize = null,
+    /// Corner radius for this instance's composite, in pixels.
+    ///
+    /// The walker stamps the answer onto the emitted `PassDispatch` and
+    /// the record path writes it into the fixed head, so a shader gets it
+    /// without the effect's own uniform block having to carry it and
+    /// without every effect having to agree on where it sits. Null and
+    /// zero both mean square corners.
+    ///
+    /// A per-instance hook rather than a factory constant, because a
+    /// document says `radius=` and two `:::gbuffer` panels in one
+    /// document may reasonably disagree.
+    corner_radius: ?*const fn (ctx: *anyopaque) f32 = null,
     /// Per-instance host-slot callback override (Effects-spec B.7).
     /// When non-null, the layout walker uses the returned `(callback,
     /// user_data)` pair in place of the Factory.pass_shape.host_slot
@@ -644,19 +656,53 @@ pub const MAX_PASS_UNIFORM_BYTES: u32 = 256;
 /// Where an effect's own push constants start, and therefore where every
 /// `*_uniform_bytes` slice in this file is pushed to.
 ///
-/// Bytes `[0, 16)` are reserved for the display transform's per-frame push
-/// (`display_mod.Push`, two floats, padded to a vec4 boundary). It lives at
-/// a FIXED offset rather than at the tail of each effect's own block —
-/// which is where the four content pipelines put it — because those
-/// pipelines build their whole push at record time, and an effect's does not
-/// exist until a component has snapshotted it. One fixed head lets a single
-/// record path write the display for every effect without knowing the size
-/// or shape of what follows it.
+/// The head is two blocks, both written by the record path rather than by
+/// the component:
+///
+///   * `[0, 16)` — the display transform's per-frame push
+///     (`display_mod.Push`, two floats, padded to a vec4 boundary).
+///   * `[16, 32)` — `CornerPush`: the composite region's pixel size and
+///     its corner radius.
+///
+/// Both live at FIXED offsets rather than at the tail of each effect's own
+/// block — which is where the four content pipelines put the display —
+/// because those pipelines build their whole push at record time, and an
+/// effect's does not exist until a component has snapshotted it. One fixed
+/// head lets a single record path write both for every effect without
+/// knowing the size or shape of what follows.
 ///
 /// Every effect fragment shader declares the head; the Zig `Uniforms` struct
 /// each one mirrors describes the bytes from `PASS_UNIFORM_OFFSET` onward,
 /// so its `@offsetOf` lock-in tests are unchanged and relative to itself.
-pub const PASS_UNIFORM_OFFSET: u32 = 16;
+pub const PASS_UNIFORM_OFFSET: u32 = 32;
+
+/// The composite's geometry, at a fixed head offset for every effect.
+///
+/// **Why the radius is here rather than in each effect's own uniforms.**
+/// A rounded corner is a property of the COMPOSITE — the shape the
+/// finished pass is poured into — and not of what any particular filter
+/// computes. Before this, `:::box` could round in pixels,
+/// `:::liquid_glass` could round in normalised units under the same
+/// attribute name, and `:::frosted_glass` / `:::drop_shadow` /
+/// `:::gbuffer` were hard rectangles with no way to ask. One head field
+/// and a shared `corner.glsl` makes `radius=` mean one thing everywhere.
+///
+/// **Why the size travels with it.** Coverage has to be computed in
+/// PIXELS. `liquid_glass.frag` computed its SDF in normalised UV against
+/// a half-extent of `vec2(0.5)`, which makes the corner an ELLIPSE on any
+/// panel that is not square and makes the antialiasing band a different
+/// number of pixels on each axis — 1.6px across and 1.05px down on a
+/// 320x210 panel. A shader that knows its region in pixels can do what
+/// `quad.frag` has always done, and derive the band from the screen-space
+/// gradient instead of from a guess.
+pub const CornerPush = extern struct {
+    /// The composite region in physical pixels.
+    size_px: [2]f32 = .{ 0, 0 },
+    /// Corner radius in pixels. Zero means square, and the shaders take
+    /// an early-out on it, so the common case costs nothing.
+    radius_px: f32 = 0,
+    _pad: f32 = 0,
+};
 
 /// Pattern-pass dispatch step — fragment shader drawn directly into
 /// the main color attachment at `layout_region`, no offscreen target,
@@ -672,6 +718,8 @@ pub const PatternStep = struct {
     layout_region: PassRegion,
     uniform_bytes: [MAX_PASS_UNIFORM_BYTES]u8 = [_]u8{0} ** MAX_PASS_UNIFORM_BYTES,
     uniform_len: u32 = 0,
+    /// Corner radius in pixels for the composite. See `CornerPush`.
+    corner_radius: f32 = 0,
     sequence_index: u32,
 };
 
@@ -725,6 +773,8 @@ pub const SingleSourceStep = struct {
     /// dispatches fall inside; the GPU consumer recurses by
     /// processing the subtree before the compose step.
     subtree_dispatch_range: [2]u32,
+    /// Corner radius in pixels for the composite. See `CornerPush`.
+    corner_radius: f32 = 0,
     sequence_index: u32,
 };
 
@@ -826,6 +876,8 @@ pub const HostSlotStep = struct {
     /// Resolved at walker time. NOT hashed. Non-null callback by
     /// walker contract — see `HostSlotInvocation`.
     invocation: HostSlotInvocation,
+    /// Corner radius in pixels for the composite. See `CornerPush`.
+    corner_radius: f32 = 0,
     sequence_index: u32,
 };
 
@@ -1099,6 +1151,8 @@ pub const ChainStep = struct {
     final_composite_shader_id: [16]u8,
     final_composite_uniforms: [MAX_PASS_UNIFORM_BYTES]u8 = [_]u8{0} ** MAX_PASS_UNIFORM_BYTES,
     final_composite_uniforms_len: u32 = 0,
+    /// Corner radius in pixels for the composite. See `CornerPush`.
+    corner_radius: f32 = 0,
     sequence_index: u32,
 };
 
@@ -1900,4 +1954,34 @@ test "triRuns: interleaved meshes split into multiple per-target runs" {
     try testing.expectEqual(@as(u32, 6), r2.first_index);
     try testing.expectEqual(@as(u32, 3), r2.index_count);
     try testing.expect(it.next() == null);
+}
+
+test "CornerPush: std140 offsets, and the head it has to fit inside" {
+    // Lock-in for the fixed push head. Every effect fragment shader
+    // declares this block by hand as
+    //
+    //     vec2 display; vec2 _display_pad;   //  0..16
+    //     vec2 corner_size;                  // 16..24
+    //     float corner_radius;               // 24..28
+    //     float _corner_pad;                 // 28..32
+    //
+    // and a silent reorder here compiles and renders garbage — a corner
+    // radius read out of the size's y, say, which cuts every composite's
+    // alpha to nothing.
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(CornerPush, "size_px"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(CornerPush, "radius_px"));
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(CornerPush));
+
+    // And the head adds up. `spark.zig` asserts the same thing at
+    // comptime from the record path's side; this is the contract stated
+    // where the type lives, because the two halves are edited by
+    // different people on different days.
+    try std.testing.expectEqual(@as(u32, 32), PASS_UNIFORM_OFFSET);
+    try std.testing.expect(@sizeOf(CornerPush) <= PASS_UNIFORM_OFFSET - 16);
+
+    // A default-constructed head is square, which is what makes `radius=`
+    // opt-in: every effect that never mentions it keeps hard corners and
+    // pays one compare per fragment.
+    const d = CornerPush{};
+    try std.testing.expectEqual(@as(f32, 0), d.radius_px);
 }

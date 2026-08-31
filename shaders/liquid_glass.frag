@@ -43,50 +43,54 @@ layout(set = 0, binding = 0) uniform sampler2D u_target;
 // slot (offset 0..16); vec4 `tint` lands at offset 16..32. Total
 // 32 bytes.
 #include "display.glsl"
+#include "corner.glsl"
 
 // The display transform's per-frame push, at a FIXED offset so ONE record
 // path can write it for every effect whatever its own uniforms look like.
 // `element.PASS_UNIFORM_OFFSET` (16) is where each effect's own block
 // starts; the Zig struct it mirrors describes the bytes from there on, and
 // its offsets are relative to it rather than to this block.
-// NOTE on premultiplication. This shader composites its own blur/tint and
-// writes `vec4(rgb, alpha)` with rgb NOT divided by alpha, while the
-// pipeline blends with srcFactor = ONE. That predates the display transform
-// and is left exactly as it was: the encode below is applied to the value
-// this shader already produced, so an SDR frame is byte-identical and an
-// HDR one is finally in the right luminance. Straightening the
-// premultiplication is its own change, with its own before/after.
+// PREMULTIPLICATION, straightened 2026-08-31. This shader used to write
+// `vec4(rgb, alpha)` with rgb NOT multiplied by alpha, while the pipeline
+// blends with srcFactor = ONE. So every partially covered edge pixel added
+// full-strength colour over `(1 - a)` of the background: the antialiased
+// corners came out with a bright fringe, which reads as the "crispiness" a
+// rounded panel had and a square one did not. Its own header called this
+// out and deferred it; this is that change.
 layout(push_constant) uniform Params {
     vec2 display;      //  0..8   mode, paperwhite — see display.glsl
     vec2 _display_pad; //  8..16
-    float radius;          // corner radius, normalized [0..0.5]
-    float refraction;      // bend strength [0..0.5]
-    float edge_softness;   // smoothstep width at edge [0..0.05]
-    float rim_brightness;  // edge highlight intensity [0..1]
-    vec4 tint;             // overlay color (alpha = intensity)
+    vec2 corner_size;  // 16..24  the composite region, in pixels
+    float corner_radius; // 24..28  corner radius, in pixels
+    float _corner_pad;   // 28..32  — see element.CornerPush
+    float refraction;      // 32..36  bend strength [0..0.5]
+    float edge_softness;   // 36..40  RIM width [0..0.05]
+    float rim_brightness;  // 40..44  edge highlight intensity [0..1]
+    float _pad;            // 44..48
+    vec4 tint;             // 48..64  overlay color (alpha = intensity)
 } u_params;
-
-// Signed distance to a rounded rectangle. p centered at origin,
-// half_size in same scale. Returns negative inside, positive
-// outside, zero at the edge. Standard IQ formulation.
-float sdRoundedBox(vec2 p, vec2 half_size, float r) {
-    vec2 d = abs(p) - half_size + r;
-    return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0) - r;
-}
 
 void main() {
     // v_uv covers the offscreen target [0..1]^2. Center at origin
-    // for SDF math.
+    // for the refraction maths, which is direction-only.
     vec2 p = v_uv - 0.5;
 
-    // SDF from the panel edge. The target IS the panel, so
-    // half_size is exactly 0.5 along both axes in v_uv space.
-    float sd = sdRoundedBox(p, vec2(0.5), u_params.radius);
+    // The edge, in PIXELS. This used to be an SDF in normalised UV
+    // against a half-extent of vec2(0.5), which made the corner an
+    // ellipse on any panel that was not square and made the AA band a
+    // different width on each axis. See corner.glsl.
+    vec2 half_px = u_params.corner_size * 0.5;
+    float r_px = min(u_params.corner_radius, min(half_px.x, half_px.y));
+    float sd_px = sparkRoundedBoxSDF((v_uv - 0.5) * u_params.corner_size, half_px, r_px);
 
-    // Alpha edge fade — opaque inside, transparent outside, smooth
-    // crossing. Early-out for fully transparent fragments saves the
-    // refraction + sampling work entirely.
-    float alpha = smoothstep(u_params.edge_softness, -u_params.edge_softness, sd);
+    // Back to a fraction of the panel's short side, so `refraction`
+    // keeps the meaning it had: a bend that reaches this far in from
+    // the edge, whatever the panel's size.
+    float short_side = max(min(u_params.corner_size.x, u_params.corner_size.y), 1.0);
+    float sd = sd_px / short_side;
+
+    // Coverage, one pixel wide at any size, from the shared helper.
+    float alpha = sparkCornerCoverage(v_uv, u_params.corner_size, u_params.corner_radius);
     if (alpha <= 0.0) {
         out_color = vec4(0.0);
         return;
@@ -125,5 +129,8 @@ void main() {
     // tint is invisible; tint.a = 1 means tint fully replaces.
     rgb = rgb * (1.0 - u_params.tint.a) + u_params.tint.rgb * u_params.tint.a;
 
-    out_color = vec4(sparkDisplay(rgb, u_params.display), alpha);
+    // Premultiplied, like every other composite on this path. The
+    // pipeline blends srcFactor = ONE, so an unmultiplied edge pixel
+    // fringes; see the header.
+    out_color = vec4(sparkDisplay(rgb, u_params.display) * alpha, alpha);
 }

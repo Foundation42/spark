@@ -325,6 +325,22 @@ const Readback = struct {
         c.vkCmdSetScissor(cmd, 0, 1, &scissor);
         var d = disp;
         c.vkCmdPushConstants(cmd, cache.layout, c.VK_SHADER_STAGE_FRAGMENT_BIT, 0, @sizeOf(display.Push), &d);
+        // The rest of the fixed head. This harness mirrors the record path
+        // by hand, so it has to write everything `pushEffectUniforms`
+        // writes — a block left unpushed is not zero, it is whatever the
+        // command buffer's push memory happened to hold, and a garbage
+        // corner radius cuts the composite's alpha and fails the colour
+        // comparison below. Which is how this gate caught the head growing
+        // under it.
+        var corner = spark.element.CornerPush{};
+        c.vkCmdPushConstants(
+            cmd,
+            cache.layout,
+            c.VK_SHADER_STAGE_FRAGMENT_BIT,
+            @sizeOf(display.Push) + 8,
+            @sizeOf(spark.element.CornerPush),
+            &corner,
+        );
         var alpha: f32 = 1.0;
         c.vkCmdPushConstants(
             cmd,

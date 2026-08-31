@@ -123,6 +123,11 @@ const Attrs = struct {
     spread: f32,
     /// Straight (non-premultiplied) RGBA, as authored.
     color: [4]f32,
+    /// Composite corner radius in pixels. Lives on the fixed push head
+    /// rather than in this effect's own uniforms, so `radius=` means the
+    /// same thing here, on `:::box`, and on every other effect. See
+    /// `element.CornerPush`.
+    radius: f32,
 
     fn read(spec: *const components.Spec) Attrs {
         return .{
@@ -133,6 +138,7 @@ const Attrs = struct {
             .blur = @max(0, params.resolve(f32, spec, "blur", 8.0)),
             .spread = std.math.clamp(params.resolve(f32, spec, "spread", 0.0), 0.0, 0.95),
             .color = params.resolve([4]f32, spec, "color", .{ 0, 0, 0, 0.5 }),
+            .radius = @max(0, params.resolve(f32, spec, "radius", 0)),
         };
     }
 };
@@ -417,11 +423,17 @@ fn layoutAndRender(
     };
 }
 
+fn cornerRadius(ctx: *anyopaque) f32 {
+    const c: *const Component = @ptrCast(@alignCast(ctx));
+    return c.attrs.radius;
+}
+
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .snapshot_uniforms = snapshotUniforms,
     .snapshot_chain_steps = snapshotChainSteps,
     .content_version = contentVersion,
+    .corner_radius = cornerRadius,
 };
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -490,6 +502,7 @@ test "steps: two blurs that clear, then one composite that keeps" {
         .blur = 9,
         .spread = 0.25,
         .color = .{ 1, 0, 0, 0.5 },
+        .radius = 0,
     });
 
     // Ping-pong: 0→1, 1→2, and finally 0 over 2.
@@ -555,7 +568,7 @@ test "steps: uniform_len names exactly the bytes that were written" {
     // to all-zeros, so a step built from a struct literal has a clean tail
     // regardless. The poisoned-slot gate for that lives in [[gaussian]].
     var steps: [3]element.ChainPassStep = undefined;
-    buildSteps(&steps, .{ .offset = .{ 1, 2 }, .blur = 4, .spread = 0, .color = .{ 0, 0, 0, 1 } });
+    buildSteps(&steps, .{ .offset = .{ 1, 2 }, .blur = 4, .spread = 0, .color = .{ 0, 0, 0, 1 }, .radius = 0 });
     for (steps) |s| {
         for (s.uniform_bytes[s.uniform_len..]) |b| try testing.expectEqual(@as(u8, 0), b);
     }
@@ -566,7 +579,7 @@ test "steps: blur is clamped at zero, and a zero blur still emits a chain" {
     // to zero, the shader clamps it, and the shadow collapses to a hard
     // offset copy — which is a picture, rather than a hang or a NaN.
     var steps: [3]element.ChainPassStep = undefined;
-    buildSteps(&steps, .{ .offset = .{ 0, 0 }, .blur = 0, .spread = 0, .color = .{ 0, 0, 0, 1 } });
+    buildSteps(&steps, .{ .offset = .{ 0, 0 }, .blur = 0, .spread = 0, .color = .{ 0, 0, 0, 1 }, .radius = 0 });
     const h = readGaussian(steps[0]);
     try testing.expectEqual(@as(f32, 0), h.sigma);
     try testing.expectEqual(@as(u32, @sizeOf(GaussianUniforms)), steps[0].uniform_len);

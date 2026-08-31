@@ -45,6 +45,9 @@ layout(set = 0, binding = 0) uniform sampler2D u_source;
 layout(push_constant) uniform Params {
     vec2 display;      //  0..8   unread — see the header
     vec2 _display_pad; //  8..16
+    vec2 corner_size;  // 16..24  the composite region, in pixels
+    float corner_radius; // 24..28  corner radius, in pixels
+    float _corner_pad;   // 28..32  — see element.CornerPush
     vec2 direction;    // (1,0) for the horizontal pass, (0,1) for vertical
     vec2 _dir_pad;
     vec4 tint;         // PREMULTIPLIED wash, laid over the blur. (0,0,0,0) = identity

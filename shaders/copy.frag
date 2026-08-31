@@ -37,6 +37,7 @@ layout(set = 0, binding = 0) uniform sampler2D u_target;
 // One f32, padded to 4 bytes; substrate test sets `alpha = 1.0`
 // to exercise the bind without altering the sampled value.
 #include "display.glsl"
+#include "corner.glsl"
 
 // The display transform's per-frame push, at a FIXED offset so ONE record
 // path can write it for every effect whatever its own uniforms look like.
@@ -46,6 +47,9 @@ layout(set = 0, binding = 0) uniform sampler2D u_target;
 layout(push_constant) uniform Params {
     vec2 display;      //  0..8   mode, paperwhite — see display.glsl
     vec2 _display_pad; //  8..16
+    vec2 corner_size;  // 16..24  the composite region, in pixels
+    float corner_radius; // 24..28  corner radius, in pixels
+    float _corner_pad;   // 28..32  — see element.CornerPush
     float alpha;       // 16..20  `CopyUniforms` on the Zig side
 } u_params;
 
@@ -59,6 +63,10 @@ void main() {
     // shaders that own their colour rather than sampling it.
     vec3 straight = src.a > 0.0 ? src.rgb / src.a : src.rgb;
     vec3 rgb = sparkDisplay(straight, u_params.display);
-    float a = src.a * u_params.alpha;
+    // The composite's corner, from the fixed head. `copy.frag` is the
+    // final composite for BOTH chain effects, so this one line is what
+    // gives `:::drop_shadow` and `:::frosted_glass` rounded corners.
+    float a = src.a * u_params.alpha
+        * sparkCornerCoverage(v_uv, u_params.corner_size, u_params.corner_radius);
     out_color = vec4(rgb * a, a);
 }

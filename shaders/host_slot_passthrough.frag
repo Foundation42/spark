@@ -29,6 +29,7 @@ layout(location = 0) out vec4 out_color;
 layout(set = 0, binding = 0) uniform sampler2D u_target;
 
 #include "display.glsl"
+#include "corner.glsl"
 
 // The display transform's per-frame push, at a FIXED offset so ONE record
 // path can write it for every effect whatever its own uniforms look like.
@@ -39,6 +40,9 @@ layout(set = 0, binding = 0) uniform sampler2D u_target;
 layout(push_constant) uniform Params {
     vec2 display;      // 0..8
     vec2 _display_pad; // 8..16
+    vec2 corner_size;  // 16..24  the composite region, in pixels
+    float corner_radius; // 24..28  corner radius, in pixels
+    float _corner_pad;   // 28..32  — see element.CornerPush
 } u_params;
 
 void main() {
@@ -46,5 +50,7 @@ void main() {
     // Premultiplied source — see copy.frag for why the round trip.
     vec3 straight = src.a > 0.0 ? src.rgb / src.a : src.rgb;
     vec3 rgb = sparkDisplay(straight, u_params.display);
-    out_color = vec4(rgb * src.a, src.a);
+    float a = src.a
+        * sparkCornerCoverage(v_uv, u_params.corner_size, u_params.corner_radius);
+    out_color = vec4(rgb * a, a);
 }
