@@ -123,6 +123,24 @@ fn surfaceName(spec: *const components.Spec) []const u8 {
     return "";
 }
 
+/// Whether an `update` takes a new surface name from the spec.
+///
+/// Split out and public so the rule can be gated without a device: it
+/// is one boolean and it is the whole of the difference between "a
+/// panel can change which buffer it looks at" and "a panel parses one
+/// name and is stuck with it".
+///
+/// Both halves matter. The arm check is why a `.subtree` or
+/// `.backdrop` effect never becomes a host window mid-life — that
+/// decision is made before layout and routes the children. The
+/// emptiness check is why a re-fire whose spec has no `surface=` at
+/// all (a `:::update` touching some other attribute) leaves the name
+/// alone instead of blanking it, which would composite nothing and
+/// look like the host stopped answering.
+pub fn adoptsSurface(source: element.PassSource, new_name: []const u8) bool {
+    return source == .host_named and new_name.len > 0;
+}
+
 fn readFlag(spec: *const components.Spec, key: []const u8) bool {
     for (spec.attrs) |a| {
         if (!std.mem.eql(u8, a.key, key)) continue;
@@ -260,6 +278,33 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
             // edge is fine; growing requires recreate via #id change.
             c.uniforms = config.apply_attrs(spec);
             c.version = prev_version +% 1;
+
+            // **The surface NAME can change under a live instance; the
+            // ARM cannot.** They look like the same question and are
+            // not.
+            //
+            // `c.source` decides where the children's drawlist
+            // primitives go, and `passSource` is asked BEFORE layout —
+            // flipping it mid-frame would route the children one way
+            // and fill the target the other, so it resolves once at
+            // create and stays. The name is read much later, at record
+            // time in `recordSingleSourceCompose`, long after the
+            // children have been placed. Nothing depends on it holding
+            // still.
+            //
+            // So `surface=${state.surface}` works, and a document can
+            // switch which engine buffer a panel is a window onto from
+            // a button, without a remount. Before this it parsed its
+            // first value, drew it, and never changed again — correct
+            // on the first frame, which is the worst way to be wrong.
+            //
+            // Only when the arm is already `.host_named` and the new
+            // spec still names something: an edit from `surface=x` to
+            // `{backdrop}` is an arm change and needs a new `#id`, the
+            // same rule inflation has.
+            if (adoptsSurface(c.source, surfaceName(spec))) {
+                c.surface = element.HostSurface.from(surfaceName(spec));
+            }
 
             // The body is authored text too, and it can change under a live
             // instance — a hot-reloaded document hands the same `#id` a new
@@ -416,4 +461,46 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
             // routing tags through cache via replay-with-offset.
         };
     };
+}
+
+// ── Tests ──────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "adoptsSurface: the NAME may change under a live panel, the ARM may not" {
+    // The distinction this whole rule exists for. `surface=` is read at
+    // record time, after the children have been routed, so it can move.
+    // `PassSource` is asked BEFORE layout and decides where those
+    // children go, so it cannot — an effect that flipped arm mid-frame
+    // would route its children one way and fill its target the other.
+    try testing.expect(adoptsSurface(.host_named, "albedo"));
+
+    // Rule 1: assert the inequality. A predicate that answered true for
+    // everything would pass the line above and turn every `:::pattern`
+    // and every `{backdrop}` into a host window the moment a bound
+    // attribute fired.
+    try testing.expect(!adoptsSurface(.subtree, "albedo"));
+    try testing.expect(!adoptsSurface(.backdrop, "albedo"));
+}
+
+test "adoptsSurface: a re-fire with no surface= leaves the name alone" {
+    // A `:::update` that touches some other attribute re-fires the whole
+    // spec, and a synthetic spec need not carry `surface=` at all.
+    // Adopting an empty name there would composite nothing — a blank
+    // panel that reads as the host having stopped answering, from a
+    // document edit that never mentioned the surface.
+    try testing.expect(!adoptsSurface(.host_named, ""));
+}
+
+test "surfaceName: an absent attribute is empty, and whitespace is trimmed" {
+    // `surface = normal ` from a document mid-edit has to resolve to the
+    // same name as `surface=normal`, because the host compares it with
+    // `mem.eql` and a trailing space is a surface nobody has.
+    var attrs = [_]components.Attr{.{ .key = "surface", .value = "  normal \t" }};
+    const spec = components.Spec{ .name = "gbuffer", .id = null, .attrs = &attrs, .body = "" };
+    try testing.expectEqualStrings("normal", surfaceName(&spec));
+
+    var other = [_]components.Attr{.{ .key = "mode", .value = "heat" }};
+    const none = components.Spec{ .name = "gbuffer", .id = null, .attrs = &other, .body = "" };
+    try testing.expectEqualStrings("", surfaceName(&none));
 }
