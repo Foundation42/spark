@@ -59,13 +59,17 @@ pub const Uniforms = extern struct {
     /// Which remap the shader applies. See `Mode`.
     mode: f32 = 1,
     /// Multiplier applied to the remapped value, for surfaces whose
-    /// interesting range is not 0..1.
+    /// interesting range is not 0..1. In `hdr` it is the EXPOSURE and
+    /// applies before the tonemap curve, which is the only place it
+    /// could usefully go.
     scale: f32 = 1,
     /// Added after `scale`.
     bias: f32 = 0,
     /// Panel opacity, so a window can be laid over the scene rather
     /// than punched through it.
     alpha: f32 = 1,
+    /// Which lane `depth`, `luma` and `heat` read. See `Channel`.
+    channel: f32 = 0,
 };
 
 /// How the shader turns a surface's DATA into a picture.
@@ -79,11 +83,43 @@ pub const Mode = enum(u8) {
     normal = 1,
     albedo = 2,
     depth = 3,
+    /// One channel, as grey. Reads the lane `channel=` names, not
+    /// always red — the name predates the selector.
     luma = 4,
+    /// One channel, through a lightness-monotonic ramp. For a scalar
+    /// whose whole variation sits in a narrow band, where grey shows a
+    /// flat sheet.
+    heat = 5,
+    /// Radiance past 1.0, through an exposure and a curve. Without it
+    /// every lighting target is a white rectangle.
+    hdr = 6,
 
     fn parse(text: []const u8) ?Mode {
         const t = std.mem.trim(u8, text, " \t");
         inline for (@typeInfo(Mode).@"enum".fields) |f| {
+            if (std.ascii.eqlIgnoreCase(t, f.name)) return @enumFromInt(f.value);
+        }
+        return null;
+    }
+};
+
+/// Which lane the scalar modes read.
+///
+/// A selector rather than a mode per channel, because the alternative
+/// is four near-identical modes that each do the same arithmetic on a
+/// different `.xyzw` — and because the interesting channel is genuinely
+/// data-dependent: `producer.g` is the CSM visibility term, `sun.a` is
+/// the shadow gate, `reflection.a` is trace validity, `gtrans.a` is the
+/// foliage flag. Named on the Zig side so a document says `channel=a`.
+pub const Channel = enum(u8) {
+    r = 0,
+    g = 1,
+    b = 2,
+    a = 3,
+
+    fn parse(text: []const u8) ?Channel {
+        const t = std.mem.trim(u8, text, " \t");
+        inline for (@typeInfo(Channel).@"enum".fields) |f| {
             if (std.ascii.eqlIgnoreCase(t, f.name)) return @enumFromInt(f.value);
         }
         return null;
@@ -104,6 +140,18 @@ fn applyAttrs(spec: *const components.Spec) Uniforms {
         }
         break :blk params.resolve(f32, spec, "mode", @floatFromInt(@intFromEnum(Mode.normal)));
     };
+    // Same shape as `mode=`, same reason: `params.resolve` reads "a" as
+    // unparseable and answers the default, which is red — so
+    // `channel=a` on a typo'd key would silently show the red channel
+    // and look like the alpha was empty.
+    const channel: f32 = blk: {
+        for (spec.attrs) |a| {
+            if (!std.mem.eql(u8, a.key, "channel")) continue;
+            if (Channel.parse(a.value)) |ch| break :blk @floatFromInt(@intFromEnum(ch));
+            break;
+        }
+        break :blk params.resolve(f32, spec, "channel", @floatFromInt(@intFromEnum(Channel.r)));
+    };
     return .{
         // Spark overwrites this; the value is what a unit test sees
         // before a frame has run, and a poison would be read as a
@@ -113,6 +161,7 @@ fn applyAttrs(spec: *const components.Spec) Uniforms {
         .scale = params.resolve(f32, spec, "scale", 1.0),
         .bias = params.resolve(f32, spec, "bias", 0.0),
         .alpha = params.resolve(f32, spec, "alpha", 1.0),
+        .channel = channel,
     };
 }
 
@@ -165,7 +214,77 @@ test "Uniforms: std140 layout offsets" {
     try testing.expectEqual(@as(usize, 20), @offsetOf(Uniforms, "scale"));
     try testing.expectEqual(@as(usize, 24), @offsetOf(Uniforms, "bias"));
     try testing.expectEqual(@as(usize, 28), @offsetOf(Uniforms, "alpha"));
-    try testing.expectEqual(@as(usize, 32), @sizeOf(Uniforms));
+    try testing.expectEqual(@as(usize, 32), @offsetOf(Uniforms, "channel"));
+    try testing.expectEqual(@as(usize, 36), @sizeOf(Uniforms));
+}
+
+test "mode: every mode in the Zig enum has a constant in the shader" {
+    // The two halves of this effect are a Zig enum and a chain of GLSL
+    // `if`s, and nothing links them but the numbers. A mode added on
+    // one side only compiles, runs, and falls through to the `else` —
+    // which is `raw`, a picture that looks like something rather than
+    // like a mistake.
+    //
+    // So the shader source is read and each `MODE_<NAME> = <value>` is
+    // matched against the enum. It is a string search and it is worth
+    // it: the failure it prevents shipped once already as `mode=nrmal`
+    // silently showing normals.
+    const src = @import("shaders").gbuffer_frag_glsl;
+    inline for (@typeInfo(Mode).@"enum".fields) |f| {
+        var name_buf: [64]u8 = undefined;
+        const upper = std.ascii.upperString(&name_buf, f.name);
+        var needle_buf: [96]u8 = undefined;
+        const needle = try std.fmt.bufPrint(&needle_buf, "MODE_{s}", .{upper});
+        const at = std.mem.indexOf(u8, src, needle) orelse {
+            std.debug.print("shader has no {s}\n", .{needle});
+            return error.ModeMissingFromShader;
+        };
+        // ...and it is bound to the SAME number. Find the `= N;` that
+        // follows the constant's declaration.
+        const eq = std.mem.indexOfScalarPos(u8, src, at, '=').?;
+        const semi = std.mem.indexOfScalarPos(u8, src, eq, ';').?;
+        const digits = std.mem.trim(u8, src[eq + 1 .. semi], " \t");
+        const value = try std.fmt.parseInt(u8, digits, 10);
+        try testing.expectEqual(@as(u8, f.value), value);
+    }
+}
+
+test "channel: a word picks the lane, and an unknown word is not silently red" {
+    // `producer.g`, `sun.a`, `reflection.a` and `gtrans.a` are the four
+    // reasons this exists. The trap is the same one `mode=` has:
+    // `params.resolve(f32, ...)` cannot read "a" and answers the
+    // default, which IS red — so a typo shows the red channel and reads
+    // as "the alpha channel is empty", which for `reflection` would be
+    // a believable and entirely wrong conclusion about the renderer.
+    const alpha = specWith("channel", "a");
+    try testing.expectEqual(@as(f32, 3), applyAttrs(&alpha).channel);
+    const green = specWith("channel", "g");
+    try testing.expectEqual(@as(f32, 1), applyAttrs(&green).channel);
+
+    // A number still works, and the default is red.
+    const numeric = specWith("channel", "2");
+    try testing.expectEqual(@as(f32, 2), applyAttrs(&numeric).channel);
+    const none = specWith("surface", "sun");
+    try testing.expectEqual(@as(f32, 0), applyAttrs(&none).channel);
+
+    // Rule 1: the answers must differ, or this asserts that a number
+    // equals itself.
+    try testing.expect(applyAttrs(&alpha).channel != applyAttrs(&none).channel);
+}
+
+test "mode: the new modes parse, and are distinct from the old ones" {
+    // `heat` and `hdr` are the two that exist because `luma` and `raw`
+    // could not read half the table — a scalar in a narrow band, and
+    // radiance above 1.0. If either fell back to its neighbour the
+    // panel would still draw a picture.
+    try testing.expectEqual(@as(f32, 5), applyAttrs(&specWith("mode", "heat")).mode);
+    try testing.expectEqual(@as(f32, 6), applyAttrs(&specWith("mode", "hdr")).mode);
+    try testing.expect(
+        applyAttrs(&specWith("mode", "heat")).mode != applyAttrs(&specWith("mode", "luma")).mode,
+    );
+    try testing.expect(
+        applyAttrs(&specWith("mode", "hdr")).mode != applyAttrs(&specWith("mode", "raw")).mode,
+    );
 }
 
 test "mode: a word is read as its enum, and an unknown word is NOT silently normal" {
@@ -220,10 +339,20 @@ test "factory: pass_shape is .single_source with null inflation" {
     }
 }
 
+/// A one-attribute `Spec` for the tests above.
+///
+/// **A rotating pool and not one static slot.** The original wrote into
+/// a single shared `[1]Attr`, which was fine only for as long as no test
+/// held two Specs alive at once: the second call overwrote the first's
+/// storage, and a comparison between them silently compared a value with
+/// itself. It passed. `channel=a` vs the default read 0 == 0 and looked
+/// like agreement rather than like a broken fixture.
+var spec_pool: [16]components.Attr = undefined;
+var spec_next: usize = 0;
+
 fn specWith(key: []const u8, value: []const u8) components.Spec {
-    const attrs = struct {
-        var storage: [1]components.Attr = undefined;
-    };
-    attrs.storage[0] = .{ .key = key, .value = value };
-    return .{ .name = "gbuffer", .id = null, .attrs = attrs.storage[0..1], .body = "" };
+    const i = spec_next % spec_pool.len;
+    spec_next += 1;
+    spec_pool[i] = .{ .key = key, .value = value };
+    return .{ .name = "gbuffer", .id = null, .attrs = spec_pool[i .. i + 1], .body = "" };
 }

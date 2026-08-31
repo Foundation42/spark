@@ -95,6 +95,16 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(gaussian_alpha_frag_spv, "gaussian_alpha.frag.spv");
     _ = wf.addCopyFile(gaussian_rgba_frag_spv, "gaussian_rgba.frag.spv");
     _ = wf.addCopyFile(gbuffer_frag_spv, "gbuffer.frag.spv");
+    // The GLSL SOURCE, alongside the SPIR-V, for `gbuffer.frag` only.
+    //
+    // `:::gbuffer`'s modes are a Zig enum on one side and a chain of
+    // GLSL `if`s on the other, linked by nothing but the numbers. A mode
+    // added to one side alone compiles, runs, and falls through to the
+    // `else` — which is `raw`, so the panel shows a picture rather than
+    // a mistake. The test that catches it has to read the shader, and a
+    // `@embedFile` cannot reach outside the package, so the source comes
+    // in through the module the SPIR-V already arrives by.
+    _ = wf.addCopyFile(b.path("shaders/gbuffer.frag"), "gbuffer.frag.glsl");
     const shader_mod = wf.add("shaders.zig",
         \\pub const text_vert align(4) = @embedFile("text.vert.spv").*;
         \\pub const text_frag align(4) = @embedFile("text.frag.spv").*;
@@ -114,6 +124,8 @@ pub fn build(b: *std.Build) void {
         \\pub const gaussian_alpha_frag align(4) = @embedFile("gaussian_alpha.frag.spv").*;
         \\pub const gaussian_rgba_frag align(4) = @embedFile("gaussian_rgba.frag.spv").*;
         \\pub const gbuffer_frag align(4) = @embedFile("gbuffer.frag.spv").*;
+        \\/// The GLSL source, so the mode table can be gated against it.
+        \\pub const gbuffer_frag_glsl = @embedFile("gbuffer.frag.glsl");
         \\
     );
 
