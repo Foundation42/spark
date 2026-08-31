@@ -169,6 +169,7 @@ pub const components = struct {
     pub const svg = @import("components/svg.zig");
     pub const tag = @import("components/tag.zig");
     pub const trend = @import("components/trend.zig");
+    pub const value = @import("components/value.zig");
     // Effects-spec Phase A.5 — three canary pattern factories.
     // Same `installCoreComponents` rung as the rasterizer-shaped
     // components per Decision #11 ("core vocabulary, not extras").
@@ -195,6 +196,7 @@ pub fn installCoreComponents(spark: *Spark) !void {
     try spark.registry.register("slider", components.slider.factory);
     try components.badge.install(spark);
     try components.sparkline.install(spark);
+    try components.value.install(spark);
     try components.kbd.install(spark);
     try components.progress.install(spark);
     try components.status.install(spark);

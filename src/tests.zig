@@ -40,6 +40,7 @@ test {
     _ = @import("components/status.zig");
     _ = @import("components/tag.zig");
     _ = @import("components/trend.zig");
+    _ = @import("components/value.zig");
     _ = @import("components/rating.zig");
     _ = @import("components/dot.zig");
     _ = @import("components/commit.zig");

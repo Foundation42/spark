@@ -300,11 +300,69 @@ pub fn keyFor(
 }
 
 /// Read the current content-version for an element (0 for built-ins).
+///
+/// **Paragraphs and headings are not built-ins for this purpose.** They
+/// are cached as a unit, keyed on `@intFromPtr(children.ptr)` — a
+/// pointer that does not move when a reactive `inline_object` inside
+/// them changes its text. Without the aggregation below, a paragraph
+/// containing `::value{text=${state.x}}` draws once and replays that
+/// snapshot forever: the state writes, the binding fires, the component
+/// re-ingests and bumps its version, and the picture never changes.
+///
+/// This is the THIRD instance of one bug — the frozen slider inside an
+/// effect and the hot-reload freeze were the first two, and both were
+/// cured the same way, by folding descendant versions upward. What is
+/// different here is the grain: those aggregate over BLOCK children
+/// (`aggregateChildVersions`), and a paragraph's children are inline.
 pub fn versionFor(elem: element.Element) u64 {
     return switch (elem) {
         .custom => |cu| if (cu.vtable.content_version) |getter| getter(cu.ctx) else 0,
+        .paragraph => |kids| aggregateInlineVersions(kids),
+        .heading => |h| aggregateInlineVersions(h.content),
         else => 0,
     };
+}
+
+/// Fold the content-versions of every `inline_object` reachable inside
+/// a paragraph or heading's inline content into a single `u64`.
+///
+/// Recurses through the inline containers (`emphasis`, `strong`,
+/// `code`, `link`) because `**${state.x}**` puts the object one level
+/// down, and a readout inside bold is not a different feature.
+///
+/// Each object contributes `mixVersion(@intFromPtr(ctx), version)`.
+/// `elementIdentity` cannot supply that identity — it answers 0 for
+/// every inline kind, deliberately — so the instance pointer stands in
+/// for it, and `mixVersion` explains why the two are hashed together
+/// rather than XORed side by side. `Showing ${state.x} of ${state.x}`
+/// is two objects on one path, moving in lockstep, and the naive fold
+/// makes a paragraph holding exactly two of them look permanently
+/// unchanged.
+///
+/// Returns 0 for the overwhelmingly common case of a paragraph with no
+/// components in it, which is what keeps the cache doing its job: a
+/// stable 0 means every ordinary paragraph still hits.
+pub fn aggregateInlineVersions(children: []const element.Element) u64 {
+    var v: u64 = 0;
+    for (children) |child| {
+        switch (child) {
+            .inline_object => |io| {
+                const cv: u64 = if (io.vtable.content_version) |getter| getter(io.ctx) else 0;
+                v ^= mixVersion(@intFromPtr(io.ctx), cv);
+            },
+            .emphasis, .strong, .code => |inner| v ^= aggregateInlineVersions(inner),
+            .link => |l| v ^= aggregateInlineVersions(l.content),
+            // A `.custom` at an inline position is a tree-construction
+            // error the layout walker rejects, so this arm is only ever
+            // reached by a hand-built tree — but `aggregateRootVersion`
+            // routes paragraph roots through here now, and dropping the
+            // block-grain case on the way past would be a silent
+            // narrowing rather than a decision.
+            .custom => v ^= mixVersion(@intCast(elementIdentity(child)), versionFor(child)),
+            else => {},
+        }
+    }
+    return v;
 }
 
 /// Stage 15 Phase C.5 — fold child content-versions into a single
@@ -314,12 +372,10 @@ pub fn versionFor(elem: element.Element) u64 {
 /// cache key then catches both "self mutated" and "a descendant
 /// mutated" without the container needing to know what mutated.
 ///
-/// Each child's contribution mixes its `versionFor` value with its
-/// `elementIdentity`. Identity mixing dodges the A XOR A = 0 trap:
-/// two siblings sharing the same version would otherwise cancel and
-/// hide each other's changes. With identity mixed in, the per-child
-/// terms are pointer-keyed and collisions become astronomically
-/// unlikely.
+/// Each child's contribution is `mixVersion(identity, version)` — see
+/// that function for why the two are HASHED TOGETHER rather than XORed
+/// side by side, which is what this did until 2026-08-31 and which had
+/// a hole in it.
 ///
 /// Bumps to grandchildren propagate up automatically because each
 /// container in the chain aggregates its own children — so a `:::box`
@@ -329,11 +385,42 @@ pub fn versionFor(elem: element.Element) u64 {
 pub fn aggregateChildVersions(children: []const element.Element) u64 {
     var v: u64 = 0;
     for (children) |child| {
-        const cv = versionFor(child);
-        const id: u64 = @intCast(elementIdentity(child));
-        v ^= cv ^ id;
+        v ^= mixVersion(@intCast(elementIdentity(child)), versionFor(child));
     }
     return v;
+}
+
+/// Combine one child's identity and content-version into a term that
+/// can be XOR-folded with its siblings'.
+///
+/// **The hole this closes.** The fold used to be `v ^= version ^ id`,
+/// with a comment claiming that mixing the identity in "dodges the
+/// A XOR A = 0 trap". It dodges half of it. Two siblings holding the
+/// same version at the same instant do not cancel, because their ids
+/// differ — but the ids are constant, so the *pair* contributes
+/// `id_a ^ id_b` at every value the two versions share. Two components
+/// bound to the same state path bump in lockstep by construction:
+/// created together, re-ingested together, re-fired together on a
+/// write. `:::flex` holding two `:::progress {value=${state.p}}` folds
+/// to `id_a ^ id_b` before the write and `id_a ^ id_b` after it, so the
+/// flex replays a stale drawlist and both bars are frozen.
+///
+/// Found on 2026-08-31 by the test written for the INLINE aggregate,
+/// which has the same shape and hit the same wall. Nothing had ever
+/// pointed two same-path bindings at one container, which is why the
+/// block-grain version survived since Stage 15 Phase C.5.
+///
+/// Hashing the pair (splitmix64's finaliser over an identity-keyed
+/// product) means a shared version bump moves both terms to unrelated
+/// values, and their XOR moves with it.
+pub fn mixVersion(identity: u64, version: u64) u64 {
+    var x = (identity *% 0x9E3779B97F4A7C15) ^ (version *% 0xBF58476D1CE4E5B9);
+    x ^= x >> 30;
+    x *%= 0xBF58476D1CE4E5B9;
+    x ^= x >> 27;
+    x *%= 0x94D049BB133111EB;
+    x ^= x >> 31;
+    return x;
 }
 
 /// `aggregateChildVersions` for a component that holds ONE root element
@@ -353,9 +440,13 @@ pub fn aggregateChildVersions(children: []const element.Element) u64 {
 pub fn aggregateRootVersion(root: element.Element) u64 {
     return switch (root) {
         .container => |co| aggregateChildVersions(co.children),
-        .paragraph => |kids| aggregateChildVersions(kids),
         // A root that is itself the component (an effect wrapping a single
-        // `:::box`) still has a version worth folding in.
+        // `:::box`) still has a version worth folding in — and since
+        // `versionFor` learned to aggregate a paragraph's inline objects,
+        // a lone paragraph root arrives here already folded. It used to
+        // route to `aggregateChildVersions`, which walks a paragraph's
+        // INLINE children with block-grain accessors and therefore
+        // answered a constant 0 for all of them.
         else => versionFor(root),
     };
 }
@@ -907,6 +998,17 @@ test "aggregateChildVersions: child bumps flip the aggregated value" {
     State.ver_b = 7;
     const v_diff = aggregateChildVersions(&children);
     try testing.expect(v_same != v_diff);
+
+    // And the half of that trap the identity mix did NOT cover until
+    // 2026-08-31. Two siblings bound to the same state path bump in
+    // LOCKSTEP — created together, re-ingested together, re-fired
+    // together — so the pair's contribution under `v ^ id` was
+    // `id_a ^ id_b` at 5,5 and `id_a ^ id_b` again at 6,6. Constant.
+    // `:::flex` holding two `:::progress {value=${state.p}}` replayed a
+    // stale drawlist and both bars were frozen. See `mixVersion`.
+    State.ver_a = 6;
+    State.ver_b = 6;
+    try testing.expect(aggregateChildVersions(&children) != v_same);
 }
 
 test "aggregateRootVersion: a child's bump reaches the wrapper" {
@@ -942,4 +1044,108 @@ test "aggregateRootVersion: a child's bump reaches the wrapper" {
     const plain = [_]element.Element{.{ .line_break = {} }};
     const plain_root = element.Element{ .paragraph = &plain };
     try std.testing.expectEqual(aggregateRootVersion(plain_root), aggregateRootVersion(plain_root));
+}
+
+/// Minimal `inline_object` stand-in: a `u64` you can write, reachable
+/// through a vtable. Each instance is its own `ctx`, which is also the
+/// identity the aggregate mixes in.
+const FakeInline = struct {
+    version: u64 = 0,
+
+    fn read(ctx: *anyopaque) u64 {
+        return @as(*const FakeInline, @ptrCast(@alignCast(ctx))).version;
+    }
+
+    const vt: element.ElementVTable = .{
+        .layout_and_render = undefined,
+        .measure_inline = undefined,
+        .content_version = read,
+    };
+
+    fn elem(self: *FakeInline) element.Element {
+        return .{ .inline_object = .{ .vtable = &vt, .ctx = @ptrCast(self) } };
+    }
+};
+
+test "versionFor: a reactive inline object's bump reaches its paragraph" {
+    // THE BUG. A paragraph is cached on `@intFromPtr(children.ptr)`,
+    // and that pointer does not move when `::value{text=${state.x}}`
+    // re-ingests. Before this, `versionFor(.paragraph)` was a constant
+    // 0, so the paragraph drew once and replayed that snapshot for the
+    // life of the document — the state wrote, the binding fired, the
+    // component's own version bumped, and the picture never changed.
+    var v = FakeInline{};
+    const kids = [_]element.Element{ .{ .text = .{
+        .content = "showing ",
+        .style = .{ .font_id = 0, .color = .{ 1, 1, 1, 1 } },
+    } }, v.elem() };
+    const para = element.Element{ .paragraph = &kids };
+
+    const before = versionFor(para);
+    v.version = 1;
+    const after = versionFor(para);
+    try std.testing.expect(before != after);
+
+    // Rule 5, and the reason this is not simply "aggregate everything":
+    // an ordinary paragraph must report a STABLE version, or every
+    // paragraph in every document misses its cache on every frame and
+    // the fix costs more than the bug.
+    const plain = [_]element.Element{.{ .text = .{
+        .content = "no components here",
+        .style = .{ .font_id = 0, .color = .{ 1, 1, 1, 1 } },
+    } }};
+    const plain_para = element.Element{ .paragraph = &plain };
+    try std.testing.expectEqual(@as(u64, 0), versionFor(plain_para));
+
+    // A heading is cached the same way and gets the same treatment —
+    // `# Showing ::value{...}` is a title that reports what it is
+    // titling.
+    const head = element.Element{ .heading = .{ .level = 2, .content = &kids } };
+    v.version = 2;
+    const h2 = versionFor(head);
+    v.version = 3;
+    try std.testing.expect(h2 != versionFor(head));
+}
+
+test "aggregateInlineVersions: two readouts on one path do not cancel" {
+    // `Showing ${state.x} of ${state.x}` — both objects are bound to
+    // the same path, so they bump in lockstep and hold equal versions
+    // forever. Without the per-instance identity mixed in, `v XOR v`
+    // is 0 at every value and the paragraph looks permanently
+    // unchanged: the exact shape of the bug, reintroduced by the fix.
+    var a = FakeInline{};
+    var b = FakeInline{};
+    const kids = [_]element.Element{ a.elem(), b.elem() };
+
+    a.version = 5;
+    b.version = 5;
+    const at_five = aggregateInlineVersions(&kids);
+    try std.testing.expect(at_five != 0);
+
+    a.version = 6;
+    b.version = 6;
+    try std.testing.expect(aggregateInlineVersions(&kids) != at_five);
+}
+
+test "aggregateInlineVersions: reaches through emphasis, strong and links" {
+    // `**${state.x}**` puts the object one level down. A readout inside
+    // bold is not a different feature, and a version that stopped at the
+    // paragraph's immediate children would freeze it.
+    var v = FakeInline{};
+    const inner = [_]element.Element{v.elem()};
+
+    const wrappers = [_]element.Element{
+        .{ .emphasis = &inner },
+        .{ .strong = &inner },
+        .{ .code = &inner },
+        .{ .link = .{ .target = "#", .content = &inner } },
+    };
+
+    for (wrappers) |w| {
+        const kids = [_]element.Element{w};
+        v.version = 1;
+        const before = aggregateInlineVersions(&kids);
+        v.version = 2;
+        try std.testing.expect(before != aggregateInlineVersions(&kids));
+    }
 }
