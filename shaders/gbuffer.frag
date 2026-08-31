@@ -23,9 +23,11 @@
 // attributes are parsed. `(scale.xy, offset.xy)` maps this quad's own
 // [0,1] UV onto the fraction of the surface the panel covers, so the
 // panel shows what is genuinely beneath it and keeps doing so when it
-// is dragged. The surface's dimensions are ITS OWN — a render target
-// at 70% scale is smaller than the window, and dividing by the screen
-// would slide the picture at every scale but 100%.
+// is dragged. The divisor is the surface's SPAN — the screen extent
+// its full UV range covers — which is NOT its resolution: a half-res
+// buffer covers the same screen with fewer texels, and a buffer
+// written at a reduced dispatch footprint covers less of the screen
+// than its allocation suggests. See `HostSurfaceImage.span_w`.
 
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 out_color;

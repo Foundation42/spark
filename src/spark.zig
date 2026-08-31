@@ -113,13 +113,89 @@ pub const FrameInfo = struct {
 /// in) at the moment it calls into spark.
 pub const HostSurfaceImage = struct {
     view: vk.c.VkImageView,
-    /// The surface's own dimensions, which are NOT the panel's and
-    /// usually not the screen's either — a render target at 70% scale
-    /// is 70% of the window. The window transform is computed from
-    /// these, so getting them wrong slides the picture rather than
-    /// failing.
-    width: u32,
-    height: u32,
+    /// **The span: the screen extent this image's full `[0,1]` UV range
+    /// covers. NOT the image's resolution.**
+    ///
+    /// The two coincide for a full-resolution surface on a host
+    /// rendering at native scale, which is the only case that existed
+    /// when this field was first written, and the coincidence is a
+    /// trap. Two ways out of it:
+    ///
+    /// * A **half-resolution** surface still covers the whole screen,
+    ///   with fewer texels. UV is normalised to the image, so the
+    ///   fraction a panel wants is unchanged — its span is the screen,
+    ///   and reporting `width/2` would window twice as far across.
+    /// * A surface **written at a reduced dispatch footprint** (a host
+    ///   rendering at 70% into a full-size image) has its content in
+    ///   the top-left 70% of its UV range, so the full range spans
+    ///   `screen / 0.7` — larger than the screen, not smaller.
+    ///
+    /// Both fall out of one question, which is the one to answer when
+    /// adding a surface: *how much of the screen would I see if I
+    /// looked at all of this image?*
+    span_w: u32,
+    span_h: u32,
+    /// Whether the image corresponds to the screen at all. See
+    /// `HostSurfaceFit`.
+    fit: HostSurfaceFit = .screen,
+    /// **The layout the image is actually in, and there is no default.**
+    ///
+    /// A combined-image-sampler descriptor declares the layout it will
+    /// read the image in, and it must be the one the image is in. Both
+    /// values here are legal to sample from; declaring the wrong one is
+    /// undefined behaviour that a driver may well survive.
+    /// `:::gbuffer` shipped declaring `shader_read_only` against images
+    /// sitting in `GENERAL`, drew correctly for a whole campaign, and
+    /// the validation layers said so to nobody — that path had never
+    /// been run with them on.
+    ///
+    /// Required rather than defaulted, because neither answer is safe
+    /// to assume and forgetting to think about it is exactly how it
+    /// happened the first time.
+    layout: HostSurfaceLayout,
+};
+
+/// Which sampleable layout a host surface is sitting in.
+///
+/// spark never transitions a host image — the host owns the layout — so
+/// this is the host stating what it already did, not asking for
+/// anything.
+pub const HostSurfaceLayout = enum(u8) {
+    /// `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL` — a surface the host
+    /// deliberately handed to the fragment stage.
+    shader_read_only,
+    /// `VK_IMAGE_LAYOUT_GENERAL` — where a compute-written surface
+    /// already sits, and the reason this field exists.
+    general,
+    /// `VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL` — a depth attachment
+    /// the host has finished writing and left readable. A shadow map
+    /// arrives this way, which is how the third variant was found:
+    /// `GENERAL` covered every colour surface and none of the depth
+    /// ones.
+    depth_read_only,
+
+    pub fn toVk(self: HostSurfaceLayout) c_uint {
+        return switch (self) {
+            .shader_read_only => vk.c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .general => vk.c.VK_IMAGE_LAYOUT_GENERAL,
+            .depth_read_only => vk.c.VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL,
+        };
+    }
+};
+
+/// Whether a host surface is screen-aligned, which decides what a panel
+/// over it is a window ONTO.
+pub const HostSurfaceFit = enum(u8) {
+    /// The image covers the screen. The panel shows the part of it
+    /// under the panel, and keeps doing so when it is dragged. Every
+    /// G-buffer, every lighting target, every post buffer.
+    screen,
+    /// The image is not a view of the screen — a shadow map from a
+    /// light's point of view, a texture atlas, a probe grid. There is
+    /// no "underneath" to window onto, so the panel shows the whole
+    /// image wherever it sits, and dragging it moves the picture
+    /// without changing it.
+    whole,
 };
 
 /// Answers a surface name with an image, or null when the host has
@@ -675,16 +751,25 @@ pub const Spark = struct {
     /// hundred pixels away, and it is not visible in a unit test any
     /// other way.
     ///
-    /// The surface is not the screen: at `render_scale_pct < 100` a
-    /// G-buffer is smaller than the window, so the panel's screen
-    /// rectangle is divided by the SURFACE's dimensions and lands in
-    /// the same fraction of a smaller image. Dividing by the window
-    /// instead would work perfectly at 100% and slide the picture at
-    /// every other setting — which is why the surface carries its own
-    /// size rather than spark assuming the frame's.
-    pub fn hostWindow(region: element.PassRegion, surface_w: u32, surface_h: u32) [4]f32 {
-        const sw: f32 = @floatFromInt(@max(1, surface_w));
-        const sh: f32 = @floatFromInt(@max(1, surface_h));
+    /// **The divisor is the SPAN, and the span is not the image's
+    /// resolution.** See `HostSurfaceImage.span_w` — a half-resolution
+    /// surface and a full-resolution one covering the same screen have
+    /// the same span, and a panel over either must show the same place.
+    /// An earlier version of this comment argued for the image's own
+    /// dimensions and was wrong in both directions at once.
+    ///
+    /// `.whole` short-circuits to the identity: an image that is not a
+    /// view of the screen has no region under the panel to find, so the
+    /// panel shows all of it.
+    pub fn hostWindow(
+        region: element.PassRegion,
+        span_w: u32,
+        span_h: u32,
+        fit: HostSurfaceFit,
+    ) [4]f32 {
+        if (fit == .whole) return .{ 1, 1, 0, 0 };
+        const sw: f32 = @floatFromInt(@max(1, span_w));
+        const sh: f32 = @floatFromInt(@max(1, span_h));
         const rw: f32 = @floatFromInt(region.w);
         const rh: f32 = @floatFromInt(region.h);
         const rx: f32 = @floatFromInt(region.x);
@@ -1752,6 +1837,11 @@ pub const Spark = struct {
         // UV already IS the panel. Only a host surface is bigger than
         // what is being shown of it.
         var window: ?[4]f32 = null;
+        // Spark's own targets are left in `SHADER_READ_ONLY_OPTIMAL` by
+        // the barrier that ended their pass. A host surface is in
+        // whatever the host put it in, and the descriptor must declare
+        // that layout and not this one — see `HostSurfaceImage.layout`.
+        var source_layout: c_uint = vk.c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         const source_view: vk.c.VkImageView = blk: {
             if (ss.source == .host_named) {
                 // No surface, or a name this host does not answer for:
@@ -1760,7 +1850,8 @@ pub const Spark = struct {
                 // empty panel with working buttons, which is a legible
                 // wrong rather than a validation error on a null view.
                 const img = self.hostSurface(ss.host_surface.slice()) orelse return;
-                window = hostWindow(ss.compose_region, img.width, img.height);
+                window = hostWindow(ss.compose_region, img.span_w, img.span_h, img.fit);
+                source_layout = img.layout.toVk();
                 break :blk img.view;
             }
             break :blk (target_handle orelse return).view();
@@ -1773,6 +1864,7 @@ pub const Spark = struct {
         const set = try self.single_source_descriptor_pool.acquire(
             source_view,
             self.single_source_pipelines.sampler,
+            source_layout,
         );
         var set_local = set; // pDescriptorSets wants a pointer
         vk.c.vkCmdBindDescriptorSets(
@@ -1869,6 +1961,8 @@ pub const Spark = struct {
         const set = try self.single_source_descriptor_pool.acquire(
             target_handle.view(),
             self.single_source_pipelines.sampler,
+            // Spark's own target: its barrier ended here.
+            vk.c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         );
         var set_local = set;
         vk.c.vkCmdBindDescriptorSets(
@@ -2110,6 +2204,8 @@ pub const Spark = struct {
         const set = try self.single_source_descriptor_pool.acquire(
             source.view(),
             self.single_source_pipelines.sampler,
+            // Spark's own target: its barrier ended here.
+            vk.c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         );
         var set_local = set;
         vk.c.vkCmdBindDescriptorSets(
@@ -2180,6 +2276,8 @@ pub const Spark = struct {
         const set = try self.single_source_descriptor_pool.acquire(
             target_handle.view(),
             self.single_source_pipelines.sampler,
+            // Spark's own target: its barrier ended here.
+            vk.c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         );
         var set_local = set;
         vk.c.vkCmdBindDescriptorSets(
@@ -3049,9 +3147,9 @@ test "Spark: testStub produces a usable shell for component tests" {
 // a picture that looks plausible either way.
 
 test "hostWindow: a panel maps onto the fraction of the surface it covers" {
-    // A 240x160 panel at (576, 115) on a 960x540 surface. The window is
+    // A 240x160 panel at (576, 115) on a 960x540 span. The window is
     // its rectangle expressed as fractions, and nothing else.
-    const w = Spark.hostWindow(.{ .x = 576, .y = 115, .w = 240, .h = 160 }, 960, 540);
+    const w = Spark.hostWindow(.{ .x = 576, .y = 115, .w = 240, .h = 160 }, 960, 540, .screen);
     try testing.expectApproxEqAbs(@as(f32, 0.25), w[0], 1e-6); // 240/960
     try testing.expectApproxEqAbs(@as(f32, 160.0 / 540.0), w[1], 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 0.6), w[2], 1e-6); // 576/960
@@ -3064,40 +3162,82 @@ test "hostWindow: a panel covering the whole surface is the identity" {
     // wrong by the same factor — and a slightly-wrong window still
     // produces a plausible-looking picture, which is why this is
     // asserted rather than eyeballed.
-    const w = Spark.hostWindow(.{ .x = 0, .y = 0, .w = 1920, .h = 1080 }, 1920, 1080);
+    const w = Spark.hostWindow(.{ .x = 0, .y = 0, .w = 1920, .h = 1080 }, 1920, 1080, .screen);
     try testing.expectApproxEqAbs(@as(f32, 1), w[0], 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 1), w[1], 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 0), w[2], 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 0), w[3], 1e-6);
 }
 
-test "hostWindow: the SURFACE's size is the divisor, not the screen's" {
-    // The one that would pass at 100% render scale and slide the picture
-    // at every other setting. A surface smaller than the window is the
-    // same panel landing in the same FRACTION of a smaller image — so
-    // halving the surface doubles every component.
+test "hostWindow: the span and the image's resolution are DIFFERENT numbers" {
+    // The trap this beat was written to close, stated where the
+    // arithmetic lives.
     //
-    // Rule 1: the two answers must differ, or this is asserting that a
-    // number equals itself.
+    // `shadow`, `ao` and `ao_filtered` are created at half the render
+    // extent and still cover the whole screen. Their span is therefore
+    // the screen, and a panel over the middle of the screen shows the
+    // middle of each of them. Passing the image's own dimensions
+    // instead lands somewhere else entirely — and it is not a small
+    // error that looks like a rounding problem, it is the far edge.
+    //
+    // `hostWindow` cannot tell the two apart on its own: it divides by
+    // whatever it is handed. So what is gated here is that THE CHOICE
+    // MATTERS — the two answers differ, by a factor of two, in a way
+    // that is visible. The gate that the host reports the right one of
+    // them lives in matryoshka's `HudSurfaces` table, which is the code
+    // that actually makes the choice.
     const region = element.PassRegion{ .x = 480, .y = 270, .w = 240, .h = 160 };
-    const full = Spark.hostWindow(region, 960, 540);
-    const half = Spark.hostWindow(region, 480, 270);
-    try testing.expect(full[0] != half[0]);
-    try testing.expectApproxEqAbs(full[0] * 2, half[0], 1e-6);
-    try testing.expectApproxEqAbs(full[2] * 2, half[2], 1e-6);
-    // Concretely: a panel whose left edge is at the screen's midpoint
-    // reads as 0.5 of a full-size surface and 1.0 of a half-size one.
-    // Same panel, same place on screen, different fraction — which is
-    // the whole reason the surface carries its own dimensions.
-    try testing.expectApproxEqAbs(@as(f32, 0.5), full[2], 1e-6);
-    try testing.expectApproxEqAbs(@as(f32, 1.0), half[2], 1e-6);
+    const by_span = Spark.hostWindow(region, 960, 540, .screen);
+    const by_resolution = Spark.hostWindow(region, 480, 270, .screen);
+    try testing.expect(by_resolution[2] != by_span[2]);
+    // Concretely: a panel whose left edge sits at the screen's midpoint
+    // reads as 0.5 of the screen and 1.0 of a half-size image — the far
+    // right edge. The panel would show the bottom-right quadrant while
+    // sitting in the middle. Plausible-looking, and wrong.
+    try testing.expectApproxEqAbs(@as(f32, 0.5), by_span[2], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), by_resolution[2], 1e-6);
 }
 
-test "hostWindow: a zero-sized surface does not divide by zero" {
+test "hostWindow: a reduced dispatch footprint spans MORE than the screen" {
+    // The other direction, and the one the retired comment got backwards.
+    //
+    // matryoshka allocates every intermediate at full output size and
+    // uses `render_scale_pct` to shrink the DISPATCH — so at 70% the
+    // content sits in the top-left 70% of the image's UV range, and the
+    // full range spans `screen / 0.7`. Dividing by the image's
+    // dimensions (which equal the screen's here) leaves the panel
+    // looking 1/0.7 too far out, into texels nothing wrote.
+    const region = element.PassRegion{ .x = 480, .y = 0, .w = 240, .h = 160 };
+    const at_native = Spark.hostWindow(region, 960, 540, .screen);
+    // span = screen * screen / render_extent, integer-exact against the
+    // host's own `renderW()`.
+    const at_70 = Spark.hostWindow(region, 960 * 960 / 672, 540 * 540 / 378, .screen);
+    try testing.expect(at_70[2] < at_native[2]);
+    try testing.expectApproxEqAbs(@as(f32, 0.5) * 0.7, at_70[2], 1e-3);
+}
+
+test "hostWindow: a .whole surface ignores the panel's position entirely" {
+    // A shadow map is rendered from the sun's point of view. There is no
+    // part of it that is "under" a panel, so windowing it would show a
+    // meaningless crop that moved as the panel was dragged — which reads
+    // as a bug in the shadow map rather than a category error in the
+    // panel. `.whole` shows all of it, from anywhere.
+    const a = Spark.hostWindow(.{ .x = 0, .y = 0, .w = 240, .h = 160 }, 960, 540, .whole);
+    const b = Spark.hostWindow(.{ .x = 700, .y = 380, .w = 240, .h = 160 }, 960, 540, .whole);
+    try testing.expectEqual(a, b);
+    try testing.expectEqual([4]f32{ 1, 1, 0, 0 }, a);
+
+    // And the same region under `.screen` is NOT the identity, so this
+    // is testing the fit and not the arithmetic being trivial.
+    const windowed = Spark.hostWindow(.{ .x = 700, .y = 380, .w = 240, .h = 160 }, 960, 540, .screen);
+    try testing.expect(windowed[2] != b[2]);
+}
+
+test "hostWindow: a zero-sized span does not divide by zero" {
     // A resize can hand a frame a surface with no extent, and a NaN
     // window samples nothing and paints the panel with whatever the
     // sampler does at NaN — a black box that looks like a missing
     // surface rather than a bad divisor.
-    const w = Spark.hostWindow(.{ .x = 10, .y = 10, .w = 100, .h = 100 }, 0, 0);
+    const w = Spark.hostWindow(.{ .x = 10, .y = 10, .w = 100, .h = 100 }, 0, 0, .screen);
     for (w) |v| try testing.expect(!std.math.isNan(v));
 }

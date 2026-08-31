@@ -310,7 +310,7 @@ const Readback = struct {
         c.vkCmdBeginRendering(cmd, &ri);
 
         c.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-        var set = try dpool.acquire(src_view, cache.sampler);
+        var set = try dpool.acquire(src_view, cache.sampler, c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         c.vkCmdBindDescriptorSets(cmd, c.VK_PIPELINE_BIND_POINT_GRAPHICS, cache.layout, 0, 1, &set, 0, null);
         var viewport = c.VkViewport{
             .x = 0,

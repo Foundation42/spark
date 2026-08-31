@@ -171,10 +171,18 @@ pub const SingleSourceDescriptorPool = struct {
     /// binding, return the set ready to bind. Returns
     /// `error.DescriptorPoolCreation` or
     /// `error.DescriptorSetAllocation` on growth-allocation failure.
+    /// `image_layout` is the layout the image is ACTUALLY in, and it is
+    /// a parameter rather than a constant because a `.host_named` pass
+    /// samples an image spark did not transition. Spark's own targets
+    /// end their barrier in `SHADER_READ_ONLY_OPTIMAL`; a host's
+    /// compute-written surface is usually in `GENERAL`, and declaring
+    /// the wrong one here is undefined behaviour the validation layers
+    /// catch and a working picture does not.
     pub fn acquire(
         self: *SingleSourceDescriptorPool,
         view: c.VkImageView,
         sampler: c.VkSampler,
+        image_layout: c_uint,
     ) !c.VkDescriptorSet {
         const fam = &self.families[self.active_family];
 
@@ -206,7 +214,7 @@ pub const SingleSourceDescriptorPool = struct {
         var image_info = c.VkDescriptorImageInfo{
             .sampler = sampler,
             .imageView = view,
-            .imageLayout = c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .imageLayout = image_layout,
         };
         var write = std.mem.zeroes(c.VkWriteDescriptorSet);
         write.sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -341,7 +349,7 @@ test "SingleSourceDescriptorPool: acquire writes a usable set" {
     // layout flags, or sampler incompatibility at the vkUpdate call;
     // a successful return is the substrate's "binding shape is
     // correct" signal.
-    const set = try pool.acquire(target.view(), sub.cache.sampler);
+    const set = try pool.acquire(target.view(), sub.cache.sampler, c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     try testing.expect(set != null);
     const active = &pool.families[pool.active_family];
     try testing.expectEqual(@as(u32, 1), active.sets_in_current_pool);
@@ -368,14 +376,14 @@ test "SingleSourceDescriptorPool: acquire past BASE_POOL_SIZE grows + advances" 
 
     var i: u32 = 0;
     while (i < BASE_POOL_SIZE) : (i += 1) {
-        _ = try pool.acquire(target.view(), sub.cache.sampler);
+        _ = try pool.acquire(target.view(), sub.cache.sampler, c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
     const active = &pool.families[pool.active_family];
     try testing.expectEqual(@as(usize, 1), active.pools.items.len); // still base
     try testing.expectEqual(@as(u32, BASE_POOL_SIZE), active.sets_in_current_pool);
 
     // The next acquire triggers growth.
-    _ = try pool.acquire(target.view(), sub.cache.sampler);
+    _ = try pool.acquire(target.view(), sub.cache.sampler, c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     try testing.expectEqual(@as(usize, 2), active.pools.items.len); // overflow allocated
     try testing.expectEqual(@as(usize, 1), active.current_pool_index);
     try testing.expectEqual(@as(u32, 1), active.sets_in_current_pool);
@@ -404,7 +412,7 @@ test "SingleSourceDescriptorPool: advance rotates families + resets on FRAMES-cy
     try testing.expectEqual(@as(u32, 1), pool.active_family);
     var i: u32 = 0;
     while (i < BASE_POOL_SIZE + 5) : (i += 1) {
-        _ = try pool.acquire(target.view(), sub.cache.sampler);
+        _ = try pool.acquire(target.view(), sub.cache.sampler, c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
     try testing.expectEqual(@as(usize, 2), pool.families[1].pools.items.len);
 
@@ -414,7 +422,7 @@ test "SingleSourceDescriptorPool: advance rotates families + resets on FRAMES-cy
     try testing.expectEqual(@as(u32, 0), pool.active_family);
     i = 0;
     while (i < BASE_POOL_SIZE) : (i += 1) {
-        _ = try pool.acquire(target.view(), sub.cache.sampler);
+        _ = try pool.acquire(target.view(), sub.cache.sampler, c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
     try testing.expectEqual(@as(usize, 1), pool.families[0].pools.items.len);
 
@@ -428,7 +436,7 @@ test "SingleSourceDescriptorPool: advance rotates families + resets on FRAMES-cy
 
     i = 0;
     while (i < BASE_POOL_SIZE + 5) : (i += 1) {
-        _ = try pool.acquire(target.view(), sub.cache.sampler);
+        _ = try pool.acquire(target.view(), sub.cache.sampler, c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
     try testing.expectEqual(@as(usize, 2), pool.families[1].pools.items.len); // still 2
     try testing.expectEqual(@as(usize, 1), pool.families[1].current_pool_index);

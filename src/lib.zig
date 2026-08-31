@@ -45,6 +45,8 @@ pub const FrameInfo = @import("spark.zig").FrameInfo;
 /// A host image offered to a `:::gbuffer` panel, and the resolver that
 /// answers for one. See `element.PassSource.host_named`.
 pub const HostSurfaceImage = @import("spark.zig").HostSurfaceImage;
+pub const HostSurfaceFit = @import("spark.zig").HostSurfaceFit;
+pub const HostSurfaceLayout = @import("spark.zig").HostSurfaceLayout;
 pub const HostSurfaceFn = @import("spark.zig").HostSurfaceFn;
 pub const document = @import("document.zig");
 pub const Document = document.Document;
