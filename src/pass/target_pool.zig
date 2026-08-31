@@ -212,7 +212,23 @@ pub const TargetPool = struct {
         image_ci.arrayLayers = 1;
         image_ci.samples = c.VK_SAMPLE_COUNT_1_BIT;
         image_ci.tiling = c.VK_IMAGE_TILING_OPTIMAL;
-        image_ci.usage = c.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | c.VK_IMAGE_USAGE_SAMPLED_BIT;
+        // TRANSFER_DST because a `{backdrop}` effect FILLS its first target
+        // by blitting the region of the host's attachment its panel covers
+        // into it (`Spark.fillPoolZeroFromMain`) rather than by rendering
+        // children into it. A blit destination needs the flag, and without
+        // it both the barrier that moves the target to
+        // TRANSFER_DST_OPTIMAL and the blit itself are undefined.
+        //
+        // Shipping since C.4 and invisible until 2026-08-31: the picture is
+        // right on every driver we have run it on, and matryoshka's standing
+        // validation-layer gate mounts ONE document, which has no backdrop
+        // in it. Found by pointing the layers at a document that did. Same
+        // shape as the X-ray campaign's third bug, where `post_image` was a
+        // blit destination without the flag — the second instance of one
+        // mistake, so the lesson is the class rather than the image.
+        image_ci.usage = c.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+            c.VK_IMAGE_USAGE_SAMPLED_BIT |
+            c.VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         image_ci.sharingMode = c.VK_SHARING_MODE_EXCLUSIVE;
         image_ci.initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED;
 
