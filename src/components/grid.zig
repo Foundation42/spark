@@ -406,7 +406,14 @@ fn layoutAndRender(
         }
 
         const cell_x = origin[0] + track_offsets[col];
-        const cell_constraints: element.Constraints = .{ .max_w = track_widths[col] };
+        // From the inherited constraints, not fresh — a bare
+        // `.{ .max_w = … }` drops `text_align`/`block_align`, and an
+        // `align=center` on a panel wrapper would then reach every
+        // block except the ones inside a `:::grid`. The grid does not
+        // place its own cells by alignment (they are track-sized);
+        // this is only about letting the property through.
+        var cell_constraints = constraints;
+        cell_constraints.max_w = track_widths[col];
 
         // Stage 15 Phase C.4: cached cell walks. Static cells (most
         // grid cells) hit the block-layout cache. The grid itself

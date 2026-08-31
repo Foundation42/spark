@@ -868,7 +868,16 @@ fn layoutStackV(
     // Stage 14b — try parallel fan-out for cache misses across a wide
     // enough stack. The dispatcher checks classification + threshold
     // and falls back to the serial loop below when it doesn't pay.
-    if (ctx.job_system != null and ctx.cache_blocks != null and ctx.glyph_cache_lock != null and children.len >= PARALLEL_MIN_CHILDREN) {
+    //
+    // An ALIGNED stack takes the serial path. The fan-out places every
+    // child at `origin[0]` and the workers are already walking by the
+    // time a box comes back, while centring needs each child measured
+    // BEFORE it is placed. No loss in practice: `PARALLEL_MIN_CHILDREN`
+    // is well above the block count of a panel body, which is what sets
+    // `align=`.
+    if (constraints.block_align == .start and
+        ctx.job_system != null and ctx.cache_blocks != null and ctx.glyph_cache_lock != null and children.len >= PARALLEL_MIN_CHILDREN)
+    {
         if (try layoutStackVParallel(children, gap, origin, constraints, ctx, out)) |box| return box;
         // null return → not enough cache-miss work to amortise dispatch;
         // fall through to serial.
@@ -890,9 +899,26 @@ fn layoutStackV(
         const fk = flowKindOf(child);
         if (fk == .normal) {
             if (prev_was_normal) y += gap;
+            // Where this child starts, once alignment has had its say.
+            //
+            // The measure is what costs, so it is skipped entirely at
+            // `.start` — every document written before alignment existed
+            // takes the identical path it always did. A paragraph or a
+            // heading measures to the full offered width (see
+            // `measureBlock`), so it comes back with an offset of zero
+            // and only the things that are genuinely narrower — a
+            // button row, a slider with a `width=`, a `:::gbuffer` —
+            // actually move. Prose is centred by `text_align`, one level
+            // down, where the lines are.
+            const dx: f32 = if (constraints.block_align == .start or !std.math.isFinite(constraints.max_w))
+                0
+            else blk: {
+                const m = measureBlock(child, constraints, ctx) catch break :blk 0;
+                break :blk constraints.block_align.offset(constraints.max_w, m.width);
+            };
             const child_box = try layoutAndRenderCached(
                 child,
-                .{ origin[0], y },
+                .{ origin[0] + dx, y },
                 constraints,
                 ctx,
                 out,
@@ -1662,7 +1688,8 @@ fn layoutInlineFlow(
         // Forced break — flush current line (without including the
         // break itself), advance past it.
         if (isLineBreak(tok)) {
-            const lm = try emitLine(tokens.items[line_start..i], line_left, y, ctx, out);
+            const slice = tokens.items[line_start..i];
+            const lm = try emitLine(slice, alignedLineStart(slice, line_left, line_right, constraints.text_align), y, ctx, out);
             y += lm.line_height;
             last_baseline = lm.baseline;
             line_start = i + 1;
@@ -1687,7 +1714,8 @@ fn layoutInlineFlow(
             var emit_end = i;
             while (emit_end > line_start and isGap(tokens.items[emit_end - 1])) : (emit_end -= 1) {}
 
-            const lm = try emitLine(tokens.items[line_start..emit_end], line_left, y, ctx, out);
+            const slice = tokens.items[line_start..emit_end];
+            const lm = try emitLine(slice, alignedLineStart(slice, line_left, line_right, constraints.text_align), y, ctx, out);
             y += lm.line_height;
             last_baseline = lm.baseline;
 
@@ -1721,7 +1749,8 @@ fn layoutInlineFlow(
         var emit_end = tokens.items.len;
         while (emit_end > line_start and isGap(tokens.items[emit_end - 1])) : (emit_end -= 1) {}
         if (emit_end > line_start) {
-            const lm = try emitLine(tokens.items[line_start..emit_end], line_left, y, ctx, out);
+            const slice = tokens.items[line_start..emit_end];
+            const lm = try emitLine(slice, alignedLineStart(slice, line_left, line_right, constraints.text_align), y, ctx, out);
             y += lm.line_height;
             last_baseline = lm.baseline;
         }
@@ -1993,6 +2022,29 @@ const DecorationRun = struct {
 /// baseline. Second pass: stream each atom's glyphs through
 /// `appendShapedRun`. Returns the line's metrics so the caller can
 /// advance its `y`.
+/// Where a line starts, once `text_align` has had its say.
+///
+/// The line's own width is the sum of its tokens — the same
+/// `tokenWidth` the wrap decision uses, so a line that exactly filled
+/// its box measures as exactly full and does not move. Trailing gaps are
+/// already stripped by every caller before this is asked, which matters:
+/// counting the space a wrap ate would push a centred line left by half
+/// a space.
+///
+/// `.start` returns `line_left` unchanged, so the ordinary path costs
+/// one enum comparison and no summation at all.
+fn alignedLineStart(
+    line_tokens: []const InlineToken,
+    line_left: f32,
+    line_right: f32,
+    how: element.Align,
+) f32 {
+    if (how == .start) return line_left;
+    var w: f32 = 0;
+    for (line_tokens) |tok| w += tokenWidth(tok);
+    return line_left + how.offset(line_right - line_left, w);
+}
+
 fn emitLine(
     line_tokens: []const InlineToken,
     pen_x: f32,

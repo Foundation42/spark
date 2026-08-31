@@ -607,6 +607,129 @@ pub const Constraints = struct {
     max_w: f32 = std.math.inf(f32),
     min_h: f32 = 0,
     max_h: f32 = std.math.inf(f32),
+    /// Where a block child sits inside the width its parent gave it.
+    ///
+    /// Inherited: a container passes its constraints down untouched, so
+    /// setting this once on a panel's wrapper reaches everything under
+    /// it. `.start` is what every document did before this existed, and
+    /// the aligning path is skipped entirely at `.start` — so nothing
+    /// written before today pays a measure pass for a feature it does
+    /// not use.
+    block_align: Align = .start,
+    /// Where a LINE of text sits inside its line box.
+    ///
+    /// Separate from `block_align` on purpose, and the reason is visible
+    /// in `measureBlock`: a paragraph's intrinsic width IS the width it
+    /// was offered, so centring it as a block moves it by zero. Prose
+    /// centres by moving its lines, which is a different operation at a
+    /// different level, and wanting one without the other is the normal
+    /// case — centred controls over left-aligned prose is what most tool
+    /// panels want.
+    text_align: Align = .start,
+};
+
+/// Horizontal placement, for a block inside its container and for a line
+/// of text inside its line box.
+///
+/// One enum for both because the arithmetic is identical — a fraction of
+/// the leftover space goes in front — and because an author who has
+/// learnt `center` for one should not have to learn a second word for
+/// the other.
+pub const Align = enum(u8) {
+    start,
+    center,
+    end,
+
+    /// `left`/`right` are accepted as synonyms. They are what somebody
+    /// reaches for first, and refusing them to be pure about writing
+    /// direction would be pedantry in a document language whose text
+    /// engine is left-to-right anyway.
+    pub fn parse(word: []const u8) ?Align {
+        if (std.mem.eql(u8, word, "left")) return .start;
+        if (std.mem.eql(u8, word, "right")) return .end;
+        if (std.mem.eql(u8, word, "centre")) return .center;
+        return std.meta.stringToEnum(Align, word);
+    }
+
+    /// The fraction of the leftover space that goes BEFORE the content.
+    pub fn leading(self: Align) f32 {
+        return switch (self) {
+            .start => 0,
+            .center => 0.5,
+            .end => 1,
+        };
+    }
+
+    /// Where content of width `content` starts inside `avail`.
+    ///
+    /// Clamped at zero: content wider than the space it was given starts
+    /// at the left edge and overflows to the right, which is what every
+    /// other overflow in this engine does. Centring it would push its
+    /// beginning off the left edge, where it cannot be read.
+    pub fn offset(self: Align, avail: f32, content: f32) f32 {
+        if (self == .start) return 0;
+        return @max(0, (avail - content) * self.leading());
+    }
+};
+
+/// The `align=` / `text_align=` pair, as a container reads them off its
+/// own attributes.
+///
+/// **Null means inherit**, which is what makes these cascade: a
+/// container that says nothing passes its parent's answer straight
+/// through, so `align=center` on a panel's wrapper reaches every block
+/// under it without being repeated. Only a container that names one
+/// overrides it, and only for its own subtree.
+///
+/// Shared rather than reimplemented per factory because five of them
+/// take these attributes, and five copies of "which word maps to which
+/// enum" is five chances for `:::box {align=center}` and
+/// `:::flex {align=center}` to mean different things.
+pub const AlignAttrs = struct {
+    block: ?Align = null,
+    text: ?Align = null,
+
+    /// Consume one attribute. Returns true when it was one of ours, so a
+    /// factory's attribute loop can chain this in front of its own arms.
+    pub fn ingest(self: *AlignAttrs, key: []const u8, value: []const u8) bool {
+        if (std.mem.eql(u8, key, "align")) {
+            // An unparseable value leaves the field alone rather than
+            // resetting it to `.start`: `align=centre_ish` is a typo,
+            // and inheriting is a better answer to a typo than silently
+            // overriding a parent that got it right.
+            if (Align.parse(value)) |a| self.block = a;
+            return true;
+        }
+        if (std.mem.eql(u8, key, "text_align")) {
+            if (Align.parse(value)) |a| self.text = a;
+            return true;
+        }
+        return false;
+    }
+
+    /// Read both attributes off a Spec.
+    ///
+    /// `anytype` so `element.zig` stays free of a `markdown_components`
+    /// import — it is the layout contract, and the directive parser sits
+    /// above it. Every caller passes a `*const components.Spec`.
+    ///
+    /// Read FRESH each time rather than layered onto what the instance
+    /// already held, so deleting `align=` from a document and saving it
+    /// goes back to inheriting. A hot reload that could add an attribute
+    /// and not remove one would be a strange thing to live with.
+    pub fn readFrom(spec: anytype) AlignAttrs {
+        var self = AlignAttrs{};
+        for (spec.attrs) |a| _ = self.ingest(a.key, a.value);
+        return self;
+    }
+
+    /// This container's constraints for its children.
+    pub fn apply(self: AlignAttrs, base: Constraints) Constraints {
+        var out = base;
+        if (self.block) |a| out.block_align = a;
+        if (self.text) |a| out.text_align = a;
+        return out;
+    }
 };
 
 // ── Pass-graph types (effects-spec Phase A.0 / A.6) ────────────────
@@ -1847,6 +1970,106 @@ const layout_context_mod = @import("layout/context.zig");
 // Phase B.4.b.4 — run iterator gates. Pure CPU logic; no Vulkan.
 
 const testing = std.testing;
+
+// ── Alignment ───────────────────────────────────────────────────────
+
+test "Align: the words an author will actually type" {
+    try testing.expectEqual(Align.start, Align.parse("start").?);
+    try testing.expectEqual(Align.center, Align.parse("center").?);
+    try testing.expectEqual(Align.end, Align.parse("end").?);
+    // Synonyms. `left`/`right` are what somebody reaches for first, and
+    // `centre` is not a typo for half the people who will write it.
+    try testing.expectEqual(Align.start, Align.parse("left").?);
+    try testing.expectEqual(Align.end, Align.parse("right").?);
+    try testing.expectEqual(Align.center, Align.parse("centre").?);
+    // Anything else is null, so `AlignAttrs.ingest` can leave the field
+    // inheriting rather than silently resetting it to `.start`.
+    try testing.expect(Align.parse("middle") == null);
+    try testing.expect(Align.parse("") == null);
+}
+
+test "Align.offset: the arithmetic, including the case that overflows" {
+    // A 240-wide thing in a 360-wide panel — the repro gate's slider,
+    // and the number it asserts.
+    try testing.expectEqual(@as(f32, 0), Align.start.offset(360, 240));
+    try testing.expectEqual(@as(f32, 60), Align.center.offset(360, 240));
+    try testing.expectEqual(@as(f32, 120), Align.end.offset(360, 240));
+
+    // Content that exactly fills does not move, at any alignment. This
+    // is why centring a paragraph as a BLOCK is a no-op: `measureBlock`
+    // reports its width as the width it was offered.
+    try testing.expectEqual(@as(f32, 0), Align.center.offset(360, 360));
+    try testing.expectEqual(@as(f32, 0), Align.end.offset(360, 360));
+
+    // Content WIDER than its space starts at the left edge and overflows
+    // right, like every other overflow here. Centring it would push its
+    // beginning off the left edge, where it cannot be read — and a
+    // negative offset would put a panel's first glyph outside the panel.
+    try testing.expectEqual(@as(f32, 0), Align.center.offset(100, 400));
+    try testing.expectEqual(@as(f32, 0), Align.end.offset(100, 400));
+}
+
+test "AlignAttrs: null means INHERIT, which is what makes it cascade" {
+    const base: Constraints = .{ .max_w = 360, .block_align = .center, .text_align = .end };
+
+    // A container that says nothing passes its parent's answer straight
+    // through. Without this, every wrapper between a panel and its text
+    // would silently reset the alignment to `.start`.
+    const silent = AlignAttrs{};
+    const through = silent.apply(base);
+    try testing.expectEqual(Align.center, through.block_align);
+    try testing.expectEqual(Align.end, through.text_align);
+    try testing.expectEqual(@as(f32, 360), through.max_w);
+
+    // Naming ONE overrides only that one.
+    const half = AlignAttrs{ .text = .start };
+    const mixed = half.apply(base);
+    try testing.expectEqual(Align.center, mixed.block_align);
+    try testing.expectEqual(Align.start, mixed.text_align);
+}
+
+test "AlignAttrs.ingest: reads its two attrs, declines the rest" {
+    var a = AlignAttrs{};
+    try testing.expect(a.ingest("align", "center"));
+    try testing.expect(a.ingest("text_align", "right"));
+    try testing.expectEqual(Align.center, a.block.?);
+    try testing.expectEqual(Align.end, a.text.?);
+
+    // Not ours — the caller's own attribute arms still get a look.
+    try testing.expect(!a.ingest("radius", "12"));
+    try testing.expect(!a.ingest("blur", "16"));
+    // `valign` is the INLINE property and a different thing entirely.
+    // Claiming it here would swallow an attribute meant for a line box.
+    try testing.expect(!a.ingest("valign", "middle"));
+
+    // A value we cannot parse leaves the field alone rather than
+    // resetting it. `align=middle` is a typo, and inheriting is a better
+    // answer to a typo than overriding a parent that got it right.
+    var b = AlignAttrs{ .block = .center };
+    try testing.expect(b.ingest("align", "middle"));
+    try testing.expectEqual(Align.center, b.block.?);
+}
+
+test "AlignAttrs.readFrom: fresh each time, so deleting an attr takes effect" {
+    const Attr = struct { key: []const u8, value: []const u8 };
+    const Spec = struct { attrs: []const Attr };
+
+    const with = Spec{ .attrs = &[_]Attr{
+        .{ .key = "blur", .value = "16" },
+        .{ .key = "align", .value = "center" },
+    } };
+    const got = AlignAttrs.readFrom(&with);
+    try testing.expectEqual(Align.center, got.block.?);
+    try testing.expect(got.text == null); // unmentioned → inherit
+
+    // The re-ingest case, which is what a hot reload is: the attribute
+    // was deleted and saved. Reading FRESH means it goes back to
+    // inheriting; layering onto what the instance held would leave a
+    // centred panel that no document asks for any more.
+    const without = Spec{ .attrs = &[_]Attr{.{ .key = "blur", .value = "16" }} };
+    const after = AlignAttrs.readFrom(&without);
+    try testing.expect(after.block == null);
+}
 
 test "runs: empty array yields nothing" {
     const targets: []const u32 = &.{};

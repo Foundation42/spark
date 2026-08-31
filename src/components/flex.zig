@@ -45,6 +45,10 @@ pub const Error = error{
 const Component = struct {
     direction: Direction,
     gap: f32,
+    /// `align=` / `text_align=`, inherited by everything under this
+    /// flex. `align=` also places THIS flex's own children — see
+    /// `layoutAndRender`. See `element.AlignAttrs`.
+    alignment: element.AlignAttrs = .{},
     /// Owns every allocation the parsed child tree refers to.
     arena: std.heap.ArenaAllocator,
     /// Parsed child root. Typically a `container.stack_v` whose
@@ -168,6 +172,7 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
 
 fn applyAttrs(c: *Component, spec: *const components.Spec) void {
     c.direction = .row;
+    c.alignment = element.AlignAttrs.readFrom(spec);
     c.gap = 0;
     for (spec.attrs) |a| {
         if (std.mem.eql(u8, a.key, "direction")) {
@@ -248,8 +253,50 @@ fn layoutAndRender(
     }
     defer if (final_widths) |fw| lc.allocator.free(fw);
 
+    // What this flex passes DOWN: its own attributes over whatever it
+    // inherited, so `text_align` and any nested block flow keep working.
+    const inherited = c.alignment.apply(constraints);
+
+    // What this flex uses to place ITS OWN children: its own `align=`
+    // and nothing else.
+    //
+    // **Not the inherited value, and that is the whole distinction.**
+    // `block_align` in the constraints means "how the enclosing BLOCK
+    // FLOW places its children", and a flex is one of those children —
+    // its parent stack has already centred it. Reading the inherited
+    // value here centres it a second time, inside itself, and the two
+    // offsets add: measured at 93px where 62px was correct, because the
+    // measure pass runs this same layout and the stack then centred the
+    // inflated width it reported. A flex has its own opinion about its
+    // own children or it has none.
+    const how: element.Align = c.alignment.block orelse .start;
+    const can_align = how != .start and std.math.isFinite(constraints.max_w);
+
     var cur_x = origin[0];
     var cur_y = origin[1];
+
+    // A ROW aligns as ONE object: the whole run of children moves
+    // together, because a row of buttons pushed to the middle is what
+    // somebody means by centring a row. (A column aligns each child
+    // independently, in the loop below.) The row's width is the widths
+    // the measure pass already computed, plus the gaps between them —
+    // and when there was no measure pass, the children's intrinsic
+    // widths, which is the same number by a longer road.
+    if (can_align and c.direction == .row and child_slice.len > 0) {
+        var row_w: f32 = c.gap * @as(f32, @floatFromInt(child_slice.len - 1));
+        if (final_widths) |fw| {
+            for (fw) |w| row_w += w;
+        } else {
+            for (child_slice) |*child| {
+                const m = element_layout.measureBlock(child.*, inherited, lc) catch continue;
+                row_w += m.width;
+            }
+        }
+        cur_x += how.offset(constraints.max_w, row_w);
+    }
+    // Where the row actually begins, for the box reported at the end.
+    const row_x0 = cur_x;
+
     var max_w: f32 = 0;
     var max_h: f32 = 0;
     var first = true;
@@ -264,14 +311,27 @@ fn layoutAndRender(
         first = false;
 
         const child_max_w: f32 = if (final_widths) |fw| fw[i] else constraints.max_w;
-        const child_constraints: element.Constraints = .{ .max_w = child_max_w };
+        // Built FROM the inherited constraints, not fresh: a bare
+        // `.{ .max_w = … }` drops `text_align` and `block_align` on
+        // the floor, so an `align=center` on a panel wrapper would
+        // reach every block except the ones inside a `:::flex`.
+        var child_constraints = inherited;
+        child_constraints.max_w = child_max_w;
         // Stage 15 Phase C.4: cached child walks. Unchanged children
         // hit the block-layout cache and blit. The flex itself still
         // disables its outer cache (children would otherwise need
         // version aggregation up the tree).
+        // A COLUMN aligns each child on its own, the way a block stack
+        // does — the sliders and the button rows in a panel are
+        // different widths and each wants to be centred, not left-
+        // aligned inside one centred group.
+        const dx: f32 = if (can_align and c.direction == .column) blk: {
+            const m = element_layout.measureBlock(child.*, child_constraints, lc) catch break :blk 0;
+            break :blk how.offset(constraints.max_w, m.width);
+        } else 0;
         const child_box = try element_layout.layoutAndRenderCached(
             child.*,
-            .{ cur_x, cur_y },
+            .{ cur_x + dx, cur_y },
             child_constraints,
             lc,
             out,
@@ -290,10 +350,16 @@ fn layoutAndRender(
     }
 
     return switch (c.direction) {
+        // `row_x0`, not `origin[0]`: an aligned row starts further in,
+        // and a box that counted the empty space in front of it as its
+        // own width would report a flex wider than it drew. That number
+        // is what the parent stack measures and what an effect sizes its
+        // backdrop to, so the error shows up as a panel that changes
+        // shape when a row inside it is centred.
         .row => .{
-            .x = origin[0],
+            .x = row_x0,
             .y = origin[1],
-            .w = cur_x - origin[0],
+            .w = cur_x - row_x0,
             .h = max_h,
             .baseline = 0,
         },

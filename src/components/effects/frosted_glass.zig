@@ -217,6 +217,9 @@ const Component = struct {
     scope: []u8,
     spark: ?*spark_mod.Spark = null,
     attrs: Attrs,
+    /// `align=` / `text_align=`, inherited by everything under this
+    /// container. See `element.AlignAttrs`.
+    alignment: element.AlignAttrs = .{},
     version: u64 = 0,
     body: component_mod.Body = .{},
     /// Per-instance scratch the chain hook returns a slice into. Owned by the
@@ -272,6 +275,7 @@ fn create(
         .scope = undefined,
         .spark = spark,
         .attrs = Attrs.read(spec),
+        .alignment = element.AlignAttrs.readFrom(spec),
         .version = 0,
         .body = .{},
         .steps = undefined,
@@ -306,6 +310,7 @@ fn update(ctx: *anyopaque, spec: *const components.Spec) anyerror!void {
     const c: *Component = @ptrCast(@alignCast(ctx));
     const prev_version = c.version;
     c.attrs = Attrs.read(spec);
+    c.alignment = element.AlignAttrs.readFrom(spec);
     c.version = prev_version +% 1;
 
     // The body is authored text too, and a hot-reloaded document hands the
@@ -393,7 +398,7 @@ fn layoutAndRender(
     out: *element.DrawList,
 ) anyerror!element.Box {
     const c: *Component = @ptrCast(@alignCast(ctx));
-    return element_layout.layoutAndRenderCached(c.root, origin, constraints, lc, out);
+    return element_layout.layoutAndRenderCached(c.root, origin, c.alignment.apply(constraints), lc, out);
 }
 
 fn cornerRadius(ctx: *anyopaque) f32 {

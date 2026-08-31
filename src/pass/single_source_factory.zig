@@ -198,6 +198,9 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
             /// into — so `radius=${state.r}` is a reasonable thing for a
             /// document to write.
             corner_radius: f32 = 0,
+            /// `align=` / `text_align=`, inherited by everything under
+            /// this effect. See `element.AlignAttrs`.
+            alignment: element.AlignAttrs = .{},
         };
 
         pub const factory: component_mod.Factory = .{
@@ -246,6 +249,7 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
                 else
                     .{ 0, 0 },
                 .corner_radius = params.resolve(f32, spec, "radius", 0),
+                .alignment = element.AlignAttrs.readFrom(spec),
                 .version = 0,
                 .body = .{},
                 // `surface=` wins over `{backdrop}` when both are
@@ -297,6 +301,7 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
             // nothing about layout, so unlike `inflation` and
             // `min_size` it is safe to re-read here.
             c.corner_radius = params.resolve(f32, spec, "radius", 0);
+            c.alignment = element.AlignAttrs.readFrom(spec);
             c.version = prev_version +% 1;
 
             // **The surface NAME can change under a live instance; the
@@ -389,7 +394,7 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
             const c: *Component = @ptrCast(@alignCast(ctx));
             const inf = c.inflation;
 
-            var child_constraints = constraints;
+            var child_constraints = c.alignment.apply(constraints);
             if (std.math.isFinite(child_constraints.max_w)) {
                 child_constraints.max_w = @max(0, child_constraints.max_w - inf.left - inf.right);
             }

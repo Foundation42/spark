@@ -226,6 +226,10 @@ const Component = struct {
     spark: ?*spark_mod.Spark = null,
     inflation: component_mod.Edges,
     attrs: Attrs,
+    /// `align=` / `text_align=`, inherited by everything under this
+    /// container. See `element.AlignAttrs`.
+    alignment: element.AlignAttrs = .{},
+
     version: u64 = 0,
     body: component_mod.Body = .{},
     /// Per-instance scratch the chain hook returns a slice into. Owned by
@@ -284,6 +288,7 @@ fn create(
         .spark = spark,
         .inflation = computeInflation(attrs.offset[0], attrs.offset[1], attrs.blur),
         .attrs = attrs,
+        .alignment = element.AlignAttrs.readFrom(spec),
         .version = 0,
         .body = .{},
         .steps = undefined,
@@ -325,6 +330,7 @@ fn update(ctx: *anyopaque, spec: *const components.Spec) anyerror!void {
     // shadow's colour or spread is free; growing its blur needs a recreate
     // via an #id change, because the halo is already in the layout.
     c.attrs = Attrs.read(spec);
+    c.alignment = element.AlignAttrs.readFrom(spec);
     c.version = prev_version +% 1;
 
     // The body is authored text too, and a hot-reloaded document hands the
@@ -404,7 +410,7 @@ fn layoutAndRender(
     const c: *Component = @ptrCast(@alignCast(ctx));
     const inf = c.inflation;
 
-    var child_constraints = constraints;
+    var child_constraints = c.alignment.apply(constraints);
     if (std.math.isFinite(child_constraints.max_w)) {
         child_constraints.max_w = @max(0, child_constraints.max_w - inf.left - inf.right);
     }

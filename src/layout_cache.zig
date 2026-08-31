@@ -86,6 +86,14 @@ pub const Key = struct {
     /// `Constraints.max_w` bit-pattern. Different widths → different
     /// wrap → different layout.
     max_w_bits: u32,
+    /// `Constraints.block_align` and `text_align`, packed.
+    ///
+    /// They BAKE INTO THE POSITIONS a cached entry holds — a centred
+    /// line's glyphs carry their offset — so an entry laid out under one
+    /// alignment must not be replayed under another. Without this,
+    /// toggling `align=` on a wrapper leaves everything under it drawn
+    /// where it used to be, which reads as the attribute doing nothing.
+    align_bits: u16,
     /// `LayoutCtx.zoom` bit-pattern. Crisp-zoom rasterises glyphs at
     /// `display_px × zoom`, so the cached GlyphInstances' uv_min/max
     /// point to size-specific atlas rects. A zoom change at the host
@@ -293,6 +301,8 @@ pub fn keyFor(
     return .{
         .elem_id = elementIdentity(elem),
         .max_w_bits = @bitCast(constraints.max_w),
+        .align_bits = (@as(u16, @intFromEnum(constraints.block_align)) << 8) |
+            @as(u16, @intFromEnum(constraints.text_align)),
         .zoom_bits = @bitCast(zoom),
         .theme_ptr = @intFromPtr(theme),
         .pass_seed = pass_seed,
@@ -772,6 +782,39 @@ pub fn snapshotEntry(
 
 const testing = std.testing;
 
+test "keyFor: alignment is part of the key, or a centred block replays where it used to be" {
+    // A cached entry holds POSITIONS — a centred line's glyphs carry
+    // their offset baked in. Replaying one laid out under a different
+    // alignment draws everything where it used to be, which reads as
+    // `align=` doing nothing at all: the attribute is there, the layout
+    // is right, and the picture is stale.
+    //
+    // `max_w` has been in this key since the beginning for exactly the
+    // same reason. Alignment is the second thing that bakes in.
+    const kids = [_]element.Element{};
+    const elem = element.Element{ .paragraph = &kids };
+    var theme: element.Theme = undefined;
+
+    const plain = keyFor(elem, .{ .max_w = 360 }, &theme, 1.0, 0);
+    const blocks = keyFor(elem, .{ .max_w = 360, .block_align = .center }, &theme, 1.0, 0);
+    const text = keyFor(elem, .{ .max_w = 360, .text_align = .center }, &theme, 1.0, 0);
+    const both = keyFor(elem, .{ .max_w = 360, .block_align = .center, .text_align = .center }, &theme, 1.0, 0);
+
+    // All four distinct. The two attributes are independent, so a key
+    // folding them together — an OR, or only one of them — would let
+    // `align=center` hit an entry cached for `text_align=center`.
+    const keys = [_]Key{ plain, blocks, text, both };
+    for (keys, 0..) |a, i| {
+        for (keys[i + 1 ..]) |b| {
+            try std.testing.expect(!std.meta.eql(a, b));
+        }
+    }
+
+    // ...and identical constraints still hit, or nothing would ever
+    // cache and this "fix" would be a silent performance collapse.
+    try std.testing.expect(std.meta.eql(plain, keyFor(elem, .{ .max_w = 360 }, &theme, 1.0, 0)));
+}
+
 test "BlockCache: insert/lookup roundtrip" {
     var cache = BlockCache.init(testing.allocator);
     defer cache.deinit();
@@ -779,6 +822,7 @@ test "BlockCache: insert/lookup roundtrip" {
     const key: Key = .{
         .elem_id = 0xCAFE,
         .max_w_bits = @bitCast(@as(f32, 800)),
+        .align_bits = 0,
         .zoom_bits = @bitCast(@as(f32, 1.0)),
         .theme_ptr = 0xABCD,
         .pass_seed = 0,
@@ -830,6 +874,7 @@ test "BlockCache: insert replaces existing entry" {
     const key: Key = .{
         .elem_id = 0xCAFE,
         .max_w_bits = @bitCast(@as(f32, 800)),
+        .align_bits = 0,
         .zoom_bits = @bitCast(@as(f32, 1.0)),
         .theme_ptr = 0xABCD,
         .pass_seed = 0,
@@ -882,6 +927,7 @@ test "BlockCache: clear frees all entries" {
         const key: Key = .{
             .elem_id = i + 1,
             .max_w_bits = 0,
+            .align_bits = 0,
             .zoom_bits = 0,
             .theme_ptr = 0,
             .pass_seed = 0,
