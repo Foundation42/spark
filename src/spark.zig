@@ -1240,7 +1240,16 @@ pub const Spark = struct {
                         const nw: f32 = @floatFromInt(nested.compose_region.w);
                         const nh: f32 = @floatFromInt(nested.compose_region.h);
                         try self.recordSingleSourceCompose(cmd, nested, nested_target, nx, ny, nw, nh, &last_compose, .offscreen);
-                        j = nested.subtree_dispatch_range[1];
+                        // `+ 1`, because a dispatch sits AT its own
+                        // `subtree_dispatch_range[1]` — the walker captures
+                        // `seq` before appending itself. Landing on `[1]`
+                        // lands back on THIS entry and the loop never
+                        // advances, which is an infinite loop that records a
+                        // composite per turn and allocates a descriptor set
+                        // per composite: the fan spins up and the frame never
+                        // ends. `dispatchOffscreenPasses` says exactly this
+                        // and gets it right; these two nested walks did not.
+                        j = nested.subtree_dispatch_range[1] + 1;
                     },
                     // host_slot nested inside this single_source's
                     // subtree. Same compose shape as top-level host_slot
@@ -1261,10 +1270,13 @@ pub const Spark = struct {
                     // parent-target is the same compose shape as nested
                     // single_source / host_slot, just sourced from
                     // `acquired_targets[pool_base + final_pool_local]`.
-                    // C.1.5 advance mirrors nested single_source's
-                    // no-+1 shape: `j = nested.subtree_dispatch_range[1]`
-                    // (the inner walk's while-condition handles the
-                    // chain's own-index termination).
+                    // C.1.5 advance is `subtree_dispatch_range[1] + 1`,
+                    // the same fencepost every other walk uses. This
+                    // comment used to claim the no-+1 shape was fine
+                    // because "the inner walk's while-condition handles
+                    // the chain's own-index termination" — it does not:
+                    // `[1]` IS the chain's own index, so `j` lands back
+                    // on itself and spins.
                     .chain => |nested_c| {
                         const inner_base = self.chain_pool_bases.items[j] orelse unreachable;
                         const final_target = self.acquired_targets.items[inner_base + nested_c.final_pool_local];
@@ -1273,7 +1285,16 @@ pub const Spark = struct {
                         const nw: f32 = @floatFromInt(nested_c.compose_region.w);
                         const nh: f32 = @floatFromInt(nested_c.compose_region.h);
                         try self.recordChainFinalComposite(cmd, nested_c, final_target, nx, ny, nw, nh, &last_compose, .offscreen);
-                        j = nested_c.subtree_dispatch_range[1];
+                        // `+ 1`, because a dispatch sits AT its own
+                        // `subtree_dispatch_range[1]` — the walker captures
+                        // `seq` before appending itself. Landing on `[1]`
+                        // lands back on THIS entry and the loop never
+                        // advances, which is an infinite loop that records a
+                        // composite per turn and allocates a descriptor set
+                        // per composite: the fan spins up and the frame never
+                        // ends. `dispatchOffscreenPasses` says exactly this
+                        // and gets it right; these two nested walks did not.
+                        j = nested_c.subtree_dispatch_range[1] + 1;
                     },
                 }
             }
@@ -1651,7 +1672,16 @@ pub const Spark = struct {
                         const nw: f32 = @floatFromInt(nested.compose_region.w);
                         const nh: f32 = @floatFromInt(nested.compose_region.h);
                         try self.recordSingleSourceCompose(cmd, nested, nested_target, nx, ny, nw, nh, &last_compose, .offscreen);
-                        j = nested.subtree_dispatch_range[1];
+                        // `+ 1`, because a dispatch sits AT its own
+                        // `subtree_dispatch_range[1]` — the walker captures
+                        // `seq` before appending itself. Landing on `[1]`
+                        // lands back on THIS entry and the loop never
+                        // advances, which is an infinite loop that records a
+                        // composite per turn and allocates a descriptor set
+                        // per composite: the fan spins up and the frame never
+                        // ends. `dispatchOffscreenPasses` says exactly this
+                        // and gets it right; these two nested walks did not.
+                        j = nested.subtree_dispatch_range[1] + 1;
                     },
                     .host_slot => |nested_hs| {
                         const nested_target = self.dispatch_target_map.items[j] orelse unreachable;
@@ -1670,7 +1700,16 @@ pub const Spark = struct {
                         const nw: f32 = @floatFromInt(nested_c.compose_region.w);
                         const nh: f32 = @floatFromInt(nested_c.compose_region.h);
                         try self.recordChainFinalComposite(cmd, nested_c, final_target, nx, ny, nw, nh, &last_compose, .offscreen);
-                        j = nested_c.subtree_dispatch_range[1];
+                        // `+ 1`, because a dispatch sits AT its own
+                        // `subtree_dispatch_range[1]` — the walker captures
+                        // `seq` before appending itself. Landing on `[1]`
+                        // lands back on THIS entry and the loop never
+                        // advances, which is an infinite loop that records a
+                        // composite per turn and allocates a descriptor set
+                        // per composite: the fan spins up and the frame never
+                        // ends. `dispatchOffscreenPasses` says exactly this
+                        // and gets it right; these two nested walks did not.
+                        j = nested_c.subtree_dispatch_range[1] + 1;
                     },
                 }
             }
