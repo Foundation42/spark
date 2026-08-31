@@ -1542,9 +1542,47 @@ pub const LayoutCtx = struct {
     /// `MAIN_TARGET` (= `std.math.maxInt(u32)`) is the sentinel
     /// for the main color attachment. Any other value is an index
     /// into `pass_dispatches` identifying the owning single-source
-    /// effect's `SingleSourceStep`.
+    /// effect's `SingleSourceStep` — or, DURING the walk of that
+    /// effect's subtree only, a provisional tag (see
+    /// `provisionalTag`). Nothing outside the walker ever sees one.
     current_target_dispatch_index: u32 = MAIN_TARGET,
+    /// Counter behind `provisionalTag`. Bumped once per pass element
+    /// that routes its children offscreen; never read for anything
+    /// but uniqueness, so workers holding their own copy is fine —
+    /// each resolves its tags into its own private DrawList.
+    pass_tag_seq: u32 = 0,
 };
+
+/// A tag to stamp on drawlist primitives while walking a pass
+/// element's subtree, before that element's own dispatch index is
+/// known.
+///
+/// The index is not knowable at push time, and using the next best
+/// thing is what broke: the walker pushed `dispatch_start` — the
+/// length of the dispatch list BEFORE the subtree walk — while Phase 1
+/// routes primitives by the dispatch's own final index. Those two
+/// agree only when the subtree emits no dispatch of its own, so every
+/// shipping document was fine and a `:::drop_shadow` around a
+/// `:::frosted_glass {backdrop}` drew an empty shadowed panel: the
+/// glyphs were tagged with the backdrop's index, and a backdrop is the
+/// one dispatch shape that renders no drawlist primitives at all.
+///
+/// `dispatch_start` cannot be made to work by moving the consumer
+/// either, because it is not unique: an effect and the first effect
+/// nested inside it capture the SAME value. So the walk stamps a
+/// provisional tag that is unique among the pass elements currently
+/// open, and each element rewrites its own span to its real index on
+/// the way out — innermost first, by recursion. What is left carrying
+/// the outer tag when the outer element resolves is exactly what
+/// belongs to it: its own direct children, plus the children of any
+/// nested `{backdrop}`, which deliberately does not claim them.
+///
+/// Counting DOWN from `MAIN_TARGET` keeps the provisional space and
+/// the dispatch-index space disjoint while both are live, so a
+/// resolved tag is never mistaken for an unresolved one.
+pub fn provisionalTag(n: u32) u32 {
+    return MAIN_TARGET - 1 - n;
+}
 
 /// Sentinel value for `LayoutCtx.current_target_dispatch_index` and
 /// `DrawList.*_targets` entries meaning "main color attachment"
@@ -1696,6 +1734,48 @@ pub fn triRuns(targets: []const u32, indices: []const u32, match: u32) TriRunIte
 /// of render pass. tri_indices reference `tris` by index; an index
 /// inherits its target from the vertex it references, so a separate
 /// `tri_index_targets` array would be redundant.
+/// Where a pass element's subtree starts in each of the four target
+/// arrays, so the element can find its own primitives again once its
+/// dispatch index is known. See `provisionalTag`.
+pub const DrawListMark = struct {
+    glyphs: usize,
+    quads: usize,
+    tris: usize,
+    images: usize,
+
+    pub fn of(dl: *const DrawList) DrawListMark {
+        return .{
+            .glyphs = dl.glyph_targets.items.len,
+            .quads = dl.quad_targets.items.len,
+            .tris = dl.tri_targets.items.len,
+            .images = dl.image_targets.items.len,
+        };
+    }
+
+    /// Rewrite every primitive appended since this mark that still
+    /// carries `from` so it carries `to` instead.
+    ///
+    /// "Still" is the whole mechanism. A nested pass element resolves
+    /// its own span before this runs — it returns first — so its
+    /// primitives already carry a real dispatch index and are passed
+    /// over here. What is left is what the nested element declined to
+    /// claim, which is exactly what belongs to this one.
+    pub fn retag(self: DrawListMark, dl: *DrawList, from: u32, to: u32) void {
+        for (dl.glyph_targets.items[self.glyphs..]) |*t| {
+            if (t.* == from) t.* = to;
+        }
+        for (dl.quad_targets.items[self.quads..]) |*t| {
+            if (t.* == from) t.* = to;
+        }
+        for (dl.tri_targets.items[self.tris..]) |*t| {
+            if (t.* == from) t.* = to;
+        }
+        for (dl.image_targets.items[self.images..]) |*t| {
+            if (t.* == from) t.* = to;
+        }
+    }
+};
+
 pub const DrawList = struct {
     glyphs: std.ArrayList(tp.GlyphInstance),
     glyph_targets: std.ArrayList(u32),

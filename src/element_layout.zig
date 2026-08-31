@@ -251,7 +251,7 @@ pub fn layoutAndRender(
             // own subtree, restoring back to the enclosing target on
             // exit. Pattern dispatches don't push because they render
             // directly to the parent target via scissored viewport.
-            const saved_target = ctx.current_target_dispatch_index;
+            //
             // Effects-spec C.1.5 — chain (pass_kind=3) joins
             // single_source (pass_kind=2) as a content-wrapping shape.
             // Both render their child subtree's drawlist primitives
@@ -270,9 +270,21 @@ pub fn layoutAndRender(
                 2, 3 => if (cu.vtable.pass_source) |f| f(cu.ctx) == .subtree else true,
                 else => false,
             };
-            if (routes_children_offscreen and ctx.pass_dispatches != null) {
-                ctx.current_target_dispatch_index = dispatch_start;
-            }
+            //
+            // The tag pushed here is PROVISIONAL — see
+            // `element.provisionalTag` for why it cannot be
+            // `dispatch_start`, which is what it used to be. The
+            // matching resolve runs after `pd.append` below, where this
+            // element's real index is finally known; `retag_mark`
+            // records where its span of the drawlist begins.
+            const saved_target = ctx.current_target_dispatch_index;
+            const provisional: ?u32 = if (routes_children_offscreen and ctx.pass_dispatches != null) blk: {
+                const t = element.provisionalTag(ctx.pass_tag_seq);
+                ctx.pass_tag_seq += 1;
+                ctx.current_target_dispatch_index = t;
+                break :blk t;
+            } else null;
+            const retag_mark: element.DrawListMark = .of(out);
             defer ctx.current_target_dispatch_index = saved_target;
 
             const box = try cu.vtable.layout_and_render(
@@ -445,6 +457,12 @@ pub fn layoutAndRender(
                     else => unreachable,
                 };
                 try pd.append(dispatch);
+                // The dispatch now sits at `seq`, so the provisional tag
+                // its subtree was stamped with has an answer. Resolve
+                // before returning — an enclosing pass element resolves
+                // after this one and must not find our primitives still
+                // wearing a tag it could mistake for its own.
+                if (provisional) |t| retag_mark.retag(out, t, seq);
             }
             // Notify post-layout. Symmetric with the cache-hit branch
             // in `layoutAndRenderCached` — every custom walk fires

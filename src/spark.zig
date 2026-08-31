@@ -272,6 +272,74 @@ pub const InitOptions = struct {
 /// also the exclusive END of its subtree range — the walker appends a
 /// parent immediately after the children it captured, so the two numbers
 /// are the same by construction and only the START has to be carried.
+/// One document's slice of the frame — everything a single
+/// `layoutAndRender` call appended, in the four drawlist arrays and in
+/// `pass_dispatches`.
+///
+/// **A layer is the unit of paint order.** Without one, spark paints
+/// per FRAME: every background composite, then all MAIN geometry
+/// globally by primitive type (tri → image → quad → text). That is
+/// right for one document and wrong for two, because text is last in
+/// the frame — so the LOWER panel's text lands over the UPPER panel's
+/// glass and the two weave into each other. Chris dragged the Scene
+/// applet over Corners on 2026-08-31 and watched it happen.
+///
+/// A document's primitives are already contiguous (the host calls
+/// `layoutAndRender` once per document, and the walker appends as it
+/// goes), so ordering by document costs a pair of marks per call and no
+/// GPU resources at all — no per-panel target, no extra bandwidth. The
+/// earlier plan reached for one offscreen target per document; that was
+/// written when the empty-shadowed-panel bug looked like the same
+/// problem, and it is not (see `element.provisionalTag`).
+///
+/// Ranges are `[start, end)`. Tris are held in INDEX space rather than
+/// vertex space, because that is what a draw consumes and what
+/// `triRuns` walks — a vertex range would be the wrong slice of the
+/// wrong array.
+pub const PaintLayer = struct {
+    dispatches: [2]u32,
+    glyphs: [2]u32,
+    quads: [2]u32,
+    tri_indices: [2]u32,
+    images: [2]u32,
+
+    /// The whole frame as one layer — what a host that never called
+    /// `layoutAndRender` gets, and what one call produces anyway. Keeps
+    /// every pre-layers call site painting exactly as it did.
+    fn whole(dl: *const element.DrawList, pd_len: usize) PaintLayer {
+        return .{
+            .dispatches = .{ 0, @intCast(pd_len) },
+            .glyphs = .{ 0, @intCast(dl.glyph_targets.items.len) },
+            .quads = .{ 0, @intCast(dl.quad_targets.items.len) },
+            .tri_indices = .{ 0, @intCast(dl.tri_indices.items.len) },
+            .images = .{ 0, @intCast(dl.image_targets.items.len) },
+        };
+    }
+};
+
+/// Mark every dispatch that lies inside another dispatch's subtree, so
+/// Phase 1's top-level loop can leave it to the parent that owns it.
+///
+/// `out` must be `dispatches.len` long; it is overwritten in full.
+///
+/// Pulled out of `dispatchOffscreenPasses` so the rule can be asserted
+/// without a GPU. The bug it fixes is invisible in a picture — a pass
+/// processed twice draws the same thing twice — so a rendering gate
+/// cannot see it, and the only honest gate is on the rule itself.
+pub fn markSubtreeOwned(dispatches: []const element.PassDispatch, out: []bool) void {
+    std.debug.assert(out.len == dispatches.len);
+    @memset(out, false);
+    for (dispatches) |d| {
+        const range: [2]u32 = switch (d) {
+            .single_source => |ss| ss.subtree_dispatch_range,
+            .chain => |c| c.subtree_dispatch_range,
+            else => continue,
+        };
+        var k = range[0];
+        while (k < range[1]) : (k += 1) out[k] = true;
+    }
+}
+
 pub const BackgroundSpan = struct {
     index: u32,
     subtree_start: u32,
@@ -366,6 +434,12 @@ pub const Spark = struct {
     /// cross-field state to justify the struct. Revisit at A.6
     /// when the compiler ties them together.
     pass_dispatches: std.ArrayList(element.PassDispatch),
+    /// One entry per `layoutAndRender` call this frame, in call order,
+    /// which is paint order. See `PaintLayer`. Clears and carries over
+    /// with `drawlist` and `pass_dispatches` — a skip-layout frame
+    /// replays last frame's drawlist and needs last frame's layer
+    /// boundaries to replay it in the right order.
+    paint_layers: std.ArrayList(PaintLayer),
     /// Transient render-target pool — Phase A.3 typed-null stub.
     /// Sibling field per the [[feedback-spark-sibling-fields]]
     /// pattern. Phase B fills with the real ref-counted allocator.
@@ -490,7 +564,6 @@ pub const Spark = struct {
     /// cleared on click-outside or Esc. Compared by ctx pointer.
     focused: ?element.Hit = null,
 
-
     /// Construct a Spark and all engine resources. The host gives
     /// raw Vulkan handles (via opts.vk_ctx + opts.color_format), an
     /// owned FontRegistry, a borrowed Theme + root State, and
@@ -564,6 +637,7 @@ pub const Spark = struct {
         // ── DrawList + effects-side state ───────────────────────────
         const drawlist = element.DrawList.init(allocator);
         const pass_dispatches = std.ArrayList(element.PassDispatch).init(allocator);
+        const paint_layers = std.ArrayList(PaintLayer).init(allocator);
         const acquired_targets = std.ArrayList(pass_mod.TargetHandle).init(allocator);
         const dispatch_target_map = std.ArrayList(?pass_mod.TargetHandle).init(allocator);
         const chain_pool_bases = std.ArrayList(?u32).init(allocator);
@@ -629,6 +703,7 @@ pub const Spark = struct {
             .io_channel = io_channel,
             .drawlist = drawlist,
             .pass_dispatches = pass_dispatches,
+            .paint_layers = paint_layers,
             .acquired_targets = acquired_targets,
             .dispatch_target_map = dispatch_target_map,
             .chain_pool_bases = chain_pool_bases,
@@ -710,6 +785,7 @@ pub const Spark = struct {
         // 5. Per-frame state + effects-side stubs.
         self.drawlist.deinit();
         self.pass_dispatches.deinit();
+        self.paint_layers.deinit();
         self.acquired_targets.deinit();
         self.dispatch_target_map.deinit();
         self.chain_pool_bases.deinit();
@@ -899,6 +975,7 @@ pub const Spark = struct {
             // (e.g. stale pass dispatches replayed against a
             // freshly-rebuilt drawlist); the lifecycle test pins it.
             self.pass_dispatches.clearRetainingCapacity();
+            self.paint_layers.clearRetainingCapacity();
             // Effects-spec B.4.b.2: target_pool sweep + descriptor
             // pool reset run together on the reset boundary; both
             // are skipped on `.reset = false` so the dirty-gate
@@ -917,6 +994,12 @@ pub const Spark = struct {
     /// Walk `doc.root` into the per-frame DrawList. Multiple calls
     /// per frame compose vertically — the host passes successive
     /// origins. Returns the resulting Box for chaining.
+    ///
+    /// Each call is also one PAINT LAYER: later calls land wholly on top
+    /// of earlier ones, background and geometry together. For a single
+    /// document that is the order spark always painted in; for two
+    /// overlapping documents it is the difference between one panel
+    /// being above the other and the two interleaving. See `PaintLayer`.
     pub fn layoutAndRender(
         self: *Spark,
         doc: *const document_mod.Document,
@@ -940,7 +1023,29 @@ pub const Spark = struct {
             .layout_context = self.layout_context,
             .pass_dispatches = &self.pass_dispatches,
         };
-        return try element_layout.layoutAndRenderCached(doc.root, origin, constraints, &lc, &self.drawlist);
+        // Mark this document's slice of the frame. Everything the walk
+        // below appends is one layer, and layers paint in call order.
+        const dl = &self.drawlist;
+        const first: PaintLayer = .{
+            .dispatches = .{ @intCast(self.pass_dispatches.items.len), 0 },
+            .glyphs = .{ @intCast(dl.glyph_targets.items.len), 0 },
+            .quads = .{ @intCast(dl.quad_targets.items.len), 0 },
+            .tri_indices = .{ @intCast(dl.tri_indices.items.len), 0 },
+            .images = .{ @intCast(dl.image_targets.items.len), 0 },
+        };
+        // Reserved BEFORE the walk, because appending after it could
+        // fail on allocation, and a document that rendered but has no
+        // layer is a document that silently does not paint.
+        try self.paint_layers.ensureUnusedCapacity(1);
+        const box = try element_layout.layoutAndRenderCached(doc.root, origin, constraints, &lc, dl);
+        self.paint_layers.appendAssumeCapacity(.{
+            .dispatches = .{ first.dispatches[0], @intCast(self.pass_dispatches.items.len) },
+            .glyphs = .{ first.glyphs[0], @intCast(dl.glyph_targets.items.len) },
+            .quads = .{ first.quads[0], @intCast(dl.quad_targets.items.len) },
+            .tri_indices = .{ first.tri_indices[0], @intCast(dl.tri_indices.items.len) },
+            .images = .{ first.images[0], @intCast(dl.image_targets.items.len) },
+        });
+        return box;
     }
 
     // ── Document lifecycle ──────────────────────────────────────────
@@ -1018,6 +1123,7 @@ pub const Spark = struct {
     /// substrate test in `src/tests/single_source_dispatch.zig`
     /// exercises the populated path.
     pub fn dispatchOffscreenPasses(self: *Spark, cmd: vk.c.VkCommandBuffer) !void {
+        if (std.posix.getenv("SPARK_DUMP_PASSES") != null) self.dumpPassGraph();
         // Resize the dispatch_target_map to mirror pass_dispatches
         // and start every entry as null. Phase 1 fills in the
         // acquired handles at single_source positions; Phase 2 reads
@@ -1050,8 +1156,35 @@ pub const Spark = struct {
         // there); the asymmetry is intentional — Phase 1's iteration
         // only ever processes single_sources, so the natural skip
         // of `.pattern` is already correct.
+        //
+        // **A nested dispatch is its parent's to process, not ours.**
+        // The advances below skip PAST a subtree once its parent has
+        // been handled, which is the right move for pre-order and this
+        // walker emits post-order: children come first, so the top-level
+        // loop reached every nested dispatch BEFORE the parent that owns
+        // it and processed it a second time. Two pool acquisitions, two
+        // sets of recorded commands, two descriptor sets, every frame,
+        // for every effect nested in another — which is every applet
+        // wearing chrome.
+        //
+        // `owned` is not Phase 2's `is_nested`, and the two must not be
+        // merged. Phase 2 asks "was this composited into the parent's
+        // target?", which a `{backdrop}` answers no to. Phase 1 asks
+        // "will the parent walk this dispatch?", which every parent
+        // answers yes to — both `phase1ProcessSingleSource` and
+        // `phase1ProcessChain` recurse over their whole subtree before
+        // anything source-specific happens. Same-shaped bitmaps, two
+        // different questions.
+        const owned = try self.allocator.alloc(bool, self.pass_dispatches.items.len);
+        defer self.allocator.free(owned);
+        markSubtreeOwned(self.pass_dispatches.items, owned);
+
         var i: u32 = 0;
         while (i < self.pass_dispatches.items.len) {
+            if (owned[i]) {
+                i += 1;
+                continue;
+            }
             switch (self.pass_dispatches.items[i]) {
                 .pattern => i += 1,
                 .single_source => |ss| {
@@ -1076,6 +1209,66 @@ pub const Spark = struct {
                     i = c.subtree_dispatch_range[1] + 1;
                 },
             }
+        }
+    }
+
+    /// Print this frame's pass graph and the drawlist's routing tags.
+    /// `SPARK_DUMP_PASSES=1` in the environment turns it on.
+    ///
+    /// Two tables, and the bugs live in the join between them. The first
+    /// is what the walker emitted — each dispatch's index, its source,
+    /// and the subtree range it claims. The second is how many drawlist
+    /// primitives carry each routing tag. A tag naming a dispatch that
+    /// renders nothing (a `.backdrop`, which fills its target by copying
+    /// the attachment) means those primitives are drawn by nobody, and
+    /// the panel comes out empty. That is exactly how the
+    /// `dispatch_start` aliasing was found — see `element.provisionalTag`.
+    ///
+    /// Glyphs only: they are the primitive whose absence is obvious to a
+    /// person looking at the frame, and every routing bug so far has
+    /// moved all four arrays together.
+    fn dumpPassGraph(self: *Spark) void {
+        if (self.pass_dispatches.items.len == 0) return;
+        std.debug.print("--- pass_dispatches ({}) ---\n", .{self.pass_dispatches.items.len});
+        for (self.pass_dispatches.items, 0..) |d, di| {
+            switch (d) {
+                .pattern => std.debug.print("  [{}] pattern\n", .{di}),
+                .host_slot => std.debug.print("  [{}] host_slot\n", .{di}),
+                .single_source => |ss| std.debug.print(
+                    "  [{}] single_source src={s} subtree={any}\n",
+                    .{ di, @tagName(ss.source), ss.subtree_dispatch_range },
+                ),
+                .chain => |c| std.debug.print(
+                    "  [{}] chain src={s} subtree={any}\n",
+                    .{ di, @tagName(c.source), c.subtree_dispatch_range },
+                ),
+            }
+        }
+        // Counted by scanning per distinct tag rather than with a map:
+        // the tag space is the dispatch list plus one sentinel, so this
+        // is a handful of passes over an array, and it needs no
+        // allocator — which keeps the dump usable from anywhere.
+        var counted: usize = 0;
+        for (self.drawlist.glyph_targets.items) |t| {
+            if (t == element.MAIN_TARGET) counted += 1;
+        }
+        if (counted > 0) std.debug.print("  glyphs tagged MAIN: {}\n", .{counted});
+        for (0..self.pass_dispatches.items.len) |di| {
+            var n: usize = 0;
+            for (self.drawlist.glyph_targets.items) |t| {
+                if (t == @as(u32, @intCast(di))) n += 1;
+            }
+            counted += n;
+            if (n > 0) std.debug.print("  glyphs tagged [{}]: {}\n", .{ di, n });
+        }
+        // Anything left over is wearing a tag that is neither MAIN nor a
+        // dispatch — an unresolved provisional tag, which means a pass
+        // element returned without rewriting its own span.
+        if (counted < self.drawlist.glyph_targets.items.len) {
+            std.debug.print(
+                "  glyphs tagged UNRESOLVED: {} <- a provisional tag escaped the walk\n",
+                .{self.drawlist.glyph_targets.items.len - counted},
+            );
         }
     }
 
@@ -2561,7 +2754,11 @@ pub const Spark = struct {
         // small (~1-3 effects/doc). Sort optimisation deferred to
         // Phase C+ chain effects (bloom mips) make per-bind cost
         // matter.
-        if (self.pass_dispatches.items.len > 0) {
+        // No `if (pass_dispatches.len > 0)` guard any more: with no
+        // dispatches every range below is empty and every loop is a
+        // no-op, and the geometry draws — which it must, since a
+        // document with no effects at all is the common case.
+        {
             // B.6.b — pre-compute is_top_level bitmap. The walker emits
             // patterns BEFORE their parent single_source (post-order),
             // so a naive forward iteration treats nested patterns as
@@ -2609,258 +2806,303 @@ pub const Spark = struct {
             const sx = self.frame_info.scroll_offset[0];
             const sy = self.frame_info.scroll_offset[1];
             const z = self.frame_info.zoom;
-            var last_pattern: vk.c.VkPipeline = null;
-            var last_compose: vk.c.VkPipeline = null;
 
-            // **Backgrounds first, outermost first.** A backdrop chain is a
-            // background in the same sense `:::pattern` is: its children,
-            // and any effect nested in them, belong ON TOP of it. But the
-            // walker emits post-order — children come before their parent —
-            // so composing in the main loop would lay the panel over the
-            // very content it is supposed to sit behind. A pre-pass puts it
-            // underneath, and keeps two overlapping backdrops in the order
-            // the author wrote them.
-            //
-            // The pre-pass cannot keep raw dispatch order, though, and for
-            // a week it did. Post-order puts a background NESTED inside
-            // another before the one containing it, so a `:::gbuffer` in a
-            // `:::frosted_glass {backdrop}` composited first and the chrome
-            // painted over its own child — the panel vanished. That is the
-            // whole reason an applet could have chrome or draw its own
-            // passes and not both. `orderBackgrounds` sorts them
-            // outermost-first; see its doc for why the key is correct.
-            //
-            // The consequence, stated rather than discovered: a background
-            // still lands under every NON-background pass this frame, not
-            // just its own children. Two backdrops stack by document order;
-            // a backdrop cannot be composited over a sibling drop shadow.
-            var bg_n: usize = 0;
+            // Scratch for the per-layer background sort. Sized once for
+            // the whole frame and reused — a layer's list is a subset of
+            // it, so one allocation covers every layer.
             const bgs = try self.allocator.alloc(BackgroundSpan, pd_len);
             defer self.allocator.free(bgs);
-            for (self.pass_dispatches.items, 0..) |d, bi| {
-                // A background inside a `.subtree` parent was rendered into
-                // THAT parent's pool by Phase 1 and is not ours to put on
-                // MAIN — compositing it here as well would draw it twice,
-                // the second time outside the effect wrapping it.
-                if (is_nested[bi]) continue;
-                const start: u32 = switch (d) {
-                    .chain => |c| if (c.source.isBackground()) c.subtree_dispatch_range[0] else continue,
-                    .single_source => |ss| if (ss.source.isBackground()) ss.subtree_dispatch_range[0] else continue,
-                    else => continue,
-                };
-                bgs[bg_n] = .{ .index = @intCast(bi), .subtree_start = start };
-                bg_n += 1;
-            }
-            orderBackgrounds(bgs[0..bg_n]);
 
-            for (bgs[0..bg_n]) |bg| {
-                const bi = bg.index;
-                switch (self.pass_dispatches.items[bi]) {
-                    .chain => |c| {
-                        const pool_base = self.chain_pool_bases.items[bi] orelse unreachable;
-                        const final_target = self.acquired_targets.items[pool_base + c.final_pool_local];
-                        const bx = (@as(f32, @floatFromInt(c.compose_region.x)) - sx) * z;
-                        const by = (@as(f32, @floatFromInt(c.compose_region.y)) - sy) * z;
-                        const bw = @as(f32, @floatFromInt(c.compose_region.w)) * z;
-                        const bh = @as(f32, @floatFromInt(c.compose_region.h)) * z;
-                        try self.recordChainFinalComposite(cmd, c, final_target, bx, by, bw, bh, &last_compose, .main);
-                    },
-                    .single_source => |ss| {
-                        // Backdrops AND host-named surfaces: both are
-                        // backgrounds to their own children, and both
-                        // need the pre-pass for the same post-order
-                        // reason. A host_named pass owns no target —
-                        // its sampler is the host's image — so the
-                        // handle is legitimately null here and the
-                        // compose resolves the view itself.
-                        const target = self.dispatch_target_map.items[bi];
-                        const bx = (@as(f32, @floatFromInt(ss.compose_region.x)) - sx) * z;
-                        const by = (@as(f32, @floatFromInt(ss.compose_region.y)) - sy) * z;
-                        const bw = @as(f32, @floatFromInt(ss.compose_region.w)) * z;
-                        const bh = @as(f32, @floatFromInt(ss.compose_region.h)) * z;
-                        try self.recordSingleSourceCompose(cmd, ss, target, bx, by, bw, bh, &last_compose, .main);
-                    },
-                    // The list was built from the same two arms above, so
-                    // anything else here means the two switches drifted.
-                    else => unreachable,
-                }
-            }
+            // **One layer at a time, in call order.** Everything below —
+            // the background pre-pass, the top-level composites, and the
+            // MAIN geometry — used to run once for the whole frame, which
+            // put every document's text above every document's glass. See
+            // `PaintLayer`. A host that renders one document gets exactly
+            // one layer and the identical sequence of commands.
+            var only = [_]PaintLayer{PaintLayer.whole(dl, pd_len)};
+            const layers: []const PaintLayer = if (self.paint_layers.items.len > 0)
+                self.paint_layers.items
+            else
+                only[0..];
 
-            var i: usize = 0;
-            while (i < self.pass_dispatches.items.len) {
-                if (is_nested[i]) {
-                    i += 1;
-                    continue;
+            for (layers) |layer| {
+                // Bind cursors are PER LAYER, and must be: geometry is
+                // recorded between one layer's composites and the next
+                // layer's, so a cursor carried across the boundary would
+                // report a pipeline as still bound after the quad and
+                // text pipelines have been bound over it — and the next
+                // composite would be recorded with no bind at all.
+                var last_pattern: vk.c.VkPipeline = null;
+                var last_compose: vk.c.VkPipeline = null;
+
+                // **Backgrounds first, outermost first.** A backdrop chain is a
+                // background in the same sense `:::pattern` is: its children,
+                // and any effect nested in them, belong ON TOP of it. But the
+                // walker emits post-order — children come before their parent —
+                // so composing in the main loop would lay the panel over the
+                // very content it is supposed to sit behind. A pre-pass puts it
+                // underneath, and keeps two overlapping backdrops in the order
+                // the author wrote them.
+                //
+                // The pre-pass cannot keep raw dispatch order, though, and for
+                // a week it did. Post-order puts a background NESTED inside
+                // another before the one containing it, so a `:::gbuffer` in a
+                // `:::frosted_glass {backdrop}` composited first and the chrome
+                // painted over its own child — the panel vanished. That is the
+                // whole reason an applet could have chrome or draw its own
+                // passes and not both. `orderBackgrounds` sorts them
+                // outermost-first; see its doc for why the key is correct.
+                //
+                // The consequence, stated rather than discovered: a background
+                // still lands under every NON-background pass this frame, not
+                // just its own children. Two backdrops stack by document order;
+                // a backdrop cannot be composited over a sibling drop shadow.
+                var bg_n: usize = 0;
+                for (layer.dispatches[0]..layer.dispatches[1]) |bi| {
+                    const d = self.pass_dispatches.items[bi];
+                    // A background inside a `.subtree` parent was rendered into
+                    // THAT parent's pool by Phase 1 and is not ours to put on
+                    // MAIN — compositing it here as well would draw it twice,
+                    // the second time outside the effect wrapping it.
+                    if (is_nested[bi]) continue;
+                    const start: u32 = switch (d) {
+                        .chain => |c| if (c.source.isBackground()) c.subtree_dispatch_range[0] else continue,
+                        .single_source => |ss| if (ss.source.isBackground()) ss.subtree_dispatch_range[0] else continue,
+                        else => continue,
+                    };
+                    bgs[bg_n] = .{ .index = @intCast(bi), .subtree_start = start };
+                    bg_n += 1;
                 }
-                switch (self.pass_dispatches.items[i]) {
-                    .pattern => |p| {
-                        // World-local viewport: (region - scroll) * zoom.
-                        // Coord-space assumption — world coords are
-                        // top-left-origin pixel space, matching
-                        // `VkRect2D`'s expectation directly. Phase C's
-                        // multi-resolution chain passes will introduce
-                        // per-pass scale; revisit when chain effects
-                        // land non-1:1 target ratios.
-                        const wx: f32 = @floatFromInt(p.layout_region.x);
-                        const wy: f32 = @floatFromInt(p.layout_region.y);
-                        const ww: f32 = @floatFromInt(p.layout_region.w);
-                        const wh: f32 = @floatFromInt(p.layout_region.h);
-                        const sxr = (wx - sx) * z;
-                        const syr = (wy - sy) * z;
-                        const swr = ww * z;
-                        const shr = wh * z;
-                        self.recordPatternStep(cmd, p, sxr, syr, swr, shr, &last_pattern, .main);
+                orderBackgrounds(bgs[0..bg_n]);
+
+                for (bgs[0..bg_n]) |bg| {
+                    const bi = bg.index;
+                    switch (self.pass_dispatches.items[bi]) {
+                        .chain => |c| {
+                            const pool_base = self.chain_pool_bases.items[bi] orelse unreachable;
+                            const final_target = self.acquired_targets.items[pool_base + c.final_pool_local];
+                            const bx = (@as(f32, @floatFromInt(c.compose_region.x)) - sx) * z;
+                            const by = (@as(f32, @floatFromInt(c.compose_region.y)) - sy) * z;
+                            const bw = @as(f32, @floatFromInt(c.compose_region.w)) * z;
+                            const bh = @as(f32, @floatFromInt(c.compose_region.h)) * z;
+                            try self.recordChainFinalComposite(cmd, c, final_target, bx, by, bw, bh, &last_compose, .main);
+                        },
+                        .single_source => |ss| {
+                            // Backdrops AND host-named surfaces: both are
+                            // backgrounds to their own children, and both
+                            // need the pre-pass for the same post-order
+                            // reason. A host_named pass owns no target —
+                            // its sampler is the host's image — so the
+                            // handle is legitimately null here and the
+                            // compose resolves the view itself.
+                            const target = self.dispatch_target_map.items[bi];
+                            const bx = (@as(f32, @floatFromInt(ss.compose_region.x)) - sx) * z;
+                            const by = (@as(f32, @floatFromInt(ss.compose_region.y)) - sy) * z;
+                            const bw = @as(f32, @floatFromInt(ss.compose_region.w)) * z;
+                            const bh = @as(f32, @floatFromInt(ss.compose_region.h)) * z;
+                            try self.recordSingleSourceCompose(cmd, ss, target, bx, by, bw, bh, &last_compose, .main);
+                        },
+                        // The list was built from the same two arms above, so
+                        // anything else here means the two switches drifted.
+                        else => unreachable,
+                    }
+                }
+
+                var i: usize = layer.dispatches[0];
+                while (i < layer.dispatches[1]) {
+                    if (is_nested[i]) {
                         i += 1;
-                    },
-                    .single_source => |ss| {
-                        // Every background source was composited in the
-                        // pre-pass above — compositing again here would
-                        // draw the panel twice, the second time over its
-                        // own children.
-                        if (ss.source.isBackground()) {
-                            i = ss.subtree_dispatch_range[1] + 1;
-                            continue;
-                        }
-                        // Top-level compose. Phase 1 already
-                        // populated the target and barriered it to
-                        // SHADER_READ_ONLY_OPTIMAL; dispatch_target_map
-                        // stores the handle at this dispatch index.
-                        // Missing handle here would mean Phase 1
-                        // failed silently — unreachable in healthy
-                        // code, asserted explicitly.
-                        const target = self.dispatch_target_map.items[i] orelse unreachable;
-                        const wx: f32 = @floatFromInt(ss.compose_region.x);
-                        const wy: f32 = @floatFromInt(ss.compose_region.y);
-                        const ww: f32 = @floatFromInt(ss.compose_region.w);
-                        const wh: f32 = @floatFromInt(ss.compose_region.h);
-                        const sxr = (wx - sx) * z;
-                        const syr = (wy - sy) * z;
-                        const swr = ww * z;
-                        const shr = wh * z;
-                        try self.recordSingleSourceCompose(cmd, ss, target, sxr, syr, swr, shr, &last_compose, .main);
-                        // +1 advances past the single_source itself
-                        // (subtree[1] is exclusive END of subtree,
-                        // single_source sits AT that index). Without
-                        // the +1 we infinite-loop on this entry.
-                        // Same fencepost as Phase 1.
-                        i = ss.subtree_dispatch_range[1] + 1;
-                    },
-                    // Effects-spec B.7. Top-level host_slot compose —
-                    // same shape as single_source compose, with the
-                    // target filled by the host callback in Phase 1
-                    // instead of by spark's walker. No subtree, so
-                    // advance is plain `i += 1`.
-                    .host_slot => |hs| {
-                        const target = self.dispatch_target_map.items[i] orelse unreachable;
-                        const wx: f32 = @floatFromInt(hs.compose_region.x);
-                        const wy: f32 = @floatFromInt(hs.compose_region.y);
-                        const ww: f32 = @floatFromInt(hs.compose_region.w);
-                        const wh: f32 = @floatFromInt(hs.compose_region.h);
-                        const sxr = (wx - sx) * z;
-                        const syr = (wy - sy) * z;
-                        const swr = ww * z;
-                        const shr = wh * z;
-                        try self.recordHostSlotCompose(cmd, hs, target, sxr, syr, swr, shr, &last_compose, .main);
-                        i += 1;
-                    },
-                    // Effects-spec C.1 — top-level chain compose into
-                    // MAIN. Mirrors single_source's Phase 2 shape:
-                    // Phase 1 already populated the chain's
-                    // ping-pong pool and left `pool[final_pool_local]`
-                    // in SHADER_READ_ONLY_OPTIMAL; this samples that
-                    // target and writes into MAIN at `compose_region`
-                    // via `final_composite_shader_id`. No subtree, so
-                    // advance is plain `i += 1`.
-                    .chain => |c| {
-                        // Backgrounds were composited in the pre-pass
-                        // above. `isBackground()` rather than
-                        // `== .backdrop` so this site and the pre-pass's
-                        // filter cannot drift: a source that is a
-                        // background to one of them and not to the other
-                        // is composited twice or not at all.
-                        if (c.source.isBackground()) {
+                        continue;
+                    }
+                    switch (self.pass_dispatches.items[i]) {
+                        .pattern => |p| {
+                            // World-local viewport: (region - scroll) * zoom.
+                            // Coord-space assumption — world coords are
+                            // top-left-origin pixel space, matching
+                            // `VkRect2D`'s expectation directly. Phase C's
+                            // multi-resolution chain passes will introduce
+                            // per-pass scale; revisit when chain effects
+                            // land non-1:1 target ratios.
+                            const wx: f32 = @floatFromInt(p.layout_region.x);
+                            const wy: f32 = @floatFromInt(p.layout_region.y);
+                            const ww: f32 = @floatFromInt(p.layout_region.w);
+                            const wh: f32 = @floatFromInt(p.layout_region.h);
+                            const sxr = (wx - sx) * z;
+                            const syr = (wy - sy) * z;
+                            const swr = ww * z;
+                            const shr = wh * z;
+                            self.recordPatternStep(cmd, p, sxr, syr, swr, shr, &last_pattern, .main);
                             i += 1;
-                            continue;
-                        }
-                        const pool_base = self.chain_pool_bases.items[i] orelse unreachable;
-                        const final_target = self.acquired_targets.items[pool_base + c.final_pool_local];
-                        const wx: f32 = @floatFromInt(c.compose_region.x);
-                        const wy: f32 = @floatFromInt(c.compose_region.y);
-                        const ww: f32 = @floatFromInt(c.compose_region.w);
-                        const wh: f32 = @floatFromInt(c.compose_region.h);
-                        const sxr = (wx - sx) * z;
-                        const syr = (wy - sy) * z;
-                        const swr = ww * z;
-                        const shr = wh * z;
-                        try self.recordChainFinalComposite(cmd, c, final_target, sxr, syr, swr, shr, &last_compose, .main);
-                        i += 1;
-                    },
+                        },
+                        .single_source => |ss| {
+                            // Every background source was composited in the
+                            // pre-pass above — compositing again here would
+                            // draw the panel twice, the second time over its
+                            // own children.
+                            if (ss.source.isBackground()) {
+                                i = ss.subtree_dispatch_range[1] + 1;
+                                continue;
+                            }
+                            // Top-level compose. Phase 1 already
+                            // populated the target and barriered it to
+                            // SHADER_READ_ONLY_OPTIMAL; dispatch_target_map
+                            // stores the handle at this dispatch index.
+                            // Missing handle here would mean Phase 1
+                            // failed silently — unreachable in healthy
+                            // code, asserted explicitly.
+                            const target = self.dispatch_target_map.items[i] orelse unreachable;
+                            const wx: f32 = @floatFromInt(ss.compose_region.x);
+                            const wy: f32 = @floatFromInt(ss.compose_region.y);
+                            const ww: f32 = @floatFromInt(ss.compose_region.w);
+                            const wh: f32 = @floatFromInt(ss.compose_region.h);
+                            const sxr = (wx - sx) * z;
+                            const syr = (wy - sy) * z;
+                            const swr = ww * z;
+                            const shr = wh * z;
+                            try self.recordSingleSourceCompose(cmd, ss, target, sxr, syr, swr, shr, &last_compose, .main);
+                            // +1 advances past the single_source itself
+                            // (subtree[1] is exclusive END of subtree,
+                            // single_source sits AT that index). Without
+                            // the +1 we infinite-loop on this entry.
+                            // Same fencepost as Phase 1.
+                            i = ss.subtree_dispatch_range[1] + 1;
+                        },
+                        // Effects-spec B.7. Top-level host_slot compose —
+                        // same shape as single_source compose, with the
+                        // target filled by the host callback in Phase 1
+                        // instead of by spark's walker. No subtree, so
+                        // advance is plain `i += 1`.
+                        .host_slot => |hs| {
+                            const target = self.dispatch_target_map.items[i] orelse unreachable;
+                            const wx: f32 = @floatFromInt(hs.compose_region.x);
+                            const wy: f32 = @floatFromInt(hs.compose_region.y);
+                            const ww: f32 = @floatFromInt(hs.compose_region.w);
+                            const wh: f32 = @floatFromInt(hs.compose_region.h);
+                            const sxr = (wx - sx) * z;
+                            const syr = (wy - sy) * z;
+                            const swr = ww * z;
+                            const shr = wh * z;
+                            try self.recordHostSlotCompose(cmd, hs, target, sxr, syr, swr, shr, &last_compose, .main);
+                            i += 1;
+                        },
+                        // Effects-spec C.1 — top-level chain compose into
+                        // MAIN. Mirrors single_source's Phase 2 shape:
+                        // Phase 1 already populated the chain's
+                        // ping-pong pool and left `pool[final_pool_local]`
+                        // in SHADER_READ_ONLY_OPTIMAL; this samples that
+                        // target and writes into MAIN at `compose_region`
+                        // via `final_composite_shader_id`. No subtree, so
+                        // advance is plain `i += 1`.
+                        .chain => |c| {
+                            // Backgrounds were composited in the pre-pass
+                            // above. `isBackground()` rather than
+                            // `== .backdrop` so this site and the pre-pass's
+                            // filter cannot drift: a source that is a
+                            // background to one of them and not to the other
+                            // is composited twice or not at all.
+                            if (c.source.isBackground()) {
+                                i += 1;
+                                continue;
+                            }
+                            const pool_base = self.chain_pool_bases.items[i] orelse unreachable;
+                            const final_target = self.acquired_targets.items[pool_base + c.final_pool_local];
+                            const wx: f32 = @floatFromInt(c.compose_region.x);
+                            const wy: f32 = @floatFromInt(c.compose_region.y);
+                            const ww: f32 = @floatFromInt(c.compose_region.w);
+                            const wh: f32 = @floatFromInt(c.compose_region.h);
+                            const sxr = (wx - sx) * z;
+                            const syr = (wy - sy) * z;
+                            const swr = ww * z;
+                            const shr = wh * z;
+                            try self.recordChainFinalComposite(cmd, c, final_target, sxr, syr, swr, shr, &last_compose, .main);
+                            i += 1;
+                        },
+                    }
                 }
-            }
-        }
 
-        // Per-target rasterizer routing for the MAIN attachment
-        // (Phase B.4.b.4). Interleaved single_source subtrees split
-        // the MAIN run into multiple chunks separated by per-target
-        // primitives (`text :::drop_shadow{box} text` → two MAIN
-        // runs around one TARGET run). The iterator yields each
-        // MAIN run as `(first, count)`; recordDrawRange handles
-        // each one with vkCmdDraw's `firstInstance` argument (the
-        // shaders read `gl_InstanceIndex` which auto-includes it).
-        //
-        // For non-effect docs there's exactly one run covering the
-        // whole array, so the cost reduces to one recordDrawRange
-        // per pipeline — identical command volume to the pre-B.4.b.4
-        // single recordDraw, just with `firstInstance = 0` made
-        // explicit. The TriRun iterator's index-space arithmetic
-        // means `vkCmdDrawIndexed` receives the same arguments as
-        // before in the no-effect case.
-        //
-        // Paint order: tri → image → quad → text. SVG fills under
-        // chrome under glyphs — same as pre-B.4.b.4 and same as the
-        // offscreen-target order inside Phase 1.
-        // MAIN attachment world_offset = (0, 0). Drawlist primitives
-        // already carry screen-space coords by this point (endFrame's
-        // world→screen transform ran above) — no rebase needed. The
-        // (0, 0) here is the documented identity case that makes the
-        // single-shader-path work for both attachments without
-        // branching (Phase B.5 substrate).
-        const main_world_offset: [2]f32 = .{ 0, 0 };
-        // The display transform applies HERE and nowhere else. This is the
-        // composition point — the one place spark writes to the surface the
-        // host will present. Phase 1's offscreen target renders pass
-        // `.offscreen` because an effect target is an intermediate that gets
-        // composited through these same pipelines later; encoding into one
-        // would encode twice, and PQ twice is not PQ.
-        const disp = self.frame_info.displayPush();
-        {
-            var it = element.triRuns(dl.tri_targets.items, dl.tri_indices.items, element.MAIN_TARGET);
-            while (it.next()) |run| {
-                self.tri_pipeline.recordDrawIndexedRange(cmd, extent, main_world_offset, run.first_index, run.index_count, disp, .main);
-            }
-        }
-        {
-            var it = element.runs(dl.image_targets.items, element.MAIN_TARGET);
-            const all_images = dl.images.items;
-            while (it.next()) |run| {
-                if (run.count == 0) continue;
-                self.image_pipeline.bind(cmd, extent, .main);
-                const subset = all_images[run.first .. run.first + run.count];
-                for (subset) |im| {
-                    self.image_pipeline.recordOne(cmd, extent, main_world_offset, @ptrCast(@alignCast(im.descriptor_set)), im.dst_pos, im.dst_size, disp);
+                // Per-target rasterizer routing for the MAIN attachment
+                // (Phase B.4.b.4). Interleaved single_source subtrees split
+                // the MAIN run into multiple chunks separated by per-target
+                // primitives (`text :::drop_shadow{box} text` → two MAIN
+                // runs around one TARGET run). The iterator yields each
+                // MAIN run as `(first, count)`; recordDrawRange handles
+                // each one with vkCmdDraw's `firstInstance` argument (the
+                // shaders read `gl_InstanceIndex` which auto-includes it).
+                //
+                // For non-effect docs there's exactly one run covering the
+                // whole layer, so the cost reduces to one recordDrawRange
+                // per pipeline — identical command volume to the pre-B.4.b.4
+                // single recordDraw, just with `firstInstance = 0` made
+                // explicit. The TriRun iterator's index-space arithmetic
+                // means `vkCmdDrawIndexed` receives the same arguments as
+                // before in the no-effect case.
+                //
+                // Paint order: tri → image → quad → text. SVG fills under
+                // chrome under glyphs — same as pre-B.4.b.4 and same as the
+                // offscreen-target order inside Phase 1. Within a LAYER: the
+                // rule orders one document's own primitives, and it is the
+                // wrong rule to apply across two, which is what a
+                // frame-global sweep did.
+                //
+                // Each iterator is given the layer's slice, so `run.first` is
+                // layer-relative and the layer's start is added back. Tris
+                // slice `tri_indices` rather than `tri_targets` because a
+                // draw consumes indices and the tag lives in vertex space —
+                // slicing the tags would cut the wrong array at the wrong
+                // place, and would do it silently.
+                //
+                // MAIN attachment world_offset = (0, 0). Drawlist primitives
+                // already carry screen-space coords by this point (endFrame's
+                // world→screen transform ran above) — no rebase needed. The
+                // (0, 0) here is the documented identity case that makes the
+                // single-shader-path work for both attachments without
+                // branching (Phase B.5 substrate).
+                const main_world_offset: [2]f32 = .{ 0, 0 };
+                // The display transform applies HERE and nowhere else. This is the
+                // composition point — the one place spark writes to the surface the
+                // host will present. Phase 1's offscreen target renders pass
+                // `.offscreen` because an effect target is an intermediate that gets
+                // composited through these same pipelines later; encoding into one
+                // would encode twice, and PQ twice is not PQ.
+                const disp = self.frame_info.displayPush();
+                {
+                    const base = layer.tri_indices[0];
+                    var it = element.triRuns(
+                        dl.tri_targets.items,
+                        dl.tri_indices.items[base..layer.tri_indices[1]],
+                        element.MAIN_TARGET,
+                    );
+                    while (it.next()) |run| {
+                        self.tri_pipeline.recordDrawIndexedRange(cmd, extent, main_world_offset, base + run.first_index, run.index_count, disp, .main);
+                    }
                 }
-            }
-        }
-        {
-            var it = element.runs(dl.quad_targets.items, element.MAIN_TARGET);
-            while (it.next()) |run| {
-                self.quad_pipeline.recordDrawRange(cmd, extent, main_world_offset, run.first, run.count, disp, .main);
-            }
-        }
-        {
-            var it = element.runs(dl.glyph_targets.items, element.MAIN_TARGET);
-            while (it.next()) |run| {
-                self.text_pipeline.recordDrawRange(cmd, extent, main_world_offset, run.first, run.count, disp, .main);
+                {
+                    const base = layer.images[0];
+                    var it = element.runs(dl.image_targets.items[base..layer.images[1]], element.MAIN_TARGET);
+                    const all_images = dl.images.items;
+                    while (it.next()) |run| {
+                        if (run.count == 0) continue;
+                        self.image_pipeline.bind(cmd, extent, .main);
+                        const subset = all_images[base + run.first .. base + run.first + run.count];
+                        for (subset) |im| {
+                            self.image_pipeline.recordOne(cmd, extent, main_world_offset, @ptrCast(@alignCast(im.descriptor_set)), im.dst_pos, im.dst_size, disp);
+                        }
+                    }
+                }
+                {
+                    const base = layer.quads[0];
+                    var it = element.runs(dl.quad_targets.items[base..layer.quads[1]], element.MAIN_TARGET);
+                    while (it.next()) |run| {
+                        self.quad_pipeline.recordDrawRange(cmd, extent, main_world_offset, base + run.first, run.count, disp, .main);
+                    }
+                }
+                {
+                    const base = layer.glyphs[0];
+                    var it = element.runs(dl.glyph_targets.items[base..layer.glyphs[1]], element.MAIN_TARGET);
+                    while (it.next()) |run| {
+                        self.text_pipeline.recordDrawRange(cmd, extent, main_world_offset, base + run.first, run.count, disp, .main);
+                    }
+                }
             }
         }
 
@@ -3061,6 +3303,7 @@ pub const Spark = struct {
             .io_channel = undefined,
             .drawlist = undefined,
             .pass_dispatches = undefined,
+            .paint_layers = undefined,
             .target_pool = undefined,
             .shader_resolver = undefined,
             .pattern_pipelines = undefined,
@@ -3349,6 +3592,88 @@ test "orderBackgrounds: an already-correct list is left alone" {
         .{ .index = 3, .subtree_start = 2 },
     };
     try testing.expectEqualSlices(u32, &.{ 1, 3 }, orderOf(&two)[0..2]);
+}
+
+/// A `.chain` dispatch carrying nothing but the subtree range these
+/// tests are about. Every other field is inert here.
+fn chainAt(subtree: [2]u32, seq: u32) element.PassDispatch {
+    return .{ .chain = .{
+        .target_size = .{ 1, 1 },
+        .target_format = 0,
+        .target_pool_count = 1,
+        .steps = &.{},
+        .compose_region = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+        .final_pool_local = 0,
+        .subtree_dispatch_range = subtree,
+        .final_composite_shader_id = [_]u8{0} ** 16,
+        .sequence_index = seq,
+    } };
+}
+
+test "markSubtreeOwned: a nested pass belongs to its parent, not to the top level" {
+    // The walker emits POST-ORDER, so a nested dispatch always sits at a
+    // LOWER index than the parent that owns it. Phase 1's top-level loop
+    // therefore reached index 0 first and processed it, and then the
+    // parent at index 1 recursed into index 0 and processed it again:
+    // two pool acquisitions and two sets of recorded commands per frame,
+    // for every effect nested inside another.
+    //
+    // `:::drop_shadow` wrapping `:::frosted_glass {backdrop}` — the
+    // shape Chris hit — is exactly this list.
+    var out: [2]bool = undefined;
+    const nested = [_]element.PassDispatch{
+        chainAt(.{ 0, 0 }, 0), // the inner glass: no subtree of its own
+        chainAt(.{ 0, 1 }, 1), // the shadow: owns index 0
+    };
+    markSubtreeOwned(&nested, &out);
+    try testing.expectEqualSlices(bool, &.{ true, false }, &out);
+}
+
+test "markSubtreeOwned: two effects side by side are both top-level" {
+    // Siblings own nothing of each other, so neither is skipped. This is
+    // the case a too-eager skip would break — and it would break it
+    // SILENTLY, by not drawing an effect at all.
+    var out: [2]bool = undefined;
+    const siblings = [_]element.PassDispatch{
+        chainAt(.{ 0, 0 }, 0),
+        chainAt(.{ 1, 1 }, 1),
+    };
+    markSubtreeOwned(&siblings, &out);
+    try testing.expectEqualSlices(bool, &.{ false, false }, &out);
+}
+
+test "markSubtreeOwned: three deep, and only the outermost is top-level" {
+    // Ownership is not just parent-to-child: the outermost effect's range
+    // covers the whole nest, so a middle effect is marked by BOTH its
+    // parent and its grandparent. Marking is idempotent, which is why the
+    // rule can be a plain sweep rather than a tree walk.
+    var out: [3]bool = undefined;
+    const deep = [_]element.PassDispatch{
+        chainAt(.{ 0, 0 }, 0),
+        chainAt(.{ 0, 1 }, 1),
+        chainAt(.{ 0, 2 }, 2),
+    };
+    markSubtreeOwned(&deep, &out);
+    try testing.expectEqualSlices(bool, &.{ true, true, false }, &out);
+}
+
+test "markSubtreeOwned: a pattern owns nothing and can still be owned" {
+    // `.pattern` and `.host_slot` have no subtree, so they never mark
+    // anyone — but they sit inside other effects' ranges all the time and
+    // must be marked when they do. Phase 1's top-level loop skips
+    // patterns anyway; this pins that the bitmap agrees with it rather
+    // than relying on two places to stay in step.
+    var out: [2]bool = undefined;
+    const with_pattern = [_]element.PassDispatch{
+        .{ .pattern = .{
+            .shader_id = [_]u8{0} ** 16,
+            .layout_region = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+            .sequence_index = 0,
+        } },
+        chainAt(.{ 0, 1 }, 1),
+    };
+    markSubtreeOwned(&with_pattern, &out);
+    try testing.expectEqualSlices(bool, &.{ true, false }, &out);
 }
 
 test "claimsPointer: inside a hit box yes, outside no, and captured always" {
