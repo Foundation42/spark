@@ -219,7 +219,7 @@ pub fn preprocess(arena: std.mem.Allocator, source: []const u8, state: ?*const s
         }
 
         // ── Inline-directive scan (stage 15E.2) ────────────────────
-        // Mid-line `::name{attrs}` becomes an `<!--ti:N-->` sentinel
+        // Mid-line `::name{attrs}` becomes a `<ti-N></ti-N>` sentinel
         // that the inline mapper later materialises as an
         // `Element.inline_object`. Honours single-backtick code-span
         // state so `` `::badge{}` `` round-trips verbatim, and
@@ -502,24 +502,58 @@ pub fn extractSentinelIndex(literal: []const u8) ?usize {
 }
 
 /// Counterpart of `extractSentinelIndex` for the inline-directive
-/// sentinel emitted by `scanInlineDirectives` — `<!--ti:N-->`. Distinct
-/// prefix from the block path (`te` vs `ti`) so the mapper knows
-/// whether to materialise as `Element.custom` or
-/// `Element.inline_object`. Same spec-index space; the two sentinel
-/// families just disambiguate the materialisation contract.
+/// sentinel emitted by `scanInlineDirectives` — the OPEN half of
+/// `<ti-N></ti-N>`. Distinct shape from the block path (a tag pair vs
+/// an HTML comment) so the mapper knows whether to materialise as
+/// `Element.custom` or `Element.inline_object`. Same spec-index space;
+/// the two sentinel families just disambiguate the materialisation
+/// contract.
+///
+/// **Why a tag pair and not a comment.** It was `<!--ti:N-->` until
+/// 2026-08-31, and cmark starts an HTML BLOCK on any line beginning
+/// with `<!--` (block start condition 2), swallowing through the line
+/// that closes the comment. So a paragraph whose FIRST character was a
+/// directive became one raw HTML block and rendered its own sentinel as
+/// visible monospace text. `::badge` could reach that from the day
+/// inline directives shipped; nothing had put one first on a line until
+/// the `${...}` desugar made `${state.surf} as ${state.mode}` the
+/// obvious first sentence to write.
+///
+/// A tag is immune to conditions 1-6, which name specific non-tag
+/// openers. Condition 7 — a complete tag alone on its line — is what
+/// the CLOSING half defeats: `<ti-0>` is followed by `</ti-0>` rather
+/// than by end-of-line, so the line stays a paragraph even when the
+/// interpolation is the only thing on it. The pair is emitted always
+/// rather than only at line start, because a sentinel whose shape
+/// depended on its column would be a second thing to remember.
 pub fn extractInlineSentinelIndex(literal: []const u8) ?usize {
     const trimmed = std.mem.trim(u8, literal, " \t\r\n");
-    const prefix = "<!--ti:";
-    const suffix = "-->";
+    const prefix = "<ti-";
+    const suffix = ">";
     if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
     if (!std.mem.endsWith(u8, trimmed, suffix)) return null;
     const body = trimmed[prefix.len .. trimmed.len - suffix.len];
     return std.fmt.parseInt(usize, body, 10) catch null;
 }
 
+/// The CLOSING half of the inline sentinel pair, `</ti-N>`. cmark hands
+/// it back as its own `CMARK_NODE_HTML_INLINE`, and it carries no
+/// content — it exists only to keep the open tag from being alone on
+/// its line. The mapper drops it; without this it would fall through to
+/// the raw-HTML-as-code path and print `</ti-0>` next to every readout.
+pub fn isInlineSentinelClose(literal: []const u8) bool {
+    const trimmed = std.mem.trim(u8, literal, " \t\r\n");
+    const prefix = "</ti-";
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return false;
+    if (!std.mem.endsWith(u8, trimmed, ">")) return false;
+    const body = trimmed[prefix.len .. trimmed.len - 1];
+    _ = std.fmt.parseInt(usize, body, 10) catch return false;
+    return true;
+}
+
 /// Scan one non-fence, non-block-`:::` source line for inline
 /// `::name{attrs}` directives. Successful matches get replaced with
-/// `<!--ti:N-->` sentinels (a new entry pushed to `specs`); everything
+/// `<ti-N></ti-N>` sentinels (a new entry pushed to `specs`); everything
 /// else passes through verbatim. The trailing newline is the caller's
 /// responsibility — this helper writes line content only.
 ///
@@ -533,6 +567,11 @@ pub fn extractInlineSentinelIndex(literal: []const u8) ?usize {
 /// nothing, by whitespace, or by punctuation other than `:`. This
 /// keeps C++-style `Foo::bar` and our own line-start `:::` from
 /// matching as inline directives.
+///
+/// Interpolation (readout campaign, beat 2): a bare `${path}` in prose
+/// desugars to `::value{text=${path}}` right here, so the sentence
+/// `Showing ${state.surf}.` becomes a live readout with no new element
+/// kind, no new parse path and no new reactivity. See the `$` arm.
 fn scanInlineDirectives(
     line: []const u8,
     arena: std.mem.Allocator,
@@ -564,13 +603,66 @@ fn scanInlineDirectives(
             if (try parseInlineDirective(arena, line, i, state)) |hit| {
                 const idx = specs.items.len;
                 try specs.append(hit.spec);
-                try out.writer().print("<!--ti:{d}-->", .{idx});
+                try out.writer().print("<ti-{d}></ti-{d}>", .{ idx, idx });
                 i = hit.end;
                 continue;
             }
             // Parser declined (malformed attrs reach here as errors;
             // null returns mean the position didn't actually start a
             // directive). Fall through and emit the byte verbatim.
+        }
+
+        // Escaped interpolation: `\${x}` is prose ABOUT the syntax
+        // rather than a readout. Both bytes go out untouched and
+        // cmark's own backslash escape drops the backslash on the way
+        // through — `$` is ASCII punctuation, so this is a rule
+        // markdown already has rather than one we invented.
+        if (c == '\\' and i + 1 < line.len and line[i + 1] == '$') {
+            try out.append(c);
+            try out.append(line[i + 1]);
+            i += 2;
+            continue;
+        }
+
+        // ── Interpolation in prose (readout campaign, beat 2) ───────
+        //
+        // `Showing ${state.surf}.` becomes
+        // `Showing ::value{text=${state.surf}}.` — one rewrite, sitting
+        // beside the one above, and everything downstream is the
+        // machinery `::badge` has ridden since stage 15E.2: sentinel,
+        // registry resolve, `Binding`, `refire`.
+        //
+        // The value stays TEMPLATED. `preprocess` is called with a null
+        // state on purpose (`markdown.zig`), so the registry keeps the
+        // `${...}` to re-substitute on every mutation; substituting
+        // here would produce a readout that was correct once.
+        //
+        // What this costs: `${` is no longer inert in body text. Every
+        // occurrence in the shipped documents today is already inside a
+        // code span — `` `primary=${state.box_color}` `` and friends —
+        // which the backtick arm above swallows before reaching here.
+        // That is not luck, it is the reason the escape hatch is a
+        // code span first and `\${` second.
+        if (c == '$' and i + 1 < line.len and line[i + 1] == '{') {
+            if (std.mem.indexOfScalarPos(u8, line, i + 2, '}')) |close| {
+                const attrs = try arena.alloc(Attr, 1);
+                attrs[0] = .{
+                    .key = try arena.dupe(u8, "text"),
+                    .value = try substituteState(arena, line[i .. close + 1], state),
+                };
+                const idx = specs.items.len;
+                try specs.append(.{
+                    .name = try arena.dupe(u8, "value"),
+                    .id = null,
+                    .attrs = attrs,
+                    .body = "",
+                });
+                try out.writer().print("<ti-{d}></ti-{d}>", .{ idx, idx });
+                i = close + 1;
+                continue;
+            }
+            // Unterminated `${` — emit verbatim, the same policy
+            // `substituteState` follows for the same shape.
         }
 
         try out.append(c);
@@ -858,10 +950,10 @@ test "extractSentinelIndex" {
 }
 
 test "extractInlineSentinelIndex" {
-    try std.testing.expectEqual(@as(?usize, 0), extractInlineSentinelIndex("<!--ti:0-->"));
-    try std.testing.expectEqual(@as(?usize, 7), extractInlineSentinelIndex("<!--ti:7-->"));
+    try std.testing.expectEqual(@as(?usize, 0), extractInlineSentinelIndex("<ti-0>"));
+    try std.testing.expectEqual(@as(?usize, 7), extractInlineSentinelIndex("<ti-7>"));
     try std.testing.expectEqual(@as(?usize, null), extractInlineSentinelIndex("<!--te:0-->"));
-    try std.testing.expectEqual(@as(?usize, null), extractInlineSentinelIndex("<!--ti:foo-->"));
+    try std.testing.expectEqual(@as(?usize, null), extractInlineSentinelIndex("<ti-foo>"));
 }
 
 test "parseInlineDirective: basic name + attrs" {
@@ -904,7 +996,7 @@ test "preprocess: inline directive becomes ti sentinel" {
     , null);
     try std.testing.expectEqual(@as(usize, 1), p.specs.len);
     try std.testing.expectEqualStrings("badge", p.specs[0].name);
-    try std.testing.expect(std.mem.indexOf(u8, p.source, "<!--ti:0-->") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "<ti-0>") != null);
     // The original `::badge{...}` source is gone from the output.
     try std.testing.expect(std.mem.indexOf(u8, p.source, "::badge") == null);
     // Surrounding text survives.
@@ -920,9 +1012,9 @@ test "preprocess: multiple inline directives per line" {
         \\
     , null);
     try std.testing.expectEqual(@as(usize, 3), p.specs.len);
-    try std.testing.expect(std.mem.indexOf(u8, p.source, "<!--ti:0-->") != null);
-    try std.testing.expect(std.mem.indexOf(u8, p.source, "<!--ti:1-->") != null);
-    try std.testing.expect(std.mem.indexOf(u8, p.source, "<!--ti:2-->") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "<ti-0>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "<ti-1>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "<ti-2>") != null);
 }
 
 test "preprocess: inline directive inside backtick code span is untouched" {
@@ -974,9 +1066,9 @@ test "preprocess: inline directives mix with a block directive" {
     try std.testing.expectEqualStrings("badge", p.specs[0].name);
     try std.testing.expectEqualStrings("box", p.specs[1].name);
     try std.testing.expectEqualStrings("badge", p.specs[2].name);
-    try std.testing.expect(std.mem.indexOf(u8, p.source, "<!--ti:0-->") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "<ti-0>") != null);
     try std.testing.expect(std.mem.indexOf(u8, p.source, "<!--te:1-->") != null);
-    try std.testing.expect(std.mem.indexOf(u8, p.source, "<!--ti:2-->") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "<ti-2>") != null);
 }
 
 test "preprocess: inline directive inside fenced code is untouched" {
@@ -1013,4 +1105,138 @@ test "parseDirectiveLine: unresolved ${} stays literal" {
     defer state.deinit();
     const s = try parseDirectiveLine(arena.allocator(), "box {color=${state.missing}}", &state);
     try std.testing.expectEqualStrings("${state.missing}", s.attrs[0].value);
+}
+
+// ── Interpolation in prose (readout campaign, beat 2) ───────────────
+
+test "preprocess: ${path} in prose desugars to an inline ::value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = try preprocess(arena.allocator(),
+        \\Showing ${state.surf} in ${state.mode}.
+        \\
+    , null);
+    try std.testing.expectEqual(@as(usize, 2), p.specs.len);
+    try std.testing.expectEqualStrings("value", p.specs[0].name);
+    try std.testing.expectEqualStrings("text", p.specs[0].attrs[0].key);
+
+    // The value stays TEMPLATED. Substituting here would produce a
+    // readout that was correct once — the registry needs the template
+    // to re-substitute on every mutation, and `collectReferencedPaths`
+    // needs it to know what to subscribe to.
+    try std.testing.expectEqualStrings("${state.surf}", p.specs[0].attrs[0].value);
+    try std.testing.expectEqualStrings("${state.mode}", p.specs[1].attrs[0].value);
+
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "<ti-0>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "<ti-1>") != null);
+    // And the prose around them is untouched.
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "Showing ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.source, " in ") != null);
+    // No `${` survives — the whole point is that the template stops
+    // being rendered literally, which is what the first draft of
+    // matryoshka's `xray.md` did.
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "${") == null);
+}
+
+test "preprocess: ${path} inside a code span stays literal" {
+    // Load-bearing, not a nicety. Every occurrence of `${` in prose
+    // across the shipped documents today is inside a code span —
+    // `demo.md`'s `headless=${state.config_hidden}` and
+    // `remote_panel.md`'s `primary=${state.box_color}` — and beat 2
+    // would have rewritten all of them into readouts.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = try preprocess(arena.allocator(),
+        \\The embed's `headless=${state.config_hidden}` re-resolves later.
+        \\
+    , null);
+    try std.testing.expectEqual(@as(usize, 0), p.specs.len);
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "`headless=${state.config_hidden}`") != null);
+}
+
+test "preprocess: backslash escapes an interpolation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = try preprocess(arena.allocator(),
+        \\Write \${state.x} to interpolate.
+        \\
+    , null);
+    try std.testing.expectEqual(@as(usize, 0), p.specs.len);
+    // The backslash goes through untouched — cmark's own escape rule
+    // drops it, because `$` is ASCII punctuation. Inventing a second
+    // escape here would have meant two ways to write the same thing.
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "\\${state.x}") != null);
+}
+
+test "preprocess: interpolation inside a directive's attrs is not double-rewritten" {
+    // `::progress{value=${state.box_radius}}` is `demo.md` line 23. The
+    // `::` arm consumes the whole directive including its `${...}`, so
+    // the `$` arm never sees those bytes — one spec, not two.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = try preprocess(arena.allocator(),
+        \\Radius is ::progress{value=${state.box_radius} max=40} live.
+        \\
+    , null);
+    try std.testing.expectEqual(@as(usize, 1), p.specs.len);
+    try std.testing.expectEqualStrings("progress", p.specs[0].name);
+}
+
+test "preprocess: interpolation in fenced code is untouched" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = try preprocess(arena.allocator(),
+        \\```
+        \\value=${state.x}
+        \\```
+        \\
+    , null);
+    try std.testing.expectEqual(@as(usize, 0), p.specs.len);
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "value=${state.x}") != null);
+}
+
+test "preprocess: an unterminated ${ is emitted verbatim" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = try preprocess(arena.allocator(),
+        \\Costs ${9.99 and change.
+        \\
+    , null);
+    try std.testing.expectEqual(@as(usize, 0), p.specs.len);
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "${9.99 and change.") != null);
+}
+
+test "preprocess: a bare $ is still just a dollar sign" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = try preprocess(arena.allocator(),
+        \\It costs $5 and the shell reads $HOME.
+        \\
+    , null);
+    try std.testing.expectEqual(@as(usize, 0), p.specs.len);
+    try std.testing.expect(std.mem.indexOf(u8, p.source, "$5 and the shell reads $HOME.") != null);
+}
+
+test "preprocess: interpolation inside a ::: body survives to the child parse" {
+    // A block body is handed to its factory verbatim and re-preprocessed
+    // in `create` — so the desugar has to happen THERE, not here, or a
+    // readout inside a `:::box` would be rewritten against the wrong
+    // arena and the sentinel index would point into the parent's specs.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = try preprocess(arena.allocator(),
+        \\:::box
+        \\Showing ${state.surf}.
+        \\:::
+        \\
+    , null);
+    try std.testing.expectEqual(@as(usize, 1), p.specs.len);
+    try std.testing.expectEqualStrings("box", p.specs[0].name);
+    try std.testing.expectEqualStrings("Showing ${state.surf}.", p.specs[0].body);
+
+    // And re-running it on the body — what `:::box`'s create does —
+    // produces the readout.
+    const inner = try preprocess(arena.allocator(), p.specs[0].body, null);
+    try std.testing.expectEqual(@as(usize, 1), inner.specs.len);
+    try std.testing.expectEqualStrings("value", inner.specs[0].name);
 }

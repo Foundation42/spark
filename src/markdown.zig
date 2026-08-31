@@ -676,7 +676,7 @@ fn appendInline(
 
         cmark.CMARK_NODE_HTML_INLINE => {
             // Stage 15E.2: inline `::name{attrs}` directives survive
-            // preprocess as `<!--ti:N-->` sentinels that cmark hands
+            // preprocess as `<ti-N></ti-N>` sentinels that cmark hands
             // back as HTML_INLINE literals. Detect, resolve through
             // the registry, materialise as Element.inline_object.
             // Anything else falls through to the original raw-HTML-
@@ -687,6 +687,13 @@ fn appendInline(
                 std.mem.span(literal_ptr)
             else
                 "";
+
+            // The closing half carries nothing. It exists so the open
+            // tag is never alone on its line — see
+            // `isInlineSentinelClose` — and drops here. Without this it
+            // would reach the raw-HTML-as-code path below and print
+            // `</ti-0>` beside every readout.
+            if (components.isInlineSentinelClose(literal)) return;
 
             if (components.extractInlineSentinelIndex(literal)) |idx| {
                 if (idx < mc.specs.len) {
@@ -831,4 +838,151 @@ test "non-ansi code fence stays raw" {
     try std.testing.expectEqual(@as(usize, 1), children.len);
     try std.testing.expect(children[0] == .code_block);
     try std.testing.expect(children[0].code_block.content == .raw);
+}
+
+/// Stub theme for parse-only tests — never reaches the font registry.
+fn testTheme() element.Theme {
+    const s: element.Style = .{ .font_id = 0, .color = .{ 1, 1, 1, 1 } };
+    return .{
+        .body = s,
+        .heading = .{ s, s, s, s, s, s },
+        .code_block = s,
+        .list_marker = s,
+        .emphasis_font_id = 0,
+        .strong_font_id = 0,
+        .bold_italic_font_id = 0,
+        .code_inline_font_id = 0,
+    };
+}
+
+test "inline directive at the START of a line stays inline" {
+    // The bug, found by the readout campaign's beat 3 on 2026-08-31 and
+    // present in the inline substrate since stage 15E.2.
+    //
+    // cmark starts an HTML BLOCK on any line beginning with `<!--`
+    // (block start condition 2), and it swallows through the line
+    // containing `-->`. The inline sentinel is exactly that shape, so a
+    // paragraph whose first character was a directive became one raw
+    // HTML block and rendered as `<!--ti:0--> at line start.` in
+    // monospace — the sentinel visible to the reader.
+    //
+    // Reachable with `::badge` all along; nobody had written one first
+    // on a line. Beat 2's `${...}` desugar makes it the natural thing
+    // to write — `${state.surf} as ${state.mode}` is the first sentence
+    // anyone tries — so `demos/hud-lab/xray.md` in matryoshka hit it
+    // immediately.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const theme = testTheme();
+
+    const tree = try parse(arena, "::badge{label=\"x\"} at line start.\n", &theme, null);
+    const kids = switch (tree) {
+        .container => |c| c.children,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(kids.len >= 1);
+
+    // A paragraph, not a code_block. The mis-classified form arrives
+    // here as `.code_block` (raw-HTML-as-code), which is how the
+    // sentinel became visible text.
+    switch (kids[0]) {
+        .paragraph => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    // And the sentinel is nowhere in the drawn text. Asserting the node
+    // KIND alone would pass against a paragraph that contained the
+    // literal, which is the same failure wearing a different hat.
+    try std.testing.expect(!treeContainsText(kids[0], "ti:"));
+    try std.testing.expect(!treeContainsText(kids[0], "ti-"));
+}
+
+test "inline directive mid-line stays inline (the case that always worked)" {
+    // Rule 1's other half: the line-start test above is only meaningful
+    // if the mid-line form is genuinely the same path. Both must land
+    // in a paragraph with no sentinel text in it.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const theme = testTheme();
+
+    const tree = try parse(arena, "Latency ::badge{label=\"x\"} today.\n", &theme, null);
+    const kids = switch (tree) {
+        .container => |c| c.children,
+        else => return error.TestUnexpectedResult,
+    };
+    switch (kids[0]) {
+        .paragraph => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(!treeContainsText(kids[0], "ti:"));
+    try std.testing.expect(!treeContainsText(kids[0], "ti-"));
+}
+
+/// Recursive substring search over every text leaf in a subtree.
+fn treeContainsText(elem: element.Element, needle: []const u8) bool {
+    return switch (elem) {
+        .text => |t| std.mem.indexOf(u8, t.content, needle) != null,
+        .paragraph, .emphasis, .strong, .code => |kids| blk: {
+            for (kids) |k| if (treeContainsText(k, needle)) break :blk true;
+            break :blk false;
+        },
+        .heading => |h| blk: {
+            for (h.content) |k| if (treeContainsText(k, needle)) break :blk true;
+            break :blk false;
+        },
+        .link => |l| blk: {
+            for (l.content) |k| if (treeContainsText(k, needle)) break :blk true;
+            break :blk false;
+        },
+        .container => |c| blk: {
+            for (c.children) |k| if (treeContainsText(k, needle)) break :blk true;
+            break :blk false;
+        },
+        .code_block => |cb| switch (cb.content) {
+            .raw => |r| std.mem.indexOf(u8, r.text, needle) != null,
+            .sub_block => false,
+        },
+        else => false,
+    };
+}
+
+test "an interpolation alone on its line stays a paragraph" {
+    // cmark's HTML block start condition 7 — a complete tag followed by
+    // nothing but whitespace to end of line — is the one a bare tag
+    // would still trip. `<ti-0>` is followed by `</ti-0>`, so the
+    // condition fails and the line stays a paragraph.
+    //
+    // This is the case the closing half of the sentinel pair exists
+    // for, and it is exactly what an author writes when the readout IS
+    // the line rather than part of a sentence.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const theme = testTheme();
+
+    const tree = try parse(arena, "${state.surf}\n", &theme, null);
+    const kids = switch (tree) {
+        .container => |c| c.children,
+        else => return error.TestUnexpectedResult,
+    };
+    switch (kids[0]) {
+        .paragraph => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(!treeContainsText(kids[0], "ti-"));
+}
+
+test "the sentinel's closing half draws nothing" {
+    // Rule 5's shape: if the closer fell through to the raw-HTML-as-code
+    // path it would print `</ti-0>` beside every readout, and the tests
+    // above — which only check that no sentinel text SURVIVES — would
+    // catch it. This one names the mechanism so a future edit to the
+    // mapper's ordering fails here rather than in a screenshot.
+    try std.testing.expect(components.isInlineSentinelClose("</ti-0>"));
+    try std.testing.expect(components.isInlineSentinelClose("</ti-42>"));
+    try std.testing.expect(!components.isInlineSentinelClose("<ti-0>"));
+    try std.testing.expect(!components.isInlineSentinelClose("</ti-foo>"));
+    try std.testing.expect(!components.isInlineSentinelClose("</span>"));
 }
