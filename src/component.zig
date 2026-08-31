@@ -511,6 +511,11 @@ const Binding = struct {
             .id = null,
             .attrs = fresh_attrs,
             .body = self.body,
+            // The same state this binding is subscribed to. A re-fire
+            // that dropped it would hand a body-parsing factory a Spec
+            // with no state and it would re-parse its subtree against
+            // the Spark's empty root.
+            .state = @ptrCast(self.state),
         };
         if (self.factory.update) |u| try u(self.instance_ctx, &fresh_spec);
     }
@@ -1073,7 +1078,23 @@ fn buildSubstitutedSpec(
         .id = templated.id,
         .attrs = fresh_attrs,
         .body = templated.body,
+        // The document's state, carried to the factory. A body-parsing
+        // factory needs it for the nested parse and had no way to ask.
+        .state = @ptrCast(state),
     };
+}
+
+/// The state a Spec was resolved against, or `fallback` when it carries
+/// none (a hand-built Spec, or a document parsed without one).
+///
+/// Every factory that parses its `body` must route through here rather
+/// than reaching for `spark.host_state` directly — that root state is
+/// deliberately empty in any host that gives each document its own, and
+/// a nested parse against it silently renders every `${...}` as its own
+/// template.
+pub fn specState(spec: *const components.Spec, fallback: *state_mod.State) *state_mod.State {
+    if (spec.state) |raw| return @ptrCast(@alignCast(raw));
+    return fallback;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -1746,4 +1767,56 @@ fn stub_create(
     _ = allocator;
     _ = spec;
     return error.UnknownComponentId;
+}
+
+test "the resolved Spec carries the document's state, not the Spark's root" {
+    // THE BUG, 2026-08-31 pm. A factory that parses its `body`
+    // (`:::flex`, `:::grid`, every effect, `:::embedded-document`) had
+    // nothing to hand the nested parse but `spark.host_state`, because
+    // `Factory.create` takes a Spark and a Spec and neither carried the
+    // state. In a host that gives each document its own — matryoshka
+    // gives each PANEL one — that root is deliberately empty, so
+    // `${state.x}` in prose inside any `:::` block resolved against
+    // nothing and rendered its own template. The same line outside the
+    // block resolved fine.
+    //
+    // It is also why `src/hud/lab.md`'s sliders work: a bare `:::`
+    // closes its drop_shadow above them. That was filed as a document
+    // quirk for two sessions.
+    //
+    // The drawn half of this is `demos/hud-lab/repro.sh readout` in
+    // matryoshka, which presses a button and watches a nested readout
+    // move. This half is the contract: the Spec the factory is handed
+    // names the state it should bind against.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var doc_state = state_mod.State.init(std.testing.allocator);
+    defer doc_state.deinit();
+    try doc_state.set("x", "42");
+
+    var root_state = state_mod.State.init(std.testing.allocator);
+    defer root_state.deinit();
+
+    const attrs = [_]components.Attr{.{ .key = "v", .value = "${state.x}" }};
+    const templated: components.Spec = .{ .name = "box", .attrs = &attrs, .body = "inside ${state.x}" };
+
+    const fresh = try buildSubstitutedSpec(arena.allocator(), &templated, &doc_state);
+
+    // The attrs were already substituted before today; the body was not,
+    // and could not be, because the factory that parses it had no state.
+    try std.testing.expectEqualStrings("42", fresh.attrs[0].value);
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrCast(&doc_state)), fresh.state);
+
+    // And `specState` hands the factory the document's, NOT the
+    // fallback. Rule 1: the two states are distinguishable, so this is
+    // about which one came back rather than about them being the same
+    // object.
+    try std.testing.expect(&doc_state != &root_state);
+    try std.testing.expectEqual(&doc_state, specState(&fresh, &root_state));
+
+    // A Spec nobody stamped falls back, which is what keeps a
+    // hand-built Spec and a single-state host working unchanged.
+    const bare: components.Spec = .{ .name = "box" };
+    try std.testing.expectEqual(&root_state, specState(&bare, &root_state));
 }

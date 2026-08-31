@@ -57,6 +57,26 @@ pub const Spec = struct {
     /// interpretation (YAML, CSV, arbitrary) belongs to the component
     /// at stage 7c; we just preserve the bytes.
     body: []const u8 = "",
+    /// The state this instance should bind against — the document's own,
+    /// not the Spark's.
+    ///
+    /// **The bug this exists for.** A factory that parses its `body`
+    /// (`:::flex`, `:::grid`, every effect, `:::embedded-document`) had
+    /// nothing to hand the nested parse but `spark.host_state`, because
+    /// `Factory.create` takes a Spark and a Spec and neither carried the
+    /// state. In matryoshka every panel owns its own State and the
+    /// Spark's root is deliberately EMPTY, so `${state.x}` in prose
+    /// inside any `:::` block resolved against nothing and rendered its
+    /// own template. Same line outside the block resolved fine.
+    ///
+    /// The registry already knows the state — it substitutes the attrs
+    /// with it — so it stamps it here on the way past. Null keeps the
+    /// old behaviour for a hand-built Spec, and `spark.host_state` is
+    /// the right fallback for a host that has only one state.
+    ///
+    /// Type-erased to keep `markdown_components` free of a `state.zig`
+    /// import cycle; `component.specState` casts it back.
+    state: ?*anyopaque = null,
 };
 
 pub const Preprocessed = struct {

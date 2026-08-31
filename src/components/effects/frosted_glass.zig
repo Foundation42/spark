@@ -289,7 +289,7 @@ fn create(
         spec.body,
         spark.theme,
         spark.registry,
-        spark.host_state,
+        component_mod.specState(spec, spark.host_state),  // the DOCUMENT's state, not the Spark's root — see specState
         c.scope,
     );
 
@@ -316,7 +316,7 @@ fn update(ctx: *anyopaque, spec: *const components.Spec) anyerror!void {
                 spec.body,
                 sp.theme,
                 sp.registry,
-                sp.host_state,
+                component_mod.specState(spec, sp.host_state),  // the DOCUMENT's state, not the Spark's root — see specState
                 c.scope,
             );
         }

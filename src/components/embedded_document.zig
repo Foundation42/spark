@@ -229,7 +229,10 @@ fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const co
     errdefer allocator.destroy(child_state);
     child_state.* = state_mod.State.init(allocator);
     errdefer child_state.deinit();
-    child_state.parent = spark.host_state;
+    // The PARENT is the document this embed sits in, not the Spark's
+    // root — an embed inside a panel inherits that panel's state, which
+    // is the whole point of the parent chain. See `component.specState`.
+    child_state.parent = component_mod.specState(spec, spark.host_state);
 
     const scope = try allocator.dupe(u8, id_raw);
     errdefer allocator.free(scope);

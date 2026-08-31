@@ -273,7 +273,7 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
                 spec.body,
                 spark.theme,
                 spark.registry,
-                spark.host_state,
+                component_mod.specState(spec, spark.host_state),  // the DOCUMENT's state, not the Spark's root — see specState
                 c.scope,
             );
 
@@ -345,7 +345,7 @@ pub fn SingleSourceFactory(comptime config: anytype) type {
                         spec.body,
                         sp.theme,
                         sp.registry,
-                        sp.host_state,
+                        component_mod.specState(spec, sp.host_state),  // the DOCUMENT's state, not the Spark's root — see specState
                         c.scope,
                     );
                 }
