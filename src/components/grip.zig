@@ -12,8 +12,8 @@
 //!     plane:
 //!       px:    mirror hud/panels/0/x
 //!       py:    mirror hud/panels/0/y
-//!       spanx: read   hud/panels/span/x
-//!       spany: read   hud/panels/span/y
+//!       spanx: read   hud/panels/0/span_x
+//!       spany: read   hud/panels/0/span_y
 //!
 //!     :::grip {x=px y=py x_span=${state.spanx} y_span=${state.spany}}
 //!     :::
