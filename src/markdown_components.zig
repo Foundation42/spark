@@ -77,6 +77,27 @@ pub const Spec = struct {
     /// Type-erased to keep `markdown_components` free of a `state.zig`
     /// import cycle; `component.specState` casts it back.
     state: ?*anyopaque = null,
+    /// **This instance's own registry key**, stamped by `Registry.resolve`
+    /// on the way past — `"{scope}/{id}"`, or `"{scope}/auto:N"` for a
+    /// directive with no `#id`.
+    ///
+    /// A body-parsing factory uses it as the namespace for the children it
+    /// parses, and it is the only spelling of that namespace which is
+    /// unique. Each such factory used its own `id=` attribute before this
+    /// existed, which fails twice: two UNNAMED blocks in one document
+    /// share the empty scope, and — because the DOCUMENT's scope was not
+    /// part of it — an unnamed `:::frosted_glass` in one panel and
+    /// another in a second panel resolved their children to the same
+    /// instances. Two applets each rendering `${state.v}` inside a glass
+    /// panel both showed whichever document mounted last.
+    ///
+    /// This is the same shape as the `state` field above and was found by
+    /// the same route, one level out: the registry knows the answer and
+    /// was not passing it on.
+    ///
+    /// Null for a hand-built Spec; `component.specScope` then falls back
+    /// to the factory's own `id=`, which is exactly what it did before.
+    scope: ?[]const u8 = null,
 };
 
 pub const Preprocessed = struct {

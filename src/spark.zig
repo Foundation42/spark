@@ -265,6 +265,53 @@ pub const InitOptions = struct {
     io_workers: u32 = 24,
 };
 
+/// One background pass's place in the containment tree, for Phase 2's
+/// pre-pass ordering. See `orderBackgrounds`.
+///
+/// `index` is the dispatch's own position in `pass_dispatches`, which is
+/// also the exclusive END of its subtree range — the walker appends a
+/// parent immediately after the children it captured, so the two numbers
+/// are the same by construction and only the START has to be carried.
+pub const BackgroundSpan = struct {
+    index: u32,
+    subtree_start: u32,
+};
+
+/// Sort background passes **outermost first**, keeping siblings in the
+/// order the author wrote them.
+///
+/// Phase 2 composites every background — a `{backdrop}` chain, a
+/// `.host_named` panel — in a pre-pass, because both are backgrounds to
+/// their own children and the walker emits post-order (see
+/// `PassSource.isBackground`). What that reasoning missed is that the
+/// pre-pass inherits the same post-order problem *among the backgrounds
+/// themselves*: a background NESTED in another comes out first, and its
+/// parent then composites straight over it.
+///
+/// That is not hypothetical. A `:::gbuffer` inside a
+/// `:::frosted_glass {backdrop}` vanished completely — the chrome
+/// painted over its own child — which is why `hud/xray.md` and
+/// `hud/corners.md` wore a grip and no chrome from 2026-08-31 until this
+/// was fixed. `demos/hud-lab/nested-pass-{bare,chrome}.md` are the two
+/// arms that caught it.
+///
+/// **The key is `(subtree_start ascending, index descending)`**, which is
+/// pre-order over a containment tree. Given two backgrounds whose ranges
+/// nest, the outer one's subtree starts no later and ends strictly later
+/// — it sits after everything it contains — so either its start is
+/// smaller, or the starts tie and its index is larger. Disjoint siblings
+/// never tie, and the earlier one's start is smaller, so document order
+/// survives untouched. Both facts are gated below.
+pub fn orderBackgrounds(spans: []BackgroundSpan) void {
+    std.mem.sort(BackgroundSpan, spans, {}, struct {
+        fn lt(_: void, a: BackgroundSpan, b: BackgroundSpan) bool {
+            if (a.subtree_start != b.subtree_start)
+                return a.subtree_start < b.subtree_start;
+            return a.index > b.index;
+        }
+    }.lt);
+}
+
 pub const Spark = struct {
     allocator: std.mem.Allocator,
 
@@ -2526,7 +2573,7 @@ pub const Spark = struct {
             var last_pattern: vk.c.VkPipeline = null;
             var last_compose: vk.c.VkPipeline = null;
 
-            // **Backdrops first, in document order.** A backdrop chain is a
+            // **Backgrounds first, outermost first.** A backdrop chain is a
             // background in the same sense `:::pattern` is: its children,
             // and any effect nested in them, belong ON TOP of it. But the
             // walker emits post-order — children come before their parent —
@@ -2535,14 +2582,42 @@ pub const Spark = struct {
             // underneath, and keeps two overlapping backdrops in the order
             // the author wrote them.
             //
-            // The consequence, stated rather than discovered: a backdrop
-            // always lands under EVERY other pass this frame, not just its
-            // own children. Two backdrops stack by document order; a
-            // backdrop cannot be composited over a sibling drop shadow.
+            // The pre-pass cannot keep raw dispatch order, though, and for
+            // a week it did. Post-order puts a background NESTED inside
+            // another before the one containing it, so a `:::gbuffer` in a
+            // `:::frosted_glass {backdrop}` composited first and the chrome
+            // painted over its own child — the panel vanished. That is the
+            // whole reason an applet could have chrome or draw its own
+            // passes and not both. `orderBackgrounds` sorts them
+            // outermost-first; see its doc for why the key is correct.
+            //
+            // The consequence, stated rather than discovered: a background
+            // still lands under every NON-background pass this frame, not
+            // just its own children. Two backdrops stack by document order;
+            // a backdrop cannot be composited over a sibling drop shadow.
+            var bg_n: usize = 0;
+            const bgs = try self.allocator.alloc(BackgroundSpan, pd_len);
+            defer self.allocator.free(bgs);
             for (self.pass_dispatches.items, 0..) |d, bi| {
-                switch (d) {
+                // A background inside a `.subtree` parent was rendered into
+                // THAT parent's pool by Phase 1 and is not ours to put on
+                // MAIN — compositing it here as well would draw it twice,
+                // the second time outside the effect wrapping it.
+                if (is_nested[bi]) continue;
+                const start: u32 = switch (d) {
+                    .chain => |c| if (c.source.isBackground()) c.subtree_dispatch_range[0] else continue,
+                    .single_source => |ss| if (ss.source.isBackground()) ss.subtree_dispatch_range[0] else continue,
+                    else => continue,
+                };
+                bgs[bg_n] = .{ .index = @intCast(bi), .subtree_start = start };
+                bg_n += 1;
+            }
+            orderBackgrounds(bgs[0..bg_n]);
+
+            for (bgs[0..bg_n]) |bg| {
+                const bi = bg.index;
+                switch (self.pass_dispatches.items[bi]) {
                     .chain => |c| {
-                        if (c.source != .backdrop) continue;
                         const pool_base = self.chain_pool_bases.items[bi] orelse unreachable;
                         const final_target = self.acquired_targets.items[pool_base + c.final_pool_local];
                         const bx = (@as(f32, @floatFromInt(c.compose_region.x)) - sx) * z;
@@ -2559,7 +2634,6 @@ pub const Spark = struct {
                         // its sampler is the host's image — so the
                         // handle is legitimately null here and the
                         // compose resolves the view itself.
-                        if (!ss.source.isBackground()) continue;
                         const target = self.dispatch_target_map.items[bi];
                         const bx = (@as(f32, @floatFromInt(ss.compose_region.x)) - sx) * z;
                         const by = (@as(f32, @floatFromInt(ss.compose_region.y)) - sy) * z;
@@ -2567,7 +2641,9 @@ pub const Spark = struct {
                         const bh = @as(f32, @floatFromInt(ss.compose_region.h)) * z;
                         try self.recordSingleSourceCompose(cmd, ss, target, bx, by, bw, bh, &last_compose, .main);
                     },
-                    else => continue,
+                    // The list was built from the same two arms above, so
+                    // anything else here means the two switches drifted.
+                    else => unreachable,
                 }
             }
 
@@ -2657,8 +2733,13 @@ pub const Spark = struct {
                     // via `final_composite_shader_id`. No subtree, so
                     // advance is plain `i += 1`.
                     .chain => |c| {
-                        // Backdrops were composited in the pre-pass above.
-                        if (c.source == .backdrop) {
+                        // Backgrounds were composited in the pre-pass
+                        // above. `isBackground()` rather than
+                        // `== .backdrop` so this site and the pre-pass's
+                        // filter cannot drift: a source that is a
+                        // background to one of them and not to the other
+                        // is composited twice or not at all.
+                        if (c.source.isBackground()) {
                             i += 1;
                             continue;
                         }
@@ -3134,6 +3215,102 @@ fn findHit(hits: []const element.Hit, x: f32, y: f32) ?element.Hit {
 // ── Tests ──────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+// ── `orderBackgrounds` — Phase 2's pre-pass order ───────────────────
+//
+// The rule these gate is not "the list changed": it is that a parent
+// background composites BEFORE the background nested in it, and that
+// nothing else about the author's order moves. Each test poisons in the
+// obvious wrong direction — the identity order, or the key with its
+// tiebreak flipped — and fails.
+
+fn orderOf(spans: []BackgroundSpan) [8]u32 {
+    orderBackgrounds(spans);
+    var out: [8]u32 = @splat(0xFFFF_FFFF);
+    for (spans, 0..) |s, i| out[i] = s.index;
+    return out;
+}
+
+test "orderBackgrounds: a nested background composites AFTER the one containing it" {
+    // The bug this function exists for, in its smallest form. A
+    // `:::gbuffer` (no subtree of its own, so `[0,0)`, sitting at
+    // dispatch 0) inside a `:::frosted_glass {backdrop}` whose subtree
+    // is `[0,1)` and which therefore sits at dispatch 1.
+    //
+    // Post-order hands them over as [gbuffer, frosted]. Composited in
+    // that order the chrome lands on top and the panel is GONE, which
+    // is exactly what `nested-pass-chrome.md` captured.
+    var spans = [_]BackgroundSpan{
+        .{ .index = 0, .subtree_start = 0 }, // the gbuffer
+        .{ .index = 1, .subtree_start = 0 }, // the frosted glass around it
+    };
+    const got = orderOf(&spans);
+    try testing.expectEqual(@as(u32, 1), got[0]); // chrome first — underneath
+    try testing.expectEqual(@as(u32, 0), got[1]); // then its child, on top
+}
+
+test "orderBackgrounds: sibling backdrops keep the order the author wrote them" {
+    // Rule 1 — the fix must not have bought the nesting order by
+    // throwing away document order, which is what decides which of two
+    // OVERLAPPING panels is on top. Two disjoint backdrops, each with a
+    // nested pass of its own.
+    //
+    //   dispatch: 0 gbufA, 1 panelA, 2 gbufB, 3 panelB
+    var spans = [_]BackgroundSpan{
+        .{ .index = 0, .subtree_start = 0 },
+        .{ .index = 1, .subtree_start = 0 },
+        .{ .index = 2, .subtree_start = 2 },
+        .{ .index = 3, .subtree_start = 2 },
+    };
+    const got = orderOf(&spans);
+    // A under its own child, then B under its own child — and B's panel
+    // still lands over A's child, because B was written second.
+    try testing.expectEqualSlices(u32, &.{ 1, 0, 3, 2 }, got[0..4]);
+}
+
+test "orderBackgrounds: three deep, outermost first" {
+    // Containment is a tree, not a pair, and the key has to be a real
+    // pre-order rather than a swap that happens to fix depth 2. A
+    // backdrop holding a backdrop holding a gbuffer:
+    //
+    //   dispatch: 0 gbuf, 1 inner, 2 outer
+    var spans = [_]BackgroundSpan{
+        .{ .index = 0, .subtree_start = 0 },
+        .{ .index = 1, .subtree_start = 0 },
+        .{ .index = 2, .subtree_start = 0 },
+    };
+    const got = orderOf(&spans);
+    try testing.expectEqualSlices(u32, &.{ 2, 1, 0 }, got[0..3]);
+}
+
+test "orderBackgrounds: a later sibling's start beats an earlier parent's tie-break" {
+    // The two halves of the key doing different jobs, so a single-key
+    // sort cannot pass. `subtree_start` separates siblings; `index`
+    // descending separates a parent from a child that starts where it
+    // does. Flip the tiebreak to ascending and the first pair inverts;
+    // drop the start comparison and the last entry moves to the front.
+    var spans = [_]BackgroundSpan{
+        .{ .index = 0, .subtree_start = 0 }, // child of 1
+        .{ .index = 1, .subtree_start = 0 }, // parent
+        .{ .index = 9, .subtree_start = 5 }, // a later, disjoint sibling
+    };
+    const got = orderOf(&spans);
+    try testing.expectEqualSlices(u32, &.{ 1, 0, 9 }, got[0..3]);
+}
+
+test "orderBackgrounds: an already-correct list is left alone" {
+    // A single background, and two disjoint ones, must come out in
+    // dispatch order — the overwhelmingly common case, and the one a
+    // clever reordering would be most likely to disturb.
+    var one = [_]BackgroundSpan{.{ .index = 4, .subtree_start = 2 }};
+    try testing.expectEqual(@as(u32, 4), orderOf(&one)[0]);
+
+    var two = [_]BackgroundSpan{
+        .{ .index = 1, .subtree_start = 0 },
+        .{ .index = 3, .subtree_start = 2 },
+    };
+    try testing.expectEqualSlices(u32, &.{ 1, 3 }, orderOf(&two)[0..2]);
+}
 
 test "claimsPointer: inside a hit box yes, outside no, and captured always" {
     // The host's arbitration question, answered by the same `findHit` the

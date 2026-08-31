@@ -295,7 +295,13 @@ fn create(
     };
     errdefer c.arena.deinit();
 
-    c.scope = try allocator.dupe(u8, id_raw);
+    // The namespace this block's CHILDREN are parsed into: this
+    // instance's own registry key, which is unique by construction.
+    // `id_raw` alone is not — every unnamed block shares the empty
+    // string, in this document and in every other one, so two panels
+    // each holding an unnamed effect resolved their children to one
+    // set of instances. See `Spec.scope`.
+    c.scope = try allocator.dupe(u8, component_mod.specScope(spec, id_raw));
     errdefer allocator.free(c.scope);
 
     _ = c.body.adopt(spec.body);

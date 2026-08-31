@@ -62,6 +62,31 @@ pub fn install(spark: *spark_mod.Spark) !void {
     try spark.registry.register("button", factory);
 }
 
+/// Whether an `active=` value means "pressed".
+///
+/// The values that reach this are whatever a host wrote into state, and
+/// the one that matters is a plane readback: `hud/mounted/surfaces`
+/// arrives as `{d}` on an f32, so `0` and `1`. The word forms are here
+/// because a document may write them by hand with `target=state.x`, and
+/// `active=false` rendering as pressed would be a small betrayal.
+///
+/// Anything unrecognised is TRUE, which is the right way round: `active=`
+/// is opt-in, so the attribute is only present when somebody meant
+/// something by it, and an unfamiliar truthy spelling should light the
+/// button rather than silently do nothing.
+pub fn isTruthy(value: []const u8) bool {
+    const v = std.mem.trim(u8, value, " \t\r\n");
+    if (v.len == 0) return false;
+    for ([_][]const u8{ "0", "false", "no", "off" }) |falsey| {
+        if (std.ascii.eqlIgnoreCase(v, falsey)) return false;
+    }
+    // `0`, `0.0`, `0.000` — a float that reads as zero is not pressed.
+    if (std.fmt.parseFloat(f64, v)) |n| {
+        if (n == 0) return false;
+    } else |_| {}
+    return true;
+}
+
 pub const factory: component_mod.Factory = .{
     .create = create,
     .update = update,
@@ -85,6 +110,25 @@ const Component = struct {
     /// the one panel-ish thing in the vocabulary whose corners a document
     /// could not name.
     radius: f32 = BUTTON_RADIUS,
+    /// A glyph drawn to the left of the label. Empty for none.
+    ///
+    /// An attribute rather than a body, deliberately. `:::button` has
+    /// never rendered its body — `body=` is the dispatch payload — and
+    /// teaching it to lay out arbitrary children would make every button
+    /// a layout container to give a handful of them a symbol. One string,
+    /// shaped in the same font as the label, is the whole of what a dock
+    /// button actually wants.
+    icon: []u8,
+    /// Whether to draw the PRESSED look.
+    ///
+    /// Read from an attribute rather than tracked internally, because
+    /// what makes a toggle button look pressed is not the click — it is
+    /// whether the thing it toggles is currently on, and only the
+    /// document knows that. `active=${state.up}` with
+    /// `up: read hud/mounted/surfaces` in the frontmatter is a dock
+    /// button that lights up because its applet is open, including when
+    /// something else opened it.
+    active: bool = false,
     last_box: element.Box = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     /// Bumped on every spec ingest so the retained layout cache
     /// re-walks the button when its attrs change.
@@ -100,6 +144,8 @@ const Component = struct {
         var action_raw: ?[]const u8 = null;
         var body_raw: []const u8 = "";
         var cmd_raw: []const u8 = "";
+        var icon_raw: []const u8 = "";
+        var active_opt: bool = false;
         var width_opt: ?box_helpers.Length = self.width;
         var height_opt: f32 = self.height;
         var radius_opt: f32 = self.radius;
@@ -115,6 +161,10 @@ const Component = struct {
                 body_raw = attr.value;
             } else if (std.mem.eql(u8, attr.key, "cmd")) {
                 cmd_raw = attr.value;
+            } else if (std.mem.eql(u8, attr.key, "icon")) {
+                icon_raw = attr.value;
+            } else if (std.mem.eql(u8, attr.key, "active")) {
+                active_opt = isTruthy(attr.value);
             } else if (std.mem.eql(u8, attr.key, "width")) {
                 if (box_helpers.parseLength(attr.value)) |l| width_opt = l;
             } else if (std.mem.eql(u8, attr.key, "height")) {
@@ -168,6 +218,8 @@ const Component = struct {
         errdefer a.free(new_body);
         const new_cmd = try a.dupe(u8, cmd_raw);
         errdefer a.free(new_cmd);
+        const new_icon = try a.dupe(u8, icon_raw);
+        errdefer a.free(new_icon);
 
         // Old field cleanup — only after every new dupe succeeded.
         a.free(self.label);
@@ -175,11 +227,14 @@ const Component = struct {
         a.free(self.action);
         a.free(self.body);
         a.free(self.cmd);
+        a.free(self.icon);
         self.label = new_label;
         self.target = new_target;
         self.action = new_action;
         self.body = new_body;
         self.cmd = new_cmd;
+        self.icon = new_icon;
+        self.active = active_opt;
         self.width = width_opt;
         self.height = height_opt;
         self.radius = radius_opt;
@@ -198,6 +253,7 @@ fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const co
         .action = try allocator.dupe(u8, ""),
         .body = try allocator.dupe(u8, ""),
         .cmd = try allocator.dupe(u8, ""),
+        .icon = try allocator.dupe(u8, ""),
         .width = null,
         .height = 36,
     };
@@ -217,6 +273,7 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     allocator.free(c.action);
     allocator.free(c.body);
     allocator.free(c.cmd);
+    allocator.free(c.icon);
     allocator.destroy(c);
 }
 
@@ -236,9 +293,20 @@ fn contentVersion(ctx: *anyopaque) u64 {
 const BUTTON_BG: [4]f32 = .{ 0.20, 0.36, 0.62, 1.0 };
 const BUTTON_BORDER: [4]f32 = .{ 0.45, 0.68, 0.95, 1.0 };
 const BUTTON_LABEL: [4]f32 = .{ 0.98, 0.98, 1.0, 1.0 };
+/// The PRESSED palette. Lighter and warmer than the resting one rather
+/// than merely a different hue: a toggle has to read as on-or-off at a
+/// glance across a dock, and two colours of similar lightness do not.
+const BUTTON_BG_ACTIVE: [4]f32 = .{ 0.36, 0.60, 0.92, 1.0 };
+const BUTTON_BORDER_ACTIVE: [4]f32 = .{ 0.82, 0.93, 1.0, 1.0 };
+const BUTTON_LABEL_ACTIVE: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 };
 const BUTTON_BORDER_PX: f32 = 1.5;
+/// A pressed button's border, thicker so the state survives being read
+/// past — the fill alone is a subtle cue on a translucent dock.
+const BUTTON_BORDER_PX_ACTIVE: f32 = 2.5;
 const BUTTON_RADIUS: f32 = 6;
 const BUTTON_PAD_X: f32 = 16;
+/// Between an `icon=` glyph and the label beside it.
+const BUTTON_ICON_GAP: f32 = 7;
 
 fn layoutAndRender(
     ctx: *anyopaque,
@@ -260,30 +328,68 @@ fn layoutAndRender(
     var text_w: f32 = 0;
     for (run.glyphs) |g| text_w += g.x_advance * fscale;
 
-    const intrinsic_w = text_w + 2 * BUTTON_PAD_X;
+    // The icon is shaped in the same font and treated as a second run, so
+    // it advances and centres by the same arithmetic as the label rather
+    // than by a guessed square.
+    const icon_run = if (c.icon.len > 0) try shape.shapeUtf8(aa, hb, c.icon) else null;
+    var icon_w: f32 = 0;
+    if (icon_run) |ir| {
+        for (ir.glyphs) |g| icon_w += g.x_advance * fscale;
+    }
+    const gap: f32 = if (icon_run != null and c.label.len > 0) BUTTON_ICON_GAP else 0;
+    const content_w = icon_w + gap + text_w;
+
+    const intrinsic_w = content_w + 2 * BUTTON_PAD_X;
     const max_w = constraints.max_w;
     const fallback_w = if (std.math.isFinite(max_w)) max_w else intrinsic_w;
     const w: f32 = if (c.width) |wl| wl.resolve(max_w, fallback_w) else intrinsic_w;
     const h = c.height;
 
+    const border_col = if (c.active) BUTTON_BORDER_ACTIVE else BUTTON_BORDER;
+    const bg_col = if (c.active) BUTTON_BG_ACTIVE else BUTTON_BG;
+    const label_col = if (c.active) BUTTON_LABEL_ACTIVE else BUTTON_LABEL;
+    const border_px = if (c.active) BUTTON_BORDER_PX_ACTIVE else BUTTON_BORDER_PX;
+
     // Border + body
     try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0], origin[1] },
         .dst_size = .{ w, h },
-        .color = BUTTON_BORDER,
+        .color = border_col,
         .radius = c.radius,
     });
     try out.appendQuad(lc, .{
-        .dst_pos = .{ origin[0] + BUTTON_BORDER_PX, origin[1] + BUTTON_BORDER_PX },
-        .dst_size = .{ w - 2 * BUTTON_BORDER_PX, h - 2 * BUTTON_BORDER_PX },
-        .color = BUTTON_BG,
-        .radius = @max(0, c.radius - BUTTON_BORDER_PX),
+        .dst_pos = .{ origin[0] + border_px, origin[1] + border_px },
+        .dst_size = .{ w - 2 * border_px, h - 2 * border_px },
+        .color = bg_col,
+        .radius = @max(0, c.radius - border_px),
     });
 
-    // Label centred
+    // Icon then label, centred as ONE group — so adding an icon shifts
+    // the label rather than knocking the pair off centre.
     const m = lc.fonts.metrics(style.font_id);
     const baseline_y = origin[1] + (h - m.line_height) * 0.5 + m.ascender;
-    const text_x = origin[0] + (w - text_w) * 0.5;
+    const content_x = origin[0] + (w - content_w) * 0.5;
+    if (icon_run) |ir| {
+        _ = try text_layout.appendShapedRun(
+            &out.glyphs,
+            &out.glyph_targets,
+            lc.current_target_dispatch_index,
+            lc.fonts,
+            lc.cache,
+            lc.mono_atlas,
+            lc.color_atlas,
+            lc.glyph_cache_lock,
+            ir,
+            style.font_id,
+            content_x,
+            baseline_y,
+            label_col,
+            style.hot_color,
+            style.attention,
+            lc.zoom,
+        );
+    }
+    const text_x = content_x + icon_w + gap;
     _ = try text_layout.appendShapedRun(
         &out.glyphs,
         &out.glyph_targets,
@@ -297,7 +403,7 @@ fn layoutAndRender(
         style.font_id,
         text_x,
         baseline_y,
-        BUTTON_LABEL,
+        label_col,
         style.hot_color,
         style.attention,
         lc.zoom,
@@ -643,6 +749,103 @@ test "button: a cmd on a host with NO sink does nothing and does not crash" {
     defer state.deinit();
     try onInput(inst.ctx, .{ .mouse_up = .{ .local = .{ 0, 0 }, .button = 0, .button_down = false } }, @ptrCast(&state));
     try testing.expectEqual(@as(usize, 0), CmdProbe.count);
+}
+
+// ── `active=` and `icon=` — the togglable dock button ───────────────
+
+test "button: active= reads the plane's 0/1 the way a `read` binding writes it" {
+    // The value that actually arrives. `hud/mounted/surfaces` is an f32
+    // published by the host and formatted `{d}` by the bridge, so these
+    // two spellings are the whole contract — and getting `0` wrong means
+    // every dock button is lit from the moment the dock opens.
+    try testing.expect(!isTruthy("0"));
+    try testing.expect(isTruthy("1"));
+
+    // Written by hand with `target=state.x`, which a document may do.
+    try testing.expect(!isTruthy("false"));
+    try testing.expect(!isTruthy("FALSE"));
+    try testing.expect(!isTruthy("off"));
+    try testing.expect(!isTruthy("no"));
+    try testing.expect(isTruthy("true"));
+    try testing.expect(isTruthy("yes"));
+
+    // Absent or blank is not pressed — the overwhelmingly common case,
+    // since every button written before `active=` existed has neither.
+    try testing.expect(!isTruthy(""));
+    try testing.expect(!isTruthy("   "));
+
+    // A float that reads as zero. `{d}` will not produce these, but a
+    // document interpolating a slider might, and `active=0.0` lighting
+    // the button would be a lie about a number the author can see.
+    try testing.expect(!isTruthy("0.0"));
+    try testing.expect(!isTruthy("0.000"));
+    try testing.expect(isTruthy("0.5"));
+}
+
+test "button: active= and icon= survive an ingest, and default to off/none" {
+    // The re-ingest is the whole point: `active=${state.up}` is
+    // substituted at parse and re-fired when that state changes, so a
+    // button that did not pick the new value up on `update` would light
+    // once at mount and then never change again.
+    const attrs = [_]components.Attr{
+        .{ .key = "label", .value = "X-ray" },
+        .{ .key = "cmd", .value = "hud toggle surfaces" },
+    };
+    const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
+    const inst = try create(&_test_spark, testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+    const c: *Component = @ptrCast(@alignCast(inst.ctx));
+    try testing.expect(!c.active);
+    try testing.expectEqualStrings("", c.icon);
+
+    const attrs2 = [_]components.Attr{
+        .{ .key = "label", .value = "X-ray" },
+        .{ .key = "cmd", .value = "hud toggle surfaces" },
+        .{ .key = "icon", .value = "◉" },
+        .{ .key = "active", .value = "1" },
+    };
+    const spec2: components.Spec = .{ .name = "button", .attrs = &attrs2 };
+    try update(inst.ctx, &spec2);
+    try testing.expect(c.active);
+    try testing.expectEqualStrings("◉", c.icon);
+
+    // And back off again — a toggle has to work in both directions, and
+    // a one-way latch would leave every button lit after its first open.
+    const attrs3 = [_]components.Attr{
+        .{ .key = "label", .value = "X-ray" },
+        .{ .key = "cmd", .value = "hud toggle surfaces" },
+        .{ .key = "icon", .value = "◉" },
+        .{ .key = "active", .value = "0" },
+    };
+    const spec3: components.Spec = .{ .name = "button", .attrs = &attrs3 };
+    try update(inst.ctx, &spec3);
+    try testing.expect(!c.active);
+}
+
+test "button: an ingest bumps the version, so the retained cache re-walks it" {
+    // The cache-freeze family, one more time. The layout cache keys a
+    // custom element on `content_version`, so a button whose `active=`
+    // changed but whose version did not would keep drawing its old
+    // colours — the exact shape of the four bugs the readout campaign
+    // closed, and the reason this is asserted rather than assumed.
+    const attrs = [_]components.Attr{
+        .{ .key = "label", .value = "X-ray" },
+        .{ .key = "cmd", .value = "hud toggle surfaces" },
+        .{ .key = "active", .value = "0" },
+    };
+    const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
+    const inst = try create(&_test_spark, testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+    const before = contentVersion(inst.ctx);
+
+    const attrs2 = [_]components.Attr{
+        .{ .key = "label", .value = "X-ray" },
+        .{ .key = "cmd", .value = "hud toggle surfaces" },
+        .{ .key = "active", .value = "1" },
+    };
+    const spec2: components.Spec = .{ .name = "button", .attrs = &attrs2 };
+    try update(inst.ctx, &spec2);
+    try testing.expect(contentVersion(inst.ctx) != before);
 }
 
 test "button: a cmd fires on RELEASE only, and only for the primary button" {

@@ -713,7 +713,7 @@ pub const Registry = struct {
                 if (entry_ptr.binding) |b| b.destroy();
                 // Build the replacement FIRST (may grow the map);
                 // then look up again because entry_ptr is now stale.
-                const fresh = try self.buildEntry(factory, spec, state);
+                const fresh = try self.buildEntry(factory, spec, state, id);
                 const reaq = self.instances.getPtr(id) orelse unreachable;
                 reaq.* = fresh;
                 const ps = passShapeScalars(factory.pass_shape);
@@ -747,7 +747,7 @@ pub const Registry = struct {
                 old_binding;
             if (rebind) if (old_binding) |b| b.destroy();
 
-            try self.invokeUpdate(factory, ctx_stable, spec, state);
+            try self.invokeUpdate(factory, ctx_stable, spec, state, id);
             if (self.instances.getPtr(id)) |reaq| {
                 reaq.parses_unused = 0;
                 reaq.binding = new_binding;
@@ -764,7 +764,7 @@ pub const Registry = struct {
         // Cache miss. Build the entry FIRST (recursive resolves grow
         // the map safely — we're holding no pointers into it). Then
         // put once via `putNoClobber`.
-        const built = try self.buildEntry(factory, spec, state);
+        const built = try self.buildEntry(factory, spec, state, id);
         errdefer {
             if (built.binding) |b| b.destroy();
             if (factory.deinit) |d| d(built.instance.ctx, self.allocator);
@@ -791,12 +791,13 @@ pub const Registry = struct {
         ctx: *anyopaque,
         spec: *const components.Spec,
         state: ?*state_mod.State,
+        scope: ?[]const u8,
     ) !void {
         const u = factory.update orelse return;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const fresh = try buildSubstitutedSpec(a, spec, state);
+        const fresh = try buildSubstitutedSpec(a, spec, state, scope);
         try u(ctx, &fresh);
     }
 
@@ -810,13 +811,14 @@ pub const Registry = struct {
         factory: Factory,
         spec: *const components.Spec,
         state: ?*state_mod.State,
+        scope: ?[]const u8,
     ) !Entry {
         // First create the instance with substituted attrs in a
         // scratch arena — same shape as invokeUpdate.
         var create_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer create_arena.deinit();
         const ca = create_arena.allocator();
-        const fresh = try buildSubstitutedSpec(ca, spec, state);
+        const fresh = try buildSubstitutedSpec(ca, spec, state, scope);
         const sp = self.spark orelse return error.SparkNotAttached;
         const inst = try factory.create(sp, self.allocator, &fresh);
 
@@ -1061,6 +1063,7 @@ fn buildSubstitutedSpec(
     allocator: std.mem.Allocator,
     templated: *const components.Spec,
     state: ?*state_mod.State,
+    scope: ?[]const u8,
 ) !components.Spec {
     const fresh_attrs = try allocator.alloc(components.Attr, templated.attrs.len);
     for (templated.attrs, 0..) |src, i| {
@@ -1081,6 +1084,11 @@ fn buildSubstitutedSpec(
         // The document's state, carried to the factory. A body-parsing
         // factory needs it for the nested parse and had no way to ask.
         .state = @ptrCast(state),
+        // ...and this instance's own registry key, which is the namespace
+        // its children belong in. Borrowed for the duration of the
+        // create/update call; a factory that keeps it dupes it, exactly as
+        // they already did with their `id=`.
+        .scope = scope,
     };
 }
 
@@ -1094,6 +1102,22 @@ fn buildSubstitutedSpec(
 /// template.
 pub fn specState(spec: *const components.Spec, fallback: *state_mod.State) *state_mod.State {
     if (spec.state) |raw| return @ptrCast(@alignCast(raw));
+    return fallback;
+}
+
+/// The namespace a body-parsing factory should parse its children into.
+///
+/// The Spec's own registry key when the registry stamped one, and the
+/// factory's `id=` otherwise — which is what every such factory used
+/// before, so a hand-built Spec behaves exactly as it did.
+///
+/// Every factory that calls `markdown.parseWithStateAndScope` must route
+/// through here. An `id=`-derived scope is not unique: two unnamed blocks
+/// in one document share the empty string, and two documents share it
+/// again on top of that, so their children resolve to one set of
+/// instances and the last one parsed wins for all of them.
+pub fn specScope(spec: *const components.Spec, fallback: []const u8) []const u8 {
+    if (spec.scope) |s| return s;
     return fallback;
 }
 
@@ -1118,6 +1142,11 @@ var t_last_body_len: usize = 0;
 /// separately from `t_last_body_buf` (which is `handleUpdate`'s).
 var t_update_body_buf: [256]u8 = undefined;
 var t_update_body_len: usize = 0;
+/// The `scope` stamped on the Spec handed to the most recent
+/// `factory.create` — the namespace a body-parsing factory would parse
+/// its children into. See `Spec.scope`.
+var t_create_scope_buf: [128]u8 = undefined;
+var t_create_scope_len: usize = 0;
 
 const TestState = struct {
     allocator: std.mem.Allocator,
@@ -1139,6 +1168,9 @@ fn pickColor(spec: *const components.Spec) ?[]const u8 {
 fn testCreate(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const components.Spec) anyerror!Instance {
     _ = spark; // tests don't dereference spark fields
     t_creates += 1;
+    const sc = specScope(spec, "");
+    t_create_scope_len = @min(sc.len, t_create_scope_buf.len);
+    @memcpy(t_create_scope_buf[0..t_create_scope_len], sc[0..t_create_scope_len]);
     const state = try allocator.create(TestState);
     // Real components own their state — copy the value into our own
     // allocator-owned memory. The Spec's strings live in scratch
@@ -1541,6 +1573,102 @@ test "scoped resolve namespaces cache keys" {
     try testing.expectEqual(r_a.?.ctx, r_a_again.?.ctx);
 }
 
+// ── `Spec.scope` — the namespace a nested parse belongs in ─────────
+
+fn lastCreateScope() []const u8 {
+    return t_create_scope_buf[0..t_create_scope_len];
+}
+
+test "spec scope: an UNNAMED block in two documents gets two different scopes" {
+    // **The bug this exists for.** Every body-parsing factory used its
+    // own `id=` as the namespace for the children it parsed. An unnamed
+    // `:::frosted_glass` has no id, so its children went into the EMPTY
+    // scope — in every document at once. Two HUD panels each rendering
+    // `${state.v}` inside a glass panel resolved to ONE `::value`
+    // instance, and both showed whichever document mounted last.
+    //
+    // Poison `specScope` back to returning its `id_raw` fallback and
+    // these two scopes become equal.
+    resetCounters();
+    var registry = Registry.init(testing.allocator);
+    defer registry.deinit();
+    var test_spark = spark_mod.Spark.testStub(testing.allocator);
+    registry.attachSpark(&test_spark);
+    try registry.register("box", test_factory);
+
+    // No `id` — the case that used to collapse to "".
+    const spec: components.Spec = .{ .name = "box", .body = "value is ${state.v}" };
+
+    _ = try registry.resolve(&spec, 0, null, "panel_a");
+    var a_buf: [128]u8 = undefined;
+    const a_scope = a_buf[0..lastCreateScope().len];
+    @memcpy(a_scope, lastCreateScope());
+
+    _ = try registry.resolve(&spec, 0, null, "panel_b");
+    const b_scope = lastCreateScope();
+
+    try testing.expectEqual(@as(u32, 2), t_creates);
+    try testing.expect(a_scope.len > 0);
+    try testing.expect(!std.mem.eql(u8, a_scope, b_scope));
+    // And it is the instance's own key, so children land UNDER the
+    // parent rather than beside it.
+    try testing.expectEqualStrings("panel_a/auto:0", a_scope);
+    try testing.expectEqualStrings("panel_b/auto:0", b_scope);
+}
+
+test "spec scope: two unnamed blocks in ONE document do not share a namespace either" {
+    // The same bug at the other scale, and the reason the fix is the
+    // instance's KEY rather than "the document's scope plus the id":
+    // two unnamed effects in one document both had the empty id, so the
+    // second one's children overwrote the first's.
+    resetCounters();
+    var registry = Registry.init(testing.allocator);
+    defer registry.deinit();
+    var test_spark = spark_mod.Spark.testStub(testing.allocator);
+    registry.attachSpark(&test_spark);
+    try registry.register("box", test_factory);
+
+    const spec: components.Spec = .{ .name = "box" };
+    _ = try registry.resolve(&spec, 0, null, "panel");
+    var first_buf: [128]u8 = undefined;
+    const first = first_buf[0..lastCreateScope().len];
+    @memcpy(first, lastCreateScope());
+
+    // A second, distinct directive in the same document — same name, no
+    // id, next sentinel index.
+    _ = try registry.resolve(&spec, 1, null, "panel");
+    try testing.expectEqual(@as(u32, 2), t_creates);
+    try testing.expect(!std.mem.eql(u8, first, lastCreateScope()));
+}
+
+test "spec scope: a named block still gets a scope, and it nests" {
+    // Naming a block was the workaround for all of the above, so it has
+    // to keep working — and the child scope must now be the FULL key, so
+    // two documents' `:::flex {#row}` stay distinct.
+    resetCounters();
+    var registry = Registry.init(testing.allocator);
+    defer registry.deinit();
+    var test_spark = spark_mod.Spark.testStub(testing.allocator);
+    registry.attachSpark(&test_spark);
+    try registry.register("box", test_factory);
+
+    const spec: components.Spec = .{ .name = "box", .id = "row" };
+    _ = try registry.resolve(&spec, 0, null, "panel_a");
+    try testing.expectEqualStrings("panel_a/row", lastCreateScope());
+    _ = try registry.resolve(&spec, 0, null, "panel_b");
+    try testing.expectEqualStrings("panel_b/row", lastCreateScope());
+}
+
+test "specScope: an unstamped Spec falls back to the factory's own id" {
+    // Portability. A hand-built Spec — every component unit test in this
+    // repo, and any host driving the registry directly — carries no
+    // scope and must behave exactly as it did before the field existed.
+    const bare: components.Spec = .{ .name = "box" };
+    try testing.expectEqualStrings("fallback", specScope(&bare, "fallback"));
+    const stamped: components.Spec = .{ .name = "box", .scope = "panel/auto:2" };
+    try testing.expectEqualStrings("panel/auto:2", specScope(&stamped, "fallback"));
+}
+
 test "scoped resolve: auto:N + scope" {
     resetCounters();
     var registry = Registry.init(testing.allocator);
@@ -1801,7 +1929,7 @@ test "the resolved Spec carries the document's state, not the Spark's root" {
     const attrs = [_]components.Attr{.{ .key = "v", .value = "${state.x}" }};
     const templated: components.Spec = .{ .name = "box", .attrs = &attrs, .body = "inside ${state.x}" };
 
-    const fresh = try buildSubstitutedSpec(arena.allocator(), &templated, &doc_state);
+    const fresh = try buildSubstitutedSpec(arena.allocator(), &templated, &doc_state, "panel/auto:0");
 
     // The attrs were already substituted before today; the body was not,
     // and could not be, because the factory that parses it had no state.
