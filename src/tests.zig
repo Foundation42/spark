@@ -33,6 +33,7 @@ test {
     _ = @import("components/grip.zig");
     _ = @import("components/input.zig");
     _ = @import("components/kbd.zig");
+    _ = @import("components/meter.zig");
     _ = @import("components/progress.zig");
     _ = @import("extras/llm_stream.zig");
     _ = @import("components/svg.zig");

@@ -168,6 +168,7 @@ pub const components = struct {
     pub const handle = @import("components/handle.zig");
     pub const input = @import("components/input.zig");
     pub const kbd = @import("components/kbd.zig");
+    pub const meter = @import("components/meter.zig");
     pub const price = @import("components/price.zig");
     pub const progress = @import("components/progress.zig");
     pub const rating = @import("components/rating.zig");
@@ -212,6 +213,7 @@ pub fn installCoreComponents(spark: *Spark) !void {
     try components.sparkline.install(spark);
     try components.value.install(spark);
     try components.kbd.install(spark);
+    try components.meter.install(spark);
     try components.progress.install(spark);
     try components.status.install(spark);
     try components.tag.install(spark);

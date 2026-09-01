@@ -21,16 +21,23 @@
 //! samples fall off when capacity fills — is also a natural fit for
 //! ring-buffer addressing.
 //!
-//! ### Why no state binding
+//! ### Two ways data arrives, and why there had to be a second
 //!
-//! Chart attrs (min/max/width/height/color) are static-at-author-time
-//! by design — they configure the visualisation, not the data. The
-//! data comes through `handle_update` and lives entirely in the
-//! component's opaque ring buffer. So this component runs *without*
-//! a Binding (no `${state.x}` in its attrs) which means component-
-//! target updates land cleanly without fighting any reactive
-//! re-substitution — the design pitfall flagged in [[box.zig]] doesn't
-//! apply here.
+//! **Pushed** — `:::update {#id action=append}` puts one sample on the
+//! ring buffer through the component-target path. No cmark, no walker, no
+//! re-parse. Right for a stream somebody is driving.
+//!
+//! **Bound** — `value=${state.gpu_ms}` appends each time the value moves.
+//! This module's header used to say "why no state binding" and mean it,
+//! and that was right until the perf panel: a plane path holds ONE number,
+//! republished as it changes, and the thing worth drawing is its history.
+//! Nobody is going to dispatch a `:::update` at a document ten times a
+//! second to draw a frame-time trace.
+//!
+//! The rest of the attrs are still static-at-author-time by design — they
+//! configure the visualisation, not the data — so a chart with no `value=`
+//! runs without a Binding exactly as before, and component-target updates
+//! land without fighting any reactive re-substitution.
 //!
 //! ### Attribute grammar
 //!
@@ -84,6 +91,9 @@ const Component = struct {
     /// Bumped on every visible-state mutation (append/clear/applySpec).
     /// Drives retained layout-cache invalidation.
     version: u64 = 0,
+    /// The last `value=` seen, so a re-ingest that did not move it does
+    /// not append a second copy. See the `value` arm in `applySpec`.
+    last_value: ?f32 = null,
 
     /// Apply attrs from a Spec onto the component. Values that fail
     /// to parse keep the previous (or default) field value — louder
@@ -91,7 +101,9 @@ const Component = struct {
     /// not honoured here; resizing would discard sample history.
     fn applySpec(self: *Component, spec: *const components.Spec) void {
         for (spec.attrs) |a| {
-            if (std.mem.eql(u8, a.key, "min")) {
+            if (std.mem.eql(u8, a.key, "value")) {
+                self.appendBound(a.value);
+            } else if (std.mem.eql(u8, a.key, "min")) {
                 self.min_val = std.fmt.parseFloat(f32, a.value) catch self.min_val;
             } else if (std.mem.eql(u8, a.key, "max")) {
                 self.max_val = std.fmt.parseFloat(f32, a.value) catch self.max_val;
@@ -114,6 +126,35 @@ const Component = struct {
         }
     }
 
+    /// The SECOND way samples arrive: a bound scalar, appended each time
+    /// it moves.
+    ///
+    /// The header used to say "why no state binding" and meant it — data
+    /// came through `handle_update` and only through it. That is right for
+    /// a stream somebody is pushing, and it cannot express the case the
+    /// perf panel is: a plane path holding one number, republished as it
+    /// changes, whose HISTORY is the thing worth drawing. Nobody is going
+    /// to dispatch `:::update` sixty times a second at a document.
+    ///
+    /// So `value=${state.gpu_ms}` appends. The guard is what makes it
+    /// safe: `update` fires on ANY bound attribute re-resolving, and on a
+    /// re-parse, so appending unconditionally would stack duplicates every
+    /// time a neighbouring path moved. Only an actual change is a sample.
+    ///
+    /// The cost of that guard is honest and worth stating: a value that
+    /// holds steady stops advancing the chart rather than drawing a flat
+    /// line. For a measurement that is the truth — nothing happened — and
+    /// for a clock it would be wrong, which is why this is opt-in per
+    /// document rather than the only way in.
+    fn appendBound(self: *Component, text: []const u8) void {
+        const v = std.fmt.parseFloat(f32, std.mem.trim(u8, text, " \t\r\n")) catch return;
+        if (self.last_value) |prev| {
+            if (prev == v) return;
+        }
+        self.last_value = v;
+        self.append(v);
+    }
+
     fn append(self: *Component, value: f32) void {
         self.samples[self.write_idx] = value;
         self.write_idx = (self.write_idx + 1) % self.capacity;
@@ -134,6 +175,21 @@ const Component = struct {
         return self.samples[(self.write_idx + i) % self.capacity];
     }
 };
+
+/// The space between two columns, given how wide a slot is.
+///
+/// A gap only while the columns are wide enough to read AS columns. Below
+/// `GAP_FLOOR` pixels a slot the gap stops separating samples and starts
+/// being half the picture: a 96-sample trace in 300px came out as a
+/// barcode, which reads as texture rather than as a signal. Dropping it
+/// there makes a dense series an area fill — the shape a frame-time trace
+/// is actually read for — and leaves a sparse one alone.
+pub const GAP_FLOOR: f32 = 3.0;
+
+pub fn columnGap(slot_w: f32) f32 {
+    if (slot_w < GAP_FLOOR) return 0;
+    return @min(@as(f32, 1.0), slot_w * 0.4);
+}
 
 pub const factory: component_mod.Factory = .{
     .create = create,
@@ -233,7 +289,7 @@ fn layoutAndRender(
     // width, regardless of how many samples are actually filled —
     // so the chart "scrolls in" from the right as data arrives.
     const slot_w = w / @as(f32, @floatFromInt(c.capacity));
-    const gap = @min(@as(f32, 1.0), slot_w * 0.4);
+    const gap = columnGap(slot_w);
     const bar_w = @max(@as(f32, 1.0), slot_w - gap);
 
     const range = c.max_val - c.min_val;
@@ -383,4 +439,87 @@ test "handleUpdate: unknown action silent no-op" {
     defer destroyComponent(c);
     try handleUpdate(@ptrCast(c), "explode", "boom");
     try testing.expectEqual(@as(usize, 0), c.filled);
+}
+
+test "chart: a bound value appends only when it MOVES" {
+    // `update` fires on ANY bound attribute re-resolving, and on a
+    // re-parse. Appending unconditionally would stack a duplicate sample
+    // every time a NEIGHBOURING path moved — on `hud/perf.md` that is
+    // seventeen other paths, so a frame-time trace would be eighteen
+    // copies of every reading.
+    const attrs = [_]components.Attr{
+        .{ .key = "capacity", .value = "8" },
+        .{ .key = "value", .value = "1.5" },
+    };
+    const spec: components.Spec = .{ .name = "chart", .attrs = &attrs };
+    const c = try makeComponent(testing.allocator, 8);
+    defer destroyComponent(c);
+    c.applySpec(&spec);
+    try testing.expectEqual(@as(usize, 1), c.filled);
+
+    // Same value again — a neighbour re-resolved, not this one.
+    c.applySpec(&spec);
+    c.applySpec(&spec);
+    try testing.expectEqual(@as(usize, 1), c.filled);
+
+    const moved = [_]components.Attr{
+        .{ .key = "capacity", .value = "8" },
+        .{ .key = "value", .value = "2.5" },
+    };
+    c.applySpec(&.{ .name = "chart", .attrs = &moved });
+    try testing.expectEqual(@as(usize, 2), c.filled);
+    try testing.expectEqual(@as(f32, 1.5), c.sampleAt(0));
+    try testing.expectEqual(@as(f32, 2.5), c.sampleAt(1));
+
+    // Back to the first value is a real sample, not a repeat: the guard is
+    // "different from the LAST one", not "never seen before".
+    c.applySpec(&spec);
+    try testing.expectEqual(@as(usize, 3), c.filled);
+    try testing.expectEqual(@as(f32, 1.5), c.sampleAt(2));
+}
+
+test "chart: an unpublished path does not append a zero" {
+    // A `read` binding on a path nothing has written yet interpolates to
+    // the empty string. Appending 0 for it would put a spike at the origin
+    // of every trace on a freshly mounted panel.
+    const attrs = [_]components.Attr{
+        .{ .key = "capacity", .value = "8" },
+        .{ .key = "value", .value = "" },
+    };
+    const c = try makeComponent(testing.allocator, 8);
+    defer destroyComponent(c);
+    c.applySpec(&.{ .name = "chart", .attrs = &attrs });
+    try testing.expectEqual(@as(usize, 0), c.filled);
+}
+
+test "chart: pushed and bound samples share one ring" {
+    // They are two ways in, not two buffers — a document that does both
+    // gets one interleaved history, which is the only reading that makes
+    // sense for a chart with a single y-axis.
+    const attrs = [_]components.Attr{
+        .{ .key = "capacity", .value = "8" },
+        .{ .key = "value", .value = "1" },
+    };
+    const c = try makeComponent(testing.allocator, 8);
+    defer destroyComponent(c);
+    c.applySpec(&.{ .name = "chart", .attrs = &attrs });
+
+    try handleUpdate(@ptrCast(c), "append", "7");
+    try testing.expectEqual(@as(usize, 2), c.filled);
+    try testing.expectEqual(@as(f32, 1), c.sampleAt(0));
+    try testing.expectEqual(@as(f32, 7), c.sampleAt(1));
+}
+
+test "chart: a dense series drops its gaps and becomes an area" {
+    // A 96-sample trace in 300px came out as a barcode — texture where a
+    // signal should be. The gap has to go when the columns get thin.
+    try testing.expectEqual(@as(f32, 0), columnGap(300.0 / 128.0)); // 2.3px
+    try testing.expectEqual(@as(f32, 0), columnGap(1));
+    // …and stay when they are wide enough to be read as columns, which is
+    // what a sparse series wants and is the behaviour that already shipped.
+    try testing.expect(columnGap(8) > 0);
+    try testing.expect(columnGap(300.0 / 24.0) > 0); // 12.5px
+    // Capped at a pixel however wide the slot: a gap that grew with the
+    // column would turn a 12-sample chart into 12 stripes of background.
+    try testing.expectEqual(@as(f32, 1), columnGap(40));
 }
