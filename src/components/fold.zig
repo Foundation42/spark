@@ -257,21 +257,39 @@ const Component = struct {
         // MOVED, which at create is always (the previous is null).
         if (open_opt) |v| {
             const moved = self.last_open_attr == null or self.last_open_attr.? != v;
-            if (moved) {
-                self.open_self = v;
-                // A SEED opens a fold too, so it has to close its group
-                // the same way a click does — otherwise a document that
-                // seeds two members open starts with an accordion that
-                // is not one, and only the first click fixes it.
-                //
-                // Ingest runs in document order, so the LAST member with
-                // a truthy `open=` wins. That is the rule an author can
-                // predict; anything cleverer would make `open=` mean
-                // something different inside a group than outside one.
-                if (v) closeSiblings(self);
-            }
+            if (moved) self.open_self = v;
         }
         self.last_open_attr = open_opt;
+
+        // An accordion holds from frame one, whatever the author wrote.
+        //
+        // Enforced on ANY ingest that leaves this fold open, not only on
+        // a seed that just opened it — because the interesting case is
+        // the document that seeds NOTHING. A fold with no `open=` at all
+        // defaults to open, so a group where nobody declared anything
+        // would start with every member open and stay that way until the
+        // first click. That is a rule the author has to remember, and a
+        // rule you have to remember is a rule that gets forgotten.
+        //
+        // Who wins falls out of document order, and it lands somewhere
+        // better than the rule I first wrote down. Ingest runs top to
+        // bottom, and a fold defaults to OPEN:
+        //
+        //   * Nobody declares `open=` → the FIRST member wins. It ingests
+        //     while the others are still at their default, closes them,
+        //     and they have nothing to say when their turn comes. Reading
+        //     a document top to bottom, the first section being the open
+        //     one is what you would guess.
+        //   * Somebody declares `open=1` → that member wins wherever it
+        //     sits, because a seed that MOVED re-opens it and closes
+        //     whoever the default had picked. Explicit beats default,
+        //     which is the property that actually matters.
+        //   * Two members declare `open=1` → the later one wins, for the
+        //     same reason.
+        //
+        // Cheap by construction — it walks only when this fold is open,
+        // which is at most one member of any settled group.
+        if (self.open_self) closeSiblings(self);
         self.version +%= 1;
     }
 };
@@ -1267,4 +1285,118 @@ test "fold: a fold destroyed mid-group is not walked by the next open" {
 
     freeStrings(&a);
     try testing.expect(live_folds == null);
+}
+
+test "fold: a group where NOBODY declared `open=` still settles to one" {
+    // The case that made this run on every open ingest rather than only
+    // on a seed. A fold with no `open=` defaults to OPEN, so a group
+    // whose author declared nothing would start with every member open
+    // and stay that way until the first click — a rule you have to
+    // remember, which is a rule that gets forgotten.
+    //
+    // Document order decides, same as for seeds.
+    var doc = state_mod.State.init(testing.allocator);
+    defer doc.deinit();
+
+    var a = testComponent();
+    var b = testComponent();
+    var c = testComponent();
+    try groupMember(&a, "g", &doc);
+    try groupMember(&b, "g", &doc);
+    try groupMember(&c, "g", &doc);
+    defer {
+        freeStrings(&a);
+        freeStrings(&b);
+        freeStrings(&c);
+    }
+
+    // No `open=` anywhere — every one of them defaults open.
+    const attrs = [_]components.Attr{
+        .{ .key = "title", .value = "S" },
+        .{ .key = "group", .value = "g" },
+    };
+    const spec: components.Spec = .{ .name = "fold", .attrs = &attrs };
+    try a.ingest(&spec);
+    try b.ingest(&spec);
+    try c.ingest(&spec);
+
+    // The FIRST wins here, not the last: it ingests while the others are
+    // still at their default, closes them, and they have nothing to say
+    // when their turn comes. Reading a document top to bottom, the first
+    // section being the open one is what you would guess.
+    try testing.expect(a.isOpen());
+    try testing.expect(!b.isOpen());
+    try testing.expect(!c.isOpen());
+}
+
+test "fold: an explicit `open=1` beats whichever default had won" {
+    // The property that actually matters, and the one an author leans
+    // on: saying which section opens has to work wherever that section
+    // sits in the document, including after one that said nothing.
+    var doc = state_mod.State.init(testing.allocator);
+    defer doc.deinit();
+
+    var first = testComponent();
+    var wanted = testComponent();
+    try groupMember(&first, "g", &doc);
+    try groupMember(&wanted, "g", &doc);
+    defer {
+        freeStrings(&first);
+        freeStrings(&wanted);
+    }
+
+    const bare = [_]components.Attr{
+        .{ .key = "title", .value = "A" },
+        .{ .key = "group", .value = "g" },
+    };
+    const asked = [_]components.Attr{
+        .{ .key = "title", .value = "B" },
+        .{ .key = "group", .value = "g" },
+        .{ .key = "open", .value = "1" },
+    };
+    try first.ingest(&.{ .name = "fold", .attrs = &bare });
+    try wanted.ingest(&.{ .name = "fold", .attrs = &asked });
+
+    try testing.expect(!first.isOpen());
+    try testing.expect(wanted.isOpen());
+}
+
+test "fold: re-ingesting the open member does not disturb a settled group" {
+    // The other side of running on every ingest: attrs re-resolve
+    // whenever a bound path moves, and that must not become a second
+    // event that reshuffles which section is showing.
+    var doc = state_mod.State.init(testing.allocator);
+    defer doc.deinit();
+
+    var a = testComponent();
+    var b = testComponent();
+    try groupMember(&a, "g", &doc);
+    try groupMember(&b, "g", &doc);
+    defer {
+        freeStrings(&a);
+        freeStrings(&b);
+    }
+
+    const shut = [_]components.Attr{
+        .{ .key = "title", .value = "A" },
+        .{ .key = "group", .value = "g" },
+        .{ .key = "open", .value = "0" },
+    };
+    const bare = [_]components.Attr{
+        .{ .key = "title", .value = "B" },
+        .{ .key = "group", .value = "g" },
+    };
+    const shut_spec: components.Spec = .{ .name = "fold", .attrs = &shut };
+    const bare_spec: components.Spec = .{ .name = "fold", .attrs = &bare };
+
+    try a.ingest(&shut_spec);
+    try b.ingest(&bare_spec);
+    try testing.expect(!a.isOpen() and b.isOpen());
+
+    // Re-resolve both, twice. The settled state is a fixed point.
+    for (0..2) |_| {
+        try a.ingest(&shut_spec);
+        try b.ingest(&bare_spec);
+    }
+    try testing.expect(!a.isOpen() and b.isOpen());
 }

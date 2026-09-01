@@ -125,6 +125,30 @@ pub fn flagValue(on: bool) []const u8 {
     return if (on) "1" else "0";
 }
 
+/// Whether an `active_when=` value names the same choice as a `body=`.
+///
+/// Numeric when BOTH sides are numbers, textual otherwise — and the
+/// numeric arm is not a nicety. A radio row over a plane-mirrored knob
+/// compares a readback against an authored literal, and those are two
+/// different spellings of one value the moment anything reformats,
+/// clamps or quantises: `body=2` against a readback of `2.000`, or
+/// `body=0.6` against a knob that came back `0.60000002`. A key that
+/// silently stops lighting because a float grew a decimal is the kind of
+/// bug nobody reports as a bug, they just stop trusting the row.
+///
+/// Textual equality stays for the `body=albedo` case, which is most of
+/// `hud/xray.md` and has no numeric reading at all. Trimmed on both
+/// sides because a readback and a hand-authored attribute do not agree
+/// about whitespace.
+pub fn sameChoice(chosen: []const u8, body: []const u8) bool {
+    const a = std.mem.trim(u8, chosen, " \t\r\n");
+    const b = std.mem.trim(u8, body, " \t\r\n");
+    if (std.mem.eql(u8, a, b)) return true;
+    const na = std.fmt.parseFloat(f64, a) catch return false;
+    const nb = std.fmt.parseFloat(f64, b) catch return false;
+    return na == nb;
+}
+
 pub const factory: component_mod.Factory = .{
     .create = create,
     .update = update,
@@ -339,7 +363,7 @@ const Component = struct {
         // (which carry no body) would all light the moment anything
         // resolved `active_when` to the empty string.
         self.active = active_opt or
-            (body_raw.len > 0 and std.mem.eql(u8, active_when_raw, body_raw));
+            (body_raw.len > 0 and sameChoice(active_when_raw, body_raw));
         self.flip = flip_opt;
         self.width = width_opt;
         self.height = height_opt;
@@ -1224,4 +1248,30 @@ test "button: active= still lights on its own, alongside active_when" {
     defer deinit_(inst.ctx, testing.allocator);
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
     try testing.expect(c.active);
+}
+
+test "button: a radio row over a MIRRORED knob still lights" {
+    // The case textual equality alone gets wrong. A row of keys over a
+    // plane knob compares a readback against an authored literal, and
+    // those are two spellings of one value the moment anything
+    // reformats or clamps. `render/grade/operator` comes back through
+    // `{d}` on an f32 today; a knob that came back `2.000` would leave
+    // the whole row dark with nothing to point at.
+    try testing.expect(sameChoice("2", "2"));
+    try testing.expect(sameChoice("2.000", "2"));
+    try testing.expect(sameChoice("2", "2.0"));
+    try testing.expect(sameChoice("0.60000002", "0.6") == (0.60000002 == 0.6));
+    try testing.expect(sameChoice(" 4 ", "4")); // a readback and an attr disagree about space
+    try testing.expect(!sameChoice("3", "2"));
+}
+
+test "button: a textual choice is still textual" {
+    // Most of `hud/xray.md` is `body=albedo`, which has no numeric
+    // reading at all — the numeric arm must not swallow it, and two
+    // words that both fail to parse must not compare equal.
+    try testing.expect(sameChoice("albedo", "albedo"));
+    try testing.expect(!sameChoice("albedo", "depth"));
+    try testing.expect(!sameChoice("", "depth"));
+    // …and a word against a number is simply not the same choice.
+    try testing.expect(!sameChoice("albedo", "2"));
 }
