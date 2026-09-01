@@ -150,6 +150,10 @@ pub const components = struct {
     pub const box = @import("components/box.zig");
     pub const button = @import("components/button.zig");
     pub const chart = @import("components/chart.zig");
+    /// Shared grading maths — HSV, and the balance the two colour
+    /// widgets are two pictures of. No directive of its own.
+    pub const color = @import("components/color.zig");
+    pub const color_bars = @import("components/color_bars.zig");
     pub const commit = @import("components/commit.zig");
     pub const diff = @import("components/diff.zig");
     pub const dot = @import("components/dot.zig");
@@ -167,6 +171,7 @@ pub const components = struct {
     pub const slider = @import("components/slider.zig");
     pub const sparkline = @import("components/sparkline.zig");
     pub const status = @import("components/status.zig");
+    pub const trackball = @import("components/trackball.zig");
     pub const svg = @import("components/svg.zig");
     pub const tag = @import("components/tag.zig");
     pub const trend = @import("components/trend.zig");
@@ -195,6 +200,10 @@ pub fn installCoreComponents(spark: *Spark) !void {
     try components.box.install(spark);
     try spark.registry.register("chart", components.chart.factory);
     try spark.registry.register("slider", components.slider.factory);
+    // The grading pair. Same attribute grammar, two views of it — a
+    // document swaps the directive name to swap the picture.
+    try components.trackball.install(spark);
+    try components.color_bars.install(spark);
     try components.badge.install(spark);
     try components.sparkline.install(spark);
     try components.value.install(spark);

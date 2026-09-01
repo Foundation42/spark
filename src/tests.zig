@@ -37,6 +37,10 @@ test {
     _ = @import("extras/svg_stream.zig");
     _ = @import("extras/image_stream.zig");
     _ = @import("components/slider.zig");
+    // The grading widgets: shared maths, then the two views of it.
+    _ = @import("components/color.zig");
+    _ = @import("components/trackball.zig");
+    _ = @import("components/color_bars.zig");
     _ = @import("components/sparkline.zig");
     _ = @import("components/status.zig");
     _ = @import("components/tag.zig");
