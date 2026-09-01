@@ -381,3 +381,143 @@ test "balance: an inverted range is survived, not asserted on" {
     // take out the whole triangle batch, not just this widget.
     try testing.expectApproxEqAbs(@as(f32, 0), clamp(std.math.nan(f32), 0, 1), 1e-6);
 }
+
+// ── The other parameterisation ──────────────────────────────────────
+
+/// Three channels as an ABSOLUTE colour: hue, saturation, value.
+///
+/// `Balance` is for a signed push around a neutral, which is what a
+/// grading primary is. A TINT is not that. `render/light/sun_tint` runs
+/// 0..1 per channel with a default of white — and white is the TOP of
+/// that range, so there is no headroom above neutral to push into and
+/// `Balance.pushScale` collapses to nothing. A trackball there would be
+/// inert, which is why `hud/light.md` and `hud/sky.md` still spend three
+/// sliders on every colour they own.
+///
+/// So: the same three numbers, read as a colour instead of as an offset.
+pub const Swatch = struct {
+    min: f32 = 0,
+    max: f32 = 1,
+
+    /// Degrees, `relief.onCircle` convention — the same one the disc is
+    /// drawn in, so the puck sits on the colour it names.
+    hue: f32 = 0,
+    /// 0 at the centre (grey) to 1 at the rim.
+    sat: f32 = 0,
+    /// 0 black to 1 full.
+    val: f32 = 1,
+
+    cur: [3]f32 = .{ 1, 1, 1 },
+
+    /// (hue, sat, val) → the three channels.
+    pub fn forward(self: *Swatch) void {
+        const rgb = hsv2rgb(self.hue, self.sat, self.val);
+        const span = self.max - self.min;
+        for (&self.cur, rgb) |*out, v| {
+            out.* = clamp(self.min + v * span, self.min, self.max);
+        }
+    }
+
+    /// The three channels → (hue, sat, val).
+    ///
+    /// Hue and saturation are UNDEFINED at the ends — every hue is black
+    /// at value 0, and every hue is white at saturation 0 — so they are
+    /// kept rather than recomputed out of the rounding noise there. Drag
+    /// a picker down to black and back up and the colour returns; without
+    /// this it would come back grey, having forgotten what it was.
+    pub fn inverse(self: *Swatch) void {
+        const span = self.max - self.min;
+        if (!(span > 0)) return;
+        var t: [3]f32 = undefined;
+        for (&t, self.cur) |*out, v| out.* = clamp((v - self.min) / span, 0, 1);
+
+        const hsv = rgb2hsv(t[0], t[1], t[2]);
+        self.val = hsv.v;
+        if (hsv.v > 1e-3) self.sat = hsv.s;
+        if (hsv.v > 1e-3 and hsv.s > 1e-3) self.hue = hsv.h;
+    }
+
+    pub fn setChannels(self: *Swatch, v: [3]f32) void {
+        for (&self.cur, v) |*out, in| out.* = clamp(in, self.min, self.max);
+        self.inverse();
+    }
+
+    /// The colour itself, for a swatch or a puck — always at full value
+    /// so the chip stays legible when the picker is turned down.
+    pub fn chip(self: Swatch) [4]f32 {
+        const rgb = hsv2rgb(self.hue, self.sat, 1);
+        return .{ rgb[0], rgb[1], rgb[2], 1.0 };
+    }
+};
+
+test "swatch: white is saturation zero at full value" {
+    var s: Swatch = .{};
+    s.setChannels(.{ 1, 1, 1 });
+    try testing.expectApproxEqAbs(@as(f32, 0), s.sat, 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 1), s.val, 1e-5);
+}
+
+test "swatch: forward/inverse round-trips around the wheel" {
+    var h: f32 = 0;
+    while (h < 360) : (h += 13) {
+        var s: Swatch = .{};
+        s.hue = h;
+        s.sat = 0.7;
+        s.val = 0.8;
+        s.forward();
+        // Rule 1: the colour is actually coloured, or the round trip
+        // below would be about grey.
+        const spread = @max(s.cur[0], @max(s.cur[1], s.cur[2])) -
+            @min(s.cur[0], @min(s.cur[1], s.cur[2]));
+        try testing.expect(spread > 0.3);
+
+        s.inverse();
+        try testing.expectApproxEqAbs(h, s.hue, 0.05);
+        try testing.expectApproxEqAbs(@as(f32, 0.7), s.sat, 1e-3);
+        try testing.expectApproxEqAbs(@as(f32, 0.8), s.val, 1e-3);
+    }
+}
+
+test "swatch: hue and saturation survive a trip through black" {
+    // Both are undefined at value 0. Recomputing them there would make a
+    // picker forget its colour the moment you turned it down.
+    var s: Swatch = .{};
+    s.hue = 210;
+    s.sat = 0.8;
+    s.val = 0.9;
+    s.forward();
+
+    s.val = 0;
+    s.forward();
+    s.inverse();
+    try testing.expectApproxEqAbs(@as(f32, 210), s.hue, 0.05);
+    try testing.expectApproxEqAbs(@as(f32, 0.8), s.sat, 1e-3);
+
+    // And through white, where the hue is equally undefined.
+    s.val = 1;
+    s.sat = 0;
+    s.forward();
+    s.inverse();
+    try testing.expectApproxEqAbs(@as(f32, 210), s.hue, 0.05);
+}
+
+test "swatch: a range other than 0..1 maps through it" {
+    var s: Swatch = .{ .min = -1, .max = 3 };
+    s.hue = 0;
+    s.sat = 1;
+    s.val = 1;
+    s.forward();
+    // Pure red at full: r at max, g and b at min.
+    try testing.expectApproxEqAbs(@as(f32, 3), s.cur[0], 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, -1), s.cur[1], 1e-5);
+    s.inverse();
+    try testing.expectApproxEqAbs(@as(f32, 1), s.val, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 1), s.sat, 1e-4);
+}
+
+test "swatch: a degenerate range does not divide by nothing" {
+    var s: Swatch = .{ .min = 1, .max = 1 };
+    s.setChannels(.{ 1, 1, 1 });
+    for (s.cur) |v| try testing.expect(std.math.isFinite(v));
+    try testing.expect(std.math.isFinite(s.val));
+}

@@ -76,12 +76,39 @@ const READOUT_TEMPLATE = "-0.00";
 /// Column index of the master bar. The first three are r/g/b.
 const MASTER: usize = 3;
 
+/// Where a bar's fill starts.
+///
+/// A grading primary is SIGNED — lift runs -0.3..0.3 and what you want
+/// to see is how far it has been pushed off zero, so the fill spans from
+/// the neutral tick to the value and hangs below the tick when negative.
+/// A plain RGB channel is not signed: it runs 0..1 from nothing to full,
+/// and a fill that started halfway up would be describing a quantity
+/// that has no middle. Chris: "those vertical color sliders have a
+/// different mode... where they fill with color from the bottom, not
+/// offset from the middle. Used for regular RGB sliders."
+pub const FillFrom = enum {
+    /// From the neutral tick, signed. The default, and what a primary
+    /// wants.
+    neutral,
+    /// From the bottom of the track. What a channel wants.
+    base,
+
+    fn parse(v: []const u8) ?FillFrom {
+        const t = std.mem.trim(u8, v, " \t");
+        if (std.ascii.eqlIgnoreCase(t, "neutral")) return .neutral;
+        if (std.ascii.eqlIgnoreCase(t, "base")) return .base;
+        if (std.ascii.eqlIgnoreCase(t, "bottom")) return .base;
+        return null;
+    }
+};
+
 const Component = struct {
     allocator: std.mem.Allocator,
     paths: [3][]u8,
     label: []u8,
     bal: color.Balance,
     bar_h: f32,
+    fill_from: FillFrom = .neutral,
 
     /// See `trackball.Component.last_written` — same gate, same reason.
     last_written: [3]f32 = .{ 0, 0, 0 },
@@ -129,6 +156,8 @@ const Component = struct {
                 if (parseF32(attr.value)) |v| {
                     if (v > 16) self.bar_h = v;
                 }
+            } else if (std.mem.eql(u8, k, "fill")) {
+                if (FillFrom.parse(attr.value)) |f| self.fill_from = f;
             } else if (std.mem.eql(u8, k, "label")) {
                 const dup = try a.dupe(u8, attr.value);
                 a.free(self.label);
@@ -335,8 +364,12 @@ fn layoutAndRender(
         // from the bottom so a signed range reads correctly: a lift of
         // -0.1 is a bar hanging BELOW the tick, not a short bar.
         const f_val = c.bal.fractionOf(v);
-        const lo = @min(f_val, f_neutral);
-        const hi = @max(f_val, f_neutral);
+        const from: f32 = switch (c.fill_from) {
+            .neutral => f_neutral,
+            .base => 0,
+        };
+        const lo = @min(f_val, from);
+        const hi = @max(f_val, from);
         const fill_h = (hi - lo) * c.bar_h;
         if (fill_h > 0.5) {
             try out.appendQuad(lc, .{
@@ -347,8 +380,11 @@ fn layoutAndRender(
             });
         }
 
-        // Neutral tick.
-        try out.appendQuad(lc, .{
+        // The neutral tick, which only says anything in signed mode —
+        // on a channel filling from the bottom there is no "no change"
+        // position for it to mark, and drawing it anyway would put a
+        // line across the middle of a quantity that has no middle.
+        if (c.fill_from == .neutral) try out.appendQuad(lc, .{
             .dst_pos = .{ cx - BAR_W, bars_top + (1.0 - f_neutral) * c.bar_h - 0.5 },
             .dst_size = .{ BAR_W * 2, 1.0 },
             .color = NEUTRAL_TICK_COLOR,

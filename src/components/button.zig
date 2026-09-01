@@ -144,6 +144,20 @@ const Component = struct {
     /// button that lights up because its applet is open, including when
     /// something else opened it.
     active: bool = false,
+    /// The six colours a key wears — resting fill/border/ink, then the
+    /// same three for pressed. Attributes for the reason `:::slider`'s
+    /// are: a shell that themes its sliders and not its buttons is a
+    /// shell with one rule and one exception.
+    ///
+    /// No `palette_version` here, unlike the slider: `ingest` already
+    /// bumps `version` unconditionally, so the retained cache re-walks
+    /// on any attribute change including these.
+    color: [4]f32 = BUTTON_BG,
+    border: [4]f32 = BUTTON_BORDER,
+    text: [4]f32 = BUTTON_LABEL,
+    active_color: [4]f32 = BUTTON_BG_ACTIVE,
+    active_border: [4]f32 = BUTTON_BORDER_ACTIVE,
+    active_text: [4]f32 = BUTTON_LABEL_ACTIVE,
     last_box: element.Box = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     /// Bumped on every spec ingest so the retained layout cache
     /// re-walks the button when its attrs change.
@@ -180,6 +194,18 @@ const Component = struct {
                 icon_raw = attr.value;
             } else if (std.mem.eql(u8, attr.key, "active")) {
                 active_opt = isTruthy(attr.value);
+            } else if (std.mem.eql(u8, attr.key, "color")) {
+                if (box_helpers.parseColor(attr.value)) |v| self.color = v;
+            } else if (std.mem.eql(u8, attr.key, "border")) {
+                if (box_helpers.parseColor(attr.value)) |v| self.border = v;
+            } else if (std.mem.eql(u8, attr.key, "text")) {
+                if (box_helpers.parseColor(attr.value)) |v| self.text = v;
+            } else if (std.mem.eql(u8, attr.key, "active_color")) {
+                if (box_helpers.parseColor(attr.value)) |v| self.active_color = v;
+            } else if (std.mem.eql(u8, attr.key, "active_border")) {
+                if (box_helpers.parseColor(attr.value)) |v| self.active_border = v;
+            } else if (std.mem.eql(u8, attr.key, "active_text")) {
+                if (box_helpers.parseColor(attr.value)) |v| self.active_text = v;
             } else if (std.mem.eql(u8, attr.key, "width")) {
                 if (box_helpers.parseLength(attr.value)) |l| width_opt = l;
             } else if (std.mem.eql(u8, attr.key, "height")) {
@@ -392,9 +418,9 @@ fn layoutAndRender(
     const w: f32 = if (c.width) |wl| wl.resolve(max_w, fallback_w) else intrinsic_w;
     const h = c.height;
 
-    const border_col = if (c.active) BUTTON_BORDER_ACTIVE else BUTTON_BORDER;
-    const bg_col = if (c.active) BUTTON_BG_ACTIVE else BUTTON_BG;
-    const label_col = if (c.active) BUTTON_LABEL_ACTIVE else BUTTON_LABEL;
+    const border_col = if (c.active) c.active_border else c.border;
+    const bg_col = if (c.active) c.active_color else c.color;
+    const label_col = if (c.active) c.active_text else c.text;
     const border_px = if (c.active) BUTTON_BORDER_PX_ACTIVE else BUTTON_BORDER_PX;
 
     // Border + body

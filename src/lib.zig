@@ -154,6 +154,7 @@ pub const components = struct {
     /// widgets are two pictures of. No directive of its own.
     pub const color = @import("components/color.zig");
     pub const color_bars = @import("components/color_bars.zig");
+    pub const color_wheel = @import("components/color_wheel.zig");
     pub const commit = @import("components/commit.zig");
     pub const diff = @import("components/diff.zig");
     pub const dot = @import("components/dot.zig");
@@ -204,6 +205,7 @@ pub fn installCoreComponents(spark: *Spark) !void {
     // document swaps the directive name to swap the picture.
     try components.trackball.install(spark);
     try components.color_bars.install(spark);
+    try components.color_wheel.install(spark);
     try components.badge.install(spark);
     try components.sparkline.install(spark);
     try components.value.install(spark);

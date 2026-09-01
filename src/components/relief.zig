@@ -326,6 +326,10 @@ pub const HueDisc = struct {
     /// instead of two.
     rim_shade: f32 = 0,
     shade_px: f32 = 0,
+    /// Scales every ring's colour. A picker turns its wheel down as its
+    /// value falls, so the disc shows the colours it will actually
+    /// produce rather than a bright wheel above a dark result.
+    brightness: f32 = 1,
 };
 
 pub fn hueDisc(out: *element.DrawList, lc: *element.LayoutCtx, p: HueDisc) !void {
@@ -339,13 +343,14 @@ pub fn hueDisc(out: *element.DrawList, lc: *element.LayoutCtx, p: HueDisc) !void
     var ring_k: [3]f32 = undefined;
     var ring_a: [3]f32 = undefined;
     const rings: usize = if (shaded) 3 else 2;
+    const bright = std.math.clamp(p.brightness, 0, 1);
     if (shaded) {
         ring_r = .{ p.r - p.shade_px, p.r, p.r + FEATHER };
-        ring_k = .{ 1.0, k, k };
+        ring_k = .{ bright, bright * k, bright * k };
         ring_a = .{ 1.0, 1.0, 0.0 };
     } else {
         ring_r = .{ p.r, p.r + FEATHER, 0 };
-        ring_k = .{ 1.0, 1.0, 0 };
+        ring_k = .{ bright, bright, 0 };
         ring_a = .{ 1.0, 0.0, 0 };
     }
 
