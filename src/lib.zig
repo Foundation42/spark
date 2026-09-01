@@ -92,6 +92,12 @@ pub const LayoutInflationSpec = @import("component.zig").LayoutInflationSpec;
 // Effects-spec Phase A.3+ — pass-graph compiler module.
 pub const pass = @import("pass/root.zig");
 pub const Spec = @import("markdown_components.zig").Spec;
+/// The registry namespace and the document State a body-parsing factory
+/// should hand its children — see their doc comments for the two bugs
+/// they exist for. Exported because a HOST component that parses a body
+/// needs both, and getting either wrong is silent.
+pub const specScope = @import("component.zig").specScope;
+pub const specState = @import("component.zig").specState;
 pub const Attr = @import("markdown_components.zig").Attr;
 pub const params = @import("params.zig");
 pub const display = @import("gpu/display.zig");
@@ -124,6 +130,12 @@ pub const renderer = @import("gpu/renderer.zig");
 
 // ── Producers — hosts that want raw markdown / ANSI parsing ────────
 pub const markdown = @import("markdown.zig");
+/// The block walker, for a HOST component that composes a parsed subtree
+/// of its own — matryoshka's `:::intents` generates dock markdown, parses
+/// it, and delegates layout here. Core components reach it directly; a
+/// host has only this namespace, and the alternative is a second copy of
+/// the walk that ages separately.
+pub const element_layout = @import("element_layout.zig");
 pub const ansi = @import("ansi.zig");
 
 // ── Wire-format update applier ─────────────────────────────────────
