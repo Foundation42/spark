@@ -429,9 +429,62 @@ fn mapBlockChildren(
     var list = std.ArrayList(element.Element).init(mc.arena);
     var child: ?*cmark.cmark_node = cmark.cmark_node_first_child(parent);
     while (child) |c| : (child = cmark.cmark_node_next(c)) {
+        // A comment is dropped here rather than mapped to an empty
+        // block, because an empty block is not nothing: it still takes
+        // the flow's paragraph spacing, so a note between two controls
+        // would push them apart by exactly as much as a note nobody can
+        // see. Skipping is the only rendering of "invisible" that is
+        // actually invisible.
+        if (isCommentBlock(c)) continue;
         try list.append(try mapBlock(mc, c, cascade));
     }
     return try list.toOwnedSlice();
+}
+
+/// Whether a node is an HTML COMMENT — and not one of our own sentinels.
+///
+/// **Why comments are supported at all.** Every applet in matryoshka
+/// carries its notes in the frontmatter, because that is where a `#` line
+/// is ignored. Reaching for `<!-- -->` inside the body is the obvious
+/// thing to try when a note belongs beside the block it is about, and
+/// what came back was the comment rendered as red preformatted text in
+/// the middle of a panel. Chris: "maybe we should support that HTML
+/// comment style — since you reached for it?" A markdown author expects a
+/// comment to be invisible, and being surprised by your own document is
+/// the cost of not honouring that.
+///
+/// The `:::` mechanism already rides on comments — `preprocess` replaces
+/// a directive with `<!--te:N-->` — so this MUST run after the sentinel
+/// check, never before it. `extractSentinelIndex` is what tells them
+/// apart, and it is asked first at both call sites.
+///
+/// Everything else HTML still renders as preformatted text, deliberately:
+/// a `<div>` in a document is either a mistake or a misunderstanding, and
+/// silently swallowing it makes both harder to find. Only the construct
+/// that MEANS "ignore me" is ignored.
+pub fn isCommentBlock(node: *cmark.cmark_node) bool {
+    const kind = cmark.cmark_node_get_type(node);
+    if (kind != cmark.CMARK_NODE_HTML_BLOCK and kind != cmark.CMARK_NODE_HTML_INLINE) return false;
+    const ptr = cmark.cmark_node_get_literal(node);
+    if (ptr == null) return false;
+    const literal = std.mem.span(ptr);
+    if (components.extractSentinelIndex(literal) != null) return false;
+    return isComment(literal);
+}
+
+/// Whether `literal` is entirely an HTML comment.
+///
+/// Trimmed, because cmark hands a block comment back with its trailing
+/// newline attached. A run that merely STARTS with `<!--` is not enough:
+/// `<!-- a --><b>c</b>` carries visible content, and dropping the whole
+/// run would swallow it.
+pub fn isComment(literal: []const u8) bool {
+    const t = std.mem.trim(u8, literal, " \t\r\n");
+    if (t.len < 7) return false; // `<!---->` is the shortest
+    if (!std.mem.startsWith(u8, t, "<!--")) return false;
+    if (!std.mem.endsWith(u8, t, "-->")) return false;
+    // …and exactly one comment, not two with something between them.
+    return std.mem.indexOf(u8, t[4 .. t.len - 3], "-->") == null;
 }
 
 // ── Inline mapping ─────────────────────────────────────────────────
@@ -694,6 +747,13 @@ fn appendInline(
             // would reach the raw-HTML-as-code path below and print
             // `</ti-0>` beside every readout.
             if (components.isInlineSentinelClose(literal)) return;
+
+            // An inline comment drops too, so a note mid-sentence is as
+            // invisible as one between blocks. AFTER the sentinel checks
+            // above and never before: the `::` mechanism rides on comment
+            // syntax itself, so "is this a comment" is only asked of what
+            // is left once our own are accounted for.
+            if (isComment(literal)) return;
 
             if (components.extractInlineSentinelIndex(literal)) |idx| {
                 if (idx < mc.specs.len) {
@@ -985,4 +1045,36 @@ test "the sentinel's closing half draws nothing" {
     try std.testing.expect(!components.isInlineSentinelClose("<ti-0>"));
     try std.testing.expect(!components.isInlineSentinelClose("</ti-foo>"));
     try std.testing.expect(!components.isInlineSentinelClose("</span>"));
+}
+
+test "markdown: an HTML comment is invisible, in a block and inline" {
+    // Every applet carries its notes in the frontmatter, because that is
+    // where a `#` line is ignored. Reaching for `<!-- -->` beside the
+    // block a note is ABOUT is the obvious thing to try, and it used to
+    // come back as red preformatted text in the middle of a panel.
+    try std.testing.expect(isComment("<!-- a note -->"));
+    try std.testing.expect(isComment("<!-- multi\nline -->\n")); // cmark keeps the newline
+    try std.testing.expect(isComment("<!---->"));
+    try std.testing.expect(isComment("  <!-- padded -->  "));
+}
+
+test "markdown: only a WHOLE comment is invisible" {
+    // A run that merely STARTS with `<!--` is not enough — dropping
+    // `<!-- a --><b>c</b>` would swallow content the author can see in
+    // their source and cannot find in the render.
+    try std.testing.expect(!isComment("<!-- a --><b>c</b>"));
+    try std.testing.expect(!isComment("<div>hello</div>"));
+    try std.testing.expect(!isComment("<!-- unterminated"));
+    try std.testing.expect(!isComment("text <!-- trailing -->"));
+    try std.testing.expect(!isComment(""));
+    try std.testing.expect(!isComment("<!--"));
+}
+
+test "markdown: our own `:::` sentinel is a comment and must NOT be dropped" {
+    // The directive mechanism rides on comment syntax — `preprocess`
+    // replaces a `:::block` with `<!--te:N-->`. So the sentinel check has
+    // to run FIRST at every call site; if this ever reads as "just a
+    // comment" every component in every document silently vanishes.
+    try std.testing.expect(isComment("<!--te:0-->"));
+    try std.testing.expect(components.extractSentinelIndex("<!--te:0-->") != null);
 }
