@@ -225,6 +225,9 @@ const Component = struct {
     scope: []u8,
     spark: ?*spark_mod.Spark = null,
     inflation: component_mod.Edges,
+    /// Defaulted so an existing Component literal (the gates below build
+    /// one) does not have to name it. Zero padding is the old behaviour.
+    padding: element.PadAttrs = .{},
     attrs: Attrs,
     /// `align=` / `text_align=`, inherited by everything under this
     /// container. See `element.AlignAttrs`.
@@ -289,6 +292,7 @@ fn create(
         .inflation = computeInflation(attrs.offset[0], attrs.offset[1], attrs.blur),
         .attrs = attrs,
         .alignment = element.AlignAttrs.readFrom(spec),
+        .padding = element.PadAttrs.readFrom(spec),
         .version = 0,
         .body = .{},
         .steps = undefined,
@@ -331,6 +335,7 @@ fn update(ctx: *anyopaque, spec: *const components.Spec) anyerror!void {
     // via an #id change, because the halo is already in the layout.
     c.attrs = Attrs.read(spec);
     c.alignment = element.AlignAttrs.readFrom(spec);
+    c.padding = element.PadAttrs.readFrom(spec);
     c.version = prev_version +% 1;
 
     // The body is authored text too, and a hot-reloaded document hands the
@@ -408,7 +413,17 @@ fn layoutAndRender(
     out: *element.DrawList,
 ) anyerror!element.Box {
     const c: *Component = @ptrCast(@alignCast(ctx));
-    const inf = c.inflation;
+    // The spread's inflation and the author's padding are different
+    // things that happen to add: the first is margin the SHADOW needs to
+    // avoid clipping itself, the second is space the CONTENT wants. A
+    // panel usually asks for both, so they compose rather than compete.
+    const pad = c.padding;
+    const inf: component_mod.Edges = .{
+        .left = c.inflation.left + pad.left,
+        .right = c.inflation.right + pad.right,
+        .top = c.inflation.top + pad.top,
+        .bottom = c.inflation.bottom + pad.bottom,
+    };
 
     var child_constraints = c.alignment.apply(constraints);
     if (std.math.isFinite(child_constraints.max_w)) {

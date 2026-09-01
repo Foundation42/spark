@@ -217,6 +217,9 @@ const Component = struct {
     scope: []u8,
     spark: ?*spark_mod.Spark = null,
     attrs: Attrs,
+    /// Defaulted so an existing Component literal (the gates below build
+    /// one) does not have to name it. Zero padding is the old behaviour.
+    padding: element.PadAttrs = .{},
     /// `align=` / `text_align=`, inherited by everything under this
     /// container. See `element.AlignAttrs`.
     alignment: element.AlignAttrs = .{},
@@ -275,6 +278,7 @@ fn create(
         .scope = undefined,
         .spark = spark,
         .attrs = Attrs.read(spec),
+        .padding = element.PadAttrs.readFrom(spec),
         .alignment = element.AlignAttrs.readFrom(spec),
         .version = 0,
         .body = .{},
@@ -310,6 +314,7 @@ fn update(ctx: *anyopaque, spec: *const components.Spec) anyerror!void {
     const c: *Component = @ptrCast(@alignCast(ctx));
     const prev_version = c.version;
     c.attrs = Attrs.read(spec);
+    c.padding = element.PadAttrs.readFrom(spec);
     c.alignment = element.AlignAttrs.readFrom(spec);
     c.version = prev_version +% 1;
 
@@ -398,7 +403,20 @@ fn layoutAndRender(
     out: *element.DrawList,
 ) anyerror!element.Box {
     const c: *Component = @ptrCast(@alignCast(ctx));
-    return element_layout.layoutAndRenderCached(c.root, origin, c.alignment.apply(constraints), lc, out);
+    const base = c.alignment.apply(constraints);
+    if (!c.padding.any()) {
+        return element_layout.layoutAndRenderCached(c.root, origin, base, lc, out);
+    }
+    const child = try element_layout.layoutAndRenderCached(
+        c.root,
+        c.padding.inset(origin),
+        c.padding.shrink(base),
+        lc,
+        out,
+    );
+    // The effect's box IS the pass target, so growing it here is what
+    // makes the glass cover the padding rather than stop at the content.
+    return c.padding.grow(child, origin);
 }
 
 fn cornerRadius(ctx: *anyopaque) f32 {

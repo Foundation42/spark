@@ -732,6 +732,95 @@ pub const AlignAttrs = struct {
     }
 };
 
+/// The inset between a container's edge and its children.
+///
+/// Every panel in matryoshka's `hud/` is a frosted wrapper around a
+/// stack of controls, and until 2026-09-01 the vocabulary had no way to
+/// say "not flush against the edge" — so a trailing row of buttons sat
+/// on the panel's bottom rim. Chris: "our panels need a way to express
+/// padding or something - notice how vertically the buttons at the
+/// bottom are super close to the bottom edge."
+///
+/// Read by the effect wrappers, which are what a panel is made of.
+/// `drop_shadow` composes it with its own spread inflation rather than
+/// replacing it: the spread is about the shadow, the padding is about
+/// the content, and a panel usually wants both.
+pub const PadAttrs = struct {
+    top: f32 = 0,
+    right: f32 = 0,
+    bottom: f32 = 0,
+    left: f32 = 0,
+
+    pub fn any(self: PadAttrs) bool {
+        return self.top != 0 or self.right != 0 or self.bottom != 0 or self.left != 0;
+    }
+
+    /// `padding=12`, `padding="12 20"` (vertical horizontal), or
+    /// `padding="4 8 12 16"` (top right bottom left) — the CSS ordering,
+    /// because it is the one an author already has in their fingers. A
+    /// value with spaces has to be quoted, same as `label=`.
+    pub fn parse(value: []const u8) ?PadAttrs {
+        var n: [4]f32 = undefined;
+        var count: usize = 0;
+        var it = std.mem.tokenizeAny(u8, value, " \t");
+        while (it.next()) |tok| {
+            if (count == 4) return null; // more than four is a typo, not a shorthand
+            n[count] = std.fmt.parseFloat(f32, tok) catch return null;
+            if (!std.math.isFinite(n[count]) or n[count] < 0) return null;
+            count += 1;
+        }
+        return switch (count) {
+            1 => .{ .top = n[0], .right = n[0], .bottom = n[0], .left = n[0] },
+            2 => .{ .top = n[0], .right = n[1], .bottom = n[0], .left = n[1] },
+            4 => .{ .top = n[0], .right = n[1], .bottom = n[2], .left = n[3] },
+            // Three is CSS's `top / horizontal / bottom`, which nobody
+            // remembers correctly. Refusing it is kinder than guessing.
+            else => null,
+        };
+    }
+
+    /// `anytype` for the same reason `AlignAttrs.readFrom` is — see there.
+    pub fn readFrom(spec: anytype) PadAttrs {
+        for (spec.attrs) |a| {
+            if (std.mem.eql(u8, a.key, "padding")) {
+                if (parse(a.value)) |p| return p;
+            }
+        }
+        return .{};
+    }
+
+    /// The children's constraints: this much narrower and shorter.
+    pub fn shrink(self: PadAttrs, base: Constraints) Constraints {
+        var out = base;
+        if (std.math.isFinite(out.max_w)) {
+            out.max_w = @max(0, out.max_w - self.left - self.right);
+        }
+        if (std.math.isFinite(out.max_h)) {
+            out.max_h = @max(0, out.max_h - self.top - self.bottom);
+        }
+        return out;
+    }
+
+    /// Where the children start.
+    pub fn inset(self: PadAttrs, origin: [2]f32) [2]f32 {
+        return .{ origin[0] + self.left, origin[1] + self.top };
+    }
+
+    /// The container's own box, given what the children laid out to.
+    /// `origin` is the CONTAINER's, not the children's.
+    pub fn grow(self: PadAttrs, child: Box, origin: [2]f32) Box {
+        return .{
+            .x = origin[0],
+            .y = origin[1],
+            .w = child.w + self.left + self.right,
+            .h = child.h + self.top + self.bottom,
+            // Baselines are absolute y, so the child's still points at
+            // the right line after the inset moved it.
+            .baseline = child.baseline,
+        };
+    }
+};
+
 // ── Pass-graph types (effects-spec Phase A.0 / A.6) ────────────────
 //
 // These live in element.zig rather than spark.zig (where the A.0 stub
@@ -2287,4 +2376,73 @@ test "CornerPush: std140 offsets, and the head it has to fit inside" {
     // pays one compare per fragment.
     const d = CornerPush{};
     try std.testing.expectEqual(@as(f32, 0), d.radius_px);
+}
+
+test "PadAttrs: one, two and four values, in CSS order" {
+    const one = PadAttrs.parse("12").?;
+    try std.testing.expectEqual(PadAttrs{ .top = 12, .right = 12, .bottom = 12, .left = 12 }, one);
+
+    const two = PadAttrs.parse("8 20").?;
+    try std.testing.expectEqual(PadAttrs{ .top = 8, .right = 20, .bottom = 8, .left = 20 }, two);
+
+    const four = PadAttrs.parse("4 8 12 16").?;
+    try std.testing.expectEqual(PadAttrs{ .top = 4, .right = 8, .bottom = 12, .left = 16 }, four);
+
+    // Extra whitespace is an author's formatting, not a fifth value.
+    try std.testing.expectEqual(two, PadAttrs.parse("  8   20  ").?);
+}
+
+test "PadAttrs: three values are refused rather than guessed" {
+    // CSS reads three as top / horizontal / bottom, which nobody
+    // remembers correctly. A panel silently padded wrong is worse than
+    // one that ignores a typo and stays flush.
+    try std.testing.expectEqual(@as(?PadAttrs, null), PadAttrs.parse("4 8 12"));
+    try std.testing.expectEqual(@as(?PadAttrs, null), PadAttrs.parse("1 2 3 4 5"));
+    try std.testing.expectEqual(@as(?PadAttrs, null), PadAttrs.parse("wide"));
+    try std.testing.expectEqual(@as(?PadAttrs, null), PadAttrs.parse("-4"));
+    try std.testing.expectEqual(@as(?PadAttrs, null), PadAttrs.parse(""));
+}
+
+test "PadAttrs: shrink, inset and grow are each other's inverse" {
+    const p = PadAttrs{ .top = 4, .right = 8, .bottom = 12, .left = 16 };
+    const base: Constraints = .{ .max_w = 300, .max_h = 200 };
+
+    const inner = p.shrink(base);
+    try std.testing.expectApproxEqAbs(@as(f32, 300 - 24), inner.max_w, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 200 - 16), inner.max_h, 1e-6);
+
+    const child_origin = p.inset(.{ 100, 50 });
+    try std.testing.expectApproxEqAbs(@as(f32, 116), child_origin[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 54), child_origin[1], 1e-6);
+
+    // A child that filled its shrunk constraints grows back to exactly
+    // the container's own box — or a padded panel would change width.
+    const child: Box = .{ .x = 116, .y = 54, .w = inner.max_w, .h = inner.max_h };
+    const box = p.grow(child, .{ 100, 50 });
+    try std.testing.expectApproxEqAbs(@as(f32, 100), box.x, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 300), box.w, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 200), box.h, 1e-6);
+}
+
+test "PadAttrs: an unbounded constraint stays unbounded" {
+    const p = PadAttrs{ .top = 10, .right = 10, .bottom = 10, .left = 10 };
+    const inner = p.shrink(.{ .max_w = std.math.inf(f32), .max_h = std.math.inf(f32) });
+    try std.testing.expect(std.math.isInf(inner.max_w));
+    try std.testing.expect(std.math.isInf(inner.max_h));
+    // And a padding wider than the space available clamps at zero rather
+    // than handing a child a negative width to lay out into.
+    const tight = p.shrink(.{ .max_w = 5, .max_h = 5 });
+    try std.testing.expectApproxEqAbs(@as(f32, 0), tight.max_w, 1e-6);
+}
+
+test "PadAttrs: readFrom takes the attribute, and nothing means nothing" {
+    const Attr = struct { key: []const u8, value: []const u8 };
+    const with = [_]Attr{ .{ .key = "blur", .value = "16" }, .{ .key = "padding", .value = "6 14" } };
+    const got = PadAttrs.readFrom(&.{ .attrs = &with });
+    try std.testing.expectEqual(@as(f32, 6), got.top);
+    try std.testing.expectEqual(@as(f32, 14), got.left);
+    try std.testing.expect(got.any());
+
+    const without = [_]Attr{.{ .key = "blur", .value = "16" }};
+    try std.testing.expect(!PadAttrs.readFrom(&.{ .attrs = &without }).any());
 }
