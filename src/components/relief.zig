@@ -217,6 +217,23 @@ pub fn groove(
     }
 }
 
+/// The visible face of a cylinder at `t` across its width: 1 along the
+/// crest, falling to 0 where it turns away at either edge.
+///
+/// `sqrt(1 - d²)` rather than a parabola, because that IS the circle —
+/// flat through the middle where the face is square to you, then steep
+/// at the edges where it rolls away. A mark on that surface gets both
+/// dimmer AND shorter as it goes, and it is the two together that make a
+/// ruled strip read as a drum rather than as a hatched rectangle.
+/// `edgeFade` handles the last of the dissolve; this handles the shape.
+pub fn cylinderFace(t: f32) f32 {
+    const u = std.math.clamp(t, 0, 1);
+    const d = @abs(u - 0.5) * 2.0;
+    const s = 1.0 - d * d;
+    if (s <= 0) return 0;
+    return @sqrt(s);
+}
+
 /// How much of a mark at `t` (0 at the left end of a cut-out, 1 at the
 /// right) survives the recess.
 ///

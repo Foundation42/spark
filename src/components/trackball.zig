@@ -107,7 +107,13 @@ const ARC_TRACK_SHADOW: [4]f32 = .{ 0.0, 0.0, 0.0, 0.30 };
 /// 3.5px band without visibly shortening it.
 const ARC_END_FEATHER: f32 = 1.6;
 /// How much of the dial's width the ridges fade out over, each end.
-const DIAL_RIDGE_EDGE: f32 = 0.16;
+const DIAL_RIDGE_EDGE: f32 = 0.10;
+/// How dim and how short a ridge gets where the drum has rolled fully
+/// away, as fractions of its value along the crest. Neither goes to
+/// zero: `edgeFade` finishes the dissolve, and a ridge that shrank to
+/// nothing before it faded would look bitten rather than turned.
+const RIDGE_DIM_FLOOR: f32 = 0.25;
+const RIDGE_SHORT_FLOOR: f32 = 0.40;
 const ARC_FILL_COLOR: [4]f32 = .{ 0.93, 0.95, 1.0, 0.88 };
 /// How far the level fill is inset into its groove, per side.
 const ARC_FILL_INSET: f32 = 0.9;
@@ -612,11 +618,19 @@ fn layoutAndRender(
         const t = (rx - origin[0]) / content_w;
         const fade = relief.edgeFade(t, DIAL_RIDGE_EDGE);
         if (fade <= 0.01) continue;
-        try relief.hairlineV(out, lc, rx, dial_top + 2.5, DIAL_H - 5.0, 1.0, .{
+        // Brightest and tallest along the crest, dimmer and shorter as
+        // the drum rolls away at either edge. Both at once — one alone
+        // reads as a fade, the two together read as a curved surface.
+        const face = relief.cylinderFace(t);
+        const bright = RIDGE_DIM_FLOOR + (1.0 - RIDGE_DIM_FLOOR) * face;
+        const tall = RIDGE_SHORT_FLOOR + (1.0 - RIDGE_SHORT_FLOOR) * face;
+        const full_h = DIAL_H - 5.0;
+        const rh = full_h * tall;
+        try relief.hairlineV(out, lc, rx, dial_top + 2.5 + (full_h - rh) * 0.5, rh, 1.0, .{
             DIAL_RIDGE_COLOR[0],
             DIAL_RIDGE_COLOR[1],
             DIAL_RIDGE_COLOR[2],
-            DIAL_RIDGE_COLOR[3] * fade,
+            DIAL_RIDGE_COLOR[3] * fade * bright,
         });
     }
     // The home mark, in the grip's own orange so the two draggable

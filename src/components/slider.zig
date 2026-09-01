@@ -16,6 +16,26 @@
 //! - `value` — initial / displayed value. Usually bound to the same
 //!   path via `${state.target}` so the slider sees external
 //!   mutations. Missing → midpoint of `[min, max]`.
+//! - `color` — the filled part, left of the thumb. Named `color` rather
+//!   than `fill` to match `:::box`, since it is the one a document
+//!   reaches for most.
+//! - `track` — the recess the fill sits in. A neutral DARKENING by
+//!   default, so it takes the tint of whatever panel it is on instead of
+//!   imposing one; it used to be an opaque blue-grey and put a tint in
+//!   every groove that nobody had asked for.
+//! - `thumb` — the tack.
+//! - `notch` — the ruling along the track.
+//!
+//! All four take what `:::box {color=}` takes — a name, or hex. Any left
+//! unsaid keeps its default, so setting one means one.
+//!
+//! ## The track is a cut-out, not a bar
+//!
+//! A channel with a lip shadow along its top edge, a sliver of bounce
+//! along the bottom, and notches ruled down it that fade into the recess
+//! at either end. Everything but the label is in the TRIANGLE layer —
+//! `relief.zig` says why that is load-bearing rather than incidental,
+//! and why the thumb is not a rounded quad.
 //!
 //! Drag model: mouse_down anywhere on the track snaps the thumb to
 //! the cursor and starts a drag; subsequent mouse_move (with the
@@ -40,7 +60,43 @@ const Component = struct {
     width: box_helpers.Length,
     height: f32,
     value: f32,
+    /// The four colours a slider wears. Attributes rather than baked
+    /// constants since 2026-09-01 — Chris, at the bench: "are the colors
+    /// of the slider and its tack configurable? I can't remember, they
+    /// should be."
+    fill_color: [4]f32 = TRACK_FILL_COLOR,
+    track_color: [4]f32 = TRACK_COLOR,
+    thumb_color: [4]f32 = THUMB_COLOR,
+    notch_color: [4]f32 = NOTCH_COLOR,
+    /// Bumped whenever a colour actually changes. Folded into
+    /// `contentVersion` so a `color=${state.x}` re-renders — without it
+    /// the palette was invisible to the retained layout cache, which is
+    /// the same trap the `disable_cache` note below is about.
+    palette_version: u32 = 0,
     last_box: element.Box = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+
+    /// Shared by `fromSpec` and `ingest`, which otherwise duplicate
+    /// their attribute loops. An absent attribute leaves the current
+    /// value alone, so a reactive re-render carrying only `value=` keeps
+    /// the palette the document set.
+    fn applyColors(self: *Component, spec: *const components.Spec) void {
+        const before = [_][4]f32{ self.fill_color, self.track_color, self.thumb_color, self.notch_color };
+        for (spec.attrs) |a| {
+            if (std.mem.eql(u8, a.key, "color")) {
+                if (box_helpers.parseColor(a.value)) |v| self.fill_color = v;
+            } else if (std.mem.eql(u8, a.key, "track")) {
+                if (box_helpers.parseColor(a.value)) |v| self.track_color = v;
+            } else if (std.mem.eql(u8, a.key, "thumb")) {
+                if (box_helpers.parseColor(a.value)) |v| self.thumb_color = v;
+            } else if (std.mem.eql(u8, a.key, "notch")) {
+                if (box_helpers.parseColor(a.value)) |v| self.notch_color = v;
+            }
+        }
+        const after = [_][4]f32{ self.fill_color, self.track_color, self.thumb_color, self.notch_color };
+        if (!std.mem.eql(u8, std.mem.asBytes(&before), std.mem.asBytes(&after))) {
+            self.palette_version +%= 1;
+        }
+    }
 
     fn fromSpec(allocator: std.mem.Allocator, spec: *const components.Spec) !Component {
         var min: f32 = 0;
@@ -72,7 +128,7 @@ const Component = struct {
         }
 
         const target_value = target_raw orelse "";
-        return .{
+        var c: Component = .{
             .allocator = allocator,
             .target = try allocator.dupe(u8, target_value),
             .min = min,
@@ -81,6 +137,8 @@ const Component = struct {
             .height = height,
             .value = std.math.clamp(value_opt orelse (min + (max - min) * 0.5), min, max),
         };
+        c.applyColors(spec);
+        return c;
     }
 
     fn ingest(self: *Component, spec: *const components.Spec) !void {
@@ -110,6 +168,7 @@ const Component = struct {
             // target is intentionally not re-read — changing where
             // the slider writes mid-flight would be confusing.
         }
+        self.applyColors(spec);
     }
 };
 
@@ -157,7 +216,8 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
 /// A version fixes both, because it is what the ancestors already aggregate.
 fn contentVersion(ctx: *anyopaque) u64 {
     const c: *const Component = @ptrCast(@alignCast(ctx));
-    return @as(u64, @as(u32, @bitCast(c.value)));
+    return @as(u64, @as(u32, @bitCast(c.value))) |
+        (@as(u64, c.palette_version) << 32);
 }
 
 const vtable: element.ElementVTable = .{
@@ -172,7 +232,16 @@ const vtable: element.ElementVTable = .{
 // thumb radius) onto `Theme`; for stage 7f keeping them here keeps
 // the diff focused on the input contract.
 
-const TRACK_COLOR: [4]f32 = .{ 0.30, 0.34, 0.40, 1.0 };
+/// The recess, as a NEUTRAL darkening rather than a colour of its own.
+///
+/// This was an opaque blue-grey, which put a tint in every groove that
+/// no document had asked for and that fought whatever the panel behind
+/// it was. Chris spotted it: "the recessed part seems to be slightly
+/// blue tinted, and the dark recess part under the ticks could be darker
+/// for more contrast." Black-with-alpha is what `:::color_bars` already
+/// used, and it darkens the panel's own tint instead of replacing it —
+/// so a groove reads as a hole in THIS panel on every panel.
+const TRACK_COLOR: [4]f32 = .{ 0.0, 0.0, 0.0, 0.46 };
 const TRACK_FILL_COLOR: [4]f32 = .{ 0.45, 0.72, 1.0, 1.0 };
 const THUMB_COLOR: [4]f32 = .{ 0.95, 0.95, 0.98, 1.0 };
 const THUMB_RADIUS: f32 = 7;
@@ -184,7 +253,7 @@ const TRACK_THICKNESS: f32 = 4;
 /// to the regular sliders."
 const NOTCH_COLOR: [4]f32 = .{ 1.0, 1.0, 1.0, 0.20 };
 const NOTCH_STEP: f32 = 7.0;
-const NOTCH_EDGE: f32 = 0.06;
+const NOTCH_EDGE: f32 = 0.035;
 /// How tall the notch band is, as a fraction of the groove. Short of
 /// full height so the groove still reads as a channel with marks in it
 /// rather than a hatched bar.
@@ -232,7 +301,7 @@ fn layoutAndRender(
     // cap. `relief.disc` keeps the band in the geometry.
     const groove_y = track_y - GROOVE_PAD * 0.5;
     const groove_h = TRACK_THICKNESS + GROOVE_PAD;
-    try relief.rect(out, lc, track_x, groove_y, track_w, groove_h, TRACK_COLOR);
+    try relief.rect(out, lc, track_x, groove_y, track_w, groove_h, c.track_color);
 
     // Track-filled (left of thumb, bright). Visualises the current
     // value at a glance — the slider reads as "this much of the
@@ -240,7 +309,7 @@ fn layoutAndRender(
     const t = normalised(c);
     const fill_w = track_w * t;
     if (fill_w > 0) {
-        try relief.rect(out, lc, track_x, track_y, fill_w, TRACK_THICKNESS, TRACK_FILL_COLOR);
+        try relief.rect(out, lc, track_x, track_y, fill_w, TRACK_THICKNESS, c.fill_color);
     }
 
     // Notches, over the fill as well as the empty track: a ruler is
@@ -257,10 +326,10 @@ fn layoutAndRender(
             const fade = relief.edgeFade(u, NOTCH_EDGE);
             if (fade <= 0.01) continue;
             try relief.hairlineV(out, lc, nx, notch_y, notch_h, 1.0, .{
-                NOTCH_COLOR[0],
-                NOTCH_COLOR[1],
-                NOTCH_COLOR[2],
-                NOTCH_COLOR[3] * fade,
+                c.notch_color[0],
+                c.notch_color[1],
+                c.notch_color[2],
+                c.notch_color[3] * fade,
             });
         }
     }
@@ -268,12 +337,20 @@ fn layoutAndRender(
 
     // The cut-out last, so the lip's shadow falls across the notches and
     // the fill that lie down inside it.
-    try relief.groove(out, lc, track_x, groove_y, track_w, groove_h, true);
+    //
+    // `ends = false`, like `:::color_bars`. One light from above means
+    // the lip that occludes anything is the TOP one; the left and right
+    // walls of a horizontal channel face sideways and catch it equally,
+    // so darkening both read as a vignette rather than as depth. Chris:
+    // "at the left hand and right hand edges, they are darkened in the
+    // notches, but I'm not sure it should be on the right - it should be
+    // more like your vertical primary bars."
+    try relief.groove(out, lc, track_x, groove_y, track_w, groove_h, false);
 
     // Thumb. Stable size; centred on the track at `value`.
     const thumb_cx = track_x + fill_w;
     const thumb_cy = track_y + TRACK_THICKNESS * 0.5;
-    try relief.disc(out, lc, .{ thumb_cx, thumb_cy }, THUMB_RADIUS, THUMB_COLOR, THUMB_SEGMENTS);
+    try relief.disc(out, lc, .{ thumb_cx, thumb_cy }, THUMB_RADIUS, c.thumb_color, THUMB_SEGMENTS);
 
     const box: element.Box = .{
         .x = origin[0],
@@ -403,4 +480,65 @@ test "applyDrag with empty target is a no-op" {
 
     try applyDrag(&c, &st, 50);
     try testing.expect(st.get("") == null);
+}
+
+test "slider: the palette is configurable, and defaults hold when unsaid" {
+    const attrs = [_]components.Attr{
+        .{ .key = "target", .value = "x" },
+        .{ .key = "color", .value = "#ff0000" },
+        .{ .key = "thumb", .value = "#00ff00" },
+    };
+    const spec: components.Spec = .{ .name = "slider", .attrs = &attrs };
+    const c = try Component.fromSpec(testing.allocator, &spec);
+    defer testing.allocator.free(c.target);
+
+    try testing.expectApproxEqAbs(@as(f32, 1), c.fill_color[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0), c.fill_color[1], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1), c.thumb_color[1], 1e-6);
+    // Unsaid ones keep the built-in look rather than going magenta or
+    // transparent — a document should be able to set one and mean one.
+    try testing.expectEqual(TRACK_COLOR, c.track_color);
+    try testing.expectEqual(NOTCH_COLOR, c.notch_color);
+}
+
+test "slider: a reactive re-render carrying only `value` keeps the palette" {
+    // The common case: `value=${state.x}` fires an update every frame of
+    // a drag, and its spec is the FULL attribute list — but a document
+    // that omits the colours must not have them reset out from under it.
+    const attrs = [_]components.Attr{
+        .{ .key = "target", .value = "x" },
+        .{ .key = "track", .value = "#123456" },
+    };
+    const spec: components.Spec = .{ .name = "slider", .attrs = &attrs };
+    var c = try Component.fromSpec(testing.allocator, &spec);
+    defer testing.allocator.free(c.target);
+    const set = c.track_color;
+    try testing.expect(set[2] > set[0]); // Rule 1: it really took
+
+    const only_value = [_]components.Attr{.{ .key = "value", .value = "0.5" }};
+    const next: components.Spec = .{ .name = "slider", .attrs = &only_value };
+    try c.ingest(&next);
+    try testing.expectEqual(set, c.track_color);
+}
+
+test "slider: a palette change invalidates the retained cache" {
+    // `contentVersion` used to be the value alone, so a colour driven by
+    // state re-rendered into a cached ancestor that never re-walked —
+    // the same trap the `disable_cache` note above is about.
+    const attrs = [_]components.Attr{.{ .key = "target", .value = "x" }};
+    const spec: components.Spec = .{ .name = "slider", .attrs = &attrs };
+    var c = try Component.fromSpec(testing.allocator, &spec);
+    defer testing.allocator.free(c.target);
+    const v0 = contentVersion(@ptrCast(&c));
+
+    const recolour = [_]components.Attr{.{ .key = "color", .value = "#abcdef" }};
+    const next: components.Spec = .{ .name = "slider", .attrs = &recolour };
+    try c.ingest(&next);
+    try testing.expect(contentVersion(@ptrCast(&c)) != v0);
+
+    // And re-ingesting the SAME colour does not churn the version, or
+    // every frame would look like a change and defeat the cache.
+    const v1 = contentVersion(@ptrCast(&c));
+    try c.ingest(&next);
+    try testing.expectEqual(v1, contentVersion(@ptrCast(&c)));
 }
