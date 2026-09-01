@@ -44,6 +44,7 @@ test {
     _ = @import("components/color.zig");
     _ = @import("components/relief.zig");
     _ = @import("components/trackball.zig");
+    _ = @import("components/curve.zig");
     _ = @import("components/color_bars.zig");
     _ = @import("components/color_wheel.zig");
     _ = @import("components/stack.zig");

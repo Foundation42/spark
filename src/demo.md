@@ -6,6 +6,7 @@ state:
   box_height: 80
   target_id: "SAT-04"
   config_hidden: "true"
+  size_curve: "[1.0, 0.7, 0.0]"
 ---
 
 # spark 🚀✨
@@ -94,6 +95,11 @@ Block extensions parse into Specs, get resolved through a host-owned registry in
 :::
 
 :::slider {#height_slider target=box_height min=20 max=120 value=${state.box_height} width=320}
+:::
+
+A `:::curve` is a piecewise-linear value over normalised x — spindrift's `row.age | over row.life [1.0, 0.7, 0.0]` — bound in mirror mode to a state path holding the ARRAY. Drag a puck; the whole array goes back through `state.set` as one write.
+
+:::curve {#size_curve target=size_curve value=${state.size_curve} min=0 max=2 label="size over life" width=320}
 :::
 
 ## Flex layout (stage 15c)

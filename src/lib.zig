@@ -169,6 +169,7 @@ pub const components = struct {
     pub const color_bars = @import("components/color_bars.zig");
     pub const color_wheel = @import("components/color_wheel.zig");
     pub const commit = @import("components/commit.zig");
+    pub const curve = @import("components/curve.zig");
     pub const diff = @import("components/diff.zig");
     pub const dot = @import("components/dot.zig");
     pub const embedded_document = @import("components/embedded_document.zig");
@@ -220,6 +221,7 @@ pub fn installCoreComponents(spark: *Spark) !void {
     // The grading pair. Same attribute grammar, two views of it — a
     // document swaps the directive name to swap the picture.
     try components.trackball.install(spark);
+    try components.curve.install(spark);
     try components.color_bars.install(spark);
     try components.color_wheel.install(spark);
     try components.badge.install(spark);

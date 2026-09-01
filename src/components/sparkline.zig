@@ -10,7 +10,10 @@
 //!     ::sparkline {data="3,5,7,4,8,6,9" color=cyan width=80 height=14}
 //!
 //! - `data` (required) — comma-separated numbers. Whitespace tolerated.
-//!   Non-numeric tokens silently dropped.
+//!   Non-numeric tokens silently dropped. Brackets are optional —
+//!   `[3, 5, 7]` is the rill literal, and the same wire form `:::curve`
+//!   reads and writes — so `data=${state.series}` draws an array a plane
+//!   published without the ends being eaten as `[3` and `7]`.
 //! - `color` (optional) — bar fill. Named or `#RRGGBB`. Default: accent
 //!   blue that reads on the dark editor background.
 //! - `width` (optional) — pixel literal. Default 80.
@@ -29,6 +32,7 @@ const components = @import("../markdown_components.zig");
 const spark_mod = @import("../spark.zig");
 const component_mod = @import("../component.zig");
 const box_helpers = @import("box.zig"); // reuse parseColor + parseLength
+const curve = @import("curve.zig"); // the array-on-the-wire parser
 
 pub const Error = error{
     SparklineMissingData,
@@ -145,17 +149,9 @@ const MIN_BAR_HEIGHT_PX: f32 = 1.0;
 /// code; a stray token shouldn't crash the parse. Whitespace
 /// around values is tolerated.
 fn parseData(allocator: std.mem.Allocator, raw: []const u8) ![]f32 {
-    var out = std.ArrayList(f32).init(allocator);
-    errdefer out.deinit();
-
-    var it = std.mem.splitScalar(u8, raw, ',');
-    while (it.next()) |token| {
-        const trimmed = std.mem.trim(u8, token, " \t\r\n");
-        if (trimmed.len == 0) continue;
-        const v = std.fmt.parseFloat(f32, trimmed) catch continue;
-        try out.append(v);
-    }
-    return try out.toOwnedSlice();
+    // One spelling of an array for every span that draws one. `:::curve`
+    // owns it because it is the span that also WRITES the form back.
+    return curve.parseArray(allocator, raw);
 }
 
 // ── Inline measure (wrap pass) ─────────────────────────────────────
@@ -261,6 +257,19 @@ test "parseData: whitespace and empty tokens tolerated" {
     try testing.expectEqual(@as(f32, 1), out[0]);
     try testing.expectEqual(@as(f32, 2), out[1]);
     try testing.expectEqual(@as(f32, 3.5), out[2]);
+}
+
+test "parseData: a bracketed rill literal parses the same as a bare list" {
+    // `[3, 5, 7]` used to lose both ends — `[3` and `7]` are not numbers
+    // and dropped silently — so a series bound straight from the plane
+    // drew two bars short and nobody could say which two.
+    const a = testing.allocator;
+    const lit = try parseData(a, "[3, 5, 7]");
+    defer a.free(lit);
+    const bare = try parseData(a, "3,5,7");
+    defer a.free(bare);
+    try testing.expectEqualSlices(f32, bare, lit);
+    try testing.expectEqual(@as(usize, 3), lit.len);
 }
 
 test "parseData: non-numeric tokens silently dropped" {

@@ -444,7 +444,8 @@ Move HTTP-dependent components and their support code to `src/extras/`:
 
 Core stays at `src/components/`: box, flex, grid, slider, button,
 input, badge, kbd, tag, progress, sparkline, status, handle,
-chart, svg, embedded_document (file:// only).
+chart, svg, embedded_document (file:// only) — and, since spindrift
+beat 3, curve (see the section at the end).
 
 Each extras module exposes one install function:
 
@@ -798,3 +799,62 @@ matryoshka.
 
 The follow-up spec (render-pass interop / inline 3D scenes) builds
 on top of this; it can't start until the library boundary is real.
+
+## `:::curve` — a piecewise-linear curve editor (spindrift beat 3)
+
+spindrift's kernels say `row.age | over row.life [1.0, 0.7, 0.0] | write
+row.size`: a value over normalised life, linear between evenly spaced
+knots. The Spray applet edits that array by hand with this span, bound in
+mirror mode to the plane path that holds it. spindrift is the first paying
+customer; it lands as a reusable span the way `:::trackball` did.
+
+```markdown
+:::curve {target=size_curve value=${state.size_curve} min=0 max=2 label="size" knots=3 width=240 height=96}
+:::
+```
+
+| attribute | meaning |
+|---|---|
+| `target` | the state path the curve **writes**. A bare path, as `:::slider {target=}`. Omit it for a read-only picture. |
+| `value` | the reactive input — the array, as text. Bind it to the same path (`${state.size_curve}`) for a mirror. |
+| `min` / `max` | the y range. Defaults `0..1`. |
+| `label` | a caption above the plot. Optional. |
+| `knots` | knot count to seed when `value` is **absent** (the path unset, so `${}` never resolved). Default 3, all at `max`. Ignored once an array arrives — the plane decides the count; a count change is not a gesture. |
+| `width` / `height` | pixel literal or `100%`; the plot's height in pixels. Defaults `100%` / `96`. |
+| `color` | the curve and its fill. Named or hex, like `:::box`. |
+
+**Why `target=` rather than the path inside `value=`.** The registry hands
+a factory *substituted* attributes; the `${state.x}` template lives only in
+the Binding. So the write path is its own attribute, as it is for every
+writing widget in the library.
+
+**The array on the wire.** `State` is text. An array is a comma-separated
+list of numbers; the brackets a rill literal wears — `[1.0, 0.7, 0.0]` —
+are optional on the way in and written on the way out (`[1.0000, 0.7000,
+0.0000]`, four places like `::grip`). `curve.parseArray` / `curve.formatArray`
+are public and `::sparkline {data=}` parses through the same function, so
+a host bridge that formats an array this way feeds both spans. Fewer than
+two numbers is not a curve and is ignored; an unresolved `${…}` parses to
+nothing, which is how "absent" is detected.
+
+**One write per gesture segment.** A drag is a single `state.set` carrying
+the whole array — never N scalar writes. `State.set` re-enters the writing
+component synchronously through its own binding; a loop of sets is the
+trackball's segfault (the re-entered ingest frees the key the next
+iteration hashes) and its puck jump (a subscriber sees the array
+half-written). Two guards remain from the trackball: `target` is never
+reallocated unless it changed and never while a knot is grabbed; `value`
+is ignored while a knot is grabbed. Between gestures the plane is the
+truth; during one, the widget is.
+
+**Gestures.** A press latches the nearest knot *column* and the value it
+held; a move adds the cursor's vertical travel (relative, so a press that
+misses the puck nudges nothing). The x positions are fixed. Clamped to
+`[min, max]`. An out-of-range knot the plane published is drawn pinned to
+the plot's edge but not rewritten — a drag on one knot changes one knot.
+
+**Sparkline.** `::sparkline` already exists as an *inline* span
+(`::sparkline{data="3,5,7" color=cyan width=80 height=14}`): bars from
+`0..max(data)`, read-only, no gestures, `data=` state-substitutable. It
+now accepts the bracketed array form above, so `data=${state.series}`
+over a plane-published array draws every sample.
