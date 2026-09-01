@@ -68,6 +68,7 @@ const text_layout = @import("../text/layout.zig");
 const shape = @import("../font/shape.zig");
 const box_helpers = @import("box.zig");
 const color = @import("color.zig");
+const relief = @import("relief.zig");
 
 pub fn install(spark: *spark_mod.Spark) !void {
     try spark.registry.register("trackball", factory);
@@ -90,9 +91,24 @@ const DISC_SEGMENTS: usize = 72;
 const ARC_SEGMENTS: usize = 96;
 
 const DISC_CENTRE_COLOR: [4]f32 = .{ 0.10, 0.11, 0.13, 1.0 };
-const ARC_TRACK_COLOR: [4]f32 = .{ 1.0, 1.0, 1.0, 0.12 };
-const ARC_FILL_COLOR: [4]f32 = .{ 0.93, 0.95, 1.0, 0.95 };
-const ARC_NEUTRAL_COLOR: [4]f32 = .{ 1.0, 1.0, 1.0, 0.55 };
+/// The shadow around the inside of the wheel's rim, and how far it
+/// reaches inward. Deliberately weak — it has to survive sitting on a
+/// fully saturated red and on a dark blue without either looking dirty.
+const DISC_RIM_SHADE: [4]f32 = .{ 0.0, 0.0, 0.0, 0.22 };
+const DISC_SHADE_PX: f32 = 5.0;
+/// The groove the level sweep runs in. The track is darker on its INNER
+/// edge, under the overhanging lip; the two together are the depth.
+const ARC_TRACK_COLOR: [4]f32 = .{ 1.0, 1.0, 1.0, 0.10 };
+const ARC_TRACK_SHADOW: [4]f32 = .{ 0.0, 0.0, 0.0, 0.30 };
+/// Angular softening at an arc's ends, in degrees. Enough to dissolve a
+/// 3.5px band without visibly shortening it.
+const ARC_END_FEATHER: f32 = 1.6;
+/// How much of the dial's width the ridges fade out over, each end.
+const DIAL_RIDGE_EDGE: f32 = 0.16;
+const ARC_FILL_COLOR: [4]f32 = .{ 0.93, 0.95, 1.0, 0.88 };
+/// How far the level fill is inset into its groove, per side.
+const ARC_FILL_INSET: f32 = 0.9;
+const ARC_NEUTRAL_COLOR: [4]f32 = .{ 1.0, 1.0, 1.0, 0.45 };
 const CENTRE_DOT_COLOR: [4]f32 = .{ 0.85, 0.87, 0.92, 0.55 };
 const PUCK_RING_COLOR: [4]f32 = .{ 1.0, 1.0, 1.0, 0.92 };
 const DIAL_BG_COLOR: [4]f32 = .{ 0.0, 0.0, 0.0, 0.32 };
@@ -402,16 +418,10 @@ const vtable: element.ElementVTable = .{
 
 // ── Geometry helpers ────────────────────────────────────────────────
 
-/// Screen position at `angle` degrees CLOCKWISE FROM STRAIGHT UP.
-///
-/// One convention, used by the hue rim, the puck, and the level arc, so
-/// the disc is a literal picture of `Balance.hue` and reading the code
-/// against the picture works. It matches `web/apps/color-grader`'s
-/// `atan2(dx, -dy)`, which is where the numbers have to agree.
-fn onCircle(centre: [2]f32, r: f32, angle_deg: f32) [2]f32 {
-    const a = angle_deg * std.math.pi / 180.0;
-    return .{ centre[0] + r * @sin(a), centre[1] - r * @cos(a) };
-}
+/// One angle convention for the hue rim, the puck and the level arc, so
+/// the disc is a literal picture of `Balance.hue`. Lives in `relief`
+/// because the feathered geometry there has to agree with it.
+const onCircle = relief.onCircle;
 
 /// The dial angle for a value fraction: `0` at the bottom-left end of
 /// the sweep, `1` at the bottom-right.
@@ -419,72 +429,14 @@ fn sweepAngle(f: f32) f32 {
     return -SWEEP + f * (2 * SWEEP);
 }
 
+/// The rim colour of the wheel at `deg`. A function pointer because
+/// `relief.hueDisc` takes one — Zig has no closures, and the alternative
+/// is `relief` knowing what HSV is.
+fn hueRim(deg: f32) [3]f32 {
+    return color.hsv2rgb(deg, 1, 1);
+}
+
 // ── Paint ───────────────────────────────────────────────────────────
-
-fn appendHueDisc(
-    out: *element.DrawList,
-    lc: *element.LayoutCtx,
-    centre: [2]f32,
-    r: f32,
-) !void {
-    const base: u32 = @intCast(out.tris.items.len);
-    try out.ensureUnusedTriCapacity(DISC_SEGMENTS + 1);
-    out.appendTriAssumeCapacity(lc, .{ .pos = centre, .color = DISC_CENTRE_COLOR });
-    for (0..DISC_SEGMENTS) |i| {
-        const deg = @as(f32, @floatFromInt(i)) / @as(f32, DISC_SEGMENTS) * 360.0;
-        const rgb = color.hsv2rgb(deg, 1, 1);
-        out.appendTriAssumeCapacity(lc, .{
-            .pos = onCircle(centre, r, deg),
-            .color = .{ rgb[0], rgb[1], rgb[2], 1.0 },
-        });
-    }
-    try out.tri_indices.ensureUnusedCapacity(DISC_SEGMENTS * 3);
-    for (0..DISC_SEGMENTS) |i| {
-        const cur: u32 = base + 1 + @as(u32, @intCast(i));
-        const nxt: u32 = base + 1 + @as(u32, @intCast((i + 1) % DISC_SEGMENTS));
-        out.tri_indices.appendAssumeCapacity(base);
-        out.tri_indices.appendAssumeCapacity(cur);
-        out.tri_indices.appendAssumeCapacity(nxt);
-    }
-}
-
-/// A ring segment between two radii, swept between two angles in the
-/// `onCircle` convention. `a0` may be greater than `a1`; the band is
-/// drawn either way, which is what lets one call serve both a master
-/// above neutral and one below it.
-fn appendArc(
-    out: *element.DrawList,
-    lc: *element.LayoutCtx,
-    centre: [2]f32,
-    r_in: f32,
-    r_out: f32,
-    a0: f32,
-    a1: f32,
-    col: [4]f32,
-    segments: usize,
-) !void {
-    if (segments == 0) return;
-    const lo = @min(a0, a1);
-    const hi = @max(a0, a1);
-    if (!(hi - lo > 1e-4)) return;
-
-    const n = segments + 1;
-    const base: u32 = @intCast(out.tris.items.len);
-    try out.ensureUnusedTriCapacity(n * 2);
-    for (0..n) |i| {
-        const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(segments));
-        const a = lo + (hi - lo) * t;
-        out.appendTriAssumeCapacity(lc, .{ .pos = onCircle(centre, r_in, a), .color = col });
-        out.appendTriAssumeCapacity(lc, .{ .pos = onCircle(centre, r_out, a), .color = col });
-    }
-    try out.tri_indices.ensureUnusedCapacity(segments * 6);
-    for (0..segments) |i| {
-        const q: u32 = base + @as(u32, @intCast(i)) * 2;
-        for ([_]u32{ q, q + 1, q + 2, q + 1, q + 3, q + 2 }) |idx| {
-            out.tri_indices.appendAssumeCapacity(idx);
-        }
-    }
-}
 
 fn layoutAndRender(
     ctx: *anyopaque,
@@ -554,38 +506,71 @@ fn layoutAndRender(
     const arc_r_in = arc_r_out - ARC_BAND;
     const disc_r = @max(4.0, arc_r_in - ARC_GAP);
 
-    try appendHueDisc(out, lc, centre, disc_r);
+    try relief.hueDisc(out, lc, centre, disc_r, DISC_CENTRE_COLOR, DISC_SEGMENTS, hueRim);
+    // The wheel sits IN the panel, not on it: a shadow around the inside
+    // of the rim, fading inward. Without it a feathered disc is a
+    // perfectly clean sticker, which is the look this is avoiding.
+    try relief.arc(out, lc, .{
+        .centre = centre,
+        .r_in = disc_r - DISC_SHADE_PX,
+        .r_out = disc_r,
+        .a0 = 0,
+        .a1 = 360,
+        .inner_color = .{ 0, 0, 0, 0 },
+        .outer_color = DISC_RIM_SHADE,
+        .segments = DISC_SEGMENTS,
+        // The disc's own rim is already feathered; a second soft edge on
+        // top of it would only wash the saturated colours out.
+        .feather = 0,
+    });
 
-    // Level arc: the full sweep as a dim track, then neutral→master
-    // filled. The fill's DIRECTION carries the sign, which is why there
-    // is no separate colour for a master below neutral.
-    try appendArc(out, lc, centre, arc_r_in, arc_r_out, sweepAngle(0), sweepAngle(1), ARC_TRACK_COLOR, ARC_SEGMENTS);
     const f_neutral = c.bal.fractionOf(c.bal.neutral);
     const f_master = c.bal.fractionOf(c.bal.master);
-    try appendArc(
-        out,
-        lc,
-        centre,
-        arc_r_in,
-        arc_r_out,
-        sweepAngle(f_neutral),
-        sweepAngle(f_master),
-        ARC_FILL_COLOR,
-        ARC_SEGMENTS,
-    );
+
+    // The level sweep, as a groove cut into the panel. The track is
+    // shaded radially — darker where the lip overhangs it — which is
+    // what makes a circular cut-out read as a cut-out at all.
+    try relief.arc(out, lc, .{
+        .centre = centre,
+        .r_in = arc_r_in,
+        .r_out = arc_r_out,
+        .a0 = sweepAngle(0),
+        .a1 = sweepAngle(1),
+        .inner_color = ARC_TRACK_SHADOW,
+        .outer_color = ARC_TRACK_COLOR,
+        .segments = ARC_SEGMENTS,
+        .end_feather = ARC_END_FEATHER,
+    });
+    // The fill, neutral→master. Its DIRECTION carries the sign, which is
+    // why there is no second colour for a master below neutral. Soft
+    // ends so it dissolves into the groove rather than stopping dead —
+    // Chris: "you see the dial ring fading into the recess at the edges."
+    try relief.arc(out, lc, .{
+        .centre = centre,
+        // Inset, so the groove's shadowed inner edge still shows along
+        // it: the fill rides IN the channel rather than capping it.
+        .r_in = arc_r_in + ARC_FILL_INSET,
+        .r_out = arc_r_out - ARC_FILL_INSET * 0.4,
+        .a0 = sweepAngle(f_neutral),
+        .a1 = sweepAngle(f_master),
+        .inner_color = ARC_FILL_COLOR,
+        .outer_color = ARC_FILL_COLOR,
+        .segments = ARC_SEGMENTS,
+        .end_feather = ARC_END_FEATHER,
+    });
     // The neutral tick, drawn last so it survives the fill passing over
-    // it — it is the only mark that says where "no change" is.
-    try appendArc(
-        out,
-        lc,
-        centre,
-        arc_r_in - 1.5,
-        arc_r_out + 1.5,
-        sweepAngle(f_neutral) - 0.9,
-        sweepAngle(f_neutral) + 0.9,
-        ARC_NEUTRAL_COLOR,
-        1,
-    );
+    // it — it is the only mark that says where "no change" is. Hard
+    // ends: a tick that faded would stop being a reference.
+    try relief.arc(out, lc, .{
+        .centre = centre,
+        .r_in = arc_r_in,
+        .r_out = arc_r_out,
+        .a0 = sweepAngle(f_neutral) - 0.55,
+        .a1 = sweepAngle(f_neutral) + 0.55,
+        .inner_color = ARC_NEUTRAL_COLOR,
+        .outer_color = ARC_NEUTRAL_COLOR,
+        .segments = 2,
+    });
 
     // Centre dot — the neutral marker, and the reset target.
     const dot_r = @max(2.5, disc_r * CENTRE_FRACTION * 0.55);
@@ -615,13 +600,22 @@ fn layoutAndRender(
     y += c.size + DIAL_GAP;
 
     // ── Dial ──
+    //
+    // A ridged cylinder lying in a cut-out. Three things sell that, and
+    // none of them is the ridges: the shadow under the top lip, the lit
+    // lower lip, and the ridges FADING as they curve away at the ends.
+    // A dial whose ridges stop dead at the edge reads as a printed
+    // texture instead of a thing you could turn.
+    //
+    // All of it is TRIANGLES, and that is load-bearing. The renderer
+    // draws the whole triangle layer beneath the whole quad layer, so a
+    // quad fill under a triangle shadow puts the shadow behind the thing
+    // it should be falling on: the first cut of this had the lip's
+    // shadow hidden under the dial's own background and missing the
+    // ridges entirely. One layer, painted in order, and the recess
+    // reads.
     const dial_top = y;
-    try out.appendQuad(lc, .{
-        .dst_pos = .{ origin[0], dial_top },
-        .dst_size = .{ content_w, DIAL_H },
-        .color = DIAL_BG_COLOR,
-        .radius = 3,
-    });
+    try relief.rect(out, lc, origin[0], dial_top, content_w, DIAL_H, DIAL_BG_COLOR);
     // Ridges, phase-shifted by the master's distance from neutral. The
     // dial is a relative control with no absolute position to show, so
     // this scroll is the only feedback that a drag is landing.
@@ -630,21 +624,22 @@ fn layoutAndRender(
     var rx = origin[0] + phase;
     while (rx < origin[0] + content_w - 1) : (rx += RIDGE_STEP) {
         if (rx < origin[0] + 1) continue;
-        try out.appendQuad(lc, .{
-            .dst_pos = .{ rx, dial_top + 2.5 },
-            .dst_size = .{ 1.0, DIAL_H - 5.0 },
-            .color = DIAL_RIDGE_COLOR,
-            .radius = 0,
+        const t = (rx - origin[0]) / content_w;
+        const fade = relief.edgeFade(t, DIAL_RIDGE_EDGE);
+        if (fade <= 0.01) continue;
+        try relief.hairlineV(out, lc, rx, dial_top + 2.5, DIAL_H - 5.0, 1.0, .{
+            DIAL_RIDGE_COLOR[0],
+            DIAL_RIDGE_COLOR[1],
+            DIAL_RIDGE_COLOR[2],
+            DIAL_RIDGE_COLOR[3] * fade,
         });
     }
     // The home mark, in the grip's own orange so the two draggable
     // things on a panel share a colour.
-    try out.appendQuad(lc, .{
-        .dst_pos = .{ origin[0] + content_w * 0.5 - 0.75, dial_top },
-        .dst_size = .{ 1.5, DIAL_H },
-        .color = DIAL_CENTRE_COLOR,
-        .radius = 0,
-    });
+    try relief.hairlineV(out, lc, origin[0] + content_w * 0.5, dial_top, DIAL_H, 1.5, DIAL_CENTRE_COLOR);
+    // And the cut-out LAST, so the lip's shadow falls across the ridges
+    // that are down inside it. That is the whole trick.
+    try relief.groove(out, lc, origin[0], dial_top, content_w, DIAL_H, true);
 
     y += DIAL_H + READOUT_GAP;
 

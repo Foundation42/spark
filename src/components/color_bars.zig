@@ -43,6 +43,7 @@ const state_mod = @import("../state.zig");
 const text_layout = @import("../text/layout.zig");
 const shape = @import("../font/shape.zig");
 const color = @import("color.zig");
+const relief = @import("relief.zig");
 const trackball = @import("trackball.zig");
 
 pub fn install(spark: *spark_mod.Spark) !void {
@@ -317,13 +318,18 @@ fn layoutAndRender(
     for (values, trackball.CHANNEL_COLORS, 0..) |v, chan_col, i| {
         const cx = origin[0] + cell_w * (@as(f32, @floatFromInt(i)) + 0.5);
 
-        // Track.
-        try out.appendQuad(lc, .{
-            .dst_pos = .{ cx - TRACK_W * 0.5, bars_top },
-            .dst_size = .{ TRACK_W, c.bar_h },
-            .color = TRACK_COLOR,
-            .radius = TRACK_W * 0.5,
-        });
+        // Track, as a slot cut into the panel: the fill, then the lip's
+        // shadow down the top of it and a sliver of bounce at the
+        // bottom. `ends = false` — a vertical slot has no left and right
+        // lip to occlude anything.
+        //
+        // The fill is a TRIANGLE rect rather than the rounded quad it
+        // used to be, because the whole triangle layer draws beneath the
+        // whole quad layer: as a quad it covered its own shadow. The
+        // rounded ends were 2.5px on a 5px slot and are not missed; the
+        // depth is.
+        try relief.rect(out, lc, cx - TRACK_W * 0.5, bars_top, TRACK_W, c.bar_h, TRACK_COLOR);
+        try relief.groove(out, lc, cx - TRACK_W * 0.5, bars_top, TRACK_W, c.bar_h, false);
 
         // Fill, from neutral to the value. Drawn as a span rather than
         // from the bottom so a signed range reads correctly: a lift of

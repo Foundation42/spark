@@ -60,3 +60,28 @@ widget:
    window.
 
 Between gestures the plane is the truth; during one, the widget is.
+
+## The trap: the whole triangle layer is under the whole quad layer
+
+`DrawList` keeps tris, quads, images and glyphs in separate arrays, and
+the renderer draws them in that order — **not** in the order a component
+emitted them. So interleaving them to build up a shaded thing does not
+work: a quad fill emitted before a triangle shadow still ends up on top
+of it.
+
+That bit the trackball's recessed dial. The fill was a rounded quad and
+the ambient occlusion was a gradient triangle, so the shadow was hidden
+under the very surface it was supposed to be falling on, and never
+touched the ridges at all. The fix was to move the fill into the
+triangle layer (`relief.rect`) so the whole stack orders correctly.
+
+Practical consequences:
+
+- Anything that must be **ordered among triangles** has to BE a
+  triangle. `relief.rect` and `relief.hairlineV` exist for exactly that.
+- Anything that rides **on top** of a shaded surface — a thumb, a puck,
+  a label — is fine as a quad, and better as one: `quad.frag` gives it
+  rounded corners and anti-aliasing for free.
+- Triangles have **no anti-aliasing at all**, and a `radius = 0` quad
+  takes the flat-fill fast path and has none either. Feather the edges
+  with per-vertex alpha (`relief`) rather than hoping.
