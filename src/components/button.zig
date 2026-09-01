@@ -21,7 +21,22 @@
 //!   value. Default empty.
 //! - `width`  (optional) — pixel literal or `100%`. Default: intrinsic
 //!   to the label width plus padding.
-//! - `height` (optional) — pixel literal. Default 36.
+//! - `height` (optional) — pixel literal. Default 24.
+//! - `radius` (optional) — corner radius. Default 1.5, i.e. square.
+//!
+//! ### The look
+//!
+//! A key on an instrument: square, dark, black-edged, quiet until it is
+//! doing something. The fill is a NEUTRAL darkening rather than a colour
+//! of its own — the same idiom `:::slider`'s recess uses — so a key takes
+//! the tint of whatever panel it is on and looks cut from it rather than
+//! glued to it. A hairline of light along the inside of the top edge
+//! keeps it from reading as a hole, which is what the groove next to it
+//! is deliberately meant to look like.
+//!
+//! Pressed is WARM, not a second hue: the grip and the dial home mark
+//! are the shell'''s only other lit chrome and they are that orange, so
+//! "this one is on" is one colour everywhere.
 //!
 //! ### Click → dispatch
 //!
@@ -255,7 +270,7 @@ fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const co
         .cmd = try allocator.dupe(u8, ""),
         .icon = try allocator.dupe(u8, ""),
         .width = null,
-        .height = 36,
+        .height = BUTTON_DEFAULT_HEIGHT,
     };
     try c.ingest(spec);
     return .{ .vtable = &vtable, .ctx = @ptrCast(c) };
@@ -290,23 +305,55 @@ fn contentVersion(ctx: *anyopaque) u64 {
 
 // ── Visual constants ────────────────────────────────────────────────
 
-const BUTTON_BG: [4]f32 = .{ 0.20, 0.36, 0.62, 1.0 };
-const BUTTON_BORDER: [4]f32 = .{ 0.45, 0.68, 0.95, 1.0 };
-const BUTTON_LABEL: [4]f32 = .{ 0.98, 0.98, 1.0, 1.0 };
-/// The PRESSED palette. Lighter and warmer than the resting one rather
-/// than merely a different hue: a toggle has to read as on-or-off at a
-/// glance across a dock, and two colours of similar lightness do not.
-const BUTTON_BG_ACTIVE: [4]f32 = .{ 0.36, 0.60, 0.92, 1.0 };
-const BUTTON_BORDER_ACTIVE: [4]f32 = .{ 0.82, 0.93, 1.0, 1.0 };
-const BUTTON_LABEL_ACTIVE: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 };
-const BUTTON_BORDER_PX: f32 = 1.5;
+// A button is a KEY on an instrument: square, dark, black-edged, and
+// quiet until it is doing something. It used to be a rounded blue pill,
+// which read as a web form dropped onto a grading panel — Chris,
+// 2026-09-01: "these blue buttons on our gorgeous new panels look a bit
+// incongruous and cartoonish. I'm thinking square and dark with a black
+// border."
+//
+// The fill is a NEUTRAL darkening rather than a colour, the same idiom
+// `:::slider`'s recess and `:::color_bars`' tracks use: it takes the
+// tint of whatever panel it is on instead of imposing one, so a key
+// looks like it was cut from that panel rather than glued to it.
+
+const BUTTON_BG: [4]f32 = .{ 0.0, 0.0, 0.0, 0.34 };
+/// Nearly black, and opaque. This is the line that makes a key read as a
+/// separate object on a translucent panel; letting the panel through it
+/// would blur the two together.
+const BUTTON_BORDER: [4]f32 = .{ 0.02, 0.02, 0.03, 0.92 };
+const BUTTON_LABEL: [4]f32 = .{ 0.86, 0.87, 0.91, 1.0 };
+/// A hairline of light along the inside of the top edge. Without it a
+/// dark key inside a black border reads as a HOLE — which is exactly
+/// what the groove idiom next to it is meant to look like, and a button
+/// must not be confusable with a slot.
+const BUTTON_TOP_LIGHT: [4]f32 = .{ 1.0, 1.0, 1.0, 0.07 };
+/// The same hairline on a lit key, warm and a little stronger.
+const BUTTON_LABEL_ACTIVE_EDGE: [4]f32 = .{ 1.0, 0.80, 0.35, 0.16 };
+
+/// The PRESSED palette. Warm, because the only other lit chrome on a
+/// panel is the grip and the dial's home mark, and they are this orange
+/// — so "this one is on" is the same colour everywhere in the shell.
+/// Still dark: a toggle reads from its EDGE and its label, not from
+/// becoming a lamp.
+const BUTTON_BG_ACTIVE: [4]f32 = .{ 0.42, 0.26, 0.02, 0.55 };
+const BUTTON_BORDER_ACTIVE: [4]f32 = .{ 1.0, 0.68, 0.0, 0.90 };
+const BUTTON_LABEL_ACTIVE: [4]f32 = .{ 1.0, 0.88, 0.62, 1.0 };
+const BUTTON_BORDER_PX: f32 = 1.0;
 /// A pressed button's border, thicker so the state survives being read
 /// past — the fill alone is a subtle cue on a translucent dock.
-const BUTTON_BORDER_PX_ACTIVE: f32 = 2.5;
-const BUTTON_RADIUS: f32 = 6;
-const BUTTON_PAD_X: f32 = 16;
+const BUTTON_BORDER_PX_ACTIVE: f32 = 1.5;
+/// Square, near enough. Not a true zero: at one pixel the corner still
+/// gets the quad shader's anti-aliasing, so the edge is clean rather
+/// than stair-stepped, and nobody can see the difference in the shape.
+const BUTTON_RADIUS: f32 = 1.5;
+/// Both of these were nearly twice as big, which is what made a
+/// two-word key the size of a slider. Chris: "I notice a lot of padding
+/// on the internals."
+const BUTTON_PAD_X: f32 = 9;
+const BUTTON_DEFAULT_HEIGHT: f32 = 24;
 /// Between an `icon=` glyph and the label beside it.
-const BUTTON_ICON_GAP: f32 = 7;
+const BUTTON_ICON_GAP: f32 = 6;
 
 fn layoutAndRender(
     ctx: *anyopaque,
@@ -363,6 +410,17 @@ fn layoutAndRender(
         .color = bg_col,
         .radius = @max(0, c.radius - border_px),
     });
+    // The lit top edge — see `BUTTON_TOP_LIGHT`. Inset by the border so
+    // it sits just inside the black line, which is where a bevel would
+    // catch the light if this were a real key.
+    if (h > 2 * border_px + 2) {
+        try out.appendQuad(lc, .{
+            .dst_pos = .{ origin[0] + border_px + 1, origin[1] + border_px },
+            .dst_size = .{ @max(0, w - 2 * border_px - 2), 1 },
+            .color = if (c.active) BUTTON_LABEL_ACTIVE_EDGE else BUTTON_TOP_LIGHT,
+            .radius = 0,
+        });
+    }
 
     // Icon then label, centred as ONE group — so adding an icon shifts
     // the label rather than knocking the pair off centre.
