@@ -16,6 +16,10 @@
 //! - `unit`    (optional) — printed after the value (`ms`, `%`, `fps`).
 //! - `decimals`(optional) — fixed decimal places. Default 2.
 //! - `percent` (optional) — add a `value/max` percentage column.
+//! - `spark`   (optional) — add a sparkline of this value's own recent
+//!   history, auto-scaled to what is in the window.
+//! - `bar`     (optional) — draw the proportional bar. Default on; turn
+//!   it off for a row whose reading is the trace and the number.
 //! - `label_w` / `value_w` / `width` (optional) — column geometry.
 //!
 //! ## The bug this is the cure for
@@ -136,20 +140,42 @@ pub const Columns = struct {
     value_right: f32,
     /// Right edge of the percentage column, when there is one.
     pct_right: f32,
+    spark_x: f32,
+    spark_w: f32,
 };
 
-pub fn columnsFor(x: f32, total_w: f32, label_w: f32, value_w: f32, percent: bool) Columns {
+/// The columns, left to right: swatch, label, bar, sparkline, value,
+/// percentage. Each is either its declared width or absent — the BAR is
+/// the only elastic one, because it is the only one whose meaning is a
+/// proportion of the space it is given.
+pub fn columnsFor(
+    x: f32,
+    total_w: f32,
+    label_w: f32,
+    value_w: f32,
+    percent: bool,
+    bar: bool,
+    spark: bool,
+) Columns {
     const pct_w: f32 = if (percent) PCT_W else 0;
+    const spark_w: f32 = if (spark) SPARK_W else 0;
+    const spark_gap: f32 = if (spark) BAR_GAP else 0;
     const bar_x = x + SWATCH + SWATCH_GAP + label_w;
+    const right_of_bar = (x + total_w) - pct_w - value_w - BAR_GAP - spark_w - spark_gap;
     // The bar takes what is left. It may end up at zero on a very narrow
     // panel, and zero is drawn as nothing rather than as a negative width
     // that would fold the geometry inside out.
-    const bar_w = @max(0, (x + total_w) - pct_w - value_w - BAR_GAP - bar_x);
+    const bar_w: f32 = if (bar) @max(0, right_of_bar - bar_x) else 0;
     return .{
         .swatch_x = x,
         .label_x = x + SWATCH + SWATCH_GAP,
         .bar_x = bar_x,
         .bar_w = bar_w,
+        // The sparkline sits between the bar and the value, right-anchored
+        // — so a row with no bar keeps its trace in the same column as a
+        // row that has one, and a table of mixed rows still lines up.
+        .spark_x = right_of_bar + spark_gap,
+        .spark_w = spark_w,
         .value_right = x + total_w - pct_w,
         .pct_right = x + total_w,
     };
@@ -168,7 +194,40 @@ const Component = struct {
     width: ?box_helpers.Length = null,
     label_w: f32 = LABEL_W,
     value_w: f32 = VALUE_W,
+    /// Whether to draw the proportional bar. Off for a row whose reading
+    /// is the trace and the number — the console's pass rows are that.
+    bar: bool = true,
+    /// Whether to draw the sparkline column.
+    spark: bool = false,
+    /// The trace's own history. Small and fixed: a per-row sparkline is
+    /// forty pixels wide, so more samples than that is more resolution
+    /// than the column can show, and a heap allocation per row of a
+    /// twenty-row panel is a cost with nothing to buy.
+    hist: [SPARK_N]f32 = @splat(0),
+    hist_n: usize = 0,
+    hist_at: usize = 0,
+    /// The last value appended, so a re-ingest that did not move it does
+    /// not append a duplicate. Same guard, and same reason, as
+    /// `:::chart`'s: `update` fires on ANY bound attribute re-resolving,
+    /// and on `hud/perf.md` that is seventeen other paths.
+    last_value: ?f32 = null,
     version: u64 = 0,
+
+    fn push(self: *Component, v: f32) void {
+        if (self.last_value) |prev| {
+            if (prev == v) return;
+        }
+        self.last_value = v;
+        self.hist[self.hist_at] = v;
+        self.hist_at = (self.hist_at + 1) % SPARK_N;
+        if (self.hist_n < SPARK_N) self.hist_n += 1;
+    }
+
+    /// Logical index 0..hist_n-1, oldest first.
+    fn histAt(self: *const Component, i: usize) f32 {
+        if (self.hist_n < SPARK_N) return self.hist[i];
+        return self.hist[(self.hist_at + i) % SPARK_N];
+    }
 
     fn ingest(self: *Component, spec: *const components.Spec) !void {
         const a = self.allocator;
@@ -182,12 +241,17 @@ const Component = struct {
                 unit_raw = attr.value;
             } else if (std.mem.eql(u8, attr.key, "value")) {
                 self.value = numberOf(attr.value);
+                self.push(self.value);
             } else if (std.mem.eql(u8, attr.key, "min")) {
                 self.min = numberOf(attr.value);
             } else if (std.mem.eql(u8, attr.key, "max")) {
                 self.max = numberOf(attr.value);
             } else if (std.mem.eql(u8, attr.key, "decimals")) {
                 self.decimals = @intFromFloat(std.math.clamp(numberOf(attr.value), 0, 6));
+            } else if (std.mem.eql(u8, attr.key, "spark")) {
+                self.spark = @import("button.zig").isTruthy(attr.value);
+            } else if (std.mem.eql(u8, attr.key, "bar")) {
+                self.bar = @import("button.zig").isTruthy(attr.value);
             } else if (std.mem.eql(u8, attr.key, "percent")) {
                 self.percent = @import("button.zig").isTruthy(attr.value);
             } else if (std.mem.eql(u8, attr.key, "color")) {
@@ -273,6 +337,16 @@ const PCT: [4]f32 = .{ 0.56, 0.55, 0.54, 1.0 };
 /// The tick at zero on a signed bar. Light, because it is a reference and
 /// not a reading.
 const ZERO_MARK: [4]f32 = .{ 1.0, 1.0, 1.0, 0.28 };
+/// The per-row trace. One colour for every row on purpose: the SWATCH
+/// says which series this is, and a trace in the series colour would make
+/// twenty rows of confetti out of a table meant to be scanned.
+const SPARK: [4]f32 = .{ 0.62, 0.66, 0.74, 0.85 };
+/// Samples in a row's history. Forty pixels of column cannot show more
+/// resolution than this, and a heap allocation per row of a twenty-row
+/// panel would be a cost with nothing to buy.
+const SPARK_N: usize = 40;
+const SPARK_W: f32 = 46;
+const SPARK_H: f32 = 12;
 
 fn layoutAndRender(
     ctx: *anyopaque,
@@ -295,14 +369,14 @@ fn layoutAndRender(
     const total_w: f32 = if (c.width) |w| w.resolve(constraints.max_w, fallback) else fallback;
     const x = @round(origin[0]);
     const y = @round(origin[1]);
-    const cols = columnsFor(x, total_w, c.label_w, c.value_w, c.percent);
+    const cols = columnsFor(x, total_w, c.label_w, c.value_w, c.percent, c.bar, c.spark);
 
     const frac = fractionIn(c.value, c.min, c.max);
     const from = originFraction(c.min, c.max);
     const bar_y = @round(y + (ROW_H - BAR_H) * 0.5);
 
     // ── The bar, all triangles so it orders among itself ──────────────
-    if (cols.bar_w > 0) {
+    if (c.bar and cols.bar_w > 0) {
         try relief.rect(out, lc, cols.bar_x, bar_y, cols.bar_w, BAR_H, TRACK);
         // The fill runs BETWEEN the origin and the value, which is the same
         // arithmetic for both directions — a signed bar needs no second
@@ -322,6 +396,34 @@ fn layoutAndRender(
         // The recess shading goes over BOTH, so the fill reads as sitting
         // in the slot rather than on top of it.
         try relief.groove(out, lc, cols.bar_x, bar_y, cols.bar_w, BAR_H, false);
+    }
+
+    // ── The trace ────────────────────────────────────────────────────
+    // Newest at the RIGHT and a partly-filled history empty on the LEFT,
+    // the same anchoring `chart.slotOf` uses and for the same reason: the
+    // right-hand edge is NOW, from the first sample to forever.
+    if (c.spark and cols.spark_w > 0 and c.hist_n > 0) {
+        const sh = SPARK_H;
+        const sy = @round(y + (ROW_H - sh) * 0.5);
+        const slot = cols.spark_w / @as(f32, @floatFromInt(SPARK_N));
+        // Auto-scaled to what is IN the window, not to `max`. A pass
+        // holding 3% of the frame would otherwise be a flat line along the
+        // bottom for ever — and the shape of its own variation is the only
+        // thing a forty-pixel trace can usefully show.
+        var lo: f32 = c.histAt(0);
+        var hi: f32 = lo;
+        for (0..c.hist_n) |i| {
+            const v = c.histAt(i);
+            lo = @min(lo, v);
+            hi = @max(hi, v);
+        }
+        const span: f32 = if (hi - lo > 1e-6) hi - lo else 1;
+        for (0..c.hist_n) |i| {
+            const norm = (c.histAt(i) - lo) / span;
+            const col_h = @max(1, norm * sh);
+            const sx = cols.spark_x + @as(f32, @floatFromInt(SPARK_N - c.hist_n + i)) * slot;
+            try relief.rect(out, lc, @round(sx), sy + sh - col_h, @max(1, slot), col_h, SPARK);
+        }
     }
 
     // The swatch is a quad — it overlaps nothing, so it may as well have
@@ -505,7 +607,7 @@ test "meter: fixed decimals, so a number does not change width" {
 test "meter: the columns tile the row and never overlap" {
     // The other half of the cure. Nothing downstream is measured from the
     // value's width, so nothing a number does can move anything else.
-    const c = columnsFor(0, 300, 88, 62, true);
+    const c = columnsFor(0, 300, 88, 62, true, true, false);
     try testing.expectEqual(@as(f32, 0), c.swatch_x);
     try testing.expect(c.label_x > c.swatch_x);
     try testing.expect(c.bar_x >= c.label_x + 88);
@@ -515,8 +617,8 @@ test "meter: the columns tile the row and never overlap" {
 }
 
 test "meter: dropping the percentage column gives the width to the bar" {
-    const with = columnsFor(0, 300, 88, 62, true);
-    const without = columnsFor(0, 300, 88, 62, false);
+    const with = columnsFor(0, 300, 88, 62, true, true, false);
+    const without = columnsFor(0, 300, 88, 62, false, true, false);
     try testing.expectEqual(with.bar_w + PCT_W, without.bar_w);
     try testing.expectEqual(@as(f32, 300), without.value_right);
 }
@@ -524,16 +626,41 @@ test "meter: dropping the percentage column gives the width to the bar" {
 test "meter: a row too narrow for its columns gives a zero bar, not a fold" {
     // A negative width would wind the geometry inside out. Zero draws
     // nothing, which is the honest picture of "there is no room here".
-    const c = columnsFor(0, 40, 88, 62, true);
+    const c = columnsFor(0, 40, 88, 62, true, true, false);
     try testing.expectEqual(@as(f32, 0), c.bar_w);
 }
 
 test "meter: the row's origin carries into every column" {
-    const a = columnsFor(0, 300, 88, 62, false);
-    const b = columnsFor(50, 300, 88, 62, false);
+    const a = columnsFor(0, 300, 88, 62, false, true, false);
+    const b = columnsFor(50, 300, 88, 62, false, true, false);
     try testing.expectEqual(a.swatch_x + 50, b.swatch_x);
     try testing.expectEqual(a.label_x + 50, b.label_x);
     try testing.expectEqual(a.bar_x + 50, b.bar_x);
     try testing.expectEqual(a.value_right + 50, b.value_right);
     try testing.expectEqual(a.bar_w, b.bar_w);
+}
+
+test "meter: the sparkline sits between the bar and the value" {
+    const c = columnsFor(0, 400, 88, 62, true, true, true);
+    // Bar, then trace, then the value's column, then the percentage.
+    try testing.expect(c.spark_x >= c.bar_x + c.bar_w);
+    try testing.expect(c.spark_x + c.spark_w <= c.value_right - 62);
+    try testing.expectEqual(SPARK_W, c.spark_w);
+}
+
+test "meter: a row with no bar keeps its trace in the same column" {
+    // So a table of mixed rows still lines up — the console's pass rows
+    // are trace-and-number, and its CPU rows are bar-and-trace, and they
+    // sit one above the other.
+    const with_bar = columnsFor(0, 400, 88, 62, true, true, true);
+    const without = columnsFor(0, 400, 88, 62, true, false, true);
+    try testing.expectEqual(with_bar.spark_x, without.spark_x);
+    try testing.expectEqual(@as(f32, 0), without.bar_w);
+}
+
+test "meter: asking for no sparkline gives the width back to the bar" {
+    const with_spark = columnsFor(0, 400, 88, 62, false, true, true);
+    const without = columnsFor(0, 400, 88, 62, false, true, false);
+    try testing.expect(without.bar_w > with_spark.bar_w);
+    try testing.expectEqual(@as(f32, 0), without.spark_w);
 }

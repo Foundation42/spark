@@ -176,6 +176,26 @@ const Component = struct {
     }
 };
 
+/// Which slot logical sample `i` occupies.
+///
+/// **Newest at the RIGHT, and a partly-filled chart empty on the LEFT.**
+/// This module's comment has claimed the chart "scrolls in from the right"
+/// since stage 8b and the code put sample `i` at slot `i`, which fills from
+/// the left and leaves the gap where the newest data should be. Chris,
+/// 2026-09-01: "the chart fills in from the left, which is unusual —
+/// should fill from right."
+///
+/// It matters more than it looks. A trace read left-to-right is read as
+/// time, so the right-hand edge is NOW; a chart that grows rightwards puts
+/// the present in a different place every second until the buffer fills,
+/// and then silently starts meaning something else once it wraps. Anchoring
+/// to the right makes "the right edge is the latest sample" true from the
+/// first frame to forever.
+pub fn slotOf(i: usize, filled: usize, capacity: usize) usize {
+    if (filled >= capacity) return i;
+    return capacity - filled + i;
+}
+
 /// The space between two columns, given how wide a slot is.
 ///
 /// A gap only while the columns are wide enough to read AS columns. Below
@@ -285,9 +305,9 @@ fn layoutAndRender(
         return .{ .x = origin[0], .y = origin[1], .w = w, .h = h, .baseline = 0 };
     }
 
-    // Column geometry. Each sample claims one slot across the full
-    // width, regardless of how many samples are actually filled —
-    // so the chart "scrolls in" from the right as data arrives.
+    // Column geometry. Each sample claims one slot across the full width
+    // regardless of how many are filled, and the filled ones are pushed to
+    // the RIGHT — see `slotOf`.
     const slot_w = w / @as(f32, @floatFromInt(c.capacity));
     const gap = columnGap(slot_w);
     const bar_w = @max(@as(f32, 1.0), slot_w - gap);
@@ -302,7 +322,7 @@ fn layoutAndRender(
         const clamped = std.math.clamp(v, c.min_val, c.max_val);
         const norm = (clamped - c.min_val) / safe_range; // 0..1
         const bar_h = norm * h;
-        const x = origin[0] + @as(f32, @floatFromInt(i)) * slot_w;
+        const x = origin[0] + @as(f32, @floatFromInt(slotOf(i, c.filled, c.capacity))) * slot_w;
         try out.appendQuad(lc, .{
             .dst_pos = .{ x, baseline_y - bar_h },
             .dst_size = .{ bar_w, bar_h },
@@ -522,4 +542,25 @@ test "chart: a dense series drops its gaps and becomes an area" {
     // Capped at a pixel however wide the slot: a gap that grew with the
     // column would turn a 12-sample chart into 12 stripes of background.
     try testing.expectEqual(@as(f32, 1), columnGap(40));
+}
+
+test "chart: the newest sample is at the RIGHT edge, always" {
+    // The header has claimed this since stage 8b while the code did the
+    // opposite: sample `i` at slot `i` fills from the left and leaves the
+    // gap exactly where the newest data belongs.
+    //
+    // A partly-filled buffer — three samples in a chart that holds ten.
+    // The oldest sits at slot 7 and the newest at slot 9, the right edge.
+    try testing.expectEqual(@as(usize, 7), slotOf(0, 3, 10));
+    try testing.expectEqual(@as(usize, 8), slotOf(1, 3, 10));
+    try testing.expectEqual(@as(usize, 9), slotOf(2, 3, 10));
+
+    // A single sample is at the right edge, not the left.
+    try testing.expectEqual(@as(usize, 9), slotOf(0, 1, 10));
+
+    // Once it wraps, logical order IS slot order and the right edge is
+    // still the newest — so the picture does not jump on the frame the
+    // buffer fills, which is the failure a reader would notice.
+    try testing.expectEqual(@as(usize, 0), slotOf(0, 10, 10));
+    try testing.expectEqual(@as(usize, 9), slotOf(9, 10, 10));
 }
