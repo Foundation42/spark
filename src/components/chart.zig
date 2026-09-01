@@ -68,6 +68,7 @@ const components = @import("../markdown_components.zig");
 const component_mod = @import("../component.zig");
 const spark_mod = @import("../spark.zig");
 const box_mod = @import("box.zig");
+const relief = @import("relief.zig");
 
 const DEFAULT_CAPACITY: usize = 128;
 const DEFAULT_COLOR: [4]f32 = .{ 0.40, 0.85, 0.92, 1.0 }; // cyan
@@ -90,6 +91,7 @@ const Component = struct {
     radius: f32 = 4,
     /// Bumped on every visible-state mutation (append/clear/applySpec).
     /// Drives retained layout-cache invalidation.
+    kind: Kind = .line,
     version: u64 = 0,
     /// The last `value=` seen, so a re-ingest that did not move it does
     /// not append a second copy. See the `value` arm in `applySpec`.
@@ -101,7 +103,9 @@ const Component = struct {
     /// not honoured here; resizing would discard sample history.
     fn applySpec(self: *Component, spec: *const components.Spec) void {
         for (spec.attrs) |a| {
-            if (std.mem.eql(u8, a.key, "value")) {
+            if (std.mem.eql(u8, a.key, "type")) {
+                if (parseKind(a.value)) |k| self.kind = k;
+            } else if (std.mem.eql(u8, a.key, "value")) {
                 self.appendBound(a.value);
             } else if (std.mem.eql(u8, a.key, "min")) {
                 self.min_val = std.fmt.parseFloat(f32, a.value) catch self.min_val;
@@ -191,6 +195,27 @@ const Component = struct {
 /// and then silently starts meaning something else once it wraps. Anchoring
 /// to the right makes "the right edge is the latest sample" true from the
 /// first frame to forever.
+/// How a series is drawn.
+///
+/// **`line` is the default and now actually draws one.** The attribute has
+/// been documented since stage 8b and read by nothing, so every chart got
+/// columns — which is right for a series that varies and wrong for one
+/// that does not. A vsync-locked frame time is a near-constant, and a
+/// near-constant area-filled is a solid block: the wiggle that is the
+/// entire reason to plot it is the one thing the picture loses. Chris's
+/// perf panel showed two of them.
+///
+/// `area` keeps the columns, for a series where the quantity under the
+/// curve is the point rather than its shape.
+pub const Kind = enum { line, area };
+
+pub fn parseKind(v: []const u8) ?Kind {
+    const t = std.mem.trim(u8, v, " \t\r\n");
+    if (std.mem.eql(u8, t, "line")) return .line;
+    if (std.mem.eql(u8, t, "area") or std.mem.eql(u8, t, "bar")) return .area;
+    return null;
+}
+
 pub fn slotOf(i: usize, filled: usize, capacity: usize) usize {
     if (filled >= capacity) return i;
     return capacity - filled + i;
@@ -279,6 +304,10 @@ fn contentVersion(ctx: *anyopaque) u64 {
     return c.version;
 }
 
+/// Stroke width for a `line` series. Two pixels, matched to `:::slider`'s
+/// and every other drawn mark in the vocabulary.
+const LINE_W: f32 = 2.0;
+
 fn layoutAndRender(
     ctx: *anyopaque,
     origin: [2]f32,
@@ -293,13 +322,12 @@ fn layoutAndRender(
     const w = c.width.resolve(max_w, fallback_w);
     const h = c.height.resolve(max_w, 120.0);
 
-    // Background panel.
-    try out.appendQuad(lc, .{
-        .dst_pos = .{ origin[0], origin[1] },
-        .dst_size = .{ w, h },
-        .color = c.bg,
-        .radius = c.radius,
-    });
+    // Background panel — TRIANGLES, not a quad, and that is load-bearing.
+    // A `line` series is drawn with `relief.stroke` because it is diagonal,
+    // and the renderer draws the whole triangle layer beneath the whole
+    // quad layer: a quad background would hide the line entirely. So the
+    // whole chart lives in one layer and orders by emission.
+    try relief.rect(out, lc, origin[0], origin[1], w, h, c.bg);
 
     if (c.filled == 0) {
         return .{ .x = origin[0], .y = origin[1], .w = w, .h = h, .baseline = 0 };
@@ -317,18 +345,30 @@ fn layoutAndRender(
     const baseline_y = origin[1] + h;
 
     var i: usize = 0;
+    var prev: ?[2]f32 = null;
     while (i < c.filled) : (i += 1) {
         const v = c.sampleAt(i);
         const clamped = std.math.clamp(v, c.min_val, c.max_val);
         const norm = (clamped - c.min_val) / safe_range; // 0..1
-        const bar_h = norm * h;
-        const x = origin[0] + @as(f32, @floatFromInt(slotOf(i, c.filled, c.capacity))) * slot_w;
-        try out.appendQuad(lc, .{
-            .dst_pos = .{ x, baseline_y - bar_h },
-            .dst_size = .{ bar_w, bar_h },
-            .color = c.color,
-            .radius = 0,
-        });
+        const slot = @as(f32, @floatFromInt(slotOf(i, c.filled, c.capacity)));
+        const x = origin[0] + slot * slot_w;
+        switch (c.kind) {
+            .area => try relief.rect(out, lc, x, baseline_y - norm * h, bar_w, norm * h, c.color),
+            .line => {
+                // Through the middle of each slot, so a line and an area of
+                // the same data sit over each other rather than half a slot
+                // apart.
+                const p: [2]f32 = .{ x + slot_w * 0.5, baseline_y - norm * h };
+                if (prev) |q| {
+                    try relief.stroke(out, lc, q, p, LINE_W, c.color);
+                } else if (c.filled == 1) {
+                    // One sample is a point, and a point drawn as nothing is
+                    // a chart that looks broken for its first tick.
+                    try relief.stroke(out, lc, .{ p[0] - 1, p[1] }, .{ p[0] + 1, p[1] }, LINE_W, c.color);
+                }
+                prev = p;
+            },
+        }
     }
 
     return .{ .x = origin[0], .y = origin[1], .w = w, .h = h, .baseline = 0 };

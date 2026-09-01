@@ -126,6 +126,68 @@ pub fn originFraction(min: f32, max: f32) f32 {
     return fractionIn(std.math.clamp(@as(f32, 0), min, max), min, max);
 }
 
+/// The vertical band a sparkline is drawn against, as `{base, span}`.
+///
+/// **The scale has to be stable from the FIRST sample.** Chris, 2026-09-01:
+/// "the mini-charts don't calibrate until they get filled." Scaling
+/// straight to the window's own `[lo, hi]` means every new sample that
+/// widens the range redraws every older one at a different height, so the
+/// trace visibly writhes for the first few seconds and only settles once
+/// the buffer is full — which reads as the instrument warming up rather
+/// than as the thing being measured.
+///
+/// Two rules fix it, and both are needed:
+///
+///   * **A minimum span proportional to the value.** A run of samples that
+///     barely differ gets a band far wider than their spread, so ordinary
+///     jitter stays a nearly-flat line instead of being amplified to full
+///     height. That is also what stops a pass holding 0.01 ms from drawing
+///     a dramatic mountain range out of rounding noise.
+///   * **Centred on the data, not anchored at zero.** A constant series
+///     then draws a flat line through the MIDDLE of its box, which is
+///     legible and immediately correct, rather than along the bottom edge
+///     where it is indistinguishable from "no data".
+///
+/// And a third, which the first capture caught: **a series cannot show
+/// variation finer than the precision it is published at.** `sim` runs at
+/// 0.01 ms and `perf_plane` publishes two decimals, so it arrives as
+/// 0.00 / 0.01 / 0.02 — one quantum of rounding, which the proportional
+/// floor (a quarter of 0.01) is far too small to damp. The trace came out
+/// as a solid block of zigzag: maximum drama from a number that is not
+/// moving. The row already declares its own precision as `decimals=`, so
+/// the floor takes a few quanta of that too.
+///
+/// The band still tracks the data — a real excursion opens it out — it
+/// just cannot be narrower than either the reading's own magnitude or the
+/// precision it arrived with, so it stops moving almost at once.
+pub const Band = struct { base: f32, span: f32 };
+
+/// How much of the value's own magnitude the band is at minimum. A quarter
+/// either side, so a series wandering by less than half its own size reads
+/// as flat-ish rather than as drama.
+pub const BAND_FLOOR: f32 = 0.25;
+/// How many quanta of the row's declared precision count as noise rather
+/// than signal. Four: enough that ordinary rounding chatter stays a
+/// wobble, few enough that a real move of a few quanta still shows.
+pub const BAND_QUANTA: f32 = 4;
+
+/// The value of one step at `decimals` places — 0.01 at two, 1 at zero.
+pub fn quantumFor(decimals: u8) f32 {
+    var q: f32 = 1;
+    var n: u8 = 0;
+    while (n < decimals) : (n += 1) q *= 0.1;
+    return q;
+}
+
+pub fn bandFor(lo: f32, hi: f32, quantum: f32) Band {
+    const mid = (lo + hi) * 0.5;
+    const half = @max(
+        @max((hi - lo) * 0.5, @abs(mid) * BAND_FLOOR),
+        @max(quantum * BAND_QUANTA, 1e-6),
+    );
+    return .{ .base = mid - half, .span = half * 2 };
+}
+
 /// Where each column starts, given the row's total width.
 ///
 /// Split out so the arithmetic has somewhere to be checked: the drawing
@@ -347,6 +409,9 @@ const SPARK: [4]f32 = .{ 0.62, 0.66, 0.74, 0.85 };
 const SPARK_N: usize = 40;
 const SPARK_W: f32 = 46;
 const SPARK_H: f32 = 12;
+/// Thinner than a chart's line: forty samples in forty-six pixels, so a
+/// two-pixel stroke would merge into a band.
+const SPARK_W_PX: f32 = 1.2;
 
 fn layoutAndRender(
     ctx: *anyopaque,
@@ -406,10 +471,11 @@ fn layoutAndRender(
         const sh = SPARK_H;
         const sy = @round(y + (ROW_H - sh) * 0.5);
         const slot = cols.spark_w / @as(f32, @floatFromInt(SPARK_N));
-        // Auto-scaled to what is IN the window, not to `max`. A pass
-        // holding 3% of the frame would otherwise be a flat line along the
-        // bottom for ever — and the shape of its own variation is the only
-        // thing a forty-pixel trace can usefully show.
+        // Scaled to what is IN the window, not to `max`: a pass holding 3%
+        // of the frame would otherwise be a flat line along the bottom for
+        // ever, and the shape of its own variation is the only thing a
+        // forty-pixel trace can usefully show. `bandFor` is what keeps that
+        // from writhing while the window fills — see it.
         var lo: f32 = c.histAt(0);
         var hi: f32 = lo;
         for (0..c.hist_n) |i| {
@@ -417,12 +483,18 @@ fn layoutAndRender(
             lo = @min(lo, v);
             hi = @max(hi, v);
         }
-        const span: f32 = if (hi - lo > 1e-6) hi - lo else 1;
+        const band = bandFor(lo, hi, quantumFor(c.decimals));
+        var prev: ?[2]f32 = null;
         for (0..c.hist_n) |i| {
-            const norm = (c.histAt(i) - lo) / span;
-            const col_h = @max(1, norm * sh);
-            const sx = cols.spark_x + @as(f32, @floatFromInt(SPARK_N - c.hist_n + i)) * slot;
-            try relief.rect(out, lc, @round(sx), sy + sh - col_h, @max(1, slot), col_h, SPARK);
+            const norm = std.math.clamp((c.histAt(i) - band.base) / band.span, 0, 1);
+            const sx = cols.spark_x + (@as(f32, @floatFromInt(SPARK_N - c.hist_n + i)) + 0.5) * slot;
+            const p: [2]f32 = .{ sx, sy + sh - norm * sh };
+            if (prev) |q| {
+                try relief.stroke(out, lc, q, p, SPARK_W_PX, SPARK);
+            } else if (c.hist_n == 1) {
+                try relief.stroke(out, lc, .{ p[0] - 1, p[1] }, .{ p[0] + 1, p[1] }, SPARK_W_PX, SPARK);
+            }
+            prev = p;
         }
     }
 
@@ -663,4 +735,88 @@ test "meter: asking for no sparkline gives the width back to the bar" {
     const without = columnsFor(0, 400, 88, 62, false, true, false);
     try testing.expect(without.bar_w > with_spark.bar_w);
     try testing.expectEqual(@as(f32, 0), without.spark_w);
+}
+
+test "meter: a flat series draws through the middle, not along the bottom" {
+    // "The mini-charts don't calibrate until they get filled." A band taken
+    // straight from the window's own [lo, hi] makes a constant series
+    // degenerate — every sample at the same height, and that height is the
+    // bottom edge, where it is indistinguishable from no data at all.
+    const b = bandFor(4, 4, 0);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), (4 - b.base) / b.span, 1e-4);
+    // …and a constant of zero, which is every path before it publishes.
+    const z = bandFor(0, 0, 0);
+    try testing.expect(z.span > 0);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), (0 - z.base) / z.span, 1e-4);
+}
+
+test "meter: small jitter stays small instead of filling the box" {
+    // The band cannot be narrower than the reading's own magnitude
+    // suggests, so rounding noise on a 0.01 ms pass does not become a
+    // dramatic mountain range.
+    const b = bandFor(10.0, 10.1, 0);
+    const at_lo = (10.0 - b.base) / b.span;
+    const at_hi = (10.1 - b.base) / b.span;
+    try testing.expect(at_hi - at_lo < 0.05); // a wobble, not a cliff
+    try testing.expect(at_lo > 0.4 and at_hi < 0.6); // and centred
+}
+
+test "meter: a real excursion still opens the band out" {
+    // Stability must not become blindness — the band tracks the data, it
+    // just cannot collapse onto it.
+    const b = bandFor(0, 20, 0);
+    try testing.expectApproxEqAbs(@as(f32, 0), (0 - b.base) / b.span, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 1), (20 - b.base) / b.span, 1e-4);
+}
+
+test "meter: the band settles as the window fills, rather than writhing" {
+    // The actual complaint, stated as a property: a series wobbling around
+    // a mean must not keep rescaling as more of the same arrives. Each of
+    // these is one more sample's worth of spread around 10.
+    const one = bandFor(10, 10, 0);
+    const few = bandFor(9.9, 10.1, 0);
+    const more = bandFor(9.8, 10.2, 0);
+    for ([_]Band{ one, few, more }) |b| {
+        const mid = (10 - b.base) / b.span;
+        try testing.expect(mid > 0.45 and mid < 0.55);
+    }
+    // The band widens, but by fractions — not the order-of-magnitude jump
+    // that a raw [lo, hi] gives going from a constant to any spread at all.
+    try testing.expect(more.span < one.span * 2);
+}
+
+test "meter: rounding chatter is damped by the row's own precision" {
+    // `sim` runs at 0.01 ms and the publisher rounds to two decimals, so
+    // it arrives as 0.00 / 0.01 / 0.02 — one quantum. The proportional
+    // floor is a quarter of 0.01, far too small to damp it, and the trace
+    // came out as a solid block of zigzag: maximum drama from a number
+    // that is not moving.
+    const q = quantumFor(2);
+    try testing.expectApproxEqAbs(@as(f32, 0.01), q, 1e-6);
+
+    const b = bandFor(0.00, 0.02, q);
+    const at_lo = (0.00 - b.base) / b.span;
+    const at_hi = (0.02 - b.base) / b.span;
+    try testing.expect(at_hi - at_lo < 0.3); // a wobble in the middle third
+    try testing.expect(at_lo > 0.3 and at_hi < 0.7);
+
+    // Without the quantum it fills the box, which is the bug.
+    const raw = bandFor(0.00, 0.02, 0);
+    try testing.expectApproxEqAbs(@as(f32, 0), (0.00 - raw.base) / raw.span, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 1), (0.02 - raw.base) / raw.span, 1e-4);
+}
+
+test "meter: a move of many quanta is still signal" {
+    // Damping must not become deafness. Ten quanta at two decimals is a
+    // real excursion and has to open the band.
+    const q = quantumFor(2);
+    const b = bandFor(0.00, 0.10, q);
+    try testing.expectApproxEqAbs(@as(f32, 0), (0.00 - b.base) / b.span, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 1), (0.10 - b.base) / b.span, 1e-4);
+}
+
+test "meter: quantumFor tracks the declared decimals" {
+    try testing.expectApproxEqAbs(@as(f32, 1), quantumFor(0), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.1), quantumFor(1), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.001), quantumFor(3), 1e-7);
 }
