@@ -126,6 +126,33 @@ pub const Face = struct {
         return self.slotBitmap();
     }
 
+    /// Whether to let FreeType's hinter move the outline onto the pixel
+    /// grid before rasterising.
+    ///
+    /// **Off, deliberately.** Hinting snaps horizontal stems and the
+    /// extremes of curves to whole pixels, which is what makes hinted
+    /// text feel crisp — and at UI sizes it also flattens the top and
+    /// bottom of every round letter. A capital `G` comes back with a
+    /// straight edge across its crown and another under its bowl, and a
+    /// stem's cap lands at full coverage with no partial row above it,
+    /// so the glyph reads as though a pixel had been sliced off each
+    /// end. Chris, 2026-09-01, seeing it in a panel label: "it's the
+    /// same half pixel vertical chop off top and bottom we saw on those
+    /// slider thumb tacks."
+    ///
+    /// It is NOT that bug — nothing in this path loses a pixel. At the
+    /// HUD's zoom of 1 the whole chain is exactly 1:1: `eff_world_scale`
+    /// is 1, `dst_pos` is rounded to whole pixels, `dst_size` is the
+    /// atlas rect, and the UVs sit on texel edges. What reaches the
+    /// screen IS the bitmap FreeType handed over, row for row. The flat
+    /// edges were already in that bitmap, put there on purpose.
+    ///
+    /// Unhinted is the trade this vocabulary wants: faithful outlines
+    /// with real anti-aliasing on every edge, against slightly softer
+    /// stems. It is the call macOS makes, and the same one `relief.zig`
+    /// makes when it feathers a circle rather than snapping it.
+    const HINTING = false;
+
     fn loadFlags(self: *const Face) c_int {
         // FT_LOAD_COLOR routes through the colour-bitmap (CBDT/sbix)
         // or COLRv1 paths and produces an FT_PIXEL_MODE_BGRA bitmap;
@@ -136,7 +163,8 @@ pub const Face = struct {
         // on this platform) — explicit cast both sides keeps Zig happy.
         const base: c_long = @as(c_long, c.FT_LOAD_RENDER);
         const color: c_long = if (self.has_color) @as(c_long, c.FT_LOAD_COLOR) else 0;
-        return @intCast(base | color);
+        const hint: c_long = if (HINTING) 0 else @as(c_long, c.FT_LOAD_NO_HINTING);
+        return @intCast(base | color | hint);
     }
 
     fn slotBitmap(self: *Face) !GlyphBitmap {
