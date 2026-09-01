@@ -297,7 +297,14 @@ pub fn layoutAndRender(
             // Register the laid-out box on the hit-test layer iff
             // the component accepts input — non-interactive customs
             // (decorative quads etc.) don't appear in hit-tests.
-            if (cu.vtable.on_input != null) {
+            //
+            // …and iff it did not emit its own. This Hit is appended
+            // AFTER the component ran, so it lands after every Hit the
+            // component's children emitted, and `findHit` scans
+            // backwards. A container that returns a box covering its
+            // children therefore swallows every one of them. See
+            // `ElementVTable.emits_own_hits`.
+            if (cu.vtable.on_input != null and !cu.vtable.emits_own_hits) {
                 try out.hits.append(.{
                     .box = box,
                     .vtable = cu.vtable,
@@ -2404,9 +2411,10 @@ fn emitInlineObject(
     const box = try obj.vtable.layout_and_render(obj.ctx, origin, constraints, ctx, out);
 
     // Register on the hit-test layer if the component accepts input —
-    // mirrors the block-level `.custom` path. Stamped with the current
-    // walker `state` so input dispatch routes to the right scope.
-    if (obj.vtable.on_input != null) {
+    // mirrors the block-level `.custom` path, `emits_own_hits` and all.
+    // Stamped with the current walker `state` so input dispatch routes
+    // to the right scope.
+    if (obj.vtable.on_input != null and !obj.vtable.emits_own_hits) {
         try out.hits.append(.{
             .box = box,
             .vtable = obj.vtable,

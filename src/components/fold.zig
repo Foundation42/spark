@@ -58,14 +58,33 @@
 //! would move and nothing would reach the plane. One `State`, the
 //! document's, and the fold contributes only a registry scope.
 //!
-//! ## The cache-freeze trap this was built expecting
+//! ## The cache-freeze trap, and the door it came in by anyway
 //!
 //! `cache-freeze` is a taxonomy of four instances of one bug: a cached
 //! ancestor replays while everything under it works. "A region that
-//! exists but does not draw" is an obvious fifth home for it, so
-//! `contentVersion` aggregates its children's versions ALWAYS —
-//! including while folded, where by definition nothing is drawn. See
-//! `foldVersion`.
+//! exists but does not draw" is an obvious fifth home, so `foldVersion`
+//! aggregates the children's versions ALWAYS — including while folded,
+//! where by definition nothing is drawn.
+//!
+//! **And instance five arrived anyway, through the other door.** The
+//! prediction was about the CHILDREN. What was left out of the key was
+//! the fold's own VISIBILITY — the one thing here that is not a child's
+//! business. A header click flipped the flag and marked the host dirty,
+//! the frame was re-rendered, and the layout cache replayed the drawlist
+//! the fold had when it was shut. Chris, 2026-09-01: "if I try to open
+//! the Result sub-panel, it does not open. However, after clicking the
+//! group header, I now click on a button like normal … the Result panel
+//! now unfolds." A sibling's click bumped a CHILD's version,
+//! `foldVersion` XOR'd it in, the key finally moved, and the fold
+//! re-walked — arriving already open.
+//!
+//! So `onInput` bumps `version` as well as setting `dirty`, and the two
+//! are not the same thing: a redrawn frame and a re-walked block are
+//! different events, and only the second can change shape.
+//!
+//! The lesson for the next container: **asking "what bumps the key" of
+//! your children is half the question.** The other half is what bumps it
+//! when the container's OWN state changes and no child's did.
 
 const std = @import("std");
 const element = @import("../element.zig");
@@ -297,6 +316,18 @@ const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .on_input = onInput,
     .content_version = contentVersion,
+    // **Load-bearing.** A fold's box covers its header AND its content,
+    // and the walker's automatic Hit is appended after the component
+    // has run — so it lands after every Hit the children emitted, and
+    // `findHit` scans backwards. Without this the fold sits on top of
+    // everything inside it and the panel stops responding: Chris,
+    // 2026-09-01, "nothing is clickable. Buttons, expanders. Seems like
+    // something is eating the mouse on the entire panel."
+    //
+    // `layoutAndRender` appends the header's own Hit BEFORE walking the
+    // children, which is the order that makes a click on a control win
+    // and a click on the bar reach us.
+    .emits_own_hits = true,
 };
 
 /// Combine the fold's own version with its children's.
@@ -514,10 +545,35 @@ fn onInput(
             // rather than looking broken while writing correctly.
             c.open_self = !c.isOpen();
 
-            if (c.target.len == 0) {
-                if (c.spark) |sp| sp.host_state.dirty = true;
-                return;
-            }
+            // **Both of these, and the version is the one that bites.**
+            //
+            // `dirty` gets a frame drawn. `version` gets THIS BLOCK
+            // re-walked: the retained layout cache is keyed on
+            // `contentVersion`, so a fold whose open flag moved without
+            // its version moving replays the drawlist it had when it was
+            // shut. The frame is re-rendered and the section is still
+            // closed.
+            //
+            // That was `cache-freeze` instance five, and it came in
+            // through the door this component was NOT watching. The
+            // header predicts a folded child's writes going unnoticed and
+            // `foldVersion` aggregates children unconditionally to stop
+            // it — while the fold's OWN visibility, which is the one
+            // thing here that is not a child's business, was left out of
+            // the key entirely.
+            //
+            // Chris found it, and the report is the mechanism: "if I try
+            // to open the Result sub-panel, it does not open. However,
+            // after clicking the group header, I now click on a button
+            // like normal, or shadow from the previously opened panels,
+            // the Result panel now unfolds." A sibling's click bumps a
+            // CHILD's version, `foldVersion` XORs it in, the fold's key
+            // finally moves, and it re-walks — already open, because the
+            // flag flipped correctly two clicks ago.
+            c.version +%= 1;
+            if (c.spark) |sp| sp.host_state.dirty = true;
+
+            if (c.target.len == 0) return;
 
             const state: *state_mod.State = @ptrCast(@alignCast(state_ptr));
             // What we write is what we just DID, not the negation of
@@ -771,4 +827,66 @@ test "fold: chevron points right when closed and down when open" {
     try testing.expect(open[1][1] > open[2][1]);
     try testing.expectApproxEqAbs(open[0][1], open[2][1], 1e-4);
     try testing.expect(open[0][0] < open[2][0]);
+}
+
+test "fold: a header click MOVES the version, or the cache replays it shut" {
+    // `cache-freeze` instance five, and it came in through the door this
+    // component was not watching. `foldVersion` aggregates children
+    // unconditionally, which stops a folded child's writes going
+    // unnoticed — and the fold's OWN visibility, the one thing here that
+    // is not a child's business, was left out of the key entirely.
+    //
+    // The retained layout cache is keyed on `contentVersion`. A fold
+    // whose open flag moved without its version moving replays the
+    // drawlist it had when it was shut: the frame IS re-rendered, and
+    // the section is still closed.
+    //
+    // Chris found it, and the report is the mechanism: "if I try to open
+    // the Result sub-panel, it does not open. However, after clicking
+    // the group header, I now click on a button like normal, or shadow
+    // from the previously opened panels, the Result panel now unfolds."
+    // A sibling's click bumps a CHILD's version, `foldVersion` XORs it
+    // in, the key finally moves, and the fold re-walks — already open.
+    var c = testComponent();
+    try initStrings(&c);
+    defer freeStrings(&c);
+
+    const attrs = [_]components.Attr{.{ .key = "title", .value = "Result" }};
+    const spec: components.Spec = .{ .name = "fold", .attrs = &attrs };
+    try c.ingest(&spec);
+
+    var state = state_mod.State.init(testing.allocator);
+    defer state.deinit();
+    const click: element.InputEvent =
+        .{ .mouse_up = .{ .local = .{ 0, 0 }, .button = 0, .button_down = false } };
+
+    const shut = contentVersion(@ptrCast(&c));
+    try onInput(@ptrCast(&c), click, @ptrCast(&state));
+    const open = contentVersion(@ptrCast(&c));
+    try testing.expect(shut != open);
+
+    // And back again — a version that only ever moved on the FIRST click
+    // would fail closing just as surely as opening failed.
+    try onInput(@ptrCast(&c), click, @ptrCast(&state));
+    try testing.expect(contentVersion(@ptrCast(&c)) != open);
+}
+
+test "fold: a right-click moves neither the flag nor the version" {
+    // The other half of the gate above: bumping unconditionally would
+    // invalidate the block on every stray event that reaches it.
+    var c = testComponent();
+    try initStrings(&c);
+    defer freeStrings(&c);
+
+    const attrs = [_]components.Attr{.{ .key = "title", .value = "Result" }};
+    const spec: components.Spec = .{ .name = "fold", .attrs = &attrs };
+    try c.ingest(&spec);
+
+    var state = state_mod.State.init(testing.allocator);
+    defer state.deinit();
+
+    const before = contentVersion(@ptrCast(&c));
+    try onInput(@ptrCast(&c), .{ .mouse_up = .{ .local = .{ 0, 0 }, .button = 1, .button_down = false } }, @ptrCast(&state));
+    try testing.expectEqual(before, contentVersion(@ptrCast(&c)));
+    try testing.expect(c.isOpen());
 }

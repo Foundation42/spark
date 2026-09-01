@@ -379,6 +379,26 @@ pub const ElementVTable = struct {
     /// the host's input dispatcher can wire focus correctly.
     /// Default false — only text-bearing widgets (`:::input`) opt in.
     focusable: bool = false,
+    /// This component appends its OWN `Hit`s; the walker must not add
+    /// the whole-box one it normally does.
+    ///
+    /// **The bug this exists for.** The walker registers a Hit covering
+    /// the box a custom RETURNED, and appends it after the component has
+    /// run — so it lands after any hit the component's own children
+    /// emitted, and `findHit` scans backwards. For a leaf that is
+    /// harmless (`:::button` appends the same box twice and the second
+    /// wins). For a CONTAINER it is fatal: `:::fold` returns a box
+    /// covering its header AND its content, so the walker's hit sat on
+    /// top of every control inside it and the whole panel stopped
+    /// responding — Chris, 2026-09-01: "nothing is clickable. Buttons,
+    /// expanders. Seems like something is eating the mouse on the entire
+    /// panel."
+    ///
+    /// Any interactive custom whose box is bigger than the region it
+    /// actually wants to receive clicks in must set this and append its
+    /// own Hit. Setting it while appending nothing means a component
+    /// with an `on_input` that can never fire.
+    emits_own_hits: bool = false,
     /// Optional content-version getter for the retained layout cache
     /// (stage 14a). Returns a monotonic counter the component bumps
     /// on every internal mutation (chart append, LLM stream chunk,

@@ -316,16 +316,15 @@ fn layoutAndRender(
     };
     c.last_box = box;
 
-    // The WHOLE ROW is the hit target, label included. A 14px box is a
-    // 14px box however wide its label is, and every desktop toolkit
-    // settled this decades ago.
-    try out.hits.append(.{
-        .box = box,
-        .vtable = &vtable,
-        .ctx = @ptrCast(c),
-        .state = lc.state,
-    });
-
+    // No manual `out.hits.append` — the walker emits a Hit for any
+    // custom whose vtable has `on_input != null`, using the box we just
+    // returned, which is the WHOLE ROW, label included. That is what we
+    // want: a 14px box is a 14px target however wide its label is, and
+    // every desktop toolkit settled that decades ago.
+    //
+    // A container would have to opt out here (see
+    // `ElementVTable.emits_own_hits`) because its box covers its
+    // children. A leaf's box covers only itself.
     return box;
 }
 
