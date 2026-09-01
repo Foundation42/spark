@@ -8,18 +8,43 @@
 //!     :::input {target=#chat_local action=start placeholder="Ask…" width=480}
 //!     :::
 //!
-//! - `target` (required) — `#id` of the component to dispatch onto.
-//!   `#` prefix optional; stripped.
-//! - `action` (required) — verb passed to the target's
-//!   `Factory.handle_update(ctx, action, body)`. Pair this with the
-//!   already-supported `start` action on `:::llm-stream` (which now
+//! - `target` (required) — either:
+//!     - `#id` (or bare `id`) of a component → fires
+//!       `registry.handleUpdate(id, action, buffer)`, OR
+//!     - `state.path` → writes the buffer into the scope-local state at
+//!       `path`. `action=` is ignored on this branch.
+//! - `action` (required for component-target) — verb passed to the
+//!   target's `Factory.handle_update(ctx, action, body)`. Pair this with
+//!   the already-supported `start` action on `:::llm-stream` (which now
 //!   replaces its prompt from `body` when body is non-empty — see
 //!   `llm_stream.handleUpdate`).
+//!
 //! - `placeholder` (optional) — greyed-out text shown when the
 //!   buffer is empty. Default `""`.
 //! - `initial` (optional) — pre-fill text. Default `""`.
 //! - `width`  (optional) — pixel literal or `100%`. Default 480.
-//! - `height` (optional) — pixel literal. Default 36.
+//! - `height` (optional) — pixel literal. Default 24, matching
+//!   `:::button`, because a field and a key now sit side by side in a
+//!   panel and a field half again as tall reads as a different
+//!   vocabulary. A chat prompt wants more and asks for it.
+//! - `color` / `border` / `text` / `active_border` (optional) — the
+//!   field's palette, same shape as `:::button`'s and `:::slider`'s.
+//!
+//! ### The state arm, and why it is the same one `:::button` grew
+//!
+//! `:::button` has fired at `state.path` since stage 13b and `:::input`
+//! could only reach a component, which made the field the one control in
+//! the vocabulary that could not drive a knob. A HUD panel needs exactly
+//! that: `target=state.exposure` with `exposure: mirror
+//! render/grade/exposure` in the frontmatter puts a typed number on the
+//! plane through machinery that already exists, with no new verb and no
+//! console line in between.
+//!
+//! A field bound to the path it writes (`initial=${state.x}
+//! target=state.x`) is its own subscriber, which is the re-entrancy that
+//! crashed the trackball — `ingest` routes through
+//! `component.adoptString` for that reason, and `handleKey` touches
+//! nothing after the write.
 //!
 //! ### Focus + keyboard
 //!
@@ -91,6 +116,16 @@ const Component = struct {
     buffer: std.ArrayListUnmanaged(u8) = .{},
     cursor: usize = 0,
 
+    /// The four colours a field wears. Attributes for the reason
+    /// `:::slider`'s and `:::button`'s are: a shell that themes its keys
+    /// and not its fields is a shell with one rule and one exception.
+    color: [4]f32 = FIELD_BG,
+    border: [4]f32 = FIELD_BORDER,
+    text: [4]f32 = TEXT_COLOR,
+    /// The border while focused. Amber by default, because it is the
+    /// shell's one lit colour — see the constant.
+    active_border: [4]f32 = FIELD_BORDER_FOCUSED,
+
     focused: bool = false,
     last_box: element.Box = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     /// Captured at create time. `onInput` reaches the registry +
@@ -115,6 +150,14 @@ const Component = struct {
                 placeholder_raw = attr.value;
             } else if (std.mem.eql(u8, attr.key, "initial")) {
                 initial_raw = attr.value;
+            } else if (std.mem.eql(u8, attr.key, "color")) {
+                if (box_helpers.parseColor(attr.value)) |v| self.color = v;
+            } else if (std.mem.eql(u8, attr.key, "border")) {
+                if (box_helpers.parseColor(attr.value)) |v| self.border = v;
+            } else if (std.mem.eql(u8, attr.key, "text")) {
+                if (box_helpers.parseColor(attr.value)) |v| self.text = v;
+            } else if (std.mem.eql(u8, attr.key, "active_border")) {
+                if (box_helpers.parseColor(attr.value)) |v| self.active_border = v;
             } else if (std.mem.eql(u8, attr.key, "width")) {
                 if (box_helpers.parseLength(attr.value)) |l| width_opt = l;
             } else if (std.mem.eql(u8, attr.key, "height")) {
@@ -128,18 +171,23 @@ const Component = struct {
         }
 
         const target_full = target_raw orelse return Error.InputMissingTarget;
-        const action = action_raw orelse return Error.InputMissingAction;
         const target = if (target_full.len > 0 and target_full[0] == '#')
             target_full[1..]
         else
             target_full;
 
-        const new_target = try a.dupe(u8, target);
-        errdefer a.free(new_target);
-        const new_action = try a.dupe(u8, action);
-        errdefer a.free(new_action);
-        const new_placeholder = try a.dupe(u8, placeholder_raw);
-        errdefer a.free(new_placeholder);
+        // `action=` is required for component-target dispatch — the
+        // callee's `handle_update` arms switch on it. State-target
+        // dispatch ignores it: there is a single primitive verb (write
+        // the buffer into `state.path`), so an absent action is not a
+        // missing argument, it is an argument that has no meaning here.
+        // Exactly `:::button`'s rule, and it has to be exactly that rule
+        // or the two controls disagree about their own grammar.
+        const is_state_target = std.mem.startsWith(u8, target, "state.");
+        const action = if (is_state_target)
+            action_raw orelse ""
+        else
+            action_raw orelse return Error.InputMissingAction;
 
         // Only seed buffer from `initial` on first ingest (i.e. when
         // buffer is empty AND cursor is 0). A subsequent attr update
@@ -151,12 +199,14 @@ const Component = struct {
             }
         }
 
-        a.free(self.target);
-        a.free(self.action);
-        a.free(self.placeholder);
-        self.target = new_target;
-        self.action = new_action;
-        self.placeholder = new_placeholder;
+        // `adoptString`, not free-and-dupe: a field with
+        // `target=state.x` and `initial=${state.x}` subscribes to the
+        // path it writes, and `State.set` notifies synchronously — so
+        // Enter re-enters this function while `handleKey` is still
+        // holding a slice of `self.target`. See `component.adoptString`.
+        try component_mod.adoptString(a, &self.target, target);
+        try component_mod.adoptString(a, &self.action, action);
+        try component_mod.adoptString(a, &self.placeholder, placeholder_raw);
         self.width = width_opt;
         self.height = height_opt;
     }
@@ -172,7 +222,7 @@ fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const co
         .action = try allocator.dupe(u8, ""),
         .placeholder = try allocator.dupe(u8, ""),
         .width = .{ .pixels = 480 },
-        .height = 36,
+        .height = DEFAULT_HEIGHT,
     };
     try c.ingest(spec);
     return .{ .vtable = &vtable, .ctx = @ptrCast(c) };
@@ -206,17 +256,44 @@ const vtable: element.ElementVTable = .{
 
 // ── Visual constants ────────────────────────────────────────────────
 
-const FIELD_BG: [4]f32 = .{ 0.10, 0.12, 0.16, 0.90 };
-const FIELD_BG_FOCUSED: [4]f32 = .{ 0.13, 0.16, 0.22, 0.95 };
-const FIELD_BORDER: [4]f32 = .{ 0.36, 0.42, 0.50, 0.90 };
-const FIELD_BORDER_FOCUSED: [4]f32 = .{ 0.45, 0.68, 0.95, 1.0 };
-const TEXT_COLOR: [4]f32 = .{ 0.95, 0.96, 0.98, 1.0 };
-const PLACEHOLDER_COLOR: [4]f32 = .{ 0.55, 0.60, 0.66, 1.0 };
-const CARET_COLOR: [4]f32 = .{ 0.92, 0.95, 1.0, 1.0 };
-const BORDER_PX: f32 = 1.5;
-const BORDER_PX_FOCUSED: f32 = 2.0;
-const RADIUS: f32 = 6;
-const PAD_X: f32 = 12;
+// A field is CUT from the panel, the same way a groove and a key are:
+// neutral darkening, black edge, square. It was a rounded box with a
+// blue-grey border and a blue focus ring — the web-form look the buttons
+// were sent away for on 2026-09-01, still sitting next to them.
+//
+// The fill is a neutral darkening rather than a colour of its own, so a
+// field takes the tint of whatever panel it is on. Same rule as
+// `:::button`'s fill and `:::slider`'s recess.
+const FIELD_BG: [4]f32 = .{ 0.0, 0.0, 0.0, 0.34 };
+/// A focused field sits a little deeper. The state is carried by the
+/// BORDER — this is the supporting half, and pushing it further would
+/// make focus read as "disabled".
+const FIELD_BG_FOCUSED: [4]f32 = .{ 0.0, 0.0, 0.0, 0.42 };
+const FIELD_BORDER: [4]f32 = .{ 0.02, 0.02, 0.03, 0.92 };
+/// Focus is the shell's ONE lit colour — the same amber as the grip, the
+/// dial's home mark and a pressed key. "This one is live" is one colour
+/// everywhere or it is decoration.
+const FIELD_BORDER_FOCUSED: [4]f32 = .{ 1.0, 0.68, 0.0, 0.90 };
+const TEXT_COLOR: [4]f32 = .{ 0.88, 0.89, 0.91, 1.0 };
+/// Warm-neutral rather than blue-grey: on the panel ground `#3b3434`, a
+/// cool placeholder reads as a different material.
+const PLACEHOLDER_COLOR: [4]f32 = .{ 0.52, 0.50, 0.49, 1.0 };
+const CARET_COLOR: [4]f32 = .{ 0.95, 0.95, 0.96, 1.0 };
+/// A catch-light along the inside of the BOTTOM edge — the inverse of
+/// `:::button`'s top hairline, and inverted for the reason the button's
+/// exists at all: a key is raised so its light lands on top, a field is
+/// a hole so its light lands at the bottom. Without this the two are the
+/// same rectangle.
+const FIELD_BOTTOM_LIGHT: [4]f32 = .{ 1.0, 1.0, 1.0, 0.08 };
+/// Matched to `:::button`'s, because a field and a key sit side by side
+/// in a panel now and a field half again as tall reads as a different
+/// vocabulary. Was 36 — a chat prompt's height, from when the only
+/// `:::input` in existence was one.
+const DEFAULT_HEIGHT: f32 = 24;
+const BORDER_PX: f32 = 1.0;
+const BORDER_PX_FOCUSED: f32 = 1.5;
+const RADIUS: f32 = 1.5;
+const PAD_X: f32 = 9;
 const CARET_W: f32 = 2.0;
 const BLINK_PERIOD_MS: i64 = 1000; // half on, half off
 
@@ -243,8 +320,8 @@ fn layoutAndRender(
     const h = c.height;
 
     const border_px = if (c.focused) BORDER_PX_FOCUSED else BORDER_PX;
-    const border_rgba = if (c.focused) FIELD_BORDER_FOCUSED else FIELD_BORDER;
-    const bg_rgba = if (c.focused) FIELD_BG_FOCUSED else FIELD_BG;
+    const border_rgba = if (c.focused) c.active_border else c.border;
+    const bg_rgba = if (c.focused) FIELD_BG_FOCUSED else c.color;
 
     try out.appendQuad(lc, .{
         .dst_pos = .{ origin[0], origin[1] },
@@ -258,6 +335,15 @@ fn layoutAndRender(
         .color = bg_rgba,
         .radius = @max(0, RADIUS - border_px),
     });
+    // The catch-light on the inside of the bottom edge. Inset by the
+    // border on both sides so it stops where the border does rather than
+    // running out over the rounded corners.
+    try out.appendQuad(lc, .{
+        .dst_pos = .{ origin[0] + border_px, origin[1] + h - border_px - 1 },
+        .dst_size = .{ w - 2 * border_px, 1 },
+        .color = FIELD_BOTTOM_LIGHT,
+        .radius = 0,
+    });
 
     const baseline_y = origin[1] + (h - m.line_height) * 0.5 + m.ascender;
     const text_x = origin[0] + PAD_X;
@@ -265,7 +351,7 @@ fn layoutAndRender(
     // Draw buffer (or placeholder if empty).
     const show_buffer = c.buffer.items.len > 0;
     const display_text: []const u8 = if (show_buffer) c.buffer.items else c.placeholder;
-    const display_color: [4]f32 = if (show_buffer) TEXT_COLOR else PLACEHOLDER_COLOR;
+    const display_color: [4]f32 = if (show_buffer) c.text else PLACEHOLDER_COLOR;
 
     var prefix_w: f32 = 0;
     if (display_text.len > 0) {
@@ -352,7 +438,7 @@ const KEY_KP_ENTER: i32 = 335;
 fn onInput(
     ctx: *anyopaque,
     event: element.InputEvent,
-    _: *anyopaque,
+    state_ptr: *anyopaque,
 ) anyerror!void {
     const c: *Component = @ptrCast(@alignCast(ctx));
     switch (event) {
@@ -369,7 +455,7 @@ fn onInput(
             if (c.spark) |sp| sp.host_state.dirty = true;
         },
         .key_down => |k| {
-            try handleKey(c, k);
+            try handleKey(c, k, state_ptr);
         },
         else => {},
     }
@@ -393,7 +479,7 @@ fn insertCodepoint(c: *Component, cp: u32) !void {
     c.cursor += n;
 }
 
-fn handleKey(c: *Component, k: element.KeyEvent) !void {
+fn handleKey(c: *Component, k: element.KeyEvent, state_ptr: *anyopaque) !void {
     switch (k.key) {
         KEY_BACKSPACE => {
             if (c.cursor == 0) return;
@@ -439,7 +525,33 @@ fn handleKey(c: *Component, k: element.KeyEvent) !void {
             if (c.spark) |sp| sp.host_state.dirty = true;
         },
         KEY_ENTER, KEY_KP_ENTER => {
-            if (c.target.len == 0 or c.action.len == 0) return;
+            if (c.target.len == 0) return;
+
+            // State-target: `target=state.path` writes the buffer into
+            // the scope-local state — the same primitive `:::button`
+            // fires, with the typed text where the button's constant
+            // `body=` would be. A field inside a child
+            // `:::embedded-document` therefore mutates CHILD state, not
+            // the host's, which is what the walker's `Hit.state` is for.
+            if (std.mem.startsWith(u8, c.target, "state.")) {
+                const key = c.target["state.".len..];
+                if (key.len == 0) return;
+                const state: *state_mod.State = @ptrCast(@alignCast(state_ptr));
+
+                // Nothing may touch `c` after this line. `State.set`
+                // notifies synchronously, so a field bound to the path
+                // it writes re-enters its own `ingest` from inside this
+                // call — `adoptString` keeps that from freeing `key`
+                // mid-`set`, and returning immediately keeps us from
+                // needing anything more than that.
+                state.set(key, c.buffer.items) catch |e| {
+                    std.log.warn(":::input: state.set failed: err={s}", .{@errorName(e)});
+                };
+                return;
+            }
+
+            // Component-target.
+            if (c.action.len == 0) return;
             const sp = c.spark orelse return;
             sp.registry.handleUpdate(c.target, c.action, c.buffer.items) catch |e| {
                 std.log.warn(":::input: dispatch failed: target=#{s} action={s} err={s}", .{
@@ -628,4 +740,90 @@ test "input: initial attr seeds buffer + cursor" {
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
     try testing.expectEqualStrings("preset", c.buffer.items);
     try testing.expectEqual(@as(usize, 6), c.cursor);
+}
+
+test "input: state-target writes the buffer on Enter" {
+    // The arm that made `:::input` able to drive a knob. Before it, a
+    // field could only reach a component, so the one control shaped
+    // like "type a number here" was the one control that could not put
+    // a number anywhere.
+    const attrs = [_]components.Attr{
+        .{ .key = "target", .value = "state.exposure" },
+    };
+    const spec: components.Spec = .{ .name = "input", .attrs = &attrs };
+    const inst = try create(&_test_spark, testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+
+    var state = state_mod.State.init(testing.allocator);
+    defer state.deinit();
+
+    for ("1.85") |ch| {
+        try onInput(inst.ctx, .{ .char_input = ch }, @ptrCast(&state));
+    }
+    // Nothing lands until Enter — a field that wrote per keystroke would
+    // push "1", "1.", "1.8" at the plane on the way to "1.85".
+    try testing.expect(state.get("exposure") == null);
+
+    try onInput(inst.ctx, .{ .key_down = .{ .key = KEY_ENTER, .mods = 0 } }, @ptrCast(&state));
+    try testing.expectEqualStrings("1.85", state.get("exposure").?);
+    try testing.expect(state.dirty);
+}
+
+test "input: state-target accepts a missing action" {
+    // `action=` names a verb on a component's `handle_update`. A state
+    // write has one verb and no callee, so requiring it would be
+    // requiring an argument with nothing to mean — and `:::button`
+    // already settled that. The two grammars have to agree.
+    const attrs = [_]components.Attr{
+        .{ .key = "target", .value = "state.foo" },
+    };
+    const spec: components.Spec = .{ .name = "input", .attrs = &attrs };
+    const inst = try create(&_test_spark, testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+    const c: *Component = @ptrCast(@alignCast(inst.ctx));
+    try testing.expectEqualStrings("state.foo", c.target);
+    try testing.expectEqualStrings("", c.action);
+}
+
+test "input: component-target still demands an action" {
+    // The other half of the rule above: relaxing it for `state.` must
+    // not relax it for everyone. A `#chat` with no verb dispatches
+    // nothing and looks like it works.
+    const attrs = [_]components.Attr{
+        .{ .key = "target", .value = "#chat" },
+    };
+    const spec: components.Spec = .{ .name = "input", .attrs = &attrs };
+    try testing.expectError(Error.InputMissingAction, create(&_test_spark, testing.allocator, &spec));
+}
+
+test "input: an ingest that changes nothing frees nothing" {
+    // Same gate as `:::button`'s, for the same crash. A field with
+    // `target=state.x initial=${state.x}` is its own subscriber, and
+    // `State.set` notifies synchronously — so Enter re-enters this
+    // ingest while `handleKey` still holds a slice of `self.target`.
+    const attrs = [_]components.Attr{
+        .{ .key = "target", .value = "state.x" },
+        .{ .key = "placeholder", .value = "1.0" },
+    };
+    const spec: components.Spec = .{ .name = "input", .attrs = &attrs };
+    const inst = try create(&_test_spark, testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+    const c: *Component = @ptrCast(@alignCast(inst.ctx));
+
+    const target_ptr = c.target.ptr;
+    const placeholder_ptr = c.placeholder.ptr;
+    try update(inst.ctx, &spec);
+    try testing.expectEqual(target_ptr, c.target.ptr);
+    try testing.expectEqual(placeholder_ptr, c.placeholder.ptr);
+
+    // And the guard still lets a real edit through — a guard that never
+    // replaces breaks hot reload, which is worse than the crash.
+    const attrs2 = [_]components.Attr{
+        .{ .key = "target", .value = "state.y" },
+        .{ .key = "placeholder", .value = "2.0" },
+    };
+    const spec2: components.Spec = .{ .name = "input", .attrs = &attrs2 };
+    try update(inst.ctx, &spec2);
+    try testing.expectEqualStrings("state.y", c.target);
+    try testing.expectEqualStrings("2.0", c.placeholder);
 }

@@ -24,8 +24,10 @@ test {
     _ = @import("components/box.zig");
     _ = @import("components/button.zig");
     _ = @import("components/chart.zig");
+    _ = @import("components/checkbox.zig");
     _ = @import("components/embedded_document.zig");
     _ = @import("components/flex.zig");
+    _ = @import("components/fold.zig");
     _ = @import("components/grid.zig");
     _ = @import("components/handle.zig");
     _ = @import("components/grip.zig");
@@ -62,6 +64,7 @@ test {
     // jobs moved to `common`, which runs its own suite (`zig build test`
     // there). Re-importing it here would run those tests twice and report
     // coverage this repo does not own.
+    _ = @import("element_layout.zig");
     _ = @import("layout_cache.zig");
     _ = @import("layout/kiwi/strength.zig");
     _ = @import("layout/kiwi/term.zig");

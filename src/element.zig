@@ -1466,9 +1466,26 @@ pub const Theme = struct {
     quote_bar_color: [4]f32 = .{ 0.45, 0.55, 0.75, 0.6 },
     quote_bar_width: f32 = 3,
 
-    thematic_break_color: [4]f32 = .{ 0.45, 0.50, 0.62, 0.7 },
+    /// A divider is an ENGRAVED SEAM, not a drawn rule: one dark row
+    /// with one light row directly beneath it. Same two-row idiom
+    /// `relief.groove` uses for a slider recess, and for the same
+    /// reason — a mid-grey line painted ON a panel reads as a web
+    /// `<hr>` dropped onto a grading desk, which is the complaint the
+    /// blue buttons drew on 2026-09-01. A cut reads as part of the
+    /// surface it is cut into.
+    ///
+    /// Neutral rather than tinted, so a divider takes the colour of
+    /// whatever panel it sits on — the rule `:::slider`'s recess and
+    /// `:::button`'s fill already follow.
+    thematic_break_color: [4]f32 = .{ 0, 0, 0, 0.42 },
+    /// The catch-light under the seam. Nearly nothing on purpose: at
+    /// panel scale it is the whole difference between a cut and a
+    /// painted line. Alpha 0 drops the row rather than emitting an
+    /// invisible one — which is also how a host asks for the old
+    /// single-rule look back.
+    thematic_break_light: [4]f32 = .{ 1, 1, 1, 0.055 },
     thematic_break_height: f32 = 12,
-    thematic_break_thickness: f32 = 2,
+    thematic_break_thickness: f32 = 1,
 
     /// Link underline thickness as a fraction of em size. The walker
     /// multiplies by the run's dominant `displayPx` so underlines

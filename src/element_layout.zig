@@ -648,8 +648,45 @@ fn layoutQuote(
     };
 }
 
-/// Thematic break — markdown's `---`. Emits a thin horizontal quad
-/// spanning the available width, centred vertically within
+/// Where a divider's two rows land. Factored out of the draw so the
+/// geometry has somewhere to be checked — the drawing itself needs a
+/// font stack and two atlases to reach, and a rule nobody can gate is
+/// a rule that drifts.
+pub const SeamRows = struct {
+    /// Top of the dark row — the cut.
+    dark_y: f32,
+    /// Top of the catch-light row, directly under it.
+    light_y: f32,
+    thickness: f32,
+    /// False when the theme's catch-light is fully transparent. The
+    /// row is then not emitted at all rather than emitted invisible,
+    /// same discipline as `relief.arc` dropping a zero feather.
+    has_light: bool,
+};
+
+/// Centre a two-row seam in a band of `height`, snapped to whole
+/// pixels.
+///
+/// **The rounding is the point.** A 1px row landing on a half-pixel is
+/// the one case where the quad shader's AA works against us: it spreads
+/// the seam across two rows at half strength each and the cut goes soft
+/// and grey — which is exactly the look this replaced. Centring is done
+/// on the PAIR, not on the dark row, or the light row pushes the visual
+/// centre down by half a pixel.
+pub fn seamRows(origin_y: f32, height: f32, thickness: f32, light_alpha: f32) SeamRows {
+    const has_light = light_alpha > 0;
+    const total = if (has_light) thickness * 2 else thickness;
+    const dark_y = @round(origin_y + (height - total) * 0.5);
+    return .{
+        .dark_y = dark_y,
+        .light_y = dark_y + thickness,
+        .thickness = thickness,
+        .has_light = has_light,
+    };
+}
+
+/// Thematic break — markdown's `---`. Emits the seam described by
+/// `seamRows` across the available width, centred vertically within
 /// `theme.thematic_break_height`. Falls back to a small fixed width
 /// when constraints are unbounded.
 fn layoutThematicBreak(
@@ -659,15 +696,28 @@ fn layoutThematicBreak(
     out: *element.DrawList,
 ) !element.Box {
     const h = ctx.theme.thematic_break_height;
-    const thickness = ctx.theme.thematic_break_thickness;
     const w: f32 = if (std.math.isFinite(constraints.max_w)) constraints.max_w else 320.0;
+    const rows = seamRows(
+        origin[1],
+        h,
+        ctx.theme.thematic_break_thickness,
+        ctx.theme.thematic_break_light[3],
+    );
 
     try out.appendQuad(ctx, .{
-        .dst_pos = .{ origin[0], origin[1] + (h - thickness) * 0.5 },
-        .dst_size = .{ w, thickness },
+        .dst_pos = .{ origin[0], rows.dark_y },
+        .dst_size = .{ w, rows.thickness },
         .color = ctx.theme.thematic_break_color,
         .radius = 0,
     });
+    if (rows.has_light) {
+        try out.appendQuad(ctx, .{
+            .dst_pos = .{ origin[0], rows.light_y },
+            .dst_size = .{ w, rows.thickness },
+            .color = ctx.theme.thematic_break_light,
+            .radius = 0,
+        });
+    }
 
     return .{
         .x = origin[0],
@@ -2365,4 +2415,49 @@ fn emitInlineObject(
             .focusable = obj.vtable.focusable,
         });
     }
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "seam: two rows, dark above light, pair centred in the band" {
+    // The old divider was ONE quad centred on its own thickness. Two
+    // rows centred the same way would sit half a row low — this is the
+    // arithmetic that has to survive.
+    const r = seamRows(0, 12, 1, 0.055);
+    try testing.expect(r.has_light);
+    try testing.expectEqual(@as(f32, 5), r.dark_y);
+    try testing.expectEqual(@as(f32, 6), r.light_y);
+    // Cut above catch-light, always: a light row above a dark one is a
+    // ridge, not a groove, and reads as the surface bulging out.
+    try testing.expect(r.light_y > r.dark_y);
+    // The pair straddles the band's centre (6).
+    try testing.expectEqual(@as(f32, 6), (r.dark_y + r.light_y + r.thickness) * 0.5);
+}
+
+test "seam: a transparent catch-light drops the row, not draws it clear" {
+    const r = seamRows(0, 12, 1, 0);
+    try testing.expect(!r.has_light);
+    // And the single remaining row re-centres on ITSELF (ideal 5.5,
+    // snapped to 6) rather than staying where the pair would have put
+    // it — otherwise asking for the old look would also move it.
+    try testing.expectEqual(@as(f32, 6), r.dark_y);
+}
+
+test "seam: rows snap to whole pixels off a fractional origin" {
+    // A hairline on a half-pixel is the one case the quad shader's AA
+    // hurts: it spreads one row over two at half strength each and the
+    // cut goes soft and grey, which is the look the seam replaced.
+    const r = seamRows(20.3, 12, 1, 0.055);
+    try testing.expectEqual(@as(f32, 25), r.dark_y);
+    try testing.expectEqual(@as(f32, 26), r.light_y);
+
+    // Including when the ideal position is itself a tie. `@round`
+    // breaks half away from zero — a choice, but a CONSISTENT one, and
+    // consistency is the whole requirement: two dividers a screen apart
+    // must not land on opposite sides of the same fraction.
+    const tie = seamRows(20.5, 12, 1, 0.055);
+    try testing.expectEqual(@as(f32, 26), tie.dark_y);
+    try testing.expectEqual(tie.dark_y, @round(tie.dark_y));
 }

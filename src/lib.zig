@@ -150,6 +150,7 @@ pub const components = struct {
     pub const box = @import("components/box.zig");
     pub const button = @import("components/button.zig");
     pub const chart = @import("components/chart.zig");
+    pub const checkbox = @import("components/checkbox.zig");
     /// Shared grading maths — HSV, and the balance the two colour
     /// widgets are two pictures of. No directive of its own.
     pub const color = @import("components/color.zig");
@@ -160,6 +161,7 @@ pub const components = struct {
     pub const dot = @import("components/dot.zig");
     pub const embedded_document = @import("components/embedded_document.zig");
     pub const flex = @import("components/flex.zig");
+    pub const fold = @import("components/fold.zig");
     pub const gh_ref = @import("components/gh_ref.zig");
     pub const grid = @import("components/grid.zig");
     pub const grip = @import("components/grip.zig");
@@ -222,10 +224,14 @@ pub fn installCoreComponents(spark: *Spark) !void {
     try components.gh_ref.install(spark);
     try components.ago.install(spark);
     try components.button.install(spark);
+    // Shares `button.isTruthy` and the flip's `"1"`/`"0"` spelling, so
+    // it registers next to it.
+    try components.checkbox.install(spark);
     try components.handle.install(spark);
     try components.grip.install(spark);
     try components.embedded_document.install(spark);
     try components.flex.install(spark);
+    try components.fold.install(spark);
     try components.grid.install(spark);
     try components.input.install(spark);
     try components.svg.install(spark);

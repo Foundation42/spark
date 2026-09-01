@@ -24,6 +24,17 @@
 //! - `height` (optional) — pixel literal. Default 24.
 //! - `radius` (optional) — corner radius. Default 1.5, i.e. square.
 //!
+//! ### The three ways a key says something
+//!
+//! - `active=` — a truthiness. "Is this thing ON." A toggle, or a dock
+//!   button: `active=${state.up}`.
+//! - `active_when=` — a value compared against `body=`. "Is this the
+//!   CHOSEN one." A radio row: every key carries the same
+//!   `active_when=${state.surf}` and a different `body=`.
+//! - `flip=` — writes the negation of what is at `target` instead of
+//!   `body=`, which is what lets an on/off key turn a thing off as well
+//!   as on.
+//!
 //! ### The look
 //!
 //! A key on an instrument: square, dark, black-edged, quiet until it is
@@ -102,6 +113,18 @@ pub fn isTruthy(value: []const u8) bool {
     return true;
 }
 
+/// How a flag is SPELLED when written back into state.
+///
+/// One function so `:::button {flip}`, `:::checkbox` and `:::fold` agree,
+/// because the spelling is load-bearing rather than cosmetic:
+/// matryoshka's `Panel.writeBack` parses document state with `parseFloat`
+/// before pushing at the plane, so a `"true"` is a write that silently
+/// never lands. `isTruthy` still READS the word forms, because a document
+/// may have authored one by hand.
+pub fn flagValue(on: bool) []const u8 {
+    return if (on) "1" else "0";
+}
+
 pub const factory: component_mod.Factory = .{
     .create = create,
     .update = update,
@@ -134,6 +157,21 @@ const Component = struct {
     /// shaped in the same font as the label, is the whole of what a dock
     /// button actually wants.
     icon: []u8,
+    /// Write the NEGATION of what is at `target` instead of `body`.
+    ///
+    /// The missing half of a toggle button. `body=` is a CONSTANT, so an
+    /// on/off pair could light its ON half and never its OFF half —
+    /// `hud/fx.md` is the worked example and says so in its own
+    /// frontmatter. `flip` reads what is there at click time and writes
+    /// the other one, which is the whole primitive a checkbox needs too.
+    ///
+    /// It writes `"1"` / `"0"`, never `"true"` / `"false"`, and that is
+    /// not a spelling preference: matryoshka's `Panel.writeBack` parses
+    /// document state with `parseFloat` before pushing it at the plane,
+    /// so a `"true"` is a write that silently never reaches anything.
+    /// `isTruthy` still READS the word forms, because a document may
+    /// have authored one by hand.
+    flip: bool = false,
     /// Whether to draw the PRESSED look.
     ///
     /// Read from an attribute rather than tracked internally, because
@@ -144,6 +182,22 @@ const Component = struct {
     /// button that lights up because its applet is open, including when
     /// something else opened it.
     active: bool = false,
+    /// Light the key when this value EQUALS its `body=`.
+    ///
+    /// The missing piece of a RADIO ROW. `active=` takes a truthiness,
+    /// which answers "is this thing on" — the right question for a
+    /// toggle and the wrong one for one-of-N, where every key in the row
+    /// would light at once. `active_when=${state.surf}` on a key whose
+    /// `body=albedo` lights exactly when the thing being selected IS
+    /// albedo, and the row becomes a control that shows its own value.
+    ///
+    /// `hud/xray.md` has thirty-four buttons in eight such rows and
+    /// until this existed not one of them could say which was chosen;
+    /// the panel had to spell it out in a sentence underneath instead.
+    ///
+    /// A row of these is also what a combo box degrades to, and worth
+    /// weighing before building an overlay layer for the real thing.
+    active_when: []u8,
     /// The six colours a key wears — resting fill/border/ink, then the
     /// same three for pressed. Attributes for the reason `:::slider`'s
     /// are: a shell that themes its sliders and not its buttons is a
@@ -175,6 +229,8 @@ const Component = struct {
         var cmd_raw: []const u8 = "";
         var icon_raw: []const u8 = "";
         var active_opt: bool = false;
+        var active_when_raw: []const u8 = "";
+        var flip_opt: bool = false;
         var width_opt: ?box_helpers.Length = self.width;
         var height_opt: f32 = self.height;
         var radius_opt: f32 = self.radius;
@@ -194,6 +250,10 @@ const Component = struct {
                 icon_raw = attr.value;
             } else if (std.mem.eql(u8, attr.key, "active")) {
                 active_opt = isTruthy(attr.value);
+            } else if (std.mem.eql(u8, attr.key, "active_when")) {
+                active_when_raw = attr.value;
+            } else if (std.mem.eql(u8, attr.key, "flip")) {
+                flip_opt = isTruthy(attr.value);
             } else if (std.mem.eql(u8, attr.key, "color")) {
                 if (box_helpers.parseColor(attr.value)) |v| self.color = v;
             } else if (std.mem.eql(u8, attr.key, "border")) {
@@ -249,33 +309,38 @@ const Component = struct {
         else
             action_raw orelse return Error.ButtonMissingAction;
 
-        const new_label = try a.dupe(u8, label);
-        errdefer a.free(new_label);
-        const new_target = try a.dupe(u8, target);
-        errdefer a.free(new_target);
-        const new_action = try a.dupe(u8, action);
-        errdefer a.free(new_action);
-        const new_body = try a.dupe(u8, body_raw);
-        errdefer a.free(new_body);
-        const new_cmd = try a.dupe(u8, cmd_raw);
-        errdefer a.free(new_cmd);
-        const new_icon = try a.dupe(u8, icon_raw);
-        errdefer a.free(new_icon);
-
-        // Old field cleanup — only after every new dupe succeeded.
-        a.free(self.label);
-        a.free(self.target);
-        a.free(self.action);
-        a.free(self.body);
-        a.free(self.cmd);
-        a.free(self.icon);
-        self.label = new_label;
-        self.target = new_target;
-        self.action = new_action;
-        self.body = new_body;
-        self.cmd = new_cmd;
-        self.icon = new_icon;
-        self.active = active_opt;
+        // `adoptString` rather than free-and-dupe, because a toggle
+        // button is its own subscriber: `target=state.x flip=1
+        // active=${state.x}` writes a path whose value it also
+        // interpolates, and `State.set` notifies synchronously, so the
+        // click re-enters this function while `onInput` is still
+        // holding a slice of `self.target`. Unconditional frees are how
+        // the trackball crashed. See `component.adoptString`.
+        //
+        // What remains exposed is a target or body that is ITSELF
+        // interpolated from the path being written (`body=${state.mode}`
+        // on `target=state.mode`) — then the text genuinely differs and
+        // the free is genuine. `flip` sidesteps it by writing from a
+        // stack buffer rather than from `self.body`; nobody has written
+        // the `target=state.${...}` form and it would want its own fix.
+        try component_mod.adoptString(a, &self.label, label);
+        try component_mod.adoptString(a, &self.target, target);
+        try component_mod.adoptString(a, &self.action, action);
+        try component_mod.adoptString(a, &self.body, body_raw);
+        try component_mod.adoptString(a, &self.cmd, cmd_raw);
+        try component_mod.adoptString(a, &self.icon, icon_raw);
+        try component_mod.adoptString(a, &self.active_when, active_when_raw);
+        // Either route lights the key. `active=` answers "is this on",
+        // `active_when=` answers "is this the chosen one"; a key that
+        // wanted both would be a toggle inside a radio row, which is not
+        // a thing, so OR is the whole of the interaction.
+        //
+        // An empty `body=` never matches, or a row of `cmd=`-only keys
+        // (which carry no body) would all light the moment anything
+        // resolved `active_when` to the empty string.
+        self.active = active_opt or
+            (body_raw.len > 0 and std.mem.eql(u8, active_when_raw, body_raw));
+        self.flip = flip_opt;
         self.width = width_opt;
         self.height = height_opt;
         self.radius = radius_opt;
@@ -295,6 +360,7 @@ fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const co
         .body = try allocator.dupe(u8, ""),
         .cmd = try allocator.dupe(u8, ""),
         .icon = try allocator.dupe(u8, ""),
+        .active_when = try allocator.dupe(u8, ""),
         .width = null,
         .height = BUTTON_DEFAULT_HEIGHT,
     };
@@ -315,6 +381,7 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     allocator.free(c.body);
     allocator.free(c.cmd);
     allocator.free(c.icon);
+    allocator.free(c.active_when);
     allocator.destroy(c);
 }
 
@@ -553,8 +620,26 @@ fn onInput(
                 const key = c.target["state.".len..];
                 if (key.len == 0) return;
                 const state: *state_mod.State = @ptrCast(@alignCast(state_ptr));
-                state.set(key, c.body) catch |e| {
-                    std.log.warn(":::button: state.set failed: path={s} err={s}", .{ key, @errorName(e) });
+
+                // `flip=` READS before it writes; `body=` does not read
+                // at all. The flipped value lives in a stack buffer on
+                // purpose — see the ordering note below.
+                var flipped: [1]u8 = undefined;
+                const value: []const u8 = if (c.flip) blk: {
+                    const cur = state.get(key) orelse "";
+                    flipped[0] = if (isTruthy(cur)) '0' else '1';
+                    break :blk flipped[0..1];
+                } else c.body;
+
+                // NOTHING may touch `c` after this line, and nothing
+                // does. `State.set` notifies subscribers synchronously,
+                // so a button carrying `active=${state.x}` on the path
+                // it writes re-enters its own `ingest` from inside this
+                // call. `adoptString` keeps that from freeing `key` out
+                // from under `set` (which hashes it twice); returning
+                // straight after keeps us from needing anything else.
+                state.set(key, value) catch |e| {
+                    std.log.warn(":::button: state.set failed: err={s}", .{@errorName(e)});
                 };
                 return;
             }
@@ -957,4 +1042,186 @@ test "button: a cmd fires on RELEASE only, and only for the primary button" {
     // button that never fires at all.
     try onInput(inst.ctx, .{ .mouse_up = .{ .local = .{ 0, 0 }, .button = 0, .button_down = false } }, @ptrCast(&state));
     try testing.expectEqual(@as(usize, 1), CmdProbe.count);
+}
+
+test "button: flip writes the negation of what is already at the path" {
+    const attrs = [_]components.Attr{
+        .{ .key = "label", .value = "Grid" },
+        .{ .key = "target", .value = "state.grid" },
+        .{ .key = "flip", .value = "1" },
+    };
+    const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
+    const inst = try create(&_test_spark, testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+
+    var state = state_mod.State.init(testing.allocator);
+    defer state.deinit();
+
+    const click: element.InputEvent =
+        .{ .mouse_up = .{ .local = .{ 0, 0 }, .button = 0, .button_down = false } };
+
+    // Unset reads as off, so the first click turns it ON. A toggle
+    // whose first click did nothing visible is the bug a user reports
+    // as "I have to click it twice".
+    try onInput(inst.ctx, click, @ptrCast(&state));
+    try testing.expectEqualStrings("1", state.get("grid").?);
+
+    try onInput(inst.ctx, click, @ptrCast(&state));
+    try testing.expectEqualStrings("0", state.get("grid").?);
+
+    try onInput(inst.ctx, click, @ptrCast(&state));
+    try testing.expectEqualStrings("1", state.get("grid").?);
+}
+
+test "button: flip reads the plane's float spellings, and writes one back" {
+    const attrs = [_]components.Attr{
+        .{ .key = "label", .value = "Surfaces" },
+        .{ .key = "target", .value = "state.up" },
+        .{ .key = "flip", .value = "1" },
+    };
+    const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
+    const inst = try create(&_test_spark, testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+
+    var state = state_mod.State.init(testing.allocator);
+    defer state.deinit();
+
+    const click: element.InputEvent =
+        .{ .mouse_up = .{ .local = .{ 0, 0 }, .button = 0, .button_down = false } };
+
+    // A plane readback arrives as `{d}` on an f32 — `hud/mounted/*` is
+    // literally "0" or "1", but a mirror of a real knob can be "0.000".
+    try state.set("up", "0.000");
+    try onInput(inst.ctx, click, @ptrCast(&state));
+    // And what goes back is "1", NOT "true": `Panel.writeBack` parses
+    // document state with parseFloat before pushing it at the plane, so
+    // a word here is a write that silently never lands.
+    try testing.expectEqualStrings("1", state.get("up").?);
+
+    try state.set("up", "true");
+    try onInput(inst.ctx, click, @ptrCast(&state));
+    try testing.expectEqualStrings("0", state.get("up").?);
+}
+
+test "button: an ingest that changes nothing frees nothing" {
+    // The trackball segfault, one level down. `State.set` notifies
+    // synchronously, so a toggle button (`target=state.x flip=1
+    // active=${state.x}`) re-enters its own ingest from inside the
+    // click, while `onInput` still holds a slice of `self.target`.
+    // Unconditional free-and-dupe is what made that dangle.
+    //
+    // The gate is pointer identity: same text in, same allocation out.
+    // Against the old ingest every one of these differs.
+    const attrs = [_]components.Attr{
+        .{ .key = "label", .value = "Grid" },
+        .{ .key = "target", .value = "state.grid" },
+        .{ .key = "flip", .value = "1" },
+        .{ .key = "active", .value = "0" },
+    };
+    const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
+    const inst = try create(&_test_spark, testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+    const c: *Component = @ptrCast(@alignCast(inst.ctx));
+
+    const label_ptr = c.label.ptr;
+    const target_ptr = c.target.ptr;
+    const body_ptr = c.body.ptr;
+
+    // What a re-entrant update looks like: every string identical, only
+    // `active=` flipped — which is exactly what the state write changed.
+    const attrs2 = [_]components.Attr{
+        .{ .key = "label", .value = "Grid" },
+        .{ .key = "target", .value = "state.grid" },
+        .{ .key = "flip", .value = "1" },
+        .{ .key = "active", .value = "1" },
+    };
+    const spec2: components.Spec = .{ .name = "button", .attrs = &attrs2 };
+    try update(inst.ctx, &spec2);
+
+    try testing.expectEqual(label_ptr, c.label.ptr);
+    try testing.expectEqual(target_ptr, c.target.ptr);
+    try testing.expectEqual(body_ptr, c.body.ptr);
+    try testing.expect(c.active); // the one thing that DID change
+}
+
+test "button: an ingest that changes the text still replaces it" {
+    // The other half — a guard that never replaces is a guard that
+    // breaks hot reload, which is worse than the crash it prevents.
+    const attrs = [_]components.Attr{
+        .{ .key = "label", .value = "Old" },
+        .{ .key = "target", .value = "state.a" },
+    };
+    const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
+    const inst = try create(&_test_spark, testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+    const c: *Component = @ptrCast(@alignCast(inst.ctx));
+
+    const attrs2 = [_]components.Attr{
+        .{ .key = "label", .value = "New" },
+        .{ .key = "target", .value = "state.b" },
+    };
+    const spec2: components.Spec = .{ .name = "button", .attrs = &attrs2 };
+    try update(inst.ctx, &spec2);
+    try testing.expectEqualStrings("New", c.label);
+    try testing.expectEqualStrings("state.b", c.target);
+}
+
+test "button: active_when lights exactly the key whose body matches" {
+    // The radio row. `hud/xray.md` has eight of them and until this
+    // existed not one could say which of its keys was chosen — the panel
+    // spelled it out in a sentence underneath instead.
+    const attrs = [_]components.Attr{
+        .{ .key = "label", .value = "albedo" },
+        .{ .key = "target", .value = "state.surf" },
+        .{ .key = "body", .value = "albedo" },
+        .{ .key = "active_when", .value = "albedo" },
+    };
+    const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
+    const inst = try create(&_test_spark, testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+    const c: *Component = @ptrCast(@alignCast(inst.ctx));
+    try testing.expect(c.active);
+
+    // The sibling key in the same row, with the same `active_when`.
+    const attrs2 = [_]components.Attr{
+        .{ .key = "label", .value = "albedo" },
+        .{ .key = "target", .value = "state.surf" },
+        .{ .key = "body", .value = "depth" },
+        .{ .key = "active_when", .value = "albedo" },
+    };
+    const spec2: components.Spec = .{ .name = "button", .attrs = &attrs2 };
+    try update(inst.ctx, &spec2);
+    try testing.expect(!c.active);
+}
+
+test "button: active_when never lights a key with no body" {
+    // A row of `cmd=`-only keys carries no `body=`, so an `active_when`
+    // resolving to the empty string would light every one of them at
+    // once — which is the failure mode `active=` already had and the
+    // reason this attribute exists.
+    const attrs = [_]components.Attr{
+        .{ .key = "label", .value = "◀" },
+        .{ .key = "cmd", .value = "write hud/panels/0/x 0.05" },
+        .{ .key = "active_when", .value = "" },
+    };
+    const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
+    const inst = try create(&_test_spark, testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+    const c: *Component = @ptrCast(@alignCast(inst.ctx));
+    try testing.expect(!c.active);
+}
+
+test "button: active= still lights on its own, alongside active_when" {
+    // Either route lights the key. Adding the radio arm must not break
+    // the dock buttons, which are all `active=${state.up}`.
+    const attrs = [_]components.Attr{
+        .{ .key = "label", .value = "Surfaces" },
+        .{ .key = "cmd", .value = "hud toggle surfaces" },
+        .{ .key = "active", .value = "1" },
+    };
+    const spec: components.Spec = .{ .name = "button", .attrs = &attrs };
+    const inst = try create(&_test_spark, testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+    const c: *Component = @ptrCast(@alignCast(inst.ctx));
+    try testing.expect(c.active);
 }

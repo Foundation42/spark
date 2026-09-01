@@ -390,6 +390,35 @@ pub const Body = struct {
     }
 };
 
+/// Replace `dst.*` with a copy of `new` — but only when the text
+/// actually differs. `Body.adopt` for a single owned string.
+///
+/// **The crash this exists for.** `State.set` notifies its subscribers
+/// SYNCHRONOUSLY, so a component whose attributes interpolate a path it
+/// also writes (`target=state.x active=${state.x}` — a toggle button, a
+/// trackball, a fold header) is its own subscriber. The write re-enters
+/// the registry, which re-substitutes attrs, which calls the factory's
+/// `update`, which frees the very slice the caller is still standing on.
+/// That is the trackball segfault of 2026-09-01; `:::grip` has the same
+/// shape and survives only by luck, because its second path carries no
+/// `${}` so nothing subscribes to it.
+///
+/// An ingest built out of this frees nothing when nothing changed, and a
+/// re-entrant update is always that case. It does not excuse touching
+/// `self` after a `state.set` — it removes the sharp edge from every
+/// component that forgets.
+///
+/// Duping before freeing means an OOM leaves the old value intact. It
+/// does NOT make a multi-field ingest atomic: fields adopted before the
+/// failure keep their new values. That is a consistent object with no
+/// dangling pointers, which is the property that matters here.
+pub fn adoptString(allocator: std.mem.Allocator, dst: *[]u8, new: []const u8) !void {
+    if (std.mem.eql(u8, dst.*, new)) return;
+    const dup = try allocator.dupe(u8, new);
+    allocator.free(dst.*);
+    dst.* = dup;
+}
+
 /// What a factory produces — the (vtable, ctx) pair the Element
 /// holds. `ctx` is whatever per-instance state the component
 /// allocates in `Factory.create`; the registry remembers it

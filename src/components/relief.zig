@@ -101,6 +101,81 @@ pub fn rect(
     try gradientRect(out, lc, x, y, w, h, col, col, col, col);
 }
 
+/// A straight stroke of `width` running from `a` to `b`, feathered on
+/// every edge.
+///
+/// The missing primitive for a mark that is not axis-aligned: a
+/// checkbox's tick, a fold's disclosure chevron. `hairlineV` covers the
+/// vertical case and `rect` the axis-aligned one, and neither can be
+/// turned — so a diagonal was previously a glyph, which means it was at
+/// the mercy of whether the body font had one.
+///
+/// **The CAPS are feathered too**, not just the long sides. The triangle
+/// layer has no anti-aliasing of its own, and a diagonal cap left hard
+/// is a visible staircase at any size a tick gets drawn. The cost is
+/// that two strokes meeting at a corner must OVERLAP past it rather than
+/// butt against it — two feathered caps meeting exactly leave a seam of
+/// half-alpha down the join, which is the same "two edge treatments a
+/// pixel apart" artefact the trackball rims had.
+///
+/// Sixteen vertices on a 4×4 grid in the stroke's own frame: the inner
+/// 2×2 carries the colour, the ring around it carries alpha 0. The
+/// corners of that ring fall away in both directions at once, so the
+/// ends read as very slightly rounded, which is what a drawn mark wants
+/// anyway.
+pub fn stroke(
+    out: *element.DrawList,
+    lc: *element.LayoutCtx,
+    a: [2]f32,
+    b: [2]f32,
+    width: f32,
+    col: [4]f32,
+) !void {
+    const dx = b[0] - a[0];
+    const dy = b[1] - a[1];
+    const len = @sqrt(dx * dx + dy * dy);
+    if (!(len > 1e-6) or !(width > 0)) return;
+    const ux = dx / len;
+    const uy = dy / len;
+    // Left normal of the direction vector.
+    const nx = -uy;
+    const ny = ux;
+
+    const half = width * 0.5;
+    const us = [4]f32{ -FEATHER, 0, len, len + FEATHER };
+    const vs = [4]f32{ -half - FEATHER, -half, half, half + FEATHER };
+    const clear = withAlpha(col, 0);
+
+    const base: u32 = @intCast(out.tris.items.len);
+    try out.ensureUnusedTriCapacity(16);
+    for (vs, 0..) |v, vi| {
+        for (us, 0..) |u, ui| {
+            const solid = (ui == 1 or ui == 2) and (vi == 1 or vi == 2);
+            out.appendTriAssumeCapacity(lc, .{
+                .pos = .{
+                    a[0] + ux * u + nx * v,
+                    a[1] + uy * u + ny * v,
+                },
+                .color = if (solid) col else clear,
+            });
+        }
+    }
+
+    // Nine quads over the 4×4 grid.
+    try out.tri_indices.ensureUnusedCapacity(9 * 6);
+    var row: u32 = 0;
+    while (row < 3) : (row += 1) {
+        var col_i: u32 = 0;
+        while (col_i < 3) : (col_i += 1) {
+            // `i0` would shadow the primitive type of that name.
+            const tl = base + row * 4 + col_i;
+            for ([_]u32{ tl, tl + 1, tl + 4, tl + 1, tl + 5, tl + 4 }) |idx| {
+                out.tri_indices.appendAssumeCapacity(idx);
+            }
+        }
+    }
+}
+
 /// A vertical line with both edges faded, so a 1px mark lands crisply
 /// wherever it falls instead of snapping to a pixel boundary.
 ///
@@ -817,5 +892,76 @@ test "arc: degenerate inputs emit nothing rather than a fold" {
     none.a1 = 90;
     none.segments = 0;
     try arc(&dl, &lc, none);
+    try testing.expectEqual(@as(usize, 0), dl.tris.items.len);
+}
+
+test "stroke: the colour is in the middle 2x2 and the ring is clear" {
+    // The whole anti-aliasing story for a diagonal mark is that ring.
+    // Emit it solid and a tick is a staircase; drop it and the caller
+    // is back to hoping the font has a checkmark.
+    var dl = testList();
+    defer dl.deinit();
+    var lc = testCtx();
+
+    const col: [4]f32 = .{ 1, 0.68, 0, 1 };
+    try stroke(&dl, &lc, .{ 0, 0 }, .{ 10, 0 }, 2, col);
+
+    try testing.expectEqual(@as(usize, 16), dl.tris.items.len);
+    try testing.expectEqual(@as(usize, 9 * 6), dl.tri_indices.items.len);
+    for (dl.tris.items, 0..) |v, i| {
+        const ui = i % 4;
+        const vi = i / 4;
+        const solid = (ui == 1 or ui == 2) and (vi == 1 or vi == 2);
+        try testing.expectEqual(@as(f32, if (solid) 1 else 0), v.color[3]);
+    }
+    for (dl.tri_indices.items) |i| try testing.expect(i < dl.tris.items.len);
+}
+
+test "stroke: the solid core is exactly `width` across, at any angle" {
+    // The feather rows sit OUTSIDE the requested width rather than
+    // eating into it — a 2px tick that renders 2px of colour plus a
+    // pixel of haze either side, not 2px total with 1px of colour.
+    var dl = testList();
+    defer dl.deinit();
+    var lc = testCtx();
+
+    // 45°, which is the case a checkbox tick actually draws and the one
+    // an axis-aligned primitive cannot express at all.
+    try stroke(&dl, &lc, .{ 0, 0 }, .{ 10, 10 }, 3, .{ 1, 1, 1, 1 });
+
+    // Vertices 5 and 9 are the two inner-core corners at u = 0: one on
+    // each side of the line, so the distance between them is the width.
+    const p = dl.tris.items[5].pos;
+    const q = dl.tris.items[9].pos;
+    const d = @sqrt((p[0] - q[0]) * (p[0] - q[0]) + (p[1] - q[1]) * (p[1] - q[1]));
+    try testing.expectApproxEqAbs(@as(f32, 3), d, 1e-4);
+}
+
+test "stroke: caps extend past the endpoints, so a corner can overlap" {
+    // Two strokes meeting at a right angle butt-to-butt would leave a
+    // seam of half-alpha down the join — two feathered edges a pixel
+    // apart, the same artefact the trackball rims had. The caller
+    // overlaps instead, and can only do that if the cap is OUTSIDE the
+    // segment rather than inside it.
+    var dl = testList();
+    defer dl.deinit();
+    var lc = testCtx();
+    try stroke(&dl, &lc, .{ 4, 0 }, .{ 14, 0 }, 2, .{ 1, 1, 1, 1 });
+
+    // Column 0 is the outer cap at the `a` end: before `a`, not after.
+    try testing.expect(dl.tris.items[0].pos[0] < 4);
+    // Column 3 is the outer cap at the `b` end: past `b`.
+    try testing.expect(dl.tris.items[3].pos[0] > 14);
+    // And the solid core still starts and ends exactly where asked.
+    try testing.expectApproxEqAbs(@as(f32, 4), dl.tris.items[5].pos[0], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 14), dl.tris.items[6].pos[0], 1e-4);
+}
+
+test "stroke: degenerate inputs emit nothing rather than a fold" {
+    var dl = testList();
+    defer dl.deinit();
+    var lc = testCtx();
+    try stroke(&dl, &lc, .{ 5, 5 }, .{ 5, 5 }, 2, .{ 1, 1, 1, 1 }); // zero length
+    try stroke(&dl, &lc, .{ 0, 0 }, .{ 10, 0 }, 0, .{ 1, 1, 1, 1 }); // zero width
     try testing.expectEqual(@as(usize, 0), dl.tris.items.len);
 }

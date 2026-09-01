@@ -234,7 +234,7 @@ The block below is the *same factory* — but loaded over HTTP from a localhost 
 
 The block below is *not* a static document — it is being written by a local language model right now, streaming token by token through an [IoChannel](../src/io_channel.zig). Each chunk is line-buffered NDJSON; the `message.content` tokens accumulate into a markdown buffer that is re-parsed and re-rendered on every chunk. Click *Run* to fire the canned prompt, or **type into the input field and hit Enter** to send your own (stage 13c). The button keeps the default prompt around as a quick retry.
 
-:::input {#ask_local target=#chat_local action=start placeholder="Ask qwen3.5… (Enter to send)" width=100%}
+:::input {#ask_local target=#chat_local action=start placeholder="Ask qwen3.5… (Enter to send)" width=100% height=34}
 :::
 
 :::button {#run_local label="Run default prompt (Ollama)" target=#chat_local action=start}
@@ -247,7 +247,7 @@ The block below is *not* a static document — it is being written by a local la
 
 Same component, different provider. `provider=openai` switches the body shape (OpenAI-compatible `max_tokens` field, `Authorization: Bearer` header) and the chunk parser (SSE events instead of NDJSON). The API key lives in `~/.env` as `DEEPSEEK_DYNABOOK`; `api_key_env=` names which entry to read. The fetch goes out over real internet — **and the renderer never blocks waiting** because every byte of work happens on a worker thread.
 
-:::input {#ask_remote target=#chat_remote action=start placeholder="Ask DeepSeek… (Enter to send)" width=100%}
+:::input {#ask_remote target=#chat_remote action=start placeholder="Ask DeepSeek… (Enter to send)" width=100% height=34}
 :::
 
 :::button {#run_remote label="Run default prompt (DeepSeek)" target=#chat_remote action=start}
@@ -260,7 +260,7 @@ Same component, different provider. `provider=openai` switches the body shape (O
 
 Same component yet again, *third* provider — OpenRouter is itself OpenAI-compatible and fronts dozens of upstream models. Pointed at `google/gemini-2.5-flash` here, but `anthropic/claude-haiku-4`, `openai/gpt-4o-mini`, `meta-llama/llama-3.3-70b-instruct`, and others all drop in just by changing `model=`. The OpenAI wire format earned its place as the lingua franca.
 
-:::input {#ask_router target=#chat_router action=start placeholder="Ask Gemini Flash… (Enter to send)" width=100%}
+:::input {#ask_router target=#chat_router action=start placeholder="Ask Gemini Flash… (Enter to send)" width=100% height=34}
 :::
 
 :::button {#run_router label="Run default prompt (Gemini)" target=#chat_router action=start}
@@ -280,7 +280,7 @@ A new triangle pipeline + CPU tessellator (Bezier flatten + earcut) renders SVG 
 
 Same triangle pipeline, but the SVG isn't on disk — it's authored by **Recraft V4.1** via OpenRouter. Recraft turns out to be a one-shot image-generation model behind a chat-completions endpoint: the SVG comes back base64-encoded inside `message.images[0].image_url`. We decode, parse, **parallel-tessellate through the JobSystem from 13d.2**, and swap in the mesh. Type a prompt, hit Enter, and after 5–15s of upstream queue the figure pops in. The renderer never blocks — every byte of the HTTP wait happens off-thread on the IoChannel.
 
-:::input {#ask_petunia target=#fresh_svg action=start placeholder="Describe an SVG… (Enter to generate)" width=100%}
+:::input {#ask_petunia target=#fresh_svg action=start placeholder="Describe an SVG… (Enter to generate)" width=100% height=34}
 :::
 
 :::button {#run_petunia label="Run default prompt (a bowl of petunias)" target=#fresh_svg action=start}
@@ -293,7 +293,7 @@ Same triangle pipeline, but the SVG isn't on disk — it's authored by **Recraft
 
 Same async I/O lane as `:::svg-stream`, but the data URL is a PNG — and the decode path runs through **stb_image** instead of the SVG tessellator, dropping the pixels into a per-component `VkImage` + sampler. The wire format is identical to Recraft (OpenAI-shaped `/chat/completions`, `stream:false`, image lives in `message.images[0].image_url.url`); only the MIME prefix and decoder swap out.
 
-:::input {#ask_image target=#fresh_image action=start placeholder="Describe an image… (Enter to generate)" width=100%}
+:::input {#ask_image target=#fresh_image action=start placeholder="Describe an image… (Enter to generate)" width=100% height=34}
 :::
 
 :::button {#run_image label="Run default prompt (robot drinking coffee)" target=#fresh_image action=start}
