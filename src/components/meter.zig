@@ -8,6 +8,9 @@
 //!
 //! - `label`   (required) — the row's name, left column.
 //! - `value`   (required) — the number. Non-numeric reads as 0.
+//! - `min`     (optional) — the bar's low end. Default 0. A range that
+//!   spans zero (`min=-3 max=3`) fills from the CENTRE and draws a tick
+//!   there — what a signed reading needs, like a fly-cam's thrust stick.
 //! - `max`     (optional) — the bar's full scale. Default 1.
 //! - `color`   (optional) — swatch and bar fill.
 //! - `unit`    (optional) — printed after the value (`ms`, `%`, `fps`).
@@ -92,14 +95,31 @@ pub fn numberOf(s: []const u8) f32 {
     return std.fmt.parseFloat(f32, std.mem.trim(u8, s, " \t\r\n")) catch 0;
 }
 
-/// The filled fraction, clamped. A zero or negative `max` gives zero
-/// rather than an infinity or a NaN — `max=${state.gpu_ms}` is exactly
-/// that on the first frame.
-pub fn fractionOf(value: f32, max: f32) f32 {
-    if (!(max > 0) or !std.math.isFinite(value)) return 0;
-    const f = value / max;
+/// Where `value` sits across the bar, as 0..1. An empty or inverted range
+/// gives zero rather than an infinity or a NaN — `max=${state.gpu_ms}` is
+/// exactly an empty range on the first frame.
+pub fn fractionIn(value: f32, min: f32, max: f32) f32 {
+    if (!(max > min) or !std.math.isFinite(value)) return 0;
+    const f = (value - min) / (max - min);
     if (!std.math.isFinite(f)) return 0;
     return std.math.clamp(f, 0, 1);
+}
+
+/// Where the fill STARTS FROM, as 0..1.
+///
+/// The position of zero, clamped into the range. A `min=0` bar fills from
+/// its left edge, which is every measurement; a `min=-3 max=3` bar fills
+/// from its CENTRE, which is what a signed reading needs — a fly-cam's
+/// thrust stick pushed backwards is not "a bit of forward", it is the
+/// other direction, and a bar growing rightwards from the left edge says
+/// the wrong thing about it.
+///
+/// Falling out of "where is zero" rather than being a mode flag means a
+/// range that does not contain zero (`min=5 max=10`) still fills from its
+/// own left edge, with nothing to decide.
+pub fn originFraction(min: f32, max: f32) f32 {
+    if (!(max > min)) return 0;
+    return fractionIn(std.math.clamp(@as(f32, 0), min, max), min, max);
 }
 
 /// Where each column starts, given the row's total width.
@@ -140,6 +160,7 @@ const Component = struct {
     label: []u8,
     unit: []u8,
     value: f32 = 0,
+    min: f32 = 0,
     max: f32 = 1,
     decimals: u8 = 2,
     percent: bool = false,
@@ -161,6 +182,8 @@ const Component = struct {
                 unit_raw = attr.value;
             } else if (std.mem.eql(u8, attr.key, "value")) {
                 self.value = numberOf(attr.value);
+            } else if (std.mem.eql(u8, attr.key, "min")) {
+                self.min = numberOf(attr.value);
             } else if (std.mem.eql(u8, attr.key, "max")) {
                 self.max = numberOf(attr.value);
             } else if (std.mem.eql(u8, attr.key, "decimals")) {
@@ -247,6 +270,9 @@ const VALUE: [4]f32 = .{ 0.90, 0.91, 0.93, 1.0 };
 /// The percentage is context, not the reading — quieter than the value it
 /// is a restatement of.
 const PCT: [4]f32 = .{ 0.56, 0.55, 0.54, 1.0 };
+/// The tick at zero on a signed bar. Light, because it is a reference and
+/// not a reading.
+const ZERO_MARK: [4]f32 = .{ 1.0, 1.0, 1.0, 0.28 };
 
 fn layoutAndRender(
     ctx: *anyopaque,
@@ -271,15 +297,27 @@ fn layoutAndRender(
     const y = @round(origin[1]);
     const cols = columnsFor(x, total_w, c.label_w, c.value_w, c.percent);
 
-    const frac = fractionOf(c.value, c.max);
+    const frac = fractionIn(c.value, c.min, c.max);
+    const from = originFraction(c.min, c.max);
     const bar_y = @round(y + (ROW_H - BAR_H) * 0.5);
 
     // ── The bar, all triangles so it orders among itself ──────────────
     if (cols.bar_w > 0) {
         try relief.rect(out, lc, cols.bar_x, bar_y, cols.bar_w, BAR_H, TRACK);
-        const fill_w = @round(cols.bar_w * frac);
-        if (fill_w > 0) {
-            try relief.rect(out, lc, cols.bar_x, bar_y, fill_w, BAR_H, c.color);
+        // The fill runs BETWEEN the origin and the value, which is the same
+        // arithmetic for both directions — a signed bar needs no second
+        // code path, only a `min` that puts zero somewhere other than the
+        // left edge.
+        const a = @round(cols.bar_x + cols.bar_w * @min(from, frac));
+        const b = @round(cols.bar_x + cols.bar_w * @max(from, frac));
+        if (b > a) {
+            try relief.rect(out, lc, a, bar_y, b - a, BAR_H, c.color);
+        }
+        // The zero mark, for a bar whose zero is not its left edge. Without
+        // it a stick at rest and a stick held hard left look the same at a
+        // glance: both are "no fill near the middle".
+        if (from > 0.01 and from < 0.99) {
+            try relief.rect(out, lc, @round(cols.bar_x + cols.bar_w * from), bar_y - 1, 1, BAR_H + 2, ZERO_MARK);
         }
         // The recess shading goes over BOTH, so the fill reads as sitting
         // in the slot rather than on top of it.
@@ -307,6 +345,8 @@ fn layoutAndRender(
 
     if (c.percent) {
         var pbuf: [16]u8 = undefined;
+        // A position across the declared range, which for the ordinary
+        // `min=0` bar is the ratio to max everyone expects.
         const ptext = std.fmt.bufPrint(&pbuf, "{d:.0}%", .{frac * 100}) catch "";
         try drawRunRight(lc, out, aa, mono, ptext, cols.pct_right, baseline, PCT);
     }
@@ -415,16 +455,39 @@ test "meter: a number that has not been published yet reads as zero" {
     try testing.expectEqual(@as(f32, 4), numberOf(" 4 "));
 }
 
-test "meter: a zero max is a zero bar, not an infinity" {
-    // `max=${state.gpu_ms}` is exactly zero on the first frame, and a
-    // fraction of inf or NaN would come out as a bar of garbage width.
-    try testing.expectEqual(@as(f32, 0), fractionOf(5, 0));
-    try testing.expectEqual(@as(f32, 0), fractionOf(5, -1));
-    try testing.expectEqual(@as(f32, 0.5), fractionOf(5, 10));
+test "meter: an empty range is a zero bar, not an infinity" {
+    // `max=${state.gpu_ms}` is exactly an empty range on the first frame,
+    // and a fraction of inf or NaN is a bar of garbage width.
+    try testing.expectEqual(@as(f32, 0), fractionIn(5, 0, 0));
+    try testing.expectEqual(@as(f32, 0), fractionIn(5, 0, -1));
+    try testing.expectEqual(@as(f32, 0.5), fractionIn(5, 0, 10));
     // Clamped both ways: a pass that momentarily exceeds the frame total
     // must not draw past the end of its track.
-    try testing.expectEqual(@as(f32, 1), fractionOf(20, 10));
-    try testing.expectEqual(@as(f32, 0), fractionOf(-5, 10));
+    try testing.expectEqual(@as(f32, 1), fractionIn(20, 0, 10));
+    try testing.expectEqual(@as(f32, 0), fractionIn(-5, 0, 10));
+}
+
+test "meter: a signed range fills from its centre" {
+    // A fly-cam's thrust stick pushed backwards is not "a bit of forward",
+    // it is the other direction — and a bar growing rightwards from the
+    // left edge says the wrong thing about it.
+    try testing.expectEqual(@as(f32, 0.5), originFraction(-3, 3));
+    try testing.expectEqual(@as(f32, 0.5), fractionIn(0, -3, 3));
+    try testing.expectEqual(@as(f32, 1), fractionIn(3, -3, 3));
+    try testing.expectEqual(@as(f32, 0), fractionIn(-3, -3, 3));
+    // Off-centre zero, which is what an asymmetric stick would give.
+    try testing.expectEqual(@as(f32, 0.25), originFraction(-1, 3));
+}
+
+test "meter: a range that misses zero fills from its own edge" {
+    // Falls out of "where is zero, clamped into the range" rather than
+    // needing a mode flag — so there is nothing to decide and nothing to
+    // get wrong when a bar's range happens not to contain zero.
+    try testing.expectEqual(@as(f32, 0), originFraction(5, 10));
+    try testing.expectEqual(@as(f32, 0), originFraction(0, 10));
+    // …including a range wholly BELOW zero, where the origin is the right
+    // edge and the fill therefore grows leftwards.
+    try testing.expectEqual(@as(f32, 1), originFraction(-10, -5));
 }
 
 test "meter: fixed decimals, so a number does not change width" {
