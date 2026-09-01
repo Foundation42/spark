@@ -86,7 +86,10 @@ pub const factory: component_mod.Factory = .{
 /// interpolated across each chord, so this is the only thing between a
 /// smooth wheel and a visible polygon. 72 is 5° a side, under a pixel of
 /// chord error at any size a panel will use.
-const DISC_SEGMENTS: usize = 72;
+const DISC_SEGMENTS: usize = 96;
+/// Segments for the small solid circles — the puck and the centre dot.
+/// They are a few pixels across, so a coarse fan is invisible.
+const DOT_SEGMENTS: usize = 24;
 /// Segments across the full 270° level sweep.
 const ARC_SEGMENTS: usize = 96;
 
@@ -94,7 +97,7 @@ const DISC_CENTRE_COLOR: [4]f32 = .{ 0.10, 0.11, 0.13, 1.0 };
 /// The shadow around the inside of the wheel's rim, and how far it
 /// reaches inward. Deliberately weak — it has to survive sitting on a
 /// fully saturated red and on a dark blue without either looking dirty.
-const DISC_RIM_SHADE: [4]f32 = .{ 0.0, 0.0, 0.0, 0.22 };
+const DISC_RIM_SHADE: f32 = 0.22;
 const DISC_SHADE_PX: f32 = 5.0;
 /// The groove the level sweep runs in. The track is darker on its INNER
 /// edge, under the overhanging lip; the two together are the depth.
@@ -506,22 +509,17 @@ fn layoutAndRender(
     const arc_r_in = arc_r_out - ARC_BAND;
     const disc_r = @max(4.0, arc_r_in - ARC_GAP);
 
-    try relief.hueDisc(out, lc, centre, disc_r, DISC_CENTRE_COLOR, DISC_SEGMENTS, hueRim);
-    // The wheel sits IN the panel, not on it: a shadow around the inside
-    // of the rim, fading inward. Without it a feathered disc is a
-    // perfectly clean sticker, which is the look this is avoiding.
-    try relief.arc(out, lc, .{
+    // The wheel, with its recess shadow folded into the SAME mesh. It
+    // used to be a separate dark arc laid over the top, and the two
+    // edges disagreed by a pixel — see `relief.HueDisc.rim_shade`.
+    try relief.hueDisc(out, lc, .{
         .centre = centre,
-        .r_in = disc_r - DISC_SHADE_PX,
-        .r_out = disc_r,
-        .a0 = 0,
-        .a1 = 360,
-        .inner_color = .{ 0, 0, 0, 0 },
-        .outer_color = DISC_RIM_SHADE,
+        .r = disc_r,
+        .centre_color = DISC_CENTRE_COLOR,
         .segments = DISC_SEGMENTS,
-        // The disc's own rim is already feathered; a second soft edge on
-        // top of it would only wash the saturated colours out.
-        .feather = 0,
+        .hueAt = hueRim,
+        .rim_shade = DISC_RIM_SHADE,
+        .shade_px = DISC_SHADE_PX,
     });
 
     const f_neutral = c.bal.fractionOf(c.bal.neutral);
@@ -574,28 +572,15 @@ fn layoutAndRender(
 
     // Centre dot — the neutral marker, and the reset target.
     const dot_r = @max(2.5, disc_r * CENTRE_FRACTION * 0.55);
-    try out.appendQuad(lc, .{
-        .dst_pos = .{ centre[0] - dot_r, centre[1] - dot_r },
-        .dst_size = .{ dot_r * 2, dot_r * 2 },
-        .color = CENTRE_DOT_COLOR,
-        .radius = dot_r,
-    });
+    try relief.disc(out, lc, centre, dot_r, CENTRE_DOT_COLOR, DOT_SEGMENTS);
 
     // Puck: a white ring under a swatch of the balance hue, so it reads
-    // on a red rim and on a blue one.
+    // on a red rim and on a blue one. Triangles rather than rounded
+    // quads — a quad circle loses the outer half of its anti-aliasing
+    // band off its own edge, which at this size is a visible flat cap.
     const puck = onCircle(centre, @min(1, c.bal.push) * disc_r, c.bal.hue);
-    try out.appendQuad(lc, .{
-        .dst_pos = .{ puck[0] - PUCK_R - 1.5, puck[1] - PUCK_R - 1.5 },
-        .dst_size = .{ (PUCK_R + 1.5) * 2, (PUCK_R + 1.5) * 2 },
-        .color = PUCK_RING_COLOR,
-        .radius = PUCK_R + 1.5,
-    });
-    try out.appendQuad(lc, .{
-        .dst_pos = .{ puck[0] - PUCK_R, puck[1] - PUCK_R },
-        .dst_size = .{ PUCK_R * 2, PUCK_R * 2 },
-        .color = c.bal.puckColor(),
-        .radius = PUCK_R,
-    });
+    try relief.disc(out, lc, puck, PUCK_R + 1.5, PUCK_RING_COLOR, DOT_SEGMENTS);
+    try relief.disc(out, lc, puck, PUCK_R, c.bal.puckColor(), DOT_SEGMENTS);
 
     y += c.size + DIAL_GAP;
 

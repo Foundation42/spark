@@ -169,8 +169,14 @@ pub const Groove = struct {
     pub const LIP: [4]f32 = .{ 1.0, 1.0, 1.0, 0.09 };
     pub const LIP_PX: f32 = 1.5;
     /// Shadow at the left and right ends of a horizontal cut-out.
+    ///
+    /// Capped in pixels as well as proportioned, for the same reason
+    /// `TOP` is: a lip occludes a fixed distance into the recess, not a
+    /// share of its length. Without the cap a 300px slider got 42px of
+    /// gloom at each end, which reads as a vignette rather than a lip.
     pub const END: [4]f32 = .{ 0.0, 0.0, 0.0, 0.30 };
     pub const END_FRACTION: f32 = 0.14;
+    pub const END_MAX_PX: f32 = 16.0;
 };
 
 const CLEAR: [4]f32 = .{ 0.0, 0.0, 0.0, 0.0 };
@@ -203,7 +209,7 @@ pub fn groove(
         try shadeV(out, lc, x, y + h - lip_h, w, lip_h, CLEAR_W, Groove.LIP);
     }
     if (ends) {
-        const end_w = @min(w * 0.5, w * Groove.END_FRACTION);
+        const end_w = @min(@min(w * 0.5, w * Groove.END_FRACTION), Groove.END_MAX_PX);
         if (end_w > 0.25) {
             try shadeH(out, lc, x, y, end_w, h, Groove.END, CLEAR);
             try shadeH(out, lc, x + w - end_w, y, end_w, h, CLEAR, Groove.END);
@@ -228,56 +234,133 @@ pub fn edgeFade(t: f32, edge: f32) f32 {
 
 // ── Feathered round geometry ────────────────────────────────────────
 
-/// A hue wheel: full saturation at the rim, `centre_col` at the middle,
-/// with the rim fading over `FEATHER` pixels so the circle has an edge
-/// the triangle pipeline could not otherwise give it.
+/// A solid circle whose rim fades over `FEATHER` pixels.
 ///
-/// `hueAt` is passed as a function pointer rather than a closure because
-/// Zig has neither — the one caller wants HSV, and a future one wanting
-/// a different ramp supplies its own.
-pub fn hueDisc(
+/// Use this rather than a quad with `radius = size / 2` whenever the
+/// circle is small enough to look at. That quad IS a circle — `quad.frag`
+/// resolves it exactly — but its anti-aliasing band is centred on the
+/// edge, and the edge is the quad's own boundary, so the outer half of
+/// the band falls outside the rasterised rect and is simply lost. A 14px
+/// slider thumb came out fourteen rows tall with one soft row at the top
+/// and none at the bottom, which reads as a circle with a flat cap.
+/// Chris, 2026-09-01: "the round thumb tack top is chopped off. Looks
+/// like it is one pixel row missing at the top."
+///
+/// Here the band lives in the geometry, so it is symmetric and complete.
+pub fn disc(
     out: *element.DrawList,
     lc: *element.LayoutCtx,
     centre: [2]f32,
     r: f32,
-    centre_col: [4]f32,
+    col: [4]f32,
     segments: usize,
-    hueAt: *const fn (deg: f32) [3]f32,
 ) !void {
     if (!(r > 0) or segments < 3) return;
-
     const base: u32 = @intCast(out.tris.items.len);
     const n: u32 = @intCast(segments);
 
-    // centre, then the rim, then the feather ring beyond it.
     try out.ensureUnusedTriCapacity(1 + segments * 2);
-    out.appendTriAssumeCapacity(lc, .{ .pos = centre, .color = centre_col });
-    for (0..segments) |i| {
-        const deg = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(segments)) * 360.0;
-        const rgb = hueAt(deg);
-        out.appendTriAssumeCapacity(lc, .{
-            .pos = onCircle(centre, r, deg),
-            .color = .{ rgb[0], rgb[1], rgb[2], 1.0 },
-        });
-    }
-    for (0..segments) |i| {
-        const deg = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(segments)) * 360.0;
-        const rgb = hueAt(deg);
-        out.appendTriAssumeCapacity(lc, .{
-            .pos = onCircle(centre, r + FEATHER, deg),
-            .color = .{ rgb[0], rgb[1], rgb[2], 0.0 },
-        });
+    out.appendTriAssumeCapacity(lc, .{ .pos = centre, .color = col });
+    for (0..2) |ring| {
+        const rr = if (ring == 0) r else r + FEATHER;
+        const cc = if (ring == 0) col else withAlpha(col, 0);
+        for (0..segments) |i| {
+            const deg = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(segments)) * 360.0;
+            out.appendTriAssumeCapacity(lc, .{ .pos = onCircle(centre, rr, deg), .color = cc });
+        }
     }
 
     try out.tri_indices.ensureUnusedCapacity(segments * 9);
     for (0..segments) |i| {
         const a: u32 = 1 + @as(u32, @intCast(i));
         const b: u32 = 1 + @as(u32, @intCast((i + 1) % segments));
-        // The solid fan.
         for ([_]u32{ 0, a, b }) |o| out.tri_indices.appendAssumeCapacity(base + o);
-        // And the ring that fades it out.
         for ([_]u32{ a, a + n, b, b, a + n, b + n }) |o| {
             out.tri_indices.appendAssumeCapacity(base + o);
+        }
+    }
+}
+
+/// A hue wheel, optionally darkened toward its rim.
+pub const HueDisc = struct {
+    centre: [2]f32,
+    r: f32,
+    centre_color: [4]f32,
+    segments: usize = 72,
+    /// A function pointer rather than a closure because Zig has neither.
+    /// The one caller wants HSV; a future one wanting a different ramp
+    /// supplies its own, and `relief` never learns what a hue is.
+    hueAt: *const fn (deg: f32) [3]f32,
+    /// How far the rim is darkened toward black, 0..1, over
+    /// `shade_px` inward. Zero for a flat wheel.
+    ///
+    /// **Folded into this mesh on purpose.** It was a separate dark arc
+    /// laid over the disc, and the two edges did not line up: the arc
+    /// ended hard at the rim while the disc was still fading out over
+    /// the pixel beyond it, so the outermost ring came out brighter than
+    /// the darkened one just inside it. Against saturated hues that
+    /// bright-on-dark fringe reads as compression noise — Chris,
+    /// 2026-09-01: "a slight gamma aliasing issue on the color wheel
+    /// outside edge. It reads as jpeg artifacting."
+    ///
+    /// One mesh has one edge. The rim colour is MIXED toward black
+    /// rather than composited under a black overlay, so the pixel is a
+    /// single opaque value that then fades — one blend at the edge
+    /// instead of two.
+    rim_shade: f32 = 0,
+    shade_px: f32 = 0,
+};
+
+pub fn hueDisc(out: *element.DrawList, lc: *element.LayoutCtx, p: HueDisc) !void {
+    if (!(p.r > 0) or p.segments < 3) return;
+
+    const shaded = p.rim_shade > 1e-4 and p.shade_px > 1e-4 and p.shade_px < p.r;
+    const k = 1.0 - std.math.clamp(p.rim_shade, 0, 1);
+
+    // Radius, brightness and alpha for each ring, outward from the middle.
+    var ring_r: [3]f32 = undefined;
+    var ring_k: [3]f32 = undefined;
+    var ring_a: [3]f32 = undefined;
+    const rings: usize = if (shaded) 3 else 2;
+    if (shaded) {
+        ring_r = .{ p.r - p.shade_px, p.r, p.r + FEATHER };
+        ring_k = .{ 1.0, k, k };
+        ring_a = .{ 1.0, 1.0, 0.0 };
+    } else {
+        ring_r = .{ p.r, p.r + FEATHER, 0 };
+        ring_k = .{ 1.0, 1.0, 0 };
+        ring_a = .{ 1.0, 0.0, 0 };
+    }
+
+    const base: u32 = @intCast(out.tris.items.len);
+    const n: u32 = @intCast(p.segments);
+
+    try out.ensureUnusedTriCapacity(1 + p.segments * rings);
+    out.appendTriAssumeCapacity(lc, .{ .pos = p.centre, .color = p.centre_color });
+    for (0..rings) |ring| {
+        for (0..p.segments) |i| {
+            const deg = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(p.segments)) * 360.0;
+            const rgb = p.hueAt(deg);
+            const m = ring_k[ring];
+            out.appendTriAssumeCapacity(lc, .{
+                .pos = onCircle(p.centre, ring_r[ring], deg),
+                .color = .{ rgb[0] * m, rgb[1] * m, rgb[2] * m, ring_a[ring] },
+            });
+        }
+    }
+
+    try out.tri_indices.ensureUnusedCapacity(p.segments * (3 + (rings - 1) * 6));
+    for (0..p.segments) |i| {
+        const a: u32 = 1 + @as(u32, @intCast(i));
+        const b: u32 = 1 + @as(u32, @intCast((i + 1) % p.segments));
+        // The solid fan out to the innermost ring.
+        for ([_]u32{ 0, a, b }) |o| out.tri_indices.appendAssumeCapacity(base + o);
+        // Then a strip between each pair of rings.
+        for (0..rings - 1) |ring| {
+            const off: u32 = @intCast(ring * p.segments);
+            for ([_]u32{ a + off, a + off + n, b + off, b + off, a + off + n, b + off + n }) |o| {
+                out.tri_indices.appendAssumeCapacity(base + o);
+            }
         }
     }
 }
@@ -317,16 +400,33 @@ pub fn arc(out: *element.DrawList, lc: *element.LayoutCtx, p: Arc) !void {
     const cols = inner_cols + @as(usize, if (soft_ends) 2 else 0);
 
     // Rows run outward: the radial feather, the band, the radial feather.
-    const radii = [4]f32{ p.r_in - p.feather, p.r_in, p.r_out, p.r_out + p.feather };
-    const row_col = [4][4]f32{
-        withAlpha(p.inner_color, 0),
-        p.inner_color,
-        p.outer_color,
-        withAlpha(p.outer_color, 0),
-    };
+    //
+    // A zero feather drops the two feather rows ENTIRELY rather than
+    // emitting them at the band's own radii. Keeping them would put two
+    // vertices at the same position with different alphas — degenerate
+    // triangles carrying a hard discontinuity, which rasterise as
+    // speckle along the edge.
+    const soft_radial = p.feather > 1e-4;
+    const rows: usize = if (soft_radial) 4 else 2;
+    var radii: [4]f32 = undefined;
+    var row_col: [4][4]f32 = undefined;
+    if (soft_radial) {
+        radii = .{ p.r_in - p.feather, p.r_in, p.r_out, p.r_out + p.feather };
+        row_col = .{
+            withAlpha(p.inner_color, 0),
+            p.inner_color,
+            p.outer_color,
+            withAlpha(p.outer_color, 0),
+        };
+    } else {
+        radii[0] = p.r_in;
+        radii[1] = p.r_out;
+        row_col[0] = p.inner_color;
+        row_col[1] = p.outer_color;
+    }
 
     const base: u32 = @intCast(out.tris.items.len);
-    try out.ensureUnusedTriCapacity(cols * 4);
+    try out.ensureUnusedTriCapacity(cols * rows);
     for (0..cols) |ci| {
         // Angle for this column, and whether it is a feather column.
         var a: f32 = undefined;
@@ -342,7 +442,7 @@ pub fn arc(out: *element.DrawList, lc: *element.LayoutCtx, p: Arc) !void {
             const t = @as(f32, @floatFromInt(k)) / @as(f32, @floatFromInt(p.segments));
             a = lo + (hi - lo) * t;
         }
-        for (radii, row_col) |rr, cc| {
+        for (radii[0..rows], row_col[0..rows]) |rr, cc| {
             out.appendTriAssumeCapacity(lc, .{
                 .pos = onCircle(p.centre, @max(0, rr), a),
                 .color = if (edge) withAlpha(cc, 0) else cc,
@@ -350,11 +450,11 @@ pub fn arc(out: *element.DrawList, lc: *element.LayoutCtx, p: Arc) !void {
         }
     }
 
-    try out.tri_indices.ensureUnusedCapacity((cols - 1) * 3 * 6);
+    try out.tri_indices.ensureUnusedCapacity((cols - 1) * (rows - 1) * 6);
     for (0..cols - 1) |ci| {
-        const c0: u32 = base + @as(u32, @intCast(ci)) * 4;
-        const c1: u32 = c0 + 4;
-        for (0..3) |ri| {
+        const c0: u32 = base + @as(u32, @intCast(ci * rows));
+        const c1: u32 = c0 + @as(u32, @intCast(rows));
+        for (0..rows - 1) |ri| {
             const r0: u32 = @intCast(ri);
             for ([_]u32{
                 c0 + r0,     c1 + r0,     c0 + r0 + 1,
@@ -478,7 +578,13 @@ test "hueDisc: a solid fan plus a ring that fades to nothing" {
     defer dl.deinit();
     var lc = testCtx();
     const SEG = 8;
-    try hueDisc(&dl, &lc, .{ 50, 50 }, 20, .{ 0, 0, 0, 1 }, SEG, redAt);
+    try hueDisc(&dl, &lc, .{
+        .centre = .{ 50, 50 },
+        .r = 20,
+        .centre_color = .{ 0, 0, 0, 1 },
+        .segments = SEG,
+        .hueAt = redAt,
+    });
 
     // centre + rim + feather ring.
     try testing.expectEqual(@as(usize, 1 + SEG * 2), dl.tris.items.len);
@@ -494,6 +600,98 @@ test "hueDisc: a solid fan plus a ring that fades to nothing" {
 
     for (dl.tri_indices.items) |i| try testing.expect(i < dl.tris.items.len);
     try testing.expectEqual(@as(usize, SEG * 9), dl.tri_indices.items.len);
+}
+
+test "hueDisc: the rim shade is IN the mesh, so there is one edge" {
+    // The artifact this exists for. The shade used to be a separate dark
+    // arc laid on top, ending hard at the rim while the disc was still
+    // fading over the pixel beyond it — so the outermost ring came out
+    // BRIGHTER than the darkened one just inside. Against saturated hues
+    // that reads as compression noise.
+    var dl = testList();
+    defer dl.deinit();
+    var lc = testCtx();
+    const SEG = 8;
+    try hueDisc(&dl, &lc, .{
+        .centre = .{ 50, 50 },
+        .r = 20,
+        .centre_color = .{ 0, 0, 0, 1 },
+        .segments = SEG,
+        .hueAt = redAt,
+        .rim_shade = 0.25,
+        .shade_px = 5,
+    });
+
+    // centre + three rings: full hue, darkened rim, darkened feather.
+    try testing.expectEqual(@as(usize, 1 + SEG * 3), dl.tris.items.len);
+    const inner = dl.tris.items[1];
+    const rim = dl.tris.items[1 + SEG];
+    const feath = dl.tris.items[1 + SEG * 2];
+
+    // Brightness falls outward and the two outer rings AGREE, so the
+    // fade carries a single colour instead of crossing a step.
+    try testing.expectApproxEqAbs(@as(f32, 1.0), inner.color[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.75), rim.color[0], 1e-6);
+    try testing.expectApproxEqAbs(rim.color[0], feath.color[0], 1e-6);
+    // Only the outermost is transparent.
+    try testing.expectEqual(@as(f32, 1), inner.color[3]);
+    try testing.expectEqual(@as(f32, 1), rim.color[3]);
+    try testing.expectEqual(@as(f32, 0), feath.color[3]);
+    // And the radii step outward, so no two rings sit on each other.
+    try testing.expect(@abs(inner.pos[1] - 50) < @abs(rim.pos[1] - 50));
+    try testing.expect(@abs(rim.pos[1] - 50) < @abs(feath.pos[1] - 50));
+
+    for (dl.tri_indices.items) |i| try testing.expect(i < dl.tris.items.len);
+}
+
+test "disc: the anti-aliasing band is in the geometry, not off the edge" {
+    // Why a thumb is not a `radius = size/2` quad: that circle's AA band
+    // is centred on the quad's own boundary, so its outer half is never
+    // rasterised and the circle comes out with a flat cap.
+    var dl = testList();
+    defer dl.deinit();
+    var lc = testCtx();
+    const SEG = 8;
+    try disc(&dl, &lc, .{ 10, 10 }, 7, .{ 1, 1, 1, 1 }, SEG);
+
+    try testing.expectEqual(@as(usize, 1 + SEG * 2), dl.tris.items.len);
+    // The rim is opaque, the ring beyond it is not, and it really is
+    // BEYOND — a feather drawn inside the radius would eat the shape.
+    try testing.expectEqual(@as(f32, 1), dl.tris.items[1].color[3]);
+    try testing.expectEqual(@as(f32, 0), dl.tris.items[1 + SEG].color[3]);
+    const rim_d = @abs(dl.tris.items[1].pos[1] - 10);
+    const feath_d = @abs(dl.tris.items[1 + SEG].pos[1] - 10);
+    try testing.expectApproxEqAbs(@as(f32, 7), rim_d, 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 7 + FEATHER), feath_d, 1e-5);
+    for (dl.tri_indices.items) |i| try testing.expect(i < dl.tris.items.len);
+}
+
+test "arc: a zero feather drops the feather rows instead of doubling them" {
+    // Emitting them at the band's own radii puts two vertices in the
+    // same place with different alphas — degenerate triangles carrying a
+    // hard discontinuity, which speckle along the edge.
+    var dl = testList();
+    defer dl.deinit();
+    var lc = testCtx();
+    const col: [4]f32 = .{ 1, 1, 1, 0.5 };
+    try arc(&dl, &lc, .{
+        .centre = .{ 0, 0 },
+        .r_in = 20,
+        .r_out = 24,
+        .a0 = 0,
+        .a1 = 90,
+        .inner_color = col,
+        .outer_color = col,
+        .segments = 4,
+        .feather = 0,
+    });
+
+    // Two rows, not four.
+    try testing.expectEqual(@as(usize, 5 * 2), dl.tris.items.len);
+    // No two vertices coincide with different alphas.
+    for (dl.tris.items) |v| try testing.expectApproxEqAbs(@as(f32, 0.5), v.color[3], 1e-6);
+    for (dl.tri_indices.items) |i| try testing.expect(i < dl.tris.items.len);
+    try testing.expectEqual(@as(usize, 4 * 1 * 6), dl.tri_indices.items.len);
 }
 
 test "arc: four radial rows, with the outer two transparent" {

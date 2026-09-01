@@ -30,6 +30,7 @@ const component_mod = @import("../component.zig");
 const spark_mod = @import("../spark.zig");
 const state_mod = @import("../state.zig");
 const box_helpers = @import("box.zig"); // reuse parseLength + Length
+const relief = @import("relief.zig");
 
 const Component = struct {
     allocator: std.mem.Allocator,
@@ -177,6 +178,24 @@ const THUMB_COLOR: [4]f32 = .{ 0.95, 0.95, 0.98, 1.0 };
 const THUMB_RADIUS: f32 = 7;
 const TRACK_THICKNESS: f32 = 4;
 
+/// The ruled notches along the track, and how far in from each end they
+/// fade out. Ported from `:::trackball`'s dial, where Chris asked for
+/// them: "the notches on the sliders are incredible. Could you add those
+/// to the regular sliders."
+const NOTCH_COLOR: [4]f32 = .{ 1.0, 1.0, 1.0, 0.20 };
+const NOTCH_STEP: f32 = 7.0;
+const NOTCH_EDGE: f32 = 0.06;
+/// How tall the notch band is, as a fraction of the groove. Short of
+/// full height so the groove still reads as a channel with marks in it
+/// rather than a hatched bar.
+const NOTCH_INSET: f32 = 0.22;
+/// Segments in the thumb's fan. It is 14px across; 28 is a tenth of a
+/// pixel of chord error and costs nothing.
+const THUMB_SEGMENTS: usize = 28;
+/// The groove is taller than the coloured fill, so the fill sits IN a
+/// channel. Track thickness plus this, split either side.
+const GROOVE_PAD: f32 = 2.0;
+
 fn layoutAndRender(
     ctx: *anyopaque,
     origin: [2]f32,
@@ -199,13 +218,21 @@ fn layoutAndRender(
     const track_x = origin[0] + thumb_pad;
     const track_w = w - 2 * thumb_pad;
 
-    // Track (full, dim).
-    try out.appendQuad(lc, .{
-        .dst_pos = .{ track_x, track_y },
-        .dst_size = .{ track_w, TRACK_THICKNESS },
-        .color = TRACK_COLOR,
-        .radius = TRACK_THICKNESS * 0.5,
-    });
+    // ── A channel with marks in it, all in the TRIANGLE layer ──
+    //
+    // Two reasons it is triangles rather than the rounded quads this
+    // used to be, and both are about what the quad pipeline cannot do.
+    //
+    // The renderer draws the whole triangle layer beneath the whole quad
+    // layer, so a quad track under a triangle shadow would put the
+    // shadow behind the surface it falls on. And a `radius = size / 2`
+    // quad is a circle exactly inscribed in its own rect, so the outer
+    // half of its anti-aliasing band falls outside the rasterised area
+    // and is lost — which is why this thumb used to come out with a flat
+    // cap. `relief.disc` keeps the band in the geometry.
+    const groove_y = track_y - GROOVE_PAD * 0.5;
+    const groove_h = TRACK_THICKNESS + GROOVE_PAD;
+    try relief.rect(out, lc, track_x, groove_y, track_w, groove_h, TRACK_COLOR);
 
     // Track-filled (left of thumb, bright). Visualises the current
     // value at a glance — the slider reads as "this much of the
@@ -213,23 +240,40 @@ fn layoutAndRender(
     const t = normalised(c);
     const fill_w = track_w * t;
     if (fill_w > 0) {
-        try out.appendQuad(lc, .{
-            .dst_pos = .{ track_x, track_y },
-            .dst_size = .{ fill_w, TRACK_THICKNESS },
-            .color = TRACK_FILL_COLOR,
-            .radius = TRACK_THICKNESS * 0.5,
-        });
+        try relief.rect(out, lc, track_x, track_y, fill_w, TRACK_THICKNESS, TRACK_FILL_COLOR);
     }
+
+    // Notches, over the fill as well as the empty track: a ruler is
+    // uniform along its length, and drawing them only on the unfilled
+    // part turns the scale into a second progress bar. Faded toward
+    // both ends so they sink into the recess instead of stopping dead
+    // against the lip.
+    const notch_y = groove_y + groove_h * NOTCH_INSET;
+    const notch_h = groove_h * (1.0 - NOTCH_INSET * 2.0);
+    if (notch_h > 0.5 and track_w > NOTCH_STEP) {
+        var nx = track_x + NOTCH_STEP;
+        while (nx < track_x + track_w - 1) : (nx += NOTCH_STEP) {
+            const u = (nx - track_x) / track_w;
+            const fade = relief.edgeFade(u, NOTCH_EDGE);
+            if (fade <= 0.01) continue;
+            try relief.hairlineV(out, lc, nx, notch_y, notch_h, 1.0, .{
+                NOTCH_COLOR[0],
+                NOTCH_COLOR[1],
+                NOTCH_COLOR[2],
+                NOTCH_COLOR[3] * fade,
+            });
+        }
+    }
+
+
+    // The cut-out last, so the lip's shadow falls across the notches and
+    // the fill that lie down inside it.
+    try relief.groove(out, lc, track_x, groove_y, track_w, groove_h, true);
 
     // Thumb. Stable size; centred on the track at `value`.
     const thumb_cx = track_x + fill_w;
     const thumb_cy = track_y + TRACK_THICKNESS * 0.5;
-    try out.appendQuad(lc, .{
-        .dst_pos = .{ thumb_cx - THUMB_RADIUS, thumb_cy - THUMB_RADIUS },
-        .dst_size = .{ THUMB_RADIUS * 2, THUMB_RADIUS * 2 },
-        .color = THUMB_COLOR,
-        .radius = THUMB_RADIUS,
-    });
+    try relief.disc(out, lc, .{ thumb_cx, thumb_cy }, THUMB_RADIUS, THUMB_COLOR, THUMB_SEGMENTS);
 
     const box: element.Box = .{
         .x = origin[0],
