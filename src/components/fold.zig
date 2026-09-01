@@ -17,6 +17,11 @@
 //!   between, the header click is in charge. See `last_open_attr`.
 //! - `target`  (optional) — `state.path` the header click flips, so the
 //!   flag can be published rather than kept private.
+//! - `group`   (optional) — an ACCORDION group name. Opening this fold
+//!   closes every other open fold carrying the same `group` in the same
+//!   DOCUMENT. Closing one closes nothing else, so an accordion can be
+//!   emptied. Absent by default: folds mind their own business unless
+//!   they are told to collaborate. See `closeSiblings`.
 //! - `color` / `text` (optional) — palette for the header bar.
 //!
 //! ## Collapse is a VISIBILITY fact, not a document fact
@@ -171,6 +176,40 @@ const Component = struct {
     last_box: element.Box = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     spark: ?*spark_mod.Spark = null,
 
+    /// An ACCORDION group name. Empty for a fold that minds its own
+    /// business, which is the default. Opening a fold closes every other
+    /// open fold that shares its group — see `closeSiblings`.
+    group: []u8,
+    /// The document this fold belongs to, and the other half of a
+    /// group's identity.
+    ///
+    /// A group name alone is not enough: two panels each declaring
+    /// `group=sections` are two accordions, not one, and coupling them
+    /// would make opening a section in the X-ray collapse one in FX. The
+    /// document's `State` pointer is exactly the right grain — every
+    /// component in one panel shares it, and no two panels do. It is
+    /// also what makes the module-level list below safe across two
+    /// `Spark`s in one process.
+    ///
+    /// Compared as an address and never dereferenced.
+    doc_state: ?*state_mod.State = null,
+    /// Intrusive singly-linked list of every live fold, so a group can
+    /// find its members.
+    ///
+    /// **A module-level list is a smell and this is the honest version
+    /// of it.** `Factory.create` sees a Spark and a Spec, and nothing
+    /// offers "every instance of my factory" — `:::embedded-document`
+    /// has the same complaint written in its header about theme and
+    /// registry. The alternatives were worse: routing the coordination
+    /// through a state path would need an equality operator the template
+    /// language has not got, and giving each group an owner component
+    /// would make the document declare a container it does not otherwise
+    /// need.
+    ///
+    /// Cost is one pointer per fold and a walk of every live fold per
+    /// open, which is a handful of items at a human-scale event.
+    next_live: ?*Component = null,
+
     fn isOpen(self: *const Component) bool {
         return self.open_self;
     }
@@ -179,6 +218,7 @@ const Component = struct {
         const a = self.allocator;
         var title_raw: ?[]const u8 = null;
         var target_raw: []const u8 = "";
+        var group_raw: []const u8 = "";
         var open_opt: ?bool = null;
 
         self.alignment = element.AlignAttrs.readFrom(spec);
@@ -187,6 +227,8 @@ const Component = struct {
                 title_raw = attr.value;
             } else if (std.mem.eql(u8, attr.key, "target")) {
                 target_raw = attr.value;
+            } else if (std.mem.eql(u8, attr.key, "group")) {
+                group_raw = attr.value;
             } else if (std.mem.eql(u8, attr.key, "open")) {
                 open_opt = button.isTruthy(attr.value);
             } else if (std.mem.eql(u8, attr.key, "color")) {
@@ -209,17 +251,83 @@ const Component = struct {
         // `self.target`. See `component.adoptString`.
         try component_mod.adoptString(a, &self.title, title);
         try component_mod.adoptString(a, &self.target, target);
+        try component_mod.adoptString(a, &self.group, group_raw);
 
         // Seed and sync — see `last_open_attr`. Applied when the value
         // MOVED, which at create is always (the previous is null).
         if (open_opt) |v| {
             const moved = self.last_open_attr == null or self.last_open_attr.? != v;
-            if (moved) self.open_self = v;
+            if (moved) {
+                self.open_self = v;
+                // A SEED opens a fold too, so it has to close its group
+                // the same way a click does — otherwise a document that
+                // seeds two members open starts with an accordion that
+                // is not one, and only the first click fixes it.
+                //
+                // Ingest runs in document order, so the LAST member with
+                // a truthy `open=` wins. That is the rule an author can
+                // predict; anything cleverer would make `open=` mean
+                // something different inside a group than outside one.
+                if (v) closeSiblings(self);
+            }
         }
         self.last_open_attr = open_opt;
         self.version +%= 1;
     }
 };
+
+/// Head of the intrusive list of live folds. See `Component.next_live`
+/// for why a module-level list rather than something tidier, and why it
+/// is safe across two `Spark`s in one process.
+var live_folds: ?*Component = null;
+
+fn linkLive(c: *Component) void {
+    c.next_live = live_folds;
+    live_folds = c;
+}
+
+fn unlinkLive(c: *Component) void {
+    var slot = &live_folds;
+    while (slot.*) |node| {
+        if (node == c) {
+            slot.* = node.next_live;
+            c.next_live = null;
+            return;
+        }
+        slot = &node.next_live;
+    }
+}
+
+/// Close every OTHER open fold sharing this one's group and document.
+///
+/// The accordion. Chris, 2026-09-01: "right now you can open two
+/// collapsible regions at the same time … it would be cool if opening
+/// one closes another. I'm thinking the regions could take an optional
+/// region group name."
+///
+/// Group membership is (name, document) and not name alone — "those
+/// region names should be local to the document of course." The
+/// document's `State` pointer is that scope exactly: shared by every
+/// component in one panel, distinct between panels.
+///
+/// **Bumping the closed sibling's `version` is the load-bearing line.**
+/// Setting its flag alone is precisely this morning's bug one door
+/// along: the retained layout cache is keyed on `contentVersion`, so a
+/// fold whose visibility moved without its version moving replays the
+/// drawlist it had while open. The section would stay on screen, fully
+/// drawn, while believing itself shut. See the header.
+fn closeSiblings(self: *Component) void {
+    if (self.group.len == 0) return;
+    var it = live_folds;
+    while (it) |other| : (it = other.next_live) {
+        if (other == self) continue;
+        if (!other.open_self) continue;
+        if (other.doc_state != self.doc_state) continue;
+        if (!std.mem.eql(u8, other.group, self.group)) continue;
+        other.open_self = false;
+        other.version +%= 1;
+    }
+}
 
 fn create(
     spark: *spark_mod.Spark,
@@ -235,6 +343,11 @@ fn create(
         .spark = spark,
         .title = try allocator.dupe(u8, ""),
         .target = try allocator.dupe(u8, ""),
+        .group = try allocator.dupe(u8, ""),
+        // The DOCUMENT's state, which is a group's scope — see
+        // `doc_state`. Same call the body parse below uses, so the two
+        // cannot drift.
+        .doc_state = component_mod.specState(spec, spark.host_state),
         .arena = std.heap.ArenaAllocator.init(allocator),
         .root = element.Element{ .paragraph = &[_]element.Element{} },
         .scope = undefined,
@@ -242,8 +355,17 @@ fn create(
     errdefer {
         allocator.free(c.title);
         allocator.free(c.target);
+        allocator.free(c.group);
         c.arena.deinit();
     }
+
+    // Linked BEFORE `ingest`, because a seeded `open=` closes its group
+    // and a fold that is not in the list yet cannot be found by the
+    // siblings it is supposed to be collaborating with. Unlinked in
+    // `deinit_` — a stale node is a dangling pointer walked on the next
+    // open, which is the one way this list can hurt.
+    linkLive(c);
+    errdefer unlinkLive(c);
 
     c.scope = try allocator.dupe(u8, component_mod.specScope(spec, id_raw));
     errdefer allocator.free(c.scope);
@@ -304,11 +426,13 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     // Children FIRST — their bindings unsubscribe from a State that is
     // not ours to free, but the instances themselves live in the shared
     // registry under our scope and nobody else will sweep them.
+    unlinkLive(c);
     if (c.spark) |sp| sp.registry.deinitScope(c.scope);
     c.arena.deinit();
     allocator.free(c.scope);
     allocator.free(c.title);
     allocator.free(c.target);
+    allocator.free(c.group);
     allocator.destroy(c);
 }
 
@@ -573,6 +697,12 @@ fn onInput(
             c.version +%= 1;
             if (c.spark) |sp| sp.host_state.dirty = true;
 
+            // Opening one member of a group closes the rest. Closing a
+            // member closes nothing — clicking the open section of an
+            // accordion leaves you with none open, which is what every
+            // inspector does and what "toggle" already meant here.
+            if (c.open_self) closeSiblings(c);
+
             if (c.target.len == 0) return;
 
             const state: *state_mod.State = @ptrCast(@alignCast(state_ptr));
@@ -608,6 +738,7 @@ fn testComponent() Component {
         .allocator = testing.allocator,
         .title = undefined,
         .target = undefined,
+        .group = undefined,
         .arena = std.heap.ArenaAllocator.init(testing.allocator),
         .root = element.Element{ .paragraph = &[_]element.Element{} },
         .scope = undefined,
@@ -617,11 +748,14 @@ fn testComponent() Component {
 fn initStrings(c: *Component) !void {
     c.title = try testing.allocator.dupe(u8, "");
     c.target = try testing.allocator.dupe(u8, "");
+    c.group = try testing.allocator.dupe(u8, "");
 }
 
 fn freeStrings(c: *Component) void {
+    unlinkLive(c);
     testing.allocator.free(c.title);
     testing.allocator.free(c.target);
+    testing.allocator.free(c.group);
     c.arena.deinit();
 }
 
@@ -889,4 +1023,248 @@ test "fold: a right-click moves neither the flag nor the version" {
     try onInput(@ptrCast(&c), .{ .mouse_up = .{ .local = .{ 0, 0 }, .button = 1, .button_down = false } }, @ptrCast(&state));
     try testing.expectEqual(before, contentVersion(@ptrCast(&c)));
     try testing.expect(c.isOpen());
+}
+
+// ── The accordion ───────────────────────────────────────────────────
+//
+// These build their Components by hand and link them into `live_folds`
+// themselves, because `create` needs a live theme and registry to parse
+// a body and none of what is under test here reads the tree.
+
+fn groupMember(c: *Component, group: []const u8, doc: ?*state_mod.State) !void {
+    try initStrings(c);
+    testing.allocator.free(c.group);
+    c.group = try testing.allocator.dupe(u8, group);
+    c.doc_state = doc;
+    linkLive(c);
+}
+
+const CLICK: element.InputEvent =
+    .{ .mouse_up = .{ .local = .{ 0, 0 }, .button = 0, .button_down = false } };
+
+test "fold: opening one member of a group closes the others" {
+    // Chris, 2026-09-01: "it would be cool if opening one closes
+    // another. I'm thinking the regions could take an optional region
+    // group name, so they collaborate with the folding and unfolding."
+    var doc = state_mod.State.init(testing.allocator);
+    defer doc.deinit();
+
+    var a = testComponent();
+    var b = testComponent();
+    var c = testComponent();
+    try groupMember(&a, "sections", &doc);
+    try groupMember(&b, "sections", &doc);
+    try groupMember(&c, "sections", &doc);
+    defer {
+        freeStrings(&a);
+        freeStrings(&b);
+        freeStrings(&c);
+    }
+
+    // All three start open, which is the default and is exactly the
+    // state a group has to be able to resolve.
+    a.open_self = true;
+    b.open_self = true;
+    c.open_self = true;
+
+    // Click `a` twice: shut, then open. The OPEN is what collapses the
+    // rest — closing a member must close nothing else, or an accordion
+    // could never be emptied.
+    try onInput(@ptrCast(&a), CLICK, @ptrCast(&doc));
+    try testing.expect(!a.isOpen());
+    try testing.expect(b.isOpen() and c.isOpen());
+
+    try onInput(@ptrCast(&a), CLICK, @ptrCast(&doc));
+    try testing.expect(a.isOpen());
+    try testing.expect(!b.isOpen() and !c.isOpen());
+}
+
+test "fold: a closed sibling's VERSION moves, or it stays on screen" {
+    // The same trap as the header click, one door along. Setting the
+    // sibling's flag without bumping its version leaves the retained
+    // layout cache replaying the drawlist it had while open — the
+    // section would remain fully drawn while believing itself shut,
+    // which is a worse bug than the one this feature is built on.
+    var doc = state_mod.State.init(testing.allocator);
+    defer doc.deinit();
+
+    var a = testComponent();
+    var b = testComponent();
+    try groupMember(&a, "sections", &doc);
+    try groupMember(&b, "sections", &doc);
+    defer {
+        freeStrings(&a);
+        freeStrings(&b);
+    }
+
+    a.open_self = false;
+    b.open_self = true;
+    const b_before = contentVersion(@ptrCast(&b));
+
+    try onInput(@ptrCast(&a), CLICK, @ptrCast(&doc));
+    try testing.expect(a.isOpen() and !b.isOpen());
+    try testing.expect(contentVersion(@ptrCast(&b)) != b_before);
+}
+
+test "fold: a group is local to its document" {
+    // "Those region names should be local to the document of course."
+    // Two panels each saying `group=sections` are two accordions, and
+    // coupling them would make opening a section in the X-ray collapse
+    // one in FX. The document's State pointer is the scope.
+    var doc_x = state_mod.State.init(testing.allocator);
+    defer doc_x.deinit();
+    var doc_f = state_mod.State.init(testing.allocator);
+    defer doc_f.deinit();
+
+    var mine = testComponent();
+    var theirs = testComponent();
+    try groupMember(&mine, "sections", &doc_x);
+    try groupMember(&theirs, "sections", &doc_f); // same NAME, other panel
+    defer {
+        freeStrings(&mine);
+        freeStrings(&theirs);
+    }
+
+    mine.open_self = false;
+    theirs.open_self = true;
+    try onInput(@ptrCast(&mine), CLICK, @ptrCast(&doc_x));
+    try testing.expect(mine.isOpen());
+    try testing.expect(theirs.isOpen()); // untouched
+}
+
+test "fold: an ungrouped fold collaborates with nobody" {
+    // The default, and it has to stay the default: every fold shipped
+    // before this feature has no `group=`, and folds in one panel that
+    // are deliberately independent must not start herding each other
+    // just because they are neighbours.
+    var doc = state_mod.State.init(testing.allocator);
+    defer doc.deinit();
+
+    var a = testComponent();
+    var b = testComponent();
+    try groupMember(&a, "", &doc);
+    try groupMember(&b, "", &doc);
+    defer {
+        freeStrings(&a);
+        freeStrings(&b);
+    }
+
+    a.open_self = false;
+    b.open_self = true;
+    try onInput(@ptrCast(&a), CLICK, @ptrCast(&doc));
+    try testing.expect(a.isOpen() and b.isOpen());
+}
+
+test "fold: a seeded `open=` closes its group too, last member winning" {
+    // A seed opens a fold exactly as a click does, so it has to collapse
+    // the group the same way — otherwise a document that seeds two
+    // members open starts with an accordion that is not one, and only
+    // the first click repairs it.
+    var doc = state_mod.State.init(testing.allocator);
+    defer doc.deinit();
+
+    var a = testComponent();
+    var b = testComponent();
+    try groupMember(&a, "sections", &doc);
+    try groupMember(&b, "sections", &doc);
+    defer {
+        freeStrings(&a);
+        freeStrings(&b);
+    }
+
+    const attrs = [_]components.Attr{
+        .{ .key = "title", .value = "S" },
+        .{ .key = "group", .value = "sections" },
+        .{ .key = "open", .value = "1" },
+    };
+    const spec: components.Spec = .{ .name = "fold", .attrs = &attrs };
+
+    // Ingest runs in document order, so the LAST member with a truthy
+    // `open=` wins. Predictable beats clever: `open=` has to mean the
+    // same thing inside a group as outside one.
+    try a.ingest(&spec);
+    try b.ingest(&spec);
+    try testing.expect(!a.isOpen());
+    try testing.expect(b.isOpen());
+}
+
+test "fold: unlinkLive removes head, middle and tail without losing the rest" {
+    // The one way this list can hurt: a stale node is a dangling pointer
+    // dereferenced by the next open in that group, and a panel unmounted
+    // while another is on screen is the ordinary case. `deinit_` calls
+    // this first, before anything is freed.
+    //
+    // Head, middle and tail because that is where singly-linked removal
+    // actually breaks — a version that walked `node.next` instead of the
+    // slot pointer would pass on the middle and drop the head.
+    var doc = state_mod.State.init(testing.allocator);
+    defer doc.deinit();
+
+    var a = testComponent();
+    var b = testComponent();
+    var c = testComponent();
+    try groupMember(&a, "g", &doc); // linked last → head is c
+    try groupMember(&b, "g", &doc);
+    try groupMember(&c, "g", &doc);
+    defer {
+        freeStrings(&a);
+        freeStrings(&b);
+        freeStrings(&c);
+    }
+
+    const count = struct {
+        fn f() usize {
+            var n: usize = 0;
+            var it = live_folds;
+            while (it) |node| : (it = node.next_live) n += 1;
+            return n;
+        }
+        fn has(target: *Component) bool {
+            var it = live_folds;
+            while (it) |node| : (it = node.next_live) {
+                if (node == target) return true;
+            }
+            return false;
+        }
+    };
+    try testing.expectEqual(@as(usize, 3), count.f());
+
+    unlinkLive(&c); // the head
+    try testing.expectEqual(@as(usize, 2), count.f());
+    try testing.expect(!count.has(&c) and count.has(&b) and count.has(&a));
+
+    unlinkLive(&a); // the tail
+    try testing.expectEqual(@as(usize, 1), count.f());
+    try testing.expect(count.has(&b));
+
+    unlinkLive(&b);
+    try testing.expectEqual(@as(usize, 0), count.f());
+
+    // Unlinking something already gone is a no-op, not a corruption —
+    // `deinit_` and the create-path errdefer can both reach it.
+    unlinkLive(&b);
+    try testing.expectEqual(@as(usize, 0), count.f());
+}
+
+test "fold: a fold destroyed mid-group is not walked by the next open" {
+    // The same claim from the outside: link three, drop the middle, and
+    // the accordion still resolves rather than reading freed memory.
+    var doc = state_mod.State.init(testing.allocator);
+    defer doc.deinit();
+
+    var a = testComponent();
+    try groupMember(&a, "sections", &doc);
+    {
+        var gone = testComponent();
+        try groupMember(&gone, "sections", &doc);
+        gone.open_self = true;
+        freeStrings(&gone); // what `deinit_` does, in the same order
+    }
+
+    a.open_self = false;
+    try onInput(@ptrCast(&a), CLICK, @ptrCast(&doc));
+    try testing.expect(a.isOpen());
+
+    freeStrings(&a);
+    try testing.expect(live_folds == null);
 }
