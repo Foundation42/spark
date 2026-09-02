@@ -109,6 +109,8 @@ A `numeric` field is right-aligned, mono and **draggable**: press and pull sidew
 
 **The drag is curved.** Near the press point a pixel is worth about a sixth of what a straight-line scrub would give it, so you can creep up on a value one unit at a time; further out the curve overtakes and the whole range is still one gesture. Twelve pixels moves `box_width` by about four, where a linear scrub would have moved it twenty-eight.
 
+**Drag whichever way you reach for.** The field watches the first few pixels and commits to that axis for the rest of the gesture — sideways like Blender and Resolve, or up and down like a DAW's number box. Up is more. Once it has committed it stays committed, so a mostly-vertical pull that wanders sideways keeps answering to the vertical.
+
 Nothing else writes `box_width`, so the box up the page is following this field alone. Compare the feel against the two sliders above it.
 
 :::input {numeric target=state.box_width initial=${state.box_width} min=40 max=600 width=140}

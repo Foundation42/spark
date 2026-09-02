@@ -155,6 +155,39 @@ pub const Error = error{
 /// header.
 pub const Gesture = enum { none, pending, scrubbing };
 
+/// Which way a scrub is being pulled, latched once per gesture.
+pub const Axis = enum { x, y };
+
+/// The axis a gesture commits to, decided at the moment it crosses the
+/// slop and never revisited.
+///
+/// **Why this is not simply one or the other.** Chris reached for a
+/// vertical drag on the first field he tried; the code only did
+/// horizontal. Both are real conventions with real tools behind them —
+/// Blender, Unity, Fusion and Resolve scrub sideways, while DAW number
+/// boxes and Max-style value fields scrub up and down — so "the right
+/// one" is whichever the hand already expects, and a field cannot know
+/// that. It can watch, though: the first few pixels of travel say which
+/// instrument the user thinks they are holding.
+///
+/// Ties go to `.x` — arbitrary, but it has to be *decided* rather than
+/// left to floating-point luck, or a perfectly diagonal press would pick
+/// a different axis on different machines.
+pub fn axisFor(dx: f32, dy: f32) Axis {
+    return if (@abs(dy) > @abs(dx)) .y else .x;
+}
+
+/// Signed travel along the committed axis. **Up is MORE**: screen y grows
+/// downward, so the vertical arm negates. Every vertical value control
+/// ever built agrees about this and it is the one part of the convention
+/// that is not a matter of taste.
+pub fn travelOn(axis: Axis, dx: f32, dy: f32) f32 {
+    return switch (axis) {
+        .x => dx,
+        .y => -dy,
+    };
+}
+
 /// Pixels of travel before a press becomes a scrub. Paid for by hand
 /// tremor and trackpads: a click that moves two pixels is a click, and a
 /// field that nudged its knob on every click would be unusable for typing
@@ -315,12 +348,17 @@ const Component = struct {
     decimals_explicit: bool = false,
 
     gesture: Gesture = .none,
+    /// Latched with the promotion to `.scrubbing`, and not revisited for
+    /// the rest of the gesture — a field whose axis could change mid-drag
+    /// would lurch when a mostly-vertical pull wandered sideways.
+    axis: Axis = .x,
     /// Where in the box the press landed, and the value the buffer held at
     /// that moment. A scrub is always measured from the PRESS rather than
     /// integrated move-to-move: integrating accumulates its own rounding,
     /// so dragging out and back would not return the value you started
     /// with. `:::trackball`'s dial learned this first.
     press_x: f32 = 0,
+    press_y: f32 = 0,
     press_value: f32 = 0,
 
     last_box: element.Box = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
@@ -704,17 +742,25 @@ fn onInput(
             // here would discard whatever was in it on the first drag.
             const v = parseNumber(c.buffer.items) orelse return;
             c.press_x = m.local[0];
+            c.press_y = m.local[1];
             c.press_value = v;
             c.gesture = .pending;
         },
         .mouse_move => |m| {
             if (c.gesture == .none or !m.button_down) return;
             const dx = m.local[0] - c.press_x;
+            const dy = m.local[1] - c.press_y;
             if (c.gesture == .pending) {
-                if (@abs(dx) < SCRUB_SLOP) return;
+                // The slop is a RADIUS now, not a horizontal distance —
+                // otherwise a purely vertical pull would never promote and
+                // the field would look broken to anyone who scrubs that
+                // way, which is how this was found.
+                if (@max(@abs(dx), @abs(dy)) < SCRUB_SLOP) return;
+                c.axis = axisFor(dx, dy);
                 c.gesture = .scrubbing;
             }
-            const v = scrubTo(c.press_value, dx, stepFor(c.step, c.min, c.max), c.min, c.max);
+            const travel = travelOn(c.axis, dx, dy);
+            const v = scrubTo(c.press_value, travel, stepFor(c.step, c.min, c.max), c.min, c.max);
             try commitNumeric(c, state_ptr, v);
         },
         .mouse_up => |m| {
@@ -1336,4 +1382,78 @@ test "input: a numeric field scrubs at the precision it was seeded with" {
     defer deinit_(einst.ctx, testing.allocator);
     const ec: *Component = @ptrCast(@alignCast(einst.ctx));
     try testing.expectEqual(@as(u8, 1), ec.decimals);
+}
+
+test "input: the scrub axis is whichever way the hand pulled, and up is more" {
+    // Chris, 2026-09-02, trying the field: "I was trying to scrub up and
+    // down, when it is side to side!" Both are real conventions — Blender,
+    // Unity, Fusion and Resolve go sideways; DAW number boxes go up and
+    // down — so the field watches the first few pixels instead of picking
+    // a side. A purely vertical pull used to do NOTHING, because the slop
+    // was a horizontal distance.
+    const attrs = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.speed" },
+        .{ .key = "initial", .value = "10" },
+        .{ .key = "min", .value = "0" },
+        .{ .key = "max", .value = "200" },
+    };
+    const spec: components.Spec = .{ .name = "input", .attrs = &attrs };
+    const inst = try create(&_test_spark, testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+    var state = state_mod.State.init(testing.allocator);
+    defer state.deinit();
+
+    // Straight up 120px. Same travel as a rightward 120, and the same
+    // answer — one curve, two ways of reaching it.
+    try onInput(inst.ctx, .{ .mouse_down = .{ .local = .{ 50, 100 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try onInput(inst.ctx, .{ .mouse_move = .{ .local = .{ 50, -20 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    // Asserted BEFORE the unwrap. With a horizontal-only slop this writes
+    // nothing at all, and `.?` on the nothing is a panic rather than a
+    // sentence — the gate should say what went wrong, not just stop.
+    try testing.expect(state.get("speed") != null);
+    try testing.expectEqualStrings("46", state.get("speed").?);
+
+    // Down is less. Screen y grows downward, so this is the one part of
+    // the convention that is not a matter of taste.
+    try onInput(inst.ctx, .{ .mouse_move = .{ .local = .{ 50, 124 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try testing.expectEqualStrings("7", state.get("speed").?);
+}
+
+test "input: the axis latches, so a wandering drag does not lurch" {
+    // A gesture that commits to vertical and then drifts sideways must
+    // keep answering to vertical. Re-deciding per move would make a
+    // diagonal drag jump between two very different values — here, 11
+    // against 70 — every time the dominant axis changed.
+    const attrs = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.speed" },
+        .{ .key = "initial", .value = "10" },
+        .{ .key = "min", .value = "0" },
+        .{ .key = "max", .value = "200" },
+    };
+    const spec: components.Spec = .{ .name = "input", .attrs = &attrs };
+    const inst = try create(&_test_spark, testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+    var state = state_mod.State.init(testing.allocator);
+    defer state.deinit();
+
+    // Promote on a mostly-vertical move: 1 across, 10 up.
+    try onInput(inst.ctx, .{ .mouse_down = .{ .local = .{ 50, 100 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try onInput(inst.ctx, .{ .mouse_move = .{ .local = .{ 51, 90 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    const c: *Component = @ptrCast(@alignCast(inst.ctx));
+    try testing.expectEqual(Axis.y, c.axis);
+
+    // Now wander a long way sideways while staying 10 above the press.
+    // The vertical travel is still 10, so the value barely moves.
+    try onInput(inst.ctx, .{ .mouse_move = .{ .local = .{ 200, 90 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try testing.expectEqual(Axis.y, c.axis);
+    try testing.expectEqualStrings("11", state.get("speed").?);
+
+    // And the pure half, both ways round.
+    try testing.expectEqual(Axis.y, axisFor(1, -10));
+    try testing.expectEqual(Axis.x, axisFor(-10, 1));
+    try testing.expectEqual(Axis.x, axisFor(5, 5)); // decided, not luck
+    try testing.expectEqual(@as(f32, 7), travelOn(.x, 7, 3));
+    try testing.expectEqual(@as(f32, 3), travelOn(.y, 7, -3));
 }
