@@ -411,7 +411,7 @@ pub const TextPipeline = struct {
         n_glyphs: u32,
         att: vk.Attachment,
     ) void {
-        self.recordDrawRange(cmd, extent, .{ 0, 0 }, 0, n_glyphs, .{}, att);
+        self.recordDrawRange(cmd, extent, .{ 0, 0 }, 0, n_glyphs, .{}, att, null);
     }
 
     /// Bind + draw a contiguous subrange of the glyph instance
@@ -424,6 +424,11 @@ pub const TextPipeline = struct {
     ///
     /// `world_offset`: see `quad_pipeline.recordDrawRange` —
     /// (0, 0) for MAIN, `compose_region.xy` for an offscreen target.
+    /// `scissor_px`: see `quad_pipeline.recordDrawRange`. Clipping TEXT
+    /// is the half that matters for a scroll view — a partly-visible line
+    /// at the edge of the viewport has to be cut mid-glyph, which is why
+    /// this is a GPU scissor and not a CPU cull of primitives outside the
+    /// box.
     pub fn recordDrawRange(
         self: *const TextPipeline,
         cmd: c.VkCommandBuffer,
@@ -433,6 +438,7 @@ pub const TextPipeline = struct {
         instance_count: u32,
         disp: display_mod.Push,
         att: vk.Attachment,
+        scissor_px: ?[4]u32,
     ) void {
         if (instance_count == 0) return;
         c.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipelineFor(att));
@@ -455,7 +461,10 @@ pub const TextPipeline = struct {
             .maxDepth = 1,
         };
         c.vkCmdSetViewport(cmd, 0, 1, &viewport);
-        var scissor = c.VkRect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = extent };
+        var scissor = if (scissor_px) |s| c.VkRect2D{
+            .offset = .{ .x = @intCast(s[0]), .y = @intCast(s[1]) },
+            .extent = .{ .width = s[2], .height = s[3] },
+        } else c.VkRect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = extent };
         c.vkCmdSetScissor(cmd, 0, 1, &scissor);
 
         const pc = TextPushConsts{ .world_offset = world_offset, .display = disp, .viewport_size = .{

@@ -338,7 +338,7 @@ pub const QuadPipeline = struct {
         n_quads: u32,
         att: vk.Attachment,
     ) void {
-        self.recordDrawRange(cmd, extent, .{ 0, 0 }, 0, n_quads, .{}, att);
+        self.recordDrawRange(cmd, extent, .{ 0, 0 }, 0, n_quads, .{}, att, null);
     }
 
     /// Bind + draw a contiguous subrange of the quad instance
@@ -353,6 +353,12 @@ pub const QuadPipeline = struct {
     /// offscreen-target callers pass `compose_region.xy` so the
     /// world-space drawlist coords resolve to target-local coords
     /// inside the shader (Phase B.5).
+    /// `scissor_px` is `{x, y, w, h}` in surface pixels, or null for the
+    /// whole surface. The caller computes it — `element.scissorFor` turns
+    /// a world-space clip into one using the frame's scroll and zoom,
+    /// which the pipeline has no access to. A zero-area scissor is drawn
+    /// as-is rather than skipped: Vulkan handles it, and the branch would
+    /// have to be repeated in every caller.
     pub fn recordDrawRange(
         self: *const QuadPipeline,
         cmd: c.VkCommandBuffer,
@@ -362,6 +368,7 @@ pub const QuadPipeline = struct {
         instance_count: u32,
         disp: display_mod.Push,
         att: vk.Attachment,
+        scissor_px: ?[4]u32,
     ) void {
         if (instance_count == 0) return;
         c.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipelineFor(att));
@@ -384,7 +391,10 @@ pub const QuadPipeline = struct {
             .maxDepth = 1,
         };
         c.vkCmdSetViewport(cmd, 0, 1, &viewport);
-        var scissor = c.VkRect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = extent };
+        var scissor = if (scissor_px) |s| c.VkRect2D{
+            .offset = .{ .x = @intCast(s[0]), .y = @intCast(s[1]) },
+            .extent = .{ .width = s[2], .height = s[3] },
+        } else c.VkRect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = extent };
         c.vkCmdSetScissor(cmd, 0, 1, &scissor);
 
         const pc = QuadPushConsts{ .world_offset = world_offset, .display = disp, .viewport_size = .{

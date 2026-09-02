@@ -1672,6 +1672,13 @@ pub const LayoutCtx = struct {
     /// effect's subtree only, a provisional tag (see
     /// `provisionalTag`). Nothing outside the walker ever sees one.
     current_target_dispatch_index: u32 = MAIN_TARGET,
+    /// The scissor in force, as an index into `DrawList.clips`.
+    ///
+    /// Pushed and popped by a clipping container around its child walk,
+    /// the same shape as `current_target_dispatch_index` above — and for
+    /// the same reason: it is a property inherited by a whole subtree, so
+    /// the walk is where it belongs rather than the primitives.
+    current_clip: u16 = NO_CLIP,
     /// Counter behind `provisionalTag`. Bumped once per pass element
     /// that routes its children offscreen; never read for anything
     /// but uniqueness, so workers holding their own copy is fine —
@@ -1772,6 +1779,153 @@ pub const RunIterator = struct {
 
 pub fn runs(targets: []const u32, match: u32) RunIterator {
     return .{ .targets = targets, .match = match, .cursor = 0 };
+}
+
+// ── Clipping ────────────────────────────────────────────────────────
+//
+// A scissor rectangle, in the same WORLD coordinates the drawlist's
+// primitives carry. The host resolves it to pixels at draw time,
+// because that is where the scroll offset and zoom live.
+//
+// **Why a parallel array and not a field on the instance.** `QuadInstance`
+// and `GlyphInstance` are GPU vertex layouts; widening them costs
+// bandwidth on every primitive to carry a number that is the same for
+// thousands of them in a row. `*_targets` already established the
+// pattern — a parallel `u32` per primitive, scanned on the CPU into
+// runs — and clipping is exactly the same shape of question. So it rides
+// beside it, and the two are scanned together.
+//
+// **Why a table and an index rather than the rect itself.** A clip is
+// pushed by a container and inherited by every primitive under it, so the
+// same rect repeats for a whole subtree. An index makes the common
+// comparison an integer compare, which is what the run scan does per
+// primitive.
+
+/// A scissor rectangle in world coordinates.
+pub const ClipRect = struct {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+
+    /// The overlap of two clips. A clipping container INSIDE another one
+    /// may only ever narrow the region — a child that could widen its
+    /// parent's clip would draw outside the box the parent cut, which is
+    /// the whole thing clipping exists to prevent.
+    pub fn intersect(a: ClipRect, b: ClipRect) ClipRect {
+        const x0 = @max(a.x, b.x);
+        const y0 = @max(a.y, b.y);
+        const x1 = @min(a.x + a.w, b.x + b.w);
+        const y1 = @min(a.y + a.h, b.y + b.h);
+        return .{ .x = x0, .y = y0, .w = @max(0, x1 - x0), .h = @max(0, y1 - y0) };
+    }
+
+    pub fn isEmpty(self: ClipRect) bool {
+        return self.w <= 0 or self.h <= 0;
+    }
+
+    /// `screen = (world − scroll) × zoom` — the same arithmetic
+    /// `endFrame` applies to every glyph and quad, applied to the clip
+    /// table in the same pass so the two can never be a frame apart.
+    pub fn toScreen(self: ClipRect, scroll: [2]f32, zoom: f32) ClipRect {
+        return .{
+            .x = (self.x - scroll[0]) * zoom,
+            .y = (self.y - scroll[1]) * zoom,
+            .w = self.w * zoom,
+            .h = self.h * zoom,
+        };
+    }
+};
+
+/// The clip index every primitive carries until something clips it.
+/// Slot 0 of a drawlist's clip table is always the unclipped whole
+/// surface, so "no clip" needs no special case in the run scan — it is
+/// simply the clip everything inherits.
+pub const NO_CLIP: u16 = 0;
+
+/// One run of consecutive primitives sharing BOTH a target and a clip.
+pub const ClippedRun = struct { first: u32, count: u32, clip: u16 };
+
+/// Iterator over runs matching `match` in `targets`, broken further
+/// wherever the clip index changes.
+///
+/// Two keys rather than one, because both decide a different part of the
+/// draw call: the target says which attachment the primitives go to, the
+/// clip says what scissor is set before they do. A run must be uniform in
+/// both, and since a clip is pushed and popped around a subtree the extra
+/// breaks are few — a document with no clipping yields exactly the runs
+/// `runs()` yields.
+pub const ClippedRunIterator = struct {
+    targets: []const u32,
+    clips: []const u16,
+    match: u32,
+    cursor: usize,
+
+    pub fn next(self: *ClippedRunIterator) ?ClippedRun {
+        while (self.cursor < self.targets.len and self.targets[self.cursor] != self.match) {
+            self.cursor += 1;
+        }
+        if (self.cursor >= self.targets.len) return null;
+        const first = self.cursor;
+        // A drawlist whose clip array is short is treated as unclipped
+        // rather than refused: the arrays are grown in lockstep by the
+        // walker, and a caller that has not adopted clipping yet (a test
+        // fixture, an older host) still gets its runs.
+        const clip = self.clipAt(first);
+        while (self.cursor < self.targets.len and
+            self.targets[self.cursor] == self.match and
+            self.clipAt(self.cursor) == clip)
+        {
+            self.cursor += 1;
+        }
+        return .{
+            .first = @intCast(first),
+            .count = @intCast(self.cursor - first),
+            .clip = clip,
+        };
+    }
+
+    fn clipAt(self: *const ClippedRunIterator, i: usize) u16 {
+        return if (i < self.clips.len) self.clips[i] else NO_CLIP;
+    }
+};
+
+pub fn clippedRuns(targets: []const u32, clips: []const u16, match: u32) ClippedRunIterator {
+    return .{ .targets = targets, .clips = clips, .match = match, .cursor = 0 };
+}
+
+/// A screen-space clip as a pixel scissor: `{x, y, w, h}`.
+///
+/// **The rect arrives already in screen space**, because `endFrame`
+/// transforms the clip table in the same pass that transforms the
+/// primitives, with the same scroll and zoom (`ClipRect.toScreen`). It
+/// has to be the same pass: `drawlist_needs_transform` skips the
+/// transform entirely on a frame that reused the previous layout, so a
+/// clip transformed independently at draw time would be using this
+/// frame's scroll against primitives holding the last one's. That is a
+/// scissor cutting a scroll-height away from the thing it frames.
+///
+/// The min corner FLOORS and the max corner CEILS, so a clip that lands
+/// mid-pixel shows a hair too much rather than a hair too little. A
+/// scissor that rounds inward eats the edge of the content it is meant to
+/// be framing, and a one-pixel seam along a panel edge is visible.
+///
+/// Clamped to the surface: Vulkan refuses a scissor reaching outside the
+/// framebuffer, and a negative offset reaches it as an enormous unsigned
+/// one.
+pub fn scissorOf(rect: ClipRect, surface_w: u32, surface_h: u32) [4]u32 {
+    const fw: f32 = @floatFromInt(surface_w);
+    const fh: f32 = @floatFromInt(surface_h);
+    const x0 = @max(0, @min(fw, @floor(rect.x)));
+    const y0 = @max(0, @min(fh, @floor(rect.y)));
+    const x1 = @max(x0, @min(fw, @ceil(rect.x + rect.w)));
+    const y1 = @max(y0, @min(fh, @ceil(rect.y + rect.h)));
+    return .{
+        @intFromFloat(x0),
+        @intFromFloat(y0),
+        @intFromFloat(x1 - x0),
+        @intFromFloat(y1 - y0),
+    };
 }
 
 /// One run of consecutive triangles with the same target,
@@ -1928,6 +2082,24 @@ pub const DrawList = struct {
     /// the deepest-laid interactive element wins.
     hits: std.ArrayList(Hit),
 
+    /// The scissor table. Slot 0 is always the unclipped whole surface,
+    /// so `NO_CLIP` needs no special case anywhere downstream.
+    clips: std.ArrayList(ClipRect),
+    /// Per-primitive clip index, parallel to `quads` / `glyphs` exactly
+    /// as the `*_targets` arrays are.
+    ///
+    /// **These arrays LAG their primitives, on purpose.** A clip is a
+    /// property of a whole subtree, not of each quad, so tagging every
+    /// append would mean threading the current clip through
+    /// `appendShapedRun` and its forty-odd call sites — every component
+    /// that draws text. Instead the walker calls `sealClips` at each clip
+    /// boundary and once at the end of the frame, which fills in
+    /// everything emitted since the last boundary. Between two seals the
+    /// clip is by construction the same, so the result is identical and
+    /// nothing but the walker had to learn about clipping.
+    quad_clips: std.ArrayList(u16),
+    glyph_clips: std.ArrayList(u16),
+
     pub fn init(allocator: std.mem.Allocator) DrawList {
         return .{
             .glyphs = std.ArrayList(tp.GlyphInstance).init(allocator),
@@ -1940,6 +2112,9 @@ pub const DrawList = struct {
             .images = std.ArrayList(ImageDraw).init(allocator),
             .image_targets = std.ArrayList(u32).init(allocator),
             .hits = std.ArrayList(Hit).init(allocator),
+            .clips = std.ArrayList(ClipRect).init(allocator),
+            .quad_clips = std.ArrayList(u16).init(allocator),
+            .glyph_clips = std.ArrayList(u16).init(allocator),
         };
     }
 
@@ -1954,6 +2129,9 @@ pub const DrawList = struct {
         self.images.deinit();
         self.image_targets.deinit();
         self.hits.deinit();
+        self.clips.deinit();
+        self.quad_clips.deinit();
+        self.glyph_clips.deinit();
         self.* = undefined;
     }
 
@@ -1970,6 +2148,47 @@ pub const DrawList = struct {
         self.images.clearRetainingCapacity();
         self.image_targets.clearRetainingCapacity();
         self.hits.clearRetainingCapacity();
+        self.clips.clearRetainingCapacity();
+        self.quad_clips.clearRetainingCapacity();
+        self.glyph_clips.clearRetainingCapacity();
+    }
+
+    // ── Clipping ───────────────────────────────────────────────────
+
+    /// Bring the clip arrays level with the primitive arrays, tagging
+    /// everything emitted since the last seal with `clip`.
+    ///
+    /// Called by the walker at every clip boundary — on entering a
+    /// clipping container (sealing the OUTER clip over what came before)
+    /// and on leaving it (sealing the INNER clip over the children) — and
+    /// once more before the draw loop, so the tail of the frame is
+    /// covered. Idempotent: sealing twice in a row appends nothing.
+    pub fn sealClips(self: *DrawList, clip: u16) !void {
+        while (self.quad_clips.items.len < self.quads.items.len) try self.quad_clips.append(clip);
+        while (self.glyph_clips.items.len < self.glyphs.items.len) try self.glyph_clips.append(clip);
+    }
+
+    /// Intern `rect`, narrowed by whatever `current` already clips to,
+    /// and return its index. The intersection is what makes a clip inside
+    /// a clip safe — see `ClipRect.intersect`.
+    ///
+    /// Slot 0 is minted lazily on first use so that a drawlist which
+    /// never clips carries no table at all.
+    pub fn pushClip(self: *DrawList, current: u16, rect: ClipRect) !u16 {
+        if (self.clips.items.len == 0) {
+            try self.clips.append(.{ .x = 0, .y = 0, .w = std.math.floatMax(f32), .h = std.math.floatMax(f32) });
+        }
+        const narrowed = if (current == NO_CLIP) rect else self.clips.items[current].intersect(rect);
+        try self.clips.append(narrowed);
+        return @intCast(self.clips.items.len - 1);
+    }
+
+    /// The rect for a clip index. `NO_CLIP` on a drawlist that never
+    /// clipped has no table entry, so this answers for it directly.
+    pub fn clipRect(self: *const DrawList, clip: u16) ?ClipRect {
+        if (clip == NO_CLIP) return null;
+        if (clip >= self.clips.items.len) return null;
+        return self.clips.items[clip];
     }
 
     // ── Emit helpers (Phase B.4.a) ─────────────────────────────────
@@ -2322,6 +2541,208 @@ test "runs: no matches yields nothing" {
     const targets: []const u32 = &.{ 1, 2, 3, 4 };
     var it = runs(targets, 7);
     try testing.expect(it.next() == null);
+}
+
+test "clippedRuns: with no clipping it yields exactly what runs() yields" {
+    // Rule 7 — the ordinary path is a test case too, and here it is also
+    // the migration guarantee: every existing call site is being switched
+    // to this iterator, so a document that clips nothing must produce the
+    // same draw calls it produced before clipping existed.
+    const targets: []const u32 = &.{ MAIN_TARGET, MAIN_TARGET, 0, 0, MAIN_TARGET };
+    const clips: []const u16 = &.{ NO_CLIP, NO_CLIP, NO_CLIP, NO_CLIP, NO_CLIP };
+    var plain = runs(targets, MAIN_TARGET);
+    var clipped = clippedRuns(targets, clips, MAIN_TARGET);
+    while (plain.next()) |a| {
+        const b = clipped.next().?;
+        try testing.expectEqual(a.first, b.first);
+        try testing.expectEqual(a.count, b.count);
+        try testing.expectEqual(NO_CLIP, b.clip);
+    }
+    try testing.expect(clipped.next() == null);
+}
+
+test "clippedRuns: a clip change breaks a run that the target alone would not" {
+    // The whole point. Five primitives, all going to MAIN, but the middle
+    // three sit under a clipping container: one draw call becomes three,
+    // and the scissor is set between them. Matching on the target alone
+    // would emit one run and the clip would apply to everything or
+    // nothing — which is how a scroll view leaks over the panel below it.
+    const targets: []const u32 = &.{ MAIN_TARGET, MAIN_TARGET, MAIN_TARGET, MAIN_TARGET, MAIN_TARGET };
+    const clips: []const u16 = &.{ NO_CLIP, 1, 1, 1, NO_CLIP };
+    var it = clippedRuns(targets, clips, MAIN_TARGET);
+    const r1 = it.next().?;
+    try testing.expectEqual(@as(u32, 0), r1.first);
+    try testing.expectEqual(@as(u32, 1), r1.count);
+    try testing.expectEqual(NO_CLIP, r1.clip);
+    const r2 = it.next().?;
+    try testing.expectEqual(@as(u32, 1), r2.first);
+    try testing.expectEqual(@as(u32, 3), r2.count);
+    try testing.expectEqual(@as(u16, 1), r2.clip);
+    const r3 = it.next().?;
+    try testing.expectEqual(@as(u32, 4), r3.first);
+    try testing.expectEqual(@as(u32, 1), r3.count);
+    try testing.expectEqual(NO_CLIP, r3.clip);
+    try testing.expect(it.next() == null);
+}
+
+test "clippedRuns: both keys break a run, and a short clip array reads as unclipped" {
+    // Interleaved targets AND clips together — the case where the two
+    // keys disagree about where the boundaries are.
+    const targets: []const u32 = &.{ MAIN_TARGET, MAIN_TARGET, 0, MAIN_TARGET };
+    const clips: []const u16 = &.{ 2, 2, 2, 2 };
+    var it = clippedRuns(targets, clips, MAIN_TARGET);
+    const r1 = it.next().?;
+    try testing.expectEqual(@as(u32, 0), r1.first);
+    try testing.expectEqual(@as(u32, 2), r1.count);
+    try testing.expectEqual(@as(u16, 2), r1.clip);
+    const r2 = it.next().?;
+    try testing.expectEqual(@as(u32, 3), r2.first);
+    try testing.expectEqual(@as(u32, 1), r2.count);
+    try testing.expect(it.next() == null);
+
+    // A caller that has not grown a clip array yet gets unclipped runs
+    // rather than an out-of-bounds read. The arrays are kept in lockstep
+    // by the walker, but test fixtures build drawlists by hand.
+    var short = clippedRuns(targets, &.{}, MAIN_TARGET);
+    const s1 = short.next().?;
+    try testing.expectEqual(@as(u32, 2), s1.count);
+    try testing.expectEqual(NO_CLIP, s1.clip);
+}
+
+test "ClipRect: a nested clip may only narrow, never widen" {
+    // A child clip that could widen its parent's would draw outside the
+    // box the parent cut — the one thing clipping exists to prevent. So
+    // the walker intersects rather than replaces.
+    const outer: ClipRect = .{ .x = 0, .y = 0, .w = 100, .h = 100 };
+    const inner: ClipRect = .{ .x = 20, .y = 20, .w = 40, .h = 40 };
+    const both = outer.intersect(inner);
+    try testing.expectEqual(@as(f32, 20), both.x);
+    try testing.expectEqual(@as(f32, 40), both.w);
+
+    // A child asking for MORE than its parent gets its parent's bounds.
+    const greedy: ClipRect = .{ .x = -50, .y = -50, .w = 500, .h = 500 };
+    const capped = outer.intersect(greedy);
+    try testing.expectEqual(@as(f32, 0), capped.x);
+    try testing.expectEqual(@as(f32, 100), capped.w);
+
+    // Disjoint rects give an EMPTY clip, not a negative one — a negative
+    // width reaches Vulkan as a huge unsigned extent.
+    const away: ClipRect = .{ .x = 200, .y = 200, .w = 10, .h = 10 };
+    const none = outer.intersect(away);
+    try testing.expect(none.isEmpty());
+    try testing.expectEqual(@as(f32, 0), none.w);
+    try testing.expectEqual(@as(f32, 0), none.h);
+}
+
+test "ClipRect.toScreen: the same transform endFrame applies to the primitives" {
+    const r: ClipRect = .{ .x = 10, .y = 20, .w = 100, .h = 50 };
+    // At rest it is itself.
+    try testing.expectEqual(r, r.toScreen(.{ 0, 0 }, 1.0));
+    // Scrolled down 15, the clip rides UP the screen with its content.
+    // Getting this backwards puts the scissor a scroll-height away from
+    // the thing it frames, which reads as the clip doing nothing.
+    const scrolled = r.toScreen(.{ 0, 15 }, 1.0);
+    try testing.expectEqual(@as(f32, 5), scrolled.y);
+    try testing.expectEqual(@as(f32, 50), scrolled.h);
+    // Zoomed: offset AND size scale, or a zoomed panel clips at the wrong
+    // size.
+    const zoomed = r.toScreen(.{ 0, 0 }, 2.0);
+    try testing.expectEqual(@as(f32, 20), zoomed.x);
+    try testing.expectEqual(@as(f32, 200), zoomed.w);
+}
+
+test "scissorOf: pixels, clamped to the surface, generous at the edges" {
+    const r: ClipRect = .{ .x = 10, .y = 20, .w = 100, .h = 50 };
+    try testing.expectEqual([4]u32{ 10, 20, 100, 50 }, scissorOf(r, 800, 600));
+
+    // Clamped — Vulkan refuses a scissor reaching outside the framebuffer.
+    const huge: ClipRect = .{ .x = -50, .y = -50, .w = 5000, .h = 5000 };
+    try testing.expectEqual([4]u32{ 0, 0, 800, 600 }, scissorOf(huge, 800, 600));
+
+    // Entirely off the top: an EMPTY scissor, never a negative one — a
+    // negative offset reaches Vulkan as an enormous unsigned.
+    const gone: ClipRect = .{ .x = 10, .y = -5000, .w = 100, .h = 50 };
+    const g = scissorOf(gone, 800, 600);
+    try testing.expectEqual(@as(u32, 0), g[2] * g[3]);
+
+    // A mid-pixel clip shows a hair MORE, not less: floor the near edge,
+    // ceil the far one. Rounding inward eats the edge of the content the
+    // clip is framing and leaves a visible seam along it.
+    const frac: ClipRect = .{ .x = 10.4, .y = 0, .w = 9.2, .h = 10 };
+    const generous = scissorOf(frac, 800, 600);
+    try testing.expectEqual(@as(u32, 10), generous[0]); // floored down
+    try testing.expectEqual(@as(u32, 10), generous[2]); // out to 20, ceiled
+}
+
+test "DrawList: sealing fills the lagging clip arrays at each boundary" {
+    // The whole correctness argument for lagging arrays instead of tagging
+    // every primitive. Emit, seal, push, emit, seal, pop, emit, seal — and
+    // the per-primitive array must come out exactly as if every append had
+    // carried its clip. Sealing at the WRONG moment (or forgetting one) is
+    // silent: the arrays stay the right length and the wrong primitives get
+    // clipped, which looks like a panel cropping its neighbour.
+    var dl = DrawList.init(testing.allocator);
+    defer dl.deinit();
+    const q: qp.QuadInstance = .{ .dst_pos = .{ 0, 0 }, .dst_size = .{ 1, 1 }, .color = .{ 1, 1, 1, 1 }, .radius = 0 };
+
+    // Two before the window.
+    try dl.quads.append(q);
+    try dl.quads.append(q);
+    try dl.sealClips(NO_CLIP);
+    try testing.expectEqualSlices(u16, &.{ 0, 0 }, dl.quad_clips.items);
+
+    // Idempotent — the walker seals on entry and the frame seals again at
+    // the end, and a document with one clip in it hits both.
+    try dl.sealClips(NO_CLIP);
+    try testing.expectEqual(@as(usize, 2), dl.quad_clips.items.len);
+
+    // Into the window: three inside.
+    const inner = try dl.pushClip(NO_CLIP, .{ .x = 10, .y = 10, .w = 100, .h = 50 });
+    try dl.quads.append(q);
+    try dl.quads.append(q);
+    try dl.quads.append(q);
+    try dl.sealClips(inner);
+
+    // And one after it, back outside.
+    try dl.quads.append(q);
+    try dl.sealClips(NO_CLIP);
+    try testing.expectEqualSlices(u16, &.{ 0, 0, inner, inner, inner, 0 }, dl.quad_clips.items);
+
+    // Which the run scan turns into three draws with the scissor set
+    // between them.
+    const targets = [_]u32{ MAIN_TARGET, MAIN_TARGET, MAIN_TARGET, MAIN_TARGET, MAIN_TARGET, MAIN_TARGET };
+    var it = clippedRuns(&targets, dl.quad_clips.items, MAIN_TARGET);
+    const r1 = it.next().?;
+    try testing.expectEqual(@as(u32, 2), r1.count);
+    try testing.expectEqual(NO_CLIP, r1.clip);
+    const r2 = it.next().?;
+    try testing.expectEqual(@as(u32, 3), r2.count);
+    try testing.expectEqual(inner, r2.clip);
+    const r3 = it.next().?;
+    try testing.expectEqual(@as(u32, 1), r3.count);
+    try testing.expectEqual(NO_CLIP, r3.clip);
+    try testing.expect(it.next() == null);
+
+    // `NO_CLIP` resolves to no scissor, so a document that never clipped
+    // draws exactly as it did before any of this existed.
+    try testing.expect(dl.clipRect(NO_CLIP) == null);
+    try testing.expectEqual(@as(f32, 10), dl.clipRect(inner).?.x);
+}
+
+test "DrawList: a window inside a window may only narrow" {
+    // `pushClip` intersects with the clip already in force rather than
+    // replacing it. A nested viewport that could widen its parent's would
+    // draw outside the box the parent cut — a scrolled list spilling over
+    // the panel that contains it.
+    var dl = DrawList.init(testing.allocator);
+    defer dl.deinit();
+    const outer = try dl.pushClip(NO_CLIP, .{ .x = 0, .y = 0, .w = 100, .h = 100 });
+    const inner = try dl.pushClip(outer, .{ .x = -20, .y = 50, .w = 500, .h = 500 });
+    const r = dl.clipRect(inner).?;
+    try testing.expectEqual(@as(f32, 0), r.x); // not -20
+    try testing.expectEqual(@as(f32, 100), r.w); // not 500
+    try testing.expectEqual(@as(f32, 50), r.y);
+    try testing.expectEqual(@as(f32, 50), r.h); // 50..100, not 50..550
 }
 
 test "triRuns: empty index buffer yields nothing" {

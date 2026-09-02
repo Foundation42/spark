@@ -8,6 +8,7 @@ state:
   config_hidden: "true"
   size_curve: "[1.0, 0.7, 0.0]"
   gain: 1.250
+  clip_offset: 0
 ---
 
 # spark 🚀✨
@@ -124,6 +125,29 @@ Precision is inherited from the seed rather than defaulted. `gain` arrives as `1
 And an ordinary field is unchanged — proportional, left-aligned, and it ignores the drag entirely:
 
 :::input {target=state.target_id initial=${state.target_id} width=140}
+:::
+
+## Clipping — a window onto taller content
+
+`:::clip` is a fixed-size viewport. Its children are laid out at their natural size, drawn `offset` pixels up, and everything outside the box is cut by the **GPU scissor** — not by declining to draw it. That distinction is the whole point: a viewport almost always ends mid-line, so the top and bottom rows have to be cut *through* the glyphs. Half an ascender showing is what tells you there is more above.
+
+Scrub the field to scroll the window. It is an ordinary `:::input {numeric}` writing an ordinary state path — `:::clip` has no wheel handling and no opinion about what moves it, because a log pins to the bottom, a chat transcript follows the newest turn, and a launcher list does not move at all.
+
+:::input {numeric target=state.clip_offset initial=${state.clip_offset} min=0 max=420 width=120}
+:::
+
+:::clip {#viewport height=120 offset=${state.clip_offset}}
+### Cut mid-glyph, not mid-line
+
+The scissor is dynamic state in both the quad and the text pipeline, and it was already being set on every draw — to the whole surface. All that was missing was a rectangle to give it, and a way to say which primitives it applies to.
+
+That way is a second parallel array beside `quad_targets` and `glyph_targets`, filled in by *sealing* at each clip boundary rather than tagged onto every append. Tagging would have meant threading the current clip through `appendShapedRun` and its forty-odd call sites — every component that draws text.
+
+A run is now broken by two keys: the target says which attachment the primitives go to, the clip says what scissor is set before they do. A document that clips nothing yields exactly the runs it always did.
+
+### What sits on top of this
+
+The console's log, the chat transcript, and the launcher's applet list — three things in the workbench brief that all wanted the same missing piece.
 :::
 
 ## Flex layout (stage 15c)

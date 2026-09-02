@@ -35,6 +35,20 @@
 
 const std = @import("std");
 
+/// The clip slice for a primitive layer, tolerant of a clip array that
+/// has not caught up.
+///
+/// `sealClips` runs before the draw loop, so in practice the arrays are
+/// level — but a layer's range is computed from the PRIMITIVE arrays, and
+/// a bug that left the clip array short would otherwise be an
+/// out-of-bounds slice at draw time rather than an unclipped draw. The
+/// iterator already reads a short array as unclipped; this keeps the
+/// slice itself from being the thing that crashes.
+fn clipSlice(clips: []const u16, from: usize, to: usize) []const u16 {
+    if (from >= clips.len) return &.{};
+    return clips[from..@min(to, clips.len)];
+}
+
 const element = @import("element.zig");
 const state_mod = @import("state.zig");
 const component_mod = @import("component.zig");
@@ -1558,13 +1572,13 @@ pub const Spark = struct {
             {
                 var it = element.runs(dl_p1.quad_targets.items, dispatch_index_u32);
                 while (it.next()) |run| {
-                    self.quad_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen, .offscreen);
+                    self.quad_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen, .offscreen, null);
                 }
             }
             {
                 var it = element.runs(dl_p1.glyph_targets.items, dispatch_index_u32);
                 while (it.next()) |run| {
-                    self.text_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen, .offscreen);
+                    self.text_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen, .offscreen, null);
                 }
             }
 
@@ -1946,13 +1960,13 @@ pub const Spark = struct {
             {
                 var it = element.runs(dl_p1.quad_targets.items, dispatch_index_u32);
                 while (it.next()) |run| {
-                    self.quad_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen, .offscreen);
+                    self.quad_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen, .offscreen, null);
                 }
             }
             {
                 var it = element.runs(dl_p1.glyph_targets.items, dispatch_index_u32);
                 while (it.next()) |run| {
-                    self.text_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen, .offscreen);
+                    self.text_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen, .offscreen, null);
                 }
             }
 
@@ -2724,8 +2738,21 @@ pub const Spark = struct {
                 im.dst_size[0] *= z;
                 im.dst_size[1] *= z;
             }
+            // The clip table rides the SAME transform, in the same pass,
+            // with the same numbers. It has to be here and not at the
+            // draw: this whole block is skipped on a frame that reused
+            // the previous layout, so a clip transformed independently
+            // would be applying this frame's scroll to primitives still
+            // holding the last frame's.
+            for (dl.clips.items) |*r| r.* = r.toScreen(.{ sx, sy }, z);
             self.drawlist_needs_transform = false;
         }
+
+        // Every primitive emitted after the last clip boundary is
+        // unclipped — the tail of the frame, and the whole of a document
+        // that never clipped anything. `sealClips` is idempotent, so this
+        // costs nothing when the walker already sealed.
+        try dl.sealClips(element.NO_CLIP);
 
         // Upload all per-pipeline SSBOs / VBOs. Host-coherent memory
         // makes these plain memcpys — visible to the next submit
@@ -3089,18 +3116,40 @@ pub const Spark = struct {
                         }
                     }
                 }
+                // Clipping applies on the MAIN attachment only. The two
+                // offscreen paths pass null: an effect target has its own
+                // coordinate frame and its own extent, so a world-space
+                // scissor would need rebasing into it, and nothing clips
+                // inside an effect yet. Documented rather than silently
+                // half-working.
                 {
                     const base = layer.quads[0];
-                    var it = element.runs(dl.quad_targets.items[base..layer.quads[1]], element.MAIN_TARGET);
+                    var it = element.clippedRuns(
+                        dl.quad_targets.items[base..layer.quads[1]],
+                        clipSlice(dl.quad_clips.items, base, layer.quads[1]),
+                        element.MAIN_TARGET,
+                    );
                     while (it.next()) |run| {
-                        self.quad_pipeline.recordDrawRange(cmd, extent, main_world_offset, base + run.first, run.count, disp, .main);
+                        const sc: ?[4]u32 = if (dl.clipRect(run.clip)) |r|
+                            element.scissorOf(r, extent.width, extent.height)
+                        else
+                            null;
+                        self.quad_pipeline.recordDrawRange(cmd, extent, main_world_offset, base + run.first, run.count, disp, .main, sc);
                     }
                 }
                 {
                     const base = layer.glyphs[0];
-                    var it = element.runs(dl.glyph_targets.items[base..layer.glyphs[1]], element.MAIN_TARGET);
+                    var it = element.clippedRuns(
+                        dl.glyph_targets.items[base..layer.glyphs[1]],
+                        clipSlice(dl.glyph_clips.items, base, layer.glyphs[1]),
+                        element.MAIN_TARGET,
+                    );
                     while (it.next()) |run| {
-                        self.text_pipeline.recordDrawRange(cmd, extent, main_world_offset, base + run.first, run.count, disp, .main);
+                        const sc: ?[4]u32 = if (dl.clipRect(run.clip)) |r|
+                            element.scissorOf(r, extent.width, extent.height)
+                        else
+                            null;
+                        self.text_pipeline.recordDrawRange(cmd, extent, main_world_offset, base + run.first, run.count, disp, .main, sc);
                     }
                 }
             }

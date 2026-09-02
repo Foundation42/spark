@@ -175,6 +175,7 @@ pub const components = struct {
     pub const embedded_document = @import("components/embedded_document.zig");
     pub const flex = @import("components/flex.zig");
     pub const fold = @import("components/fold.zig");
+    pub const clip = @import("components/clip.zig");
     pub const gh_ref = @import("components/gh_ref.zig");
     pub const grid = @import("components/grid.zig");
     pub const grip = @import("components/grip.zig");
@@ -250,6 +251,7 @@ pub fn installCoreComponents(spark: *Spark) !void {
     try components.embedded_document.install(spark);
     try components.flex.install(spark);
     try components.fold.install(spark);
+    try components.clip.install(spark);
     try components.grid.install(spark);
     try components.input.install(spark);
     try components.svg.install(spark);

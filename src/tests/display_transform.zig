@@ -194,6 +194,7 @@ const Readback = struct {
             disp,
         
             .main, // the harness renders straight into its readback target
+            null, // unclipped: this harness reads back the whole target
         );
         c.vkCmdEndRendering(cmd);
 
