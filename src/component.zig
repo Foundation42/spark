@@ -1033,9 +1033,33 @@ pub const Registry = struct {
     /// instance is destroyed, so a child instance whose binding
     /// references the about-to-be-freed child State doesn't get
     /// fired during the embedded-doc's teardown.
+    /// **The keys are COPIED, and that is the whole of the fix for a
+    /// use-after-free that crashed matryoshka on exit.**
+    ///
+    /// Destroying an instance runs its factory's `deinit`, and a scoped
+    /// container — `:::fold`, `:::clip`, `:::intents` — calls
+    /// `deinitScope` on its OWN child scope from there. That is a
+    /// re-entrant call into this function on the same map. The child's
+    /// keys are `"parent/child/…"`, which start with the parent's prefix
+    /// too, so they are in BOTH collections: the nested call removes them
+    /// and frees their memory, and the outer loop then hands a freed
+    /// slice to `fetchRemove`, which hashes it.
+    ///
+    /// Chris, 2026-09-02, pressing escape: `Segmentation fault … in
+    /// hashString … deinitScope`. It needed a scoped container inside
+    /// another scope to reach, which the launcher's `:::intents` full of
+    /// `:::fold`s is.
+    ///
+    /// Owning the copies makes the nested removal harmless: `fetchRemove`
+    /// on an already-taken key returns null and the loop skips it. The
+    /// alternative — re-scanning the map until no key matches — is
+    /// correct too and quadratic, for a list this one already built.
     pub fn deinitScope(self: *Registry, prefix: []const u8) void {
         var dead = std.ArrayList([]const u8).init(self.allocator);
-        defer dead.deinit();
+        defer {
+            for (dead.items) |k| self.allocator.free(k);
+            dead.deinit();
+        }
 
         var sep_buf: [192]u8 = undefined;
         const search_prefix = std.fmt.bufPrint(&sep_buf, "{s}/", .{prefix}) catch return;
@@ -1043,10 +1067,15 @@ pub const Registry = struct {
         var it = self.instances.iterator();
         while (it.next()) |entry| {
             if (std.mem.startsWith(u8, entry.key_ptr.*, search_prefix)) {
-                dead.append(entry.key_ptr.*) catch continue;
+                const owned = self.allocator.dupe(u8, entry.key_ptr.*) catch continue;
+                dead.append(owned) catch {
+                    self.allocator.free(owned);
+                    continue;
+                };
             }
         }
         for (dead.items) |key| {
+            // Null when a nested teardown already took it — see above.
             const entry = self.instances.fetchRemove(key) orelse continue;
             if (entry.value.binding) |b| b.destroy();
             if (self.factories.get(entry.value.factory_name)) |f| {
@@ -1063,13 +1092,27 @@ pub const Registry = struct {
     pub fn gc(self: *Registry) void {
         // Two-pass: collect dead keys, then remove. Can't mutate the
         // map while iterating it.
+        //
+        // The keys are COPIED for `deinitScope`'s reason, which applies
+        // here identically: sweeping a scoped container runs its
+        // `deinit`, which calls `deinitScope` on its children, which
+        // removes entries this loop is still holding slices of. A sweep
+        // that collected a container and one of its children in the same
+        // pass would hash freed memory on the second one.
         var dead = std.ArrayList([]const u8).init(self.allocator);
-        defer dead.deinit();
+        defer {
+            for (dead.items) |k| self.allocator.free(k);
+            dead.deinit();
+        }
 
         var it = self.instances.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.parses_unused > self.sweep_threshold) {
-                dead.append(entry.key_ptr.*) catch continue;
+                const owned = self.allocator.dupe(u8, entry.key_ptr.*) catch continue;
+                dead.append(owned) catch {
+                    self.allocator.free(owned);
+                    continue;
+                };
             }
         }
         for (dead.items) |key| {
@@ -1976,4 +2019,92 @@ test "the resolved Spec carries the document's state, not the Spark's root" {
     // hand-built Spec and a single-state host working unchanged.
     const bare: components.Spec = .{ .name = "box" };
     try std.testing.expectEqual(&root_state, specState(&bare, &root_state));
+}
+
+// ── The re-entrant teardown ─────────────────────────────────────────
+
+/// The registry a nesting container tears its children out of. Set by the
+/// test below; the factory reaches it the way a real scoped component
+/// reaches the registry it was created against.
+var nest_registry: ?*Registry = null;
+/// The scope the nesting container owns, and destroys on the way out.
+var nest_child_scope: []const u8 = "";
+var nest_deinits: u32 = 0;
+
+fn nestCreate(_: *spark_mod.Spark, allocator: std.mem.Allocator, _: *const components.Spec) anyerror!Instance {
+    const p = try allocator.create(u8);
+    p.* = 0;
+    return .{ .vtable = &test_vtable, .ctx = @ptrCast(p) };
+}
+
+/// A scoped container's deinit: it destroys its OWN child scope, which is
+/// a re-entrant `deinitScope` on the map the outer sweep is walking.
+/// `:::fold`, `:::clip` and `:::intents` all do exactly this.
+fn nestDeinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+    nest_deinits += 1;
+    if (nest_registry) |reg| {
+        const scope = nest_child_scope;
+        nest_child_scope = ""; // once — a real container has one scope
+        if (scope.len > 0) reg.deinitScope(scope);
+    }
+    const p: *u8 = @ptrCast(ctx);
+    allocator.destroy(p);
+}
+
+const nest_factory: Factory = .{ .create = nestCreate, .deinit = nestDeinit };
+
+test "deinitScope: a container that tears down its own children leaves nothing behind" {
+    // The scenario behind the crash Chris hit pressing escape,
+    // 2026-09-02: `Segmentation fault … in hashString … deinitScope`.
+    // Destroying an instance runs its factory's deinit, and a scoped
+    // container calls `deinitScope` on its own child scope from there —
+    // re-entrantly, on the map the outer sweep is walking. The child's
+    // keys begin with the parent's prefix too, so with BORROWED key
+    // slices the outer loop can hand `fetchRemove` memory the nested call
+    // has freed.
+    //
+    // **This gate does NOT reproduce that crash, and saying so is the
+    // point.** The bug has no behavioural symptom: the outer loop hashes
+    // freed memory, gets a garbage hash, finds nothing and continues —
+    // and the entry it failed to find had already been removed by the
+    // nested call, so the end state is identical either way. Counts,
+    // leak-checks and orderings all come out the same. Tried and did not
+    // bite: sixteen children to beat the sweep order, and
+    // `page_allocator` so a freed key would be unmapped.
+    //
+    // What it DOES hold is the teardown's contract — everything under a
+    // closed scope goes, exactly once, through a re-entrant nested
+    // sweep. That is worth having and it is not the memory-safety claim.
+    // The real detector for that one is running the app; see
+    // [[gate-discipline]].
+    resetCounters();
+    nest_deinits = 0;
+    var registry = Registry.init(testing.allocator);
+    defer registry.deinit();
+    var test_spark = spark_mod.Spark.testStub(testing.allocator);
+    registry.attachSpark(&test_spark);
+    try registry.register("nest", nest_factory);
+    try registry.register("leaf", test_factory);
+
+    nest_registry = &registry;
+    defer nest_registry = null;
+    nest_child_scope = "panel/box";
+
+    // A panel scope holding a container, and the container's own scope
+    // holding two children — `panel/box/…` starts with `panel/` too,
+    // which is what puts the same keys in both sweeps.
+    const container: components.Spec = .{ .name = "nest", .id = "box", .scope = "panel" };
+    _ = try registry.resolve(&container, 0, null, "panel");
+    const a: components.Spec = .{ .name = "leaf", .id = "a", .scope = "panel/box" };
+    const b: components.Spec = .{ .name = "leaf", .id = "b", .scope = "panel/box" };
+    _ = try registry.resolve(&a, 1, null, "panel/box");
+    _ = try registry.resolve(&b, 2, null, "panel/box");
+    try testing.expectEqual(@as(usize, 3), registry.instances.count());
+
+    // The panel closes. Everything under it goes, once each — the nested
+    // sweep must not leave an entry behind, nor destroy one twice.
+    registry.deinitScope("panel");
+    try testing.expectEqual(@as(usize, 0), registry.instances.count());
+    try testing.expectEqual(@as(u32, 1), nest_deinits);
+    try testing.expectEqual(@as(u32, 2), t_deinits);
 }
