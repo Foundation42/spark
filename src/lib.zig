@@ -136,6 +136,17 @@ pub const markdown = @import("markdown.zig");
 /// host has only this namespace, and the alternative is a second copy of
 /// the walk that ages separately.
 pub const element_layout = @import("element_layout.zig");
+/// What a HOST-written container needs from the retained layout cache.
+///
+/// One function, and it is the one every container gets wrong once:
+/// `aggregateChildVersions`. A component that owns a parsed subtree must
+/// fold its children's content versions into its OWN, or a child that
+/// changes shape — a fold opening, a chart appending — moves nothing the
+/// cache can see and the whole block replays as it was. `:::fold` learned
+/// it, and then `:::intents` in matryoshka learned it again by the same
+/// door, which is what made this an export rather than an internal.
+pub const layout_cache = @import("layout_cache.zig");
+pub const aggregateChildVersions = layout_cache.aggregateChildVersions;
 pub const ansi = @import("ansi.zig");
 
 // ── Wire-format update applier ─────────────────────────────────────
