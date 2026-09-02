@@ -1058,6 +1058,99 @@ test "markdown: an HTML comment is invisible, in a block and inline" {
     try std.testing.expect(isComment("  <!-- padded -->  "));
 }
 
+test "markdown: a comment spanning BLANK LINES is one block, all of it invisible" {
+    // The predicate gates above hand `isComment` a literal and never ask
+    // cmark for one. That leaves the question `hud/dock.md` actually
+    // needs unanswered: a note long enough to be worth writing has
+    // paragraphs in it, and a blank line ends most block constructs.
+    //
+    // If cmark split this into three, the predicate would drop the
+    // first and last runs and the MIDDLE paragraph would render — the
+    // dock bug again, with the fix applied. CommonMark's HTML block
+    // type 2 ends only on the line containing `-->`, so blank lines are
+    // interior; this gate is what makes that a fact about our cmark
+    // rather than a reading of the spec.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const theme = testTheme();
+
+    const src =
+        \\Visible before.
+        \\
+        \\<!--
+        \\FIRSTPARA of the note.
+        \\
+        \\MIDDLEPARA — the one a split would leak.
+        \\
+        \\LASTPARA of the note.
+        \\-->
+        \\
+        \\Visible after.
+        \\
+    ;
+    const tree = try parse(arena, src, &theme, null);
+
+    try std.testing.expect(!treeContainsText(tree, "FIRSTPARA"));
+    try std.testing.expect(!treeContainsText(tree, "MIDDLEPARA"));
+    try std.testing.expect(!treeContainsText(tree, "LASTPARA"));
+    try std.testing.expect(!treeContainsText(tree, "<!--"));
+
+    // Rule 7: the ordinary path is a test case too. A gate that only
+    // asserts absence passes just as well against a parser that dropped
+    // the whole document.
+    try std.testing.expect(treeContainsText(tree, "Visible before."));
+    try std.testing.expect(treeContainsText(tree, "Visible after."));
+}
+
+test "markdown: a comment straight after a `:::` block does not eat the block" {
+    // `hud/dock.md`'s exact shape, and the reason it is gated rather
+    // than eyeballed: the directive mechanism IS a comment —
+    // `preprocess` leaves `<!--te:0-->` where the block was — so a note
+    // written directly beneath one puts two HTML comments in a row.
+    //
+    // If cmark ran them together into a single block the sentinel would
+    // be swallowed with the note, `:::intents` would never resolve, and
+    // the dock would come back EMPTY. That is a worse bug than the
+    // visible prose it replaces, and it is invisible in the source.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const theme = testTheme();
+
+    const src =
+        \\:::intents {#launch gap=8 exclude=dock}
+        \\:::
+        \\
+        \\<!--
+        \\NOTEPARA about the block above.
+        \\
+        \\Second paragraph of the note.
+        \\-->
+        \\
+    ;
+    const tree = try parse(arena, src, &theme, null);
+    const kids = switch (tree) {
+        .container => |c| c.children,
+        else => return error.TestUnexpectedResult,
+    };
+
+    // The block survived: no registry here, so it lands as the
+    // missing-component placeholder rather than a real instance. That
+    // it is `.custom` at all is the assertion — a merged comment would
+    // leave nothing.
+    try std.testing.expectEqual(@as(usize, 1), kids.len);
+    switch (kids[0]) {
+        .custom => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    // …and the note is still gone, both paragraphs of it.
+    try std.testing.expect(!treeContainsText(tree, "NOTEPARA"));
+    try std.testing.expect(!treeContainsText(tree, "Second paragraph"));
+    try std.testing.expect(!treeContainsText(tree, "te:0"));
+}
+
 test "markdown: only a WHOLE comment is invisible" {
     // A run that merely STARTS with `<!--` is not enough — dropping
     // `<!-- a --><b>c</b>` would swallow content the author can see in
