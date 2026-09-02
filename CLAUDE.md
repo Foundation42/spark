@@ -10,7 +10,7 @@ makes the harness the activity rather than the work.
 
     zig build test -Dtest-filter=trackball     # seconds, not the suite
 
-**The full suite (646) belongs before a commit, and there.**
+**The full suite (865) belongs before a commit, and there.**
 
     zig build test
 

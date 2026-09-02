@@ -237,6 +237,28 @@ pub const HostSurfaceFn = *const fn (ctx: *anyopaque, name: []const u8) ?HostSur
 /// actually see it.
 pub const CommandSink = *const fn (ctx: *anyopaque, line: []const u8) void;
 
+/// The system clipboard, as two host-supplied functions.
+///
+/// **Why this is a seam and not a call.** Components do not reach for
+/// GLFW — `:::input` re-declares the eight key codes it needs rather than
+/// importing `win.zig`, and matryoshka's HUD is forbidden from touching
+/// the window at all (its input is a *declared surface* on the control
+/// plane). A clipboard is host property in exactly the way a command
+/// sink is, so it arrives by the same door.
+///
+/// A host that installs none leaves Ctrl+C/X/V inert — visibly a
+/// keystroke, inertly a keystroke, which is the shape `cmd=` buttons
+/// already set for a document carried between hosts.
+///
+/// **The borrow, and why it is spelt out.** `ClipboardGet` returns memory
+/// the HOST owns, valid only until the next clipboard call. That is not a
+/// convenience, it is GLFW's actual contract — `glfwGetClipboardString`
+/// hands back a pointer it recycles — and promising anything longer would
+/// be a promise the obvious implementation cannot keep. Copy it before
+/// doing anything that could call the host again.
+pub const ClipboardGet = *const fn (ctx: *anyopaque) ?[]const u8;
+pub const ClipboardSet = *const fn (ctx: *anyopaque, text: []const u8) void;
+
 /// Construction options for `Spark.init`. Raw Vulkan handles +
 /// theme + fonts (Spark takes ownership) + borrowed host state +
 /// optional sizing knobs. Defaults match the demo's historical
@@ -543,6 +565,13 @@ pub const Spark = struct {
     /// is an empty frame with working buttons rather than a crash.
     host_surface_fn: ?HostSurfaceFn = null,
     host_surface_ctx: ?*anyopaque = null,
+
+    /// The system clipboard, or nothing. Null until `setClipboard`; see
+    /// `ClipboardGet` for why a text editor asks the host rather than the
+    /// window.
+    clipboard_get_fn: ?ClipboardGet = null,
+    clipboard_set_fn: ?ClipboardSet = null,
+    clipboard_ctx: ?*anyopaque = null,
 
     /// Where `:::button {cmd="..."}` sends its line. Null until
     /// `setCommandSink`, and a `cmd=` button on a host that installed
@@ -860,6 +889,29 @@ pub const Spark = struct {
     pub fn setCommandSink(self: *Spark, ctx: *anyopaque, f: CommandSink) void {
         self.command_sink_ctx = ctx;
         self.command_sink_fn = f;
+    }
+
+    /// Install the host's clipboard. Both directions at once, because a
+    /// host that can paste and not copy is a bug rather than a policy.
+    pub fn setClipboard(self: *Spark, ctx: *anyopaque, get: ClipboardGet, set: ClipboardSet) void {
+        self.clipboard_ctx = ctx;
+        self.clipboard_get_fn = get;
+        self.clipboard_set_fn = set;
+    }
+
+    /// What the clipboard holds, borrowed until the next clipboard call —
+    /// see `ClipboardGet`. Null when the host installed none.
+    pub fn clipboardText(self: *Spark) ?[]const u8 {
+        const f = self.clipboard_get_fn orelse return null;
+        const ctx = self.clipboard_ctx orelse return null;
+        return f(ctx);
+    }
+
+    /// Put `text` on the clipboard, if the host has one.
+    pub fn setClipboardText(self: *Spark, text: []const u8) void {
+        const f = self.clipboard_set_fn orelse return;
+        const ctx = self.clipboard_ctx orelse return;
+        f(ctx, text);
     }
 
     /// Hand a command line to the host, if one is listening.

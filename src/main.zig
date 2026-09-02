@@ -258,6 +258,28 @@ fn keyCb(window: ?*win.c.GLFWwindow, key: c_int, _: c_int, action: c_int, mods: 
     }
 }
 
+/// `Spark.ClipboardGet`. The slice borrows GLFW's own buffer, which it
+/// recycles on the next clipboard call — exactly the contract the seam
+/// promises, and the reason it promises no more than that.
+fn clipboardGet(ctx: *anyopaque) ?[]const u8 {
+    const w: *win.c.GLFWwindow = @ptrCast(@alignCast(ctx));
+    const raw = win.c.glfwGetClipboardString(w) orelse return null;
+    return std.mem.span(raw);
+}
+
+/// `Spark.ClipboardSet`. GLFW wants a NUL-terminated string and copies
+/// it, so the stack buffer is safe to let go of — and a selection longer
+/// than it is truncated rather than refused, because a partial copy is
+/// recoverable and a silently-empty clipboard is not.
+fn clipboardSet(ctx: *anyopaque, text: []const u8) void {
+    const w: *win.c.GLFWwindow = @ptrCast(@alignCast(ctx));
+    var buf: [64 * 1024]u8 = undefined;
+    const n = @min(text.len, buf.len - 1);
+    @memcpy(buf[0..n], text[0..n]);
+    buf[n] = 0;
+    win.c.glfwSetClipboardString(w, @ptrCast(&buf));
+}
+
 fn charCb(window: ?*win.c.GLFWwindow, codepoint: c_uint) callconv(.C) void {
     const ud = win.c.glfwGetWindowUserPointer(window);
     if (ud == null) return;
@@ -557,6 +579,11 @@ pub fn main() !void {
     rdr.clear_color = .{ 0.15, 0.15, 0.18, 1.0 };
 
     win.c.glfwSetWindowUserPointer(window.handle, @ptrCast(&host_ctx));
+
+    // The system clipboard, for `:::textarea`'s Ctrl+C/X/V. spark asks
+    // through a seam rather than reaching for GLFW itself — see
+    // `Spark.ClipboardGet` — so this is where the window gets handed over.
+    sp.setClipboard(@ptrCast(window.handle), clipboardGet, clipboardSet);
     _ = win.c.glfwSetScrollCallback(window.handle, scrollCb);
     _ = win.c.glfwSetKeyCallback(window.handle, keyCb);
     _ = win.c.glfwSetCharCallback(window.handle, charCb);

@@ -9,6 +9,8 @@ state:
   size_curve: "[1.0, 0.7, 0.0]"
   gain: 1.250
   clip_offset: 0
+  chat_draft: ""
+  program: ""
 ---
 
 # spark 🚀✨
@@ -126,6 +128,31 @@ And an ordinary field is unchanged — proportional, left-aligned, and it ignore
 
 :::input {target=state.target_id initial=${state.target_id} width=140}
 :::
+
+## Textarea — one editor, two customers
+
+`:::textarea` is the multi-line half of `:::input`: caret, selection, word wrap, its own scroll window, undo, and the clipboard. It was built against both of the things that wanted it at once, because the two differ in **exactly two places** and retrofitting the second onto the first is where a text widget goes wrong.
+
+**A chat prompt.** Soft wrap, Enter sends, Shift+Enter makes a newline, and the box empties itself once the line is away. Type a couple of paragraphs and watch it wrap; the wheel scrolls it once there is more text than rows, and hands the notch back to the page at either end.
+
+:::textarea {target=state.chat_draft submit=enter clear_on_submit rows=4 placeholder="Say something — Enter sends, Shift+Enter for a new line"}
+:::
+
+Last sent: **${state.chat_draft}**
+
+**A rill console.** No wrap, mono, Enter makes a newline, and running is a separate act on Ctrl+Enter. The no-wrap half is not a preference: in rill, parse order *is* topological order, so a line is a statement and a soft-wrapped program would draw a picture of a structure it does not have.
+
+`live` publishes on every keystroke rather than only on submit, which is what lets a separate Run button exist at all — a `:::button` can only fire a literal `body=`, so the text has to already be somewhere the button's target can read.
+
+:::textarea {target=state.program live wrap=none mono rows=8 width=100%}
+spin = osc 0.4
+cube.rot.y = spin
+cube.pos.x = sin spin * 2
+:::
+
+Try it: **double-click** selects a word, **triple-click** a whole hard line (not the visual one — a wrapped paragraph is one thing to a person even when it is four rows on screen). Drag to select, Shift+arrow to extend, Ctrl+arrow by word, Ctrl+Z / Ctrl+Y for undo and redo, Ctrl+A, and Ctrl+C/X/V against the system clipboard. Tab inserts two spaces rather than a tab byte, because the width of a `\t` is whatever the font happens to say.
+
+**Two details worth watching for.** Move up and down through the short line in the middle — the caret keeps its column rather than being dragged left by the line it passed. And in the wrapping box above, press End on a row that wrapped: the caret stays on *that* row, where a naive implementation drops it to the start of the row below, because a soft break gives one byte offset two screen positions.
 
 ## Clipping — a window onto taller content
 

@@ -204,6 +204,7 @@ pub const components = struct {
     pub const trackball = @import("components/trackball.zig");
     pub const svg = @import("components/svg.zig");
     pub const tag = @import("components/tag.zig");
+    pub const textarea = @import("components/textarea.zig");
     pub const trend = @import("components/trend.zig");
     pub const value = @import("components/value.zig");
     // Effects-spec Phase A.5 — three canary pattern factories.
@@ -265,6 +266,9 @@ pub fn installCoreComponents(spark: *Spark) !void {
     try components.clip.install(spark);
     try components.grid.install(spark);
     try components.input.install(spark);
+    // Registers next to the field it is the multi-line half of, and
+    // shares its palette and its codepoint walk.
+    try components.textarea.install(spark);
     try components.svg.install(spark);
     // Effects-spec Phase A.5 — Phase A pattern canaries.
     try components.effects.gradient.install(spark);

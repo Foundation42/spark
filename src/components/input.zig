@@ -566,6 +566,12 @@ const vtable: element.ElementVTable = .{
 };
 
 // ── Visual constants ────────────────────────────────────────────────
+//
+// **Public, and that is the point.** `:::textarea` is the same material —
+// a field cut from the same panel — and a second copy of these numbers
+// would be a second thing to keep in step. They drifted once already
+// between `:::button` and `:::input`, which is how the field ended up
+// still wearing the web-form look the keys had been sent away for.
 
 // A field is CUT from the panel, the same way a groove and a key are:
 // neutral darkening, black edge, square. It was a rounded box with a
@@ -575,38 +581,38 @@ const vtable: element.ElementVTable = .{
 // The fill is a neutral darkening rather than a colour of its own, so a
 // field takes the tint of whatever panel it is on. Same rule as
 // `:::button`'s fill and `:::slider`'s recess.
-const FIELD_BG: [4]f32 = .{ 0.0, 0.0, 0.0, 0.34 };
+pub const FIELD_BG: [4]f32 = .{ 0.0, 0.0, 0.0, 0.34 };
 /// A focused field sits a little deeper. The state is carried by the
 /// BORDER — this is the supporting half, and pushing it further would
 /// make focus read as "disabled".
-const FIELD_BG_FOCUSED: [4]f32 = .{ 0.0, 0.0, 0.0, 0.42 };
-const FIELD_BORDER: [4]f32 = .{ 0.02, 0.02, 0.03, 0.92 };
+pub const FIELD_BG_FOCUSED: [4]f32 = .{ 0.0, 0.0, 0.0, 0.42 };
+pub const FIELD_BORDER: [4]f32 = .{ 0.02, 0.02, 0.03, 0.92 };
 /// Focus is the shell's ONE lit colour — the same amber as the grip, the
 /// dial's home mark and a pressed key. "This one is live" is one colour
 /// everywhere or it is decoration.
-const FIELD_BORDER_FOCUSED: [4]f32 = .{ 1.0, 0.68, 0.0, 0.90 };
-const TEXT_COLOR: [4]f32 = .{ 0.88, 0.89, 0.91, 1.0 };
+pub const FIELD_BORDER_FOCUSED: [4]f32 = .{ 1.0, 0.68, 0.0, 0.90 };
+pub const TEXT_COLOR: [4]f32 = .{ 0.88, 0.89, 0.91, 1.0 };
 /// Warm-neutral rather than blue-grey: on the panel ground `#3b3434`, a
 /// cool placeholder reads as a different material.
-const PLACEHOLDER_COLOR: [4]f32 = .{ 0.52, 0.50, 0.49, 1.0 };
-const CARET_COLOR: [4]f32 = .{ 0.95, 0.95, 0.96, 1.0 };
+pub const PLACEHOLDER_COLOR: [4]f32 = .{ 0.52, 0.50, 0.49, 1.0 };
+pub const CARET_COLOR: [4]f32 = .{ 0.95, 0.95, 0.96, 1.0 };
 /// A catch-light along the inside of the BOTTOM edge — the inverse of
 /// `:::button`'s top hairline, and inverted for the reason the button's
 /// exists at all: a key is raised so its light lands on top, a field is
 /// a hole so its light lands at the bottom. Without this the two are the
 /// same rectangle.
-const FIELD_BOTTOM_LIGHT: [4]f32 = .{ 1.0, 1.0, 1.0, 0.08 };
+pub const FIELD_BOTTOM_LIGHT: [4]f32 = .{ 1.0, 1.0, 1.0, 0.08 };
 /// Matched to `:::button`'s, because a field and a key sit side by side
 /// in a panel now and a field half again as tall reads as a different
 /// vocabulary. Was 36 — a chat prompt's height, from when the only
 /// `:::input` in existence was one.
 const DEFAULT_HEIGHT: f32 = 24;
-const BORDER_PX: f32 = 1.0;
-const BORDER_PX_FOCUSED: f32 = 1.5;
-const RADIUS: f32 = 1.5;
-const PAD_X: f32 = 9;
-const CARET_W: f32 = 2.0;
-const BLINK_PERIOD_MS: i64 = 1000; // half on, half off
+pub const BORDER_PX: f32 = 1.0;
+pub const BORDER_PX_FOCUSED: f32 = 1.5;
+pub const RADIUS: f32 = 1.5;
+pub const PAD_X: f32 = 9;
+pub const CARET_W: f32 = 2.0;
+pub const BLINK_PERIOD_MS: i64 = 1000; // half on, half off
 
 fn layoutAndRender(
     ctx: *anyopaque,
@@ -946,10 +952,13 @@ fn dispatchBuffer(c: *Component, state_ptr: *anyopaque) void {
     };
 }
 
+/// Public because `:::textarea` walks the same UTF-8 with the same
+/// assumption (we only ever insert validated bytes). Two copies of a
+/// codepoint walk is two places for an off-by-one to hide.
 /// Walk back from byte offset `pos` to the previous UTF-8 codepoint
 /// start. Buffer is assumed well-formed (we only insert validated
 /// UTF-8). Returns 0 if pos is 0 or buffer is malformed.
-fn prevCodepointStart(bytes: []const u8, pos: usize) usize {
+pub fn prevCodepointStart(bytes: []const u8, pos: usize) usize {
     if (pos == 0) return 0;
     var i = pos - 1;
     while (i > 0 and (bytes[i] & 0xC0) == 0x80) : (i -= 1) {}
@@ -958,7 +967,7 @@ fn prevCodepointStart(bytes: []const u8, pos: usize) usize {
 
 /// Walk forward from byte offset `pos` to the start of the next
 /// codepoint (i.e. the byte after the current one).
-fn nextCodepointEnd(bytes: []const u8, pos: usize) usize {
+pub fn nextCodepointEnd(bytes: []const u8, pos: usize) usize {
     if (pos >= bytes.len) return bytes.len;
     const len = std.unicode.utf8ByteSequenceLength(bytes[pos]) catch 1;
     const end = pos + len;
