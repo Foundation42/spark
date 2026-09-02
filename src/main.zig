@@ -176,7 +176,15 @@ fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) 
 
     h.spark.endFrame() catch |err| {
         if (!h.overflow_logged) {
-            std.debug.print("WARN: endFrame failed: {s}\n", .{@errorName(err)});
+            // Say what overflowed and by how much. The failure is total —
+            // a black page — so the one line that reports it had better
+            // carry the number that needs raising, or the next person to
+            // add a paragraph to `demo.md` is left guessing at a blank
+            // screen. It cost an afternoon once; it should cost a glance.
+            std.debug.print(
+                "WARN: endFrame failed: {s} (drawlist: {d} glyphs, {d} quads — see max_glyphs / max_quads in Spark.init)\n",
+                .{ @errorName(err), h.spark.drawlist.glyphs.items.len, h.spark.drawlist.quads.items.len },
+            );
             h.overflow_logged = true;
         }
         return;
@@ -491,6 +499,21 @@ pub fn main() !void {
         .theme = &theme,
         .fonts = fonts,
         .host_state = &host_state,
+        // **Raised because the demo document silently outgrew the
+        // default.** `demo.md` is a bench that only ever gets longer, and
+        // the whole of it is laid out every frame — nothing culls a
+        // paragraph for being scrolled off. At 27KB it crossed the
+        // default 16384 glyphs, and one glyph over budget does not clip
+        // or drop anything: `writeGlyphs` refuses the batch, `endFrame`
+        // returns `SsboOverflow`, and the ENTIRE page goes black with a
+        // single line on stderr. Adding a section to the demo should not
+        // be able to do that, so the bench gets headroom it will take
+        // years to spend — about 5MB of it.
+        //
+        // The default is deliberately left alone: it is what every
+        // embedding host inherits, and matryoshka's panels are small.
+        .max_glyphs = 65536,
+        .max_quads = 8192,
     });
     defer {
         sp.deinit();
