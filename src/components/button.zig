@@ -413,11 +413,107 @@ const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .on_input = onInput,
     .content_version = contentVersion,
+    // A key can appear in a sentence — `::button{…}` — which the
+    // launcher's rows are made of. See `measureInline`.
+    .measure_inline = measureInline,
 };
 
 fn contentVersion(ctx: *anyopaque) u64 {
     const c: *const Component = @ptrCast(@alignCast(ctx));
     return c.version;
+}
+
+/// The shaped label and icon, and the width they add up to.
+///
+/// ONE computation, used by the block layout that draws the key and by
+/// the inline measurer that tells a paragraph how much room to leave. A
+/// key that measured one width and drew another would either overlap the
+/// text beside it or leave a hole — and the two would have drifted the
+/// first time somebody adjusted the padding, because nothing would have
+/// been watching. The block path needs the runs as well as the number,
+/// which is why this hands back both rather than just the width.
+const Shaped = struct {
+    text: shape.ShapedRun,
+    icon: ?shape.ShapedRun,
+    text_w: f32,
+    icon_w: f32,
+    gap: f32,
+    /// Icon + gap + label, without the padding either side.
+    content_w: f32,
+    /// What the key wants to be when nothing constrains it.
+    intrinsic_w: f32,
+};
+
+fn shapeContent(c: *const Component, lc: *element.LayoutCtx, aa: std.mem.Allocator) !Shaped {
+    const style = lc.theme.body;
+    const hb = lc.fonts.hbFont(style.font_id);
+    const fscale = lc.fonts.scale(style.font_id);
+
+    const run = try shape.shapeUtf8(aa, hb, c.label);
+    var text_w: f32 = 0;
+    for (run.glyphs) |g| text_w += g.x_advance * fscale;
+
+    // The icon is shaped in the same font and treated as a second run, so
+    // it advances and centres by the same arithmetic as the label rather
+    // than by a guessed square.
+    const icon_run = if (c.icon.len > 0) try shape.shapeUtf8(aa, hb, c.icon) else null;
+    var icon_w: f32 = 0;
+    if (icon_run) |ir| {
+        for (ir.glyphs) |g| icon_w += g.x_advance * fscale;
+    }
+    const gap: f32 = if (icon_run != null and c.label.len > 0) BUTTON_ICON_GAP else 0;
+    const content_w = icon_w + gap + text_w;
+    return .{
+        .text = run,
+        .icon = icon_run,
+        .text_w = text_w,
+        .icon_w = icon_w,
+        .gap = gap,
+        .content_w = content_w,
+        .intrinsic_w = content_w + 2 * BUTTON_PAD_X,
+    };
+}
+
+/// Where a key's box sits against the line's baseline.
+///
+/// Centred on the TEXT's midline rather than standing on the baseline: a
+/// 24px box on the baseline hangs its whole body above the line and reads
+/// as a floating tile, where centred it reads as a word with a box round
+/// it — which is what a key in a sentence is.
+///
+/// Clamped at the key's own height so the descender can never go
+/// negative: a key shorter than half the text's ascender would otherwise
+/// ask to be placed above its own line.
+pub fn inlineAscender(height: f32, text_ascender: f32) f32 {
+    return @min(height, text_ascender * 0.5 + height * 0.5);
+}
+
+/// A key inside a paragraph.
+///
+/// **Why a button can be inline at all.** `::button{…} — what it opens`
+/// is the launcher's row, and it works because an inline directive
+/// resolves through the same `Registry.resolve` a block one does. What it
+/// ALSO needs is this: the inline flow asks every object how wide it is
+/// and where its baseline sits before it wraps a line, and a component
+/// that surfaces inline without a measurer is `InlineObjectMissingMeasurer`
+/// — which is what the launcher hit the first time it tried.
+///
+/// The vertical placement centres the key on the TEXT's midline rather
+/// than sitting it on the baseline. A 24px box on the baseline hangs its
+/// whole body above the line and reads as a floating tile; centred, it
+/// reads as a word with a box round it, which is what a key in a sentence
+/// is. `descender` is clamped at zero because a key shorter than half the
+/// ascender would otherwise ask to be placed above its own line.
+fn measureInline(ctx: *anyopaque, em_px: f32, lc: *element.LayoutCtx) anyerror!element.IntrinsicMetrics {
+    _ = em_px;
+    const c: *const Component = @ptrCast(@alignCast(ctx));
+    var arena = std.heap.ArenaAllocator.init(lc.allocator);
+    defer arena.deinit();
+    const sh = try shapeContent(c, lc, arena.allocator());
+
+    const m = lc.fonts.metrics(lc.theme.body.font_id);
+    const asc = inlineAscender(c.height, m.ascender);
+    return .{ .width = sh.intrinsic_w, .ascender = asc, .descender = c.height - asc };
 }
 
 // ── Visual constants ────────────────────────────────────────────────
@@ -486,24 +582,13 @@ fn layoutAndRender(
     defer arena.deinit();
     const aa = arena.allocator();
 
-    const hb = lc.fonts.hbFont(style.font_id);
-    const run = try shape.shapeUtf8(aa, hb, c.label);
-    const fscale = lc.fonts.scale(style.font_id);
-    var text_w: f32 = 0;
-    for (run.glyphs) |g| text_w += g.x_advance * fscale;
-
-    // The icon is shaped in the same font and treated as a second run, so
-    // it advances and centres by the same arithmetic as the label rather
-    // than by a guessed square.
-    const icon_run = if (c.icon.len > 0) try shape.shapeUtf8(aa, hb, c.icon) else null;
-    var icon_w: f32 = 0;
-    if (icon_run) |ir| {
-        for (ir.glyphs) |g| icon_w += g.x_advance * fscale;
-    }
-    const gap: f32 = if (icon_run != null and c.label.len > 0) BUTTON_ICON_GAP else 0;
-    const content_w = icon_w + gap + text_w;
-
-    const intrinsic_w = content_w + 2 * BUTTON_PAD_X;
+    const sh = try shapeContent(c, lc, aa);
+    const run = sh.text;
+    const icon_run = sh.icon;
+    const icon_w = sh.icon_w;
+    const gap = sh.gap;
+    const content_w = sh.content_w;
+    const intrinsic_w = sh.intrinsic_w;
     const max_w = constraints.max_w;
     const fallback_w = if (std.math.isFinite(max_w)) max_w else intrinsic_w;
     const w: f32 = if (c.width) |wl| wl.resolve(max_w, fallback_w) else intrinsic_w;
@@ -1274,4 +1359,42 @@ test "button: a textual choice is still textual" {
     try testing.expect(!sameChoice("", "depth"));
     // …and a word against a number is simply not the same choice.
     try testing.expect(!sameChoice("albedo", "2"));
+}
+
+test "button: a key in a sentence is centred on the text, and never leaves its own line" {
+    // `::button{…} — what it opens` is the launcher's row, and the first
+    // attempt at it crashed with `InlineObjectMissingMeasurer`: an
+    // inline directive resolves through the same registry a block one
+    // does, but the inline flow also asks every object how wide it is and
+    // where its baseline sits, and a button had never been asked.
+    //
+    // This is the half of that answer with a judgement in it. The width
+    // comes from `shapeContent`, which the block path uses too, so it
+    // cannot drift.
+    const text_asc: f32 = 15;
+
+    // Centred on the text's midline, not standing on the baseline. A 24px
+    // box on the baseline hangs its whole body above the line and reads
+    // as a floating tile.
+    const asc = inlineAscender(24, text_asc);
+    try testing.expectEqual(@as(f32, 7.5 + 12), asc);
+    // Some of the key hangs BELOW the baseline, which is what makes it
+    // look set into the line rather than perched on it.
+    try testing.expect(24 - asc > 0);
+
+    // The descender can never go negative: a key shorter than half the
+    // text's ascender would otherwise ask to be placed above its own
+    // line, and the flow would put it there.
+    const tiny = inlineAscender(4, text_asc);
+    try testing.expectEqual(@as(f32, 4), tiny);
+    try testing.expectEqual(@as(f32, 0), 4 - tiny);
+
+    // Whatever the height, the two extents add back up to it — the flow
+    // reserves exactly the room the key occupies, so a row of them cannot
+    // overlap the line above or below.
+    for ([_]f32{ 4, 12, 24, 36, 64 }) |h| {
+        const a = inlineAscender(h, text_asc);
+        try testing.expectEqual(h, a + (h - a));
+        try testing.expect(a <= h);
+    }
 }
