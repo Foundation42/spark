@@ -7,6 +7,7 @@ state:
   target_id: "SAT-04"
   config_hidden: "true"
   size_curve: "[1.0, 0.7, 0.0]"
+  gain: 1.250
 ---
 
 # spark 🚀✨
@@ -100,6 +101,25 @@ Block extensions parse into Specs, get resolved through a host-owned registry in
 A `:::curve` is a piecewise-linear value over normalised x — spindrift's `row.age | over row.life [1.0, 0.7, 0.0]` — bound in mirror mode to a state path holding the ARRAY. Drag a puck; the whole array goes back through `state.set` as one write.
 
 :::curve {#size_curve target=size_curve value=${state.size_curve} min=0 max=2 label="size over life" width=320}
+:::
+
+## Numeric fields — drag to scrub
+
+A `numeric` field is right-aligned, mono and **draggable**: press and pull sideways to scrub, or click and type an exact value into the same rectangle. Under three pixels of travel a press is still just a click, so the field stays typeable. `min`/`max` clamp — and because the scrub is measured from the press rather than integrated, dragging hard past a bound and back returns to exactly where you started.
+
+Nothing else writes `box_width`, so the box up the page is following this field alone. Compare the feel against the two sliders above it.
+
+:::input {numeric target=state.box_width initial=${state.box_width} min=40 max=600 width=140}
+:::
+
+Precision is inherited from the seed rather than defaulted. `gain` arrives as `1.250`, so it scrubs in thousandths — a default of two decimals would have rounded it to `1.25` the first time anyone touched it. Currently **${state.gain}**.
+
+:::input {numeric target=state.gain initial=${state.gain} step=0.005 width=140}
+:::
+
+And an ordinary field is unchanged — proportional, left-aligned, and it ignores the drag entirely:
+
+:::input {target=state.target_id initial=${state.target_id} width=140}
 :::
 
 ## Flex layout (stage 15c)
