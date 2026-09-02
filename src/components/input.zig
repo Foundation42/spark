@@ -361,10 +361,21 @@ const Component = struct {
     press_y: f32 = 0,
     press_value: f32 = 0,
 
+    /// The last `initial=` text seen, so a change can be told from a
+    /// repeat. See the seed-and-sync note in `ingest`.
+    last_initial: []u8,
+
+
     last_box: element.Box = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     /// Captured at create time. `onInput` reaches the registry +
     /// host state through it (Enter-fire dispatch + caret-blink dirty).
     spark: ?*spark_mod.Spark = null,
+
+    /// Whether the field is in the user's hands right now. A synced value
+    /// must not land while it is.
+    fn editing(self: *const Component) bool {
+        return self.focused or self.gesture != .none;
+    }
 
     fn ingest(self: *Component, spec: *const components.Spec) !void {
         const a = self.allocator;
@@ -445,16 +456,38 @@ const Component = struct {
         // buffer is empty AND cursor is 0). A subsequent attr update
         // mustn't wipe what the user typed.
         if (initial_raw) |init_text| {
-            if (self.buffer.items.len == 0 and self.cursor == 0 and init_text.len > 0) {
+            const first_seed = self.buffer.items.len == 0 and self.cursor == 0 and init_text.len > 0;
+            // **Seed AND sync**, applied only when the attribute MOVED.
+            //
+            // The bug this fixes: `:::slider` follows its bound `value=` on
+            // every ingest and `:::input` only ever seeded, so a field put
+            // beside a slider on the same knob went stale the instant the
+            // slider moved — it sat there showing a number that was no
+            // longer true. Two controls on one knob have to agree, and the
+            // one that silently disagrees is worse than not having it.
+            //
+            // Only when it MOVED, because a static `initial="10"` would
+            // otherwise wipe what the user typed on every re-parse. This is
+            // `:::fold`'s `open=` rule exactly, and for the same reason:
+            // an attribute that never changes means "start here", not
+            // "always this".
+            //
+            // And never while the field is being USED. A value arriving
+            // mid-edit would yank the text out from under the caret; during
+            // a scrub the field is its own writer anyway, so what comes
+            // back is its own number a moment later.
+            const moved = !std.mem.eql(u8, init_text, self.last_initial);
+            if (first_seed or (moved and !self.editing())) {
+                self.buffer.clearRetainingCapacity();
                 try self.buffer.appendSlice(a, init_text);
-                self.cursor = init_text.len;
-                // Read the precision off the seed, ONCE, here — and only
-                // here. Doing it on every ingest would re-derive it from a
-                // buffer the user has since scrubbed, so a value that
-                // happened to land on a round number would drop a digit
-                // and never get it back.
-                if (!self.decimals_explicit) self.decimals = decimalsOf(init_text);
+                self.cursor = self.buffer.items.len;
+                // Read the precision off the seed, ONCE, on the FIRST one —
+                // and only there. Re-deriving it from a synced value would
+                // drop a digit the moment the knob happened to land on a
+                // round number, and never get it back.
+                if (!self.decimals_explicit and first_seed) self.decimals = decimalsOf(init_text);
             }
+            try component_mod.adoptString(a, &self.last_initial, init_text);
         }
 
         // `adoptString`, not free-and-dupe: a field with
@@ -479,6 +512,7 @@ fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const co
         .target = try allocator.dupe(u8, ""),
         .action = try allocator.dupe(u8, ""),
         .placeholder = try allocator.dupe(u8, ""),
+        .last_initial = try allocator.dupe(u8, ""),
         .width = .{ .pixels = 480 },
         .height = DEFAULT_HEIGHT,
     };
@@ -496,6 +530,7 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     allocator.free(c.target);
     allocator.free(c.action);
     allocator.free(c.placeholder);
+    allocator.free(c.last_initial);
     c.buffer.deinit(allocator);
     allocator.destroy(c);
 }
@@ -1456,4 +1491,79 @@ test "input: the axis latches, so a wandering drag does not lurch" {
     try testing.expectEqual(Axis.x, axisFor(5, 5)); // decided, not luck
     try testing.expectEqual(@as(f32, 7), travelOn(.x, 7, 3));
     try testing.expectEqual(@as(f32, 3), travelOn(.y, 7, -3));
+}
+
+test "input: a bound value that MOVED lands in the field; a static one never clobbers typing" {
+    // The bug: `:::slider` follows its bound `value=` on every ingest and
+    // `:::input` only ever seeded, so a field beside a slider on the same
+    // knob went stale the moment the slider moved — showing a number that
+    // was no longer true, which is worse than showing nothing.
+    const a0 = [_]components.Attr{
+        .{ .key = "target", .value = "state.exposure" },
+        .{ .key = "initial", .value = "1.00" },
+    };
+    const spec0: components.Spec = .{ .name = "input", .attrs = &a0 };
+    const inst = try create(&_test_spark, testing.allocator, &spec0);
+    defer deinit_(inst.ctx, testing.allocator);
+    const c: *Component = @ptrCast(@alignCast(inst.ctx));
+    try testing.expectEqualStrings("1.00", c.buffer.items);
+
+    // The knob moves somewhere else — the slider was dragged — and the
+    // field follows it.
+    const a1 = [_]components.Attr{
+        .{ .key = "target", .value = "state.exposure" },
+        .{ .key = "initial", .value = "1.85" },
+    };
+    try update(inst.ctx, &.{ .name = "input", .attrs = &a1 });
+    try testing.expectEqualStrings("1.85", c.buffer.items);
+    try testing.expectEqual(c.buffer.items.len, c.cursor);
+
+    // …and a re-parse that changes NOTHING leaves typing alone. Without
+    // the moved-check, every `:::update` in the document would wipe the
+    // field mid-sentence.
+    for ("2.5") |ch| try onInput(inst.ctx, .{ .char_input = ch }, @ptrCast(_test_spark.host_state));
+    try testing.expectEqualStrings("1.852.5", c.buffer.items);
+    try update(inst.ctx, &.{ .name = "input", .attrs = &a1 });
+    try testing.expectEqualStrings("1.852.5", c.buffer.items);
+}
+
+test "input: a value arriving mid-edit does not yank the text out from under the caret" {
+    // The other half of the rule. A field the user is inside must not be
+    // rewritten by the knob it is bound to — including, and especially,
+    // during a scrub, where the field is its own writer and what comes
+    // back is its own number a moment later.
+    const a0 = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.speed" },
+        .{ .key = "initial", .value = "10" },
+    };
+    const spec0: components.Spec = .{ .name = "input", .attrs = &a0 };
+    const inst = try create(&_test_spark, testing.allocator, &spec0);
+    defer deinit_(inst.ctx, testing.allocator);
+    const c: *Component = @ptrCast(@alignCast(inst.ctx));
+
+    // Focused: the field is being typed into, so a moved value waits.
+    try onInput(inst.ctx, .focus_gained, @ptrCast(_test_spark.host_state));
+    const a1 = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.speed" },
+        .{ .key = "initial", .value = "99" },
+    };
+    try update(inst.ctx, &.{ .name = "input", .attrs = &a1 });
+    try testing.expectEqualStrings("10", c.buffer.items);
+
+    // Let go, and the NEXT change lands — the field is not stuck, it was
+    // only waiting its turn.
+    try onInput(inst.ctx, .focus_lost, @ptrCast(_test_spark.host_state));
+    const a2 = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.speed" },
+        .{ .key = "initial", .value = "42" },
+    };
+    try update(inst.ctx, &.{ .name = "input", .attrs = &a2 });
+    try testing.expectEqualStrings("42", c.buffer.items);
+
+    // Precision stays the FIRST seed's. A synced value that happens to
+    // land on a round number must not drop a digit the knob still has.
+    try testing.expectEqual(@as(u8, 0), c.decimals);
 }
