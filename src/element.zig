@@ -374,6 +374,21 @@ pub const ElementVTable = struct {
         event: InputEvent,
         state: *anyopaque,
     ) anyerror!void = null,
+    /// Optional. Offered the wheel when it turns over this component,
+    /// innermost first. **Returns whether it was consumed** — false lets
+    /// the wheel keep bubbling outward and, if nothing takes it, reach
+    /// the host to scroll the document.
+    ///
+    /// Consumption is a per-notch answer, not a per-component one: a
+    /// scrolling region already at its bottom should return false for a
+    /// further downward notch so the page behind it moves instead. That
+    /// is the behaviour everyone expects from nested scrollers and it
+    /// falls out of asking the question this way round.
+    on_scroll: ?*const fn (
+        ctx: *anyopaque,
+        event: ScrollEvent,
+        state: *anyopaque,
+    ) anyerror!bool = null,
     /// True if this component wants keyboard focus on click. The
     /// element_layout walker stamps this onto the emitted `Hit` so
     /// the host's input dispatcher can wire focus correctly.
@@ -574,6 +589,21 @@ pub const InputEvent = union(enum) {
     /// or destruction). Components should commit pending state on
     /// receipt — they won't see further keys until refocused.
     focus_lost: void,
+};
+
+/// A wheel notch, already in PIXELS — the host multiplies by its own
+/// notch size once, so every component does not get to invent a
+/// different scroll speed.
+///
+/// **Sign: positive `dy` means scroll DOWN through the content**, i.e.
+/// add it to an offset. GLFW's `yoffset` is the opposite (positive is
+/// the wheel pushed away from you), and the host negates once at the
+/// callback. Stating it here because a scroll direction that is backwards
+/// is instantly obvious and endlessly confusing to track down.
+pub const ScrollEvent = struct {
+    local: [2]f32,
+    dx: f32 = 0,
+    dy: f32,
 };
 
 pub const MouseEvent = struct {

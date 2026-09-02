@@ -283,8 +283,27 @@ fn scrollCb(window: ?*win.c.GLFWwindow, _: f64, yoffset: f64) callconv(.C) void 
         h.zoom = std.math.clamp(h.zoom, 0.25, 4.0);
     } else {
         const px_per_notch: f32 = 60.0;
-        h.target_scroll_y -= @as(f32, @floatCast(yoffset)) * px_per_notch;
-        h.target_scroll_y = std.math.clamp(h.target_scroll_y, 0, h.max_scroll_y);
+        // Positive `dy` means scroll DOWN through content — see
+        // `element.ScrollEvent`. GLFW's yoffset is the other way round,
+        // and this is the one place it gets negated.
+        const dy = -@as(f32, @floatCast(yoffset)) * px_per_notch;
+
+        // Offer it to the document first. A `:::clip` under the pointer
+        // takes it if it can move that way; anything that cannot hands it
+        // back, and the page scrolls as it always has. The host's own
+        // scroll is the fallback, not the default — otherwise the page
+        // would slide out from under a panel the reader is scrolling.
+        var mx: f64 = 0;
+        var my: f64 = 0;
+        win.c.glfwGetCursorPos(window, &mx, &my);
+        const wx: f32 = @as(f32, @floatCast(mx)) / h.zoom;
+        const wy: f32 = @as(f32, @floatCast(my)) / h.zoom + h.scroll_y;
+        const taken = h.spark.dispatchScroll(wx, wy, dy, 0) catch false;
+
+        if (!taken) {
+            h.target_scroll_y += dy;
+            h.target_scroll_y = std.math.clamp(h.target_scroll_y, 0, h.max_scroll_y);
+        }
     }
     h.state.dirty = true;
 }

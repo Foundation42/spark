@@ -131,12 +131,14 @@ And an ordinary field is unchanged — proportional, left-aligned, and it ignore
 
 `:::clip` is a fixed-size viewport. Its children are laid out at their natural size, drawn `offset` pixels up, and everything outside the box is cut by the **GPU scissor** — not by declining to draw it. That distinction is the whole point: a viewport almost always ends mid-line, so the top and bottom rows have to be cut *through* the glyphs. Half an ascender showing is what tells you there is more above.
 
-Scrub the field to scroll the window. It is an ordinary `:::input {numeric}` writing an ordinary state path — `:::clip` has no wheel handling and no opinion about what moves it, because a log pins to the bottom, a chat transcript follows the newest turn, and a launcher list does not move at all.
+**Put the pointer over the window and turn the wheel.** It scrolls the window, not the page — until the window reaches an end, at which point the notch is handed back and the page takes over again. That handing-back is the whole contract: a region that claims every notch stops the page dead whenever the pointer strays over it.
+
+The field beside it drives the same offset through an ordinary state path, so you can scrub it too and the wheel keeps the field in step.
 
 :::input {numeric target=state.clip_offset initial=${state.clip_offset} min=0 max=420 width=120}
 :::
 
-:::clip {#viewport height=120 offset=${state.clip_offset}}
+:::clip {#viewport height=120 target=clip_offset offset=${state.clip_offset}}
 ### Cut mid-glyph, not mid-line
 
 The scissor is dynamic state in both the quad and the text pipeline, and it was already being set on every draw — to the whole surface. All that was missing was a rectangle to give it, and a way to say which primitives it applies to.

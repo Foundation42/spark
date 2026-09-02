@@ -304,7 +304,10 @@ pub fn layoutAndRender(
             // backwards. A container that returns a box covering its
             // children therefore swallows every one of them. See
             // `ElementVTable.emits_own_hits`.
-            if (cu.vtable.on_input != null and !cu.vtable.emits_own_hits) {
+            // `on_scroll` counts as accepting input: a component that
+            // only wants the wheel still needs a box on the hit layer for
+            // the wheel to be offered against.
+            if ((cu.vtable.on_input != null or cu.vtable.on_scroll != null) and !cu.vtable.emits_own_hits) {
                 try out.hits.append(.{
                     .box = box,
                     .vtable = cu.vtable,

@@ -3226,6 +3226,40 @@ pub const Spark = struct {
         return findHit(self.drawlist.hits.items, x, y) != null;
     }
 
+    /// Offer a wheel notch to the components under `(x, y)`, innermost
+    /// first. Returns true once one consumes it.
+    ///
+    /// **Bubbles rather than picking one.** `findHit` answers "which single
+    /// element did the pointer land on", which is right for a click and wrong
+    /// for the wheel: the pointer is very often over a button inside a
+    /// scrolling region, and the button has no opinion about the wheel. So
+    /// this walks the hit layer backwards — deepest first, since a container
+    /// that declares `emits_own_hits` appends its own box BEFORE walking its
+    /// children — and asks each in turn.
+    ///
+    /// A false from every one of them is the answer the HOST needs: nothing
+    /// in the document wanted this notch, so the document itself should
+    /// scroll. That is why there is a return value rather than this being
+    /// fire-and-forget.
+    pub fn dispatchScroll(self: *Spark, x: f32, y: f32, dy: f32, dx: f32) !bool {
+        self.mouse_x = x;
+        self.mouse_y = y;
+        const hits = self.drawlist.hits.items;
+        var i = hits.len;
+        while (i > 0) {
+            i -= 1;
+            const hit = hits[i];
+            const on_scroll = hit.vtable.on_scroll orelse continue;
+            if (x < hit.box.x or x >= hit.box.x + hit.box.w) continue;
+            if (y < hit.box.y or y >= hit.box.y + hit.box.h) continue;
+            const eff: *anyopaque = hit.state orelse @ptrCast(self.host_state);
+            if (try on_scroll(hit.ctx, .{ .local = .{ x - hit.box.x, y - hit.box.y }, .dx = dx, .dy = dy }, eff)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Dispatch a primary-button transition. `down=true` on press,
     /// `down=false` on release. Manages pointer capture + focus.
     pub fn dispatchMouseButton(self: *Spark, x: f32, y: f32, down: bool) !void {
