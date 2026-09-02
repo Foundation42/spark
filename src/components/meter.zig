@@ -206,6 +206,18 @@ pub const Columns = struct {
     spark_w: f32,
 };
 
+/// The value column's width: the DECLARED one, or what the readout
+/// actually needs, whichever is larger.
+///
+/// Larger, never smaller, and that is the whole content of the rule. The
+/// declared width is what makes a column of meters share one edge; the
+/// measured width is what keeps a long readout off the bar. Taking the
+/// max honours both — rows that fit stay aligned, and only a row that
+/// cannot fit pays, by shortening its own bar.
+pub fn valueColumnFor(declared: f32, measured: f32) f32 {
+    return @max(declared, measured + VALUE_PAD);
+}
+
 /// The columns, left to right: swatch, label, bar, sparkline, value,
 /// percentage. Each is either its declared width or absent — the BAR is
 /// the only elastic one, because it is the only one whose meaning is a
@@ -379,7 +391,18 @@ const SWATCH: f32 = 7;
 const SWATCH_GAP: f32 = 7;
 /// Between the bar and the value column.
 const BAR_GAP: f32 = 8;
-const LABEL_W: f32 = 88;
+/// The label column, fixed so a COLUMN of meters shares one edge — that
+/// alignment is the whole reason `:::meter` exists rather than a sentence
+/// with a number in it.
+///
+/// 68 and not 88: the longest label in the shell is `traversal` at nine
+/// characters, and 88 left a gap after a short one like `sens` wide
+/// enough to read as a mistake. The twenty pixels go to the bar, which is
+/// also what pays for a wider readout when a row has a long unit.
+const LABEL_W: f32 = 68;
+/// Breathing room between a readout and whatever is to its left, so a
+/// measured value column does not butt straight against the bar.
+const VALUE_PAD: f32 = 6;
 /// Wide enough for `-000.00 ms` in the mono face, which is the widest thing
 /// a frame timing puts here.
 const VALUE_W: f32 = 62;
@@ -434,7 +457,23 @@ fn layoutAndRender(
     const total_w: f32 = if (c.width) |w| w.resolve(constraints.max_w, fallback) else fallback;
     const x = @round(origin[0]);
     const y = @round(origin[1]);
-    const cols = columnsFor(x, total_w, c.label_w, c.value_w, c.percent, c.bar, c.spark);
+
+    // **Measure the readout before laying out the columns.** `value_w` is
+    // a declared width, and the bar is sized to stop exactly where the
+    // value column begins — so a readout WIDER than its column does not
+    // push the bar back, it draws over it. `camera.md` found it: `0.015
+    // rad/px` is twelve mono characters where the default budgets for
+    // ten, and the reading sat on top of the purple bar it belonged to.
+    //
+    // Taking the max keeps the alignment the fixed column exists for —
+    // rows whose readouts fit still share one edge — while a row that
+    // needs more takes it out of the BAR, which is the only elastic
+    // column and the one that loses least by being shorter.
+    var vbuf: [40]u8 = undefined;
+    const vtext = formatValue(&vbuf, c.value, c.decimals, c.unit);
+    const value_w = valueColumnFor(c.value_w, try measureRun(aa, lc, mono, vtext));
+
+    const cols = columnsFor(x, total_w, c.label_w, value_w, c.percent, c.bar, c.spark);
 
     const frac = fractionIn(c.value, c.min, c.max);
     const from = originFraction(c.min, c.max);
@@ -513,8 +552,6 @@ fn layoutAndRender(
 
     // The value, re-formatted at fixed decimals and right-aligned. Both
     // halves are the cure for the reflow — see the header.
-    var vbuf: [48]u8 = undefined;
-    const vtext = formatValue(&vbuf, c.value, c.decimals, c.unit);
     try drawRunRight(lc, out, aa, mono, vtext, cols.value_right, baseline, VALUE);
 
     if (c.percent) {
@@ -577,6 +614,26 @@ fn drawRun(
 
 /// Right-aligned to `right`. Shaping twice would be the obvious way and is
 /// wasteful; the run is measured from the advances it already carries.
+/// The width `text` will take in `style`, without drawing it.
+///
+/// Shapes and sums advances, exactly as `drawRunRight` does before
+/// right-aligning — same call, same face, so a column sized by this and a
+/// run placed by that cannot disagree about how wide the text is.
+fn measureRun(
+    aa: std.mem.Allocator,
+    lc: *element.LayoutCtx,
+    style: element.Style,
+    text: []const u8,
+) !f32 {
+    if (text.len == 0) return 0;
+    const hb = lc.fonts.hbFont(style.font_id);
+    const fscale = lc.fonts.scale(style.font_id);
+    const run = try shape.shapeUtf8(aa, hb, text);
+    var w: f32 = 0;
+    for (run.glyphs) |g| w += g.x_advance * fscale;
+    return w;
+}
+
 fn drawRunRight(
     lc: *element.LayoutCtx,
     out: *element.DrawList,
@@ -819,4 +876,65 @@ test "meter: quantumFor tracks the declared decimals" {
     try testing.expectApproxEqAbs(@as(f32, 1), quantumFor(0), 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 0.1), quantumFor(1), 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 0.001), quantumFor(3), 1e-7);
+}
+
+test "meter: a readout wider than its column takes room from the BAR, not from the bar's pixels" {
+    // Chris, from the camera applet: `0.015 rad/px` drew over the purple
+    // bar it belonged to. Twelve mono characters where the default budgets
+    // for ten — and because the bar is sized to stop exactly where the
+    // value column BEGINS, a readout wider than that column does not push
+    // the bar back, it paints on top of it. Two things in one place, which
+    // is always wrong and is never a rounding question.
+    const narrow = columnsFor(0, 300, LABEL_W, VALUE_W, false, true, false);
+    const wide = columnsFor(0, 300, LABEL_W, 110, false, true, false);
+
+    // The bar gives way. It is the only elastic column, and the one that
+    // loses least by being shorter — a bar is a proportion either way.
+    try testing.expect(wide.bar_w < narrow.bar_w);
+
+    // The invariant, both ways round: the bar's right edge never reaches
+    // into the value column, whatever the column is asked to be.
+    try testing.expect(narrow.bar_x + narrow.bar_w + BAR_GAP <= narrow.value_right - VALUE_W);
+    try testing.expect(wide.bar_x + wide.bar_w + BAR_GAP <= wide.value_right - 110);
+
+    // A readout wider than the whole row leaves NO bar rather than a
+    // negative one — a negative width folds the geometry inside out.
+    const absurd = columnsFor(0, 300, LABEL_W, 400, false, true, false);
+    try testing.expectEqual(@as(f32, 0), absurd.bar_w);
+}
+
+test "meter: the label column is fixed, and the pixels it gives up go to the bar" {
+    // Fixed is the point — a COLUMN of meters shares one edge, which is
+    // the whole reason this is a component and not a sentence. But 88 was
+    // sized by eye and the longest label in the shell is nine characters,
+    // so a short one like `sens` sat at the far end of a gap wide enough
+    // to read as a mistake.
+    const before = columnsFor(0, 300, 88, VALUE_W, false, true, false);
+    const after = columnsFor(0, 300, LABEL_W, VALUE_W, false, true, false);
+    try testing.expectEqual(@as(f32, 88 - LABEL_W), after.bar_w - before.bar_w);
+    // …and the label still starts in the same place. Tightening the column
+    // must not move the text, only what follows it.
+    try testing.expectEqual(before.label_x, after.label_x);
+}
+
+test "meter: the value column is the declared width or the measured one, whichever is larger" {
+    // The wiring the column gates cannot see: they are handed a width,
+    // and this is the rule that decides which width they are handed.
+    // Getting it wrong is invisible in `columnsFor` and visible on screen.
+    //
+    // A readout that FITS keeps the declared column, so a table of meters
+    // still shares one right edge — that alignment is the reason the
+    // component exists.
+    try testing.expectEqual(VALUE_W, valueColumnFor(VALUE_W, 20));
+    try testing.expectEqual(VALUE_W, valueColumnFor(VALUE_W, VALUE_W - VALUE_PAD));
+
+    // One that does NOT fit widens, and by enough to clear the bar rather
+    // than to touch it.
+    try testing.expectEqual(@as(f32, 90 + VALUE_PAD), valueColumnFor(VALUE_W, 90));
+    try testing.expect(valueColumnFor(VALUE_W, 90) > 90);
+
+    // Never smaller than declared — a `value_w=` a document asked for is
+    // a floor, not a suggestion, or the column it was set to align with
+    // would drift out from under it.
+    try testing.expectEqual(@as(f32, 200), valueColumnFor(200, 10));
 }
