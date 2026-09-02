@@ -76,8 +76,17 @@
 //! you can nudge without opening a slider, in the same rectangle you can
 //! still type an exact value into.
 //!
-//! Optional with it: `min` / `max` (clamp), `step` (units per pixel),
-//! `decimals` (display precision).
+//! Optional with it: `min` / `max` (clamp), `step` (the linear-equivalent
+//! gain), `decimals` (display precision).
+//!
+//! **The drag is curved, not linear.** Near the press point a pixel is
+//! worth `FINE` × what a straight-line scrub would give it, so a value
+//! can be walked one unit at a time; further out the curve overtakes, so
+//! the whole range is still one gesture. `curveG` carries the arithmetic
+//! and the nit that paid for it. The calibration worth holding on to:
+//! `g(1) = 1` exactly, so a full-span drag crosses precisely the declared
+//! range and `step`, `min` and `max` all keep the meanings they had
+//! before the curve existed.
 //!
 //! **The gesture is ambiguous at press, so it latches in three states,
 //! not two.** `:::trackball` latches a ZONE at `mouse_down` because where
@@ -158,6 +167,43 @@ pub const SCRUB_SLOP: f32 = 3.0;
 /// short enough that the middle is not a marathon.
 pub const SPAN_PX: f32 = 240;
 
+/// How much of the linear gain survives at the centre of the gesture.
+///
+/// **The nit this is paid for.** Chris, 2026-09-02: *"I think personally I
+/// prefer rubber band, physics based scrubbing — the further you drag the
+/// faster it goes. I find it easier to zero in on small increments."* A
+/// straight-line scrub spreads a 0..200 range over 240 pixels, so every
+/// pixel is 0.83 and there is no way to ask for 12.5 — the control is
+/// only as fine as its coarsest job needs it to be. Near the press point
+/// a pixel is now worth FINE × what it was, so a value can be walked one
+/// unit at a time; by `SPAN_PX` the curve has caught up, and past it, it
+/// overtakes.
+pub const FINE: f32 = 0.15;
+
+/// The response curve, dimensionless: odd, `g(0) = 0`, `g(±1) = ±1`, and
+/// `g'(0) = FINE`. A line blended with a cubic — the gamepad curve, for
+/// the gamepad's reason: two sensitivities in one gesture with no
+/// deadzone and no mode switch between them.
+///
+/// Odd rather than `sign(u) * f(|u|)` so that it is smooth THROUGH zero.
+/// A curve with a corner at the origin reads as a catch when a drag
+/// crosses back over the press point, which is exactly where the fine
+/// control is supposed to be.
+pub fn curveG(u: f32) f32 {
+    return u * FINE + u * u * u * (1 - FINE);
+}
+
+/// Value units for a drag of `dx` pixels.
+///
+/// `step` keeps its old meaning — the LINEAR-equivalent gain — and the
+/// curve is calibrated so `g(1) = 1` exactly. That is what lets the curve
+/// be added without recalibrating anything: a bounded field still crosses
+/// its whole range in one full-span drag, precisely as it did before,
+/// while the middle of that drag became some six times finer.
+pub fn scrubOffset(dx: f32, step: f32) f32 {
+    return step * SPAN_PX * curveG(dx / SPAN_PX);
+}
+
 /// What an unbounded field moves per pixel. Small, because a field with
 /// no declared range is as likely to hold 0.5 as 500 and overshooting is
 /// the more annoying failure.
@@ -195,7 +241,7 @@ pub fn stepFor(step_attr: ?f32, min_v: ?f32, max_v: ?f32) f32 {
 /// whichever bounds were declared. Absolute in `dx`, never incremental —
 /// see `Component.press_value`.
 pub fn scrubTo(press_value: f32, dx: f32, step: f32, min_v: ?f32, max_v: ?f32) f32 {
-    var v = press_value + dx * step;
+    var v = press_value + scrubOffset(dx, step);
     if (min_v) |lo| v = @max(v, lo);
     if (max_v) |hi| v = @min(v, hi);
     return v;
@@ -1083,12 +1129,30 @@ test "input: the numeric mode's arithmetic" {
     // Only ONE bound is not enough to derive a range from.
     try testing.expectEqual(DEFAULT_STEP, stepFor(null, 0, null));
 
+    // The response curve. `g(1) = 1` EXACTLY is the calibration that let
+    // the curve be added without recalibrating `step`, `min` or `max`, so
+    // it is the assertion that matters most here.
+    try testing.expectEqual(@as(f32, 0), curveG(0));
+    try testing.expectEqual(@as(f32, 1), curveG(1));
+    try testing.expectEqual(@as(f32, -1), curveG(-1));
+    // Odd, so it is smooth THROUGH the press point rather than having a
+    // corner there.
+    try testing.expectApproxEqAbs(-curveG(0.37), curveG(-0.37), 1e-7);
+    // Near the centre the gain is FINE × linear — the whole nit.
+    try testing.expectApproxEqAbs(@as(f32, 0.01 * FINE), curveG(0.01), 1e-6);
+    // …and past the reference displacement it overtakes rather than
+    // saturating: a scrub must still be able to cross a big range.
+    try testing.expect(curveG(2) > 2);
+
     // `scrubTo` clamps to whichever bounds exist, and to neither when
     // there are none.
-    try testing.expectEqual(@as(f32, 15), scrubTo(10, 10, 0.5, null, null));
-    try testing.expectEqual(@as(f32, 0), scrubTo(10, -100, 1, 0, 200));
+    try testing.expectEqual(@as(f32, 0), scrubTo(10, -1000, 1, 0, 200));
     try testing.expectEqual(@as(f32, 200), scrubTo(10, 1000, 1, 0, 200));
-    try testing.expectEqual(@as(f32, -90), scrubTo(10, -100, 1, null, 200));
+    // Unbounded below, clamped above.
+    try testing.expect(scrubTo(10, -1000, 1, null, 200) < -100);
+    // A full-span drag crosses exactly the declared range, curve or no
+    // curve — this is `g(1) = 1` seen from the outside.
+    try testing.expectApproxEqAbs(@as(f32, 200), scrubTo(0, SPAN_PX, 200.0 / SPAN_PX, null, null), 1e-3);
 
     // `parseNumber` says no rather than zero — see its comment.
     try testing.expectEqual(@as(?f32, 1.5), parseNumber("1.5"));
@@ -1135,10 +1199,12 @@ test "input: a click is not a scrub — the slop, end to end" {
     try onInput(inst.ctx, .{ .mouse_move = .{ .local = .{ 52, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
     try testing.expect(state.get("speed") == null);
 
-    // Six: a drag. 200 over SPAN_PX is 1/1.2 per pixel, so six pixels is
-    // five units, and the seed `10` carries no decimals to render.
-    try onInput(inst.ctx, .{ .mouse_move = .{ .local = .{ 56, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
-    try testing.expectEqualStrings("15", state.get("speed").?);
+    // Twelve: a drag, and the response curve is the point of the number.
+    // A straight-line scrub puts 200 over 240 pixels, so twelve pixels
+    // would be TEN units and 12.5 would be unaskable. Through the curve
+    // the same twelve pixels are worth about one and a half.
+    try onInput(inst.ctx, .{ .mouse_move = .{ .local = .{ 62, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try testing.expectEqualStrings("12", state.get("speed").?);
 }
 
 test "input: a scrub is absolute from the press — out and back returns the value it started with" {
@@ -1160,7 +1226,7 @@ test "input: a scrub is absolute from the press — out and back returns the val
 
     try onInput(inst.ctx, .{ .mouse_down = .{ .local = .{ 50, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
     try onInput(inst.ctx, .{ .mouse_move = .{ .local = .{ 74, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
-    try testing.expectEqualStrings("30", state.get("speed").?);
+    try testing.expectEqualStrings("13", state.get("speed").?);
     // …and all the way home. The slop does not re-apply once the gesture
     // has been promoted, or a drag back through the press point would go
     // dead for six pixels either side of it.
@@ -1255,8 +1321,8 @@ test "input: a numeric field scrubs at the precision it was seeded with" {
     var state = state_mod.State.init(testing.allocator);
     defer state.deinit();
     try onInput(inst.ctx, .{ .mouse_down = .{ .local = .{ 50, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
-    try onInput(inst.ctx, .{ .mouse_move = .{ .local = .{ 60, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
-    try testing.expectEqualStrings("0.025", state.get("sens").?);
+    try onInput(inst.ctx, .{ .mouse_move = .{ .local = .{ 110, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try testing.expectEqualStrings("0.027", state.get("sens").?);
 
     // An explicit `decimals=` still wins over the seed.
     const eattrs = [_]components.Attr{

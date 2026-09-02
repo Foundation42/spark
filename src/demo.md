@@ -107,6 +107,8 @@ A `:::curve` is a piecewise-linear value over normalised x — spindrift's `row.
 
 A `numeric` field is right-aligned, mono and **draggable**: press and pull sideways to scrub, or click and type an exact value into the same rectangle. Under three pixels of travel a press is still just a click, so the field stays typeable. `min`/`max` clamp — and because the scrub is measured from the press rather than integrated, dragging hard past a bound and back returns to exactly where you started.
 
+**The drag is curved.** Near the press point a pixel is worth about a sixth of what a straight-line scrub would give it, so you can creep up on a value one unit at a time; further out the curve overtakes and the whole range is still one gesture. Twelve pixels moves `box_width` by about four, where a linear scrub would have moved it twenty-eight.
+
 Nothing else writes `box_width`, so the box up the page is following this field alone. Compare the feel against the two sliders above it.
 
 :::input {numeric target=state.box_width initial=${state.box_width} min=40 max=600 width=140}
