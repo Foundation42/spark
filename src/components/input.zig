@@ -478,14 +478,32 @@ const Component = struct {
             // back is its own number a moment later.
             const moved = !std.mem.eql(u8, init_text, self.last_initial);
             if (first_seed or (moved and !self.editing())) {
-                self.buffer.clearRetainingCapacity();
-                try self.buffer.appendSlice(a, init_text);
-                self.cursor = self.buffer.items.len;
                 // Read the precision off the seed, ONCE, on the FIRST one —
                 // and only there. Re-deriving it from a synced value would
                 // drop a digit the moment the knob happened to land on a
                 // round number, and never get it back.
                 if (!self.decimals_explicit and first_seed) self.decimals = decimalsOf(init_text);
+
+                // **A numeric field shows the value at ITS OWN precision,
+                // not at the plane's.** A knob holds `13.556947` and a
+                // mirror hands that text over verbatim; `decimals=` was
+                // only being applied when a scrub COMMITTED, so a field
+                // could sit there displaying nine digits it would never
+                // write — and overflow its box doing it. Chris, from the
+                // camera applet: "slight issue with text overflow".
+                //
+                // Only for a numeric field, and only when the text really
+                // is a number: an ordinary field adopts what it was given,
+                // and a numeric one handed prose has nothing to round.
+                var fbuf: [32]u8 = undefined;
+                const shown: []const u8 = if (self.numeric) blk: {
+                    const v = parseNumber(init_text) orelse break :blk init_text;
+                    break :blk meter.formatValue(&fbuf, v, self.decimals, "");
+                } else init_text;
+
+                self.buffer.clearRetainingCapacity();
+                try self.buffer.appendSlice(a, shown);
+                self.cursor = self.buffer.items.len;
             }
             try component_mod.adoptString(a, &self.last_initial, init_text);
         }
@@ -1566,4 +1584,71 @@ test "input: a value arriving mid-edit does not yank the text out from under the
     // Precision stays the FIRST seed's. A synced value that happens to
     // land on a round number must not drop a digit the knob still has.
     try testing.expectEqual(@as(u8, 0), c.decimals);
+}
+
+test "input: a numeric field shows a bound value at ITS precision, not the plane's" {
+    // Chris, from the camera applet: "slight issue with text overflow".
+    // `camera.md` binds `speed`, the knob holds 13.556947, and the mirror
+    // hands that text over verbatim — so a 72px field rendered nine
+    // digits it would never write and ran out past its own border.
+    // `decimals=` was only being applied when a scrub COMMITTED.
+    const a0 = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.speed" },
+        .{ .key = "initial", .value = "13.556947" },
+        .{ .key = "decimals", .value = "1" },
+    };
+    const inst = try create(&_test_spark, testing.allocator, &.{ .name = "input", .attrs = &a0 });
+    defer deinit_(inst.ctx, testing.allocator);
+    const c: *Component = @ptrCast(@alignCast(inst.ctx));
+    try testing.expectEqualStrings("13.6", c.buffer.items);
+
+    // …and a value arriving later is rounded the same way, or the field
+    // would be tidy exactly until the knob moved.
+    const a1 = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.speed" },
+        .{ .key = "initial", .value = "7.111111" },
+        .{ .key = "decimals", .value = "1" },
+    };
+    try update(inst.ctx, &.{ .name = "input", .attrs = &a1 });
+    try testing.expectEqualStrings("7.1", c.buffer.items);
+}
+
+test "input: rounding the display is for NUMERIC fields with numbers in them" {
+    // The two things that must pass straight through. An ordinary field
+    // adopts what it was given — reformatting a name would be absurd —
+    // and a numeric field handed prose has nothing to round, so it shows
+    // the prose rather than swallowing it.
+    const t = [_]components.Attr{
+        .{ .key = "target", .value = "state.msg" },
+        .{ .key = "initial", .value = "13.556947" },
+    };
+    const ti = try create(&_test_spark, testing.allocator, &.{ .name = "input", .attrs = &t });
+    defer deinit_(ti.ctx, testing.allocator);
+    const tc: *Component = @ptrCast(@alignCast(ti.ctx));
+    try testing.expectEqualStrings("13.556947", tc.buffer.items);
+
+    const p = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.n" },
+        .{ .key = "initial", .value = "not a number" },
+    };
+    const pi = try create(&_test_spark, testing.allocator, &.{ .name = "input", .attrs = &p });
+    defer deinit_(pi.ctx, testing.allocator);
+    const pc: *Component = @ptrCast(@alignCast(pi.ctx));
+    try testing.expectEqualStrings("not a number", pc.buffer.items);
+
+    // With no `decimals=` the precision comes off the seed and is capped
+    // at what the formatter has — nine digits in, three shown.
+    const d = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.sens" },
+        .{ .key = "initial", .value = "0.019283818" },
+    };
+    const di = try create(&_test_spark, testing.allocator, &.{ .name = "input", .attrs = &d });
+    defer deinit_(di.ctx, testing.allocator);
+    const dc: *Component = @ptrCast(@alignCast(di.ctx));
+    try testing.expectEqual(@as(u8, 3), dc.decimals);
+    try testing.expectEqualStrings("0.019", dc.buffer.items);
 }
