@@ -66,6 +66,45 @@
 //! caret-only. The codepoint walks step by UTF-8 byte length so
 //! multi-byte chars don't split. No history (undo/redo) yet either.
 //!
+//! ### `numeric` — drag to scrub
+//!
+//!     :::input {numeric target=state.speed initial=${state.speed} min=0.1 max=200}
+//!
+//! A bare `numeric` flag makes the field a number: right-aligned, in the
+//! mono face, and **draggable**. Resolve's fields all work this way and it
+//! is the single biggest ergonomic win the edit box was missing — a knob
+//! you can nudge without opening a slider, in the same rectangle you can
+//! still type an exact value into.
+//!
+//! Optional with it: `min` / `max` (clamp), `step` (units per pixel),
+//! `decimals` (display precision).
+//!
+//! **The gesture is ambiguous at press, so it latches in three states,
+//! not two.** `:::trackball` latches a ZONE at `mouse_down` because where
+//! you pressed decides what you grabbed. Here *where* you pressed decides
+//! nothing — a press on a numeric field is either the start of a scrub or
+//! a click asking for a caret, and which one it is only becomes known when
+//! the pointer does or does not move. So `mouse_down` latches `.pending`,
+//! the first move past `SCRUB_SLOP` promotes it to `.scrubbing`, and a
+//! release still in `.pending` was a click. Below the slop nothing is
+//! written, which is what keeps a slightly-shaky click from nudging a
+//! knob.
+//!
+//! **The field focuses either way, and that is not a compromise.**
+//! `Spark.dispatchMouseButton` grants focus to a focusable hit on the
+//! press, *before* the component sees the `mouse_down`, so a component
+//! cannot decline it. Rather than fight the dispatcher: a scrub leaves the
+//! caret sitting in the number it just changed, which is exactly where you
+//! want it when the drag got you close and you want to type the last two
+//! digits.
+//!
+//! **Precision is inherited, not defaulted.** A field seeded
+//! `initial=${state.sens}` with `0.015` in it scrubs in thousandths,
+//! because `decimalsOf` reads the precision off the text it was given.
+//! Defaulting to two would have rounded the value to `0.02` the first time
+//! anyone touched it — a silent loss of a digit the document had troubled
+//! itself to write. An explicit `decimals=` still wins.
+//!
 //! ### Cursor rendering
 //!
 //! Caret is a 2-pixel-wide vertical bar at the cursor's screen x,
@@ -86,12 +125,100 @@ const state_mod = @import("../state.zig");
 const text_layout = @import("../text/layout.zig");
 const shape = @import("../font/shape.zig");
 const box_helpers = @import("box.zig");
+/// For `formatValue` only. A numeric field and a `:::meter` row show the
+/// same number in the same panel, so they had better round it the same
+/// way — one formatter, not two that agree until someone edits one.
+const meter = @import("meter.zig");
 
 pub const Error = error{
     InputMissingTarget,
     InputMissingAction,
     InputNotInstalled,
 };
+
+// ── The numeric mode's pure half ────────────────────────────────────
+//
+// Everything here is arithmetic over plain numbers, so the gestures can
+// be gated without a window, a font or a mouse.
+
+/// What a press on a numeric field turned out to be. `.pending` is the
+/// state that makes a click and a drag distinguishable at all — see the
+/// header.
+pub const Gesture = enum { none, pending, scrubbing };
+
+/// Pixels of travel before a press becomes a scrub. Paid for by hand
+/// tremor and trackpads: a click that moves two pixels is a click, and a
+/// field that nudged its knob on every click would be unusable for typing
+/// into. Three is the smallest number that felt like a click still worked.
+pub const SCRUB_SLOP: f32 = 3.0;
+
+/// The travel a bounded field's whole range is spread over. A slider's
+/// range is its width; a field has no width to speak of, so it borrows a
+/// notional one — far enough that the ends are reachable in one gesture,
+/// short enough that the middle is not a marathon.
+pub const SPAN_PX: f32 = 240;
+
+/// What an unbounded field moves per pixel. Small, because a field with
+/// no declared range is as likely to hold 0.5 as 500 and overshooting is
+/// the more annoying failure.
+pub const DEFAULT_STEP: f32 = 0.01;
+
+/// The number in `text`, or null when it is not one. Null is the answer
+/// for an empty field and for prose: a scrub needs somewhere to start
+/// from, and inventing zero would silently discard whatever was there.
+pub fn parseNumber(text: []const u8) ?f32 {
+    const t = std.mem.trim(u8, text, " \t\r\n");
+    if (t.len == 0) return null;
+    return std.fmt.parseFloat(f32, t) catch null;
+}
+
+/// Units per pixel. An explicit `step=` wins; with both bounds the range
+/// spreads over `SPAN_PX`, the way a slider's range spreads over its
+/// width; otherwise `DEFAULT_STEP`.
+///
+/// A `step=` of zero or less is ignored rather than honoured — it would
+/// make the field look draggable and do nothing, which is worse than the
+/// default it was trying to override.
+pub fn stepFor(step_attr: ?f32, min_v: ?f32, max_v: ?f32) f32 {
+    if (step_attr) |s| {
+        if (s > 0) return s;
+    }
+    if (min_v) |lo| {
+        if (max_v) |hi| {
+            if (hi > lo) return (hi - lo) / SPAN_PX;
+        }
+    }
+    return DEFAULT_STEP;
+}
+
+/// The value a drag of `dx` from `press_value` lands on, clamped to
+/// whichever bounds were declared. Absolute in `dx`, never incremental —
+/// see `Component.press_value`.
+pub fn scrubTo(press_value: f32, dx: f32, step: f32, min_v: ?f32, max_v: ?f32) f32 {
+    var v = press_value + dx * step;
+    if (min_v) |lo| v = @max(v, lo);
+    if (max_v) |hi| v = @min(v, hi);
+    return v;
+}
+
+/// Digits after the decimal point in `text`, which is a numeric field's
+/// DEFAULT precision — a field seeded `0.015` scrubs in thousandths. See
+/// the header for why inheriting beats defaulting.
+///
+/// Capped at 3 because `meter.formatValue` renders 0, 1, 2 and 3 places
+/// and falls back to 2 above that; asking for 4 would silently produce
+/// fewer digits than asking for 3.
+pub fn decimalsOf(text: []const u8) u8 {
+    const t = std.mem.trim(u8, text, " \t\r\n");
+    const dot = std.mem.indexOfScalar(u8, t, '.') orelse return 0;
+    var n: u8 = 0;
+    for (t[dot + 1 ..]) |ch| {
+        if (ch < '0' or ch > '9') break;
+        n += 1;
+        if (n == 3) break;
+    }
+    return n;
+}
 
 pub fn install(spark: *spark_mod.Spark) !void {
     try spark.registry.register("input", factory);
@@ -127,6 +254,29 @@ const Component = struct {
     active_border: [4]f32 = FIELD_BORDER_FOCUSED,
 
     focused: bool = false,
+
+    /// `numeric` — the field is a number, drawn right-aligned in the mono
+    /// face and draggable. See the header.
+    numeric: bool = false,
+    min: ?f32 = null,
+    max: ?f32 = null,
+    /// Units per pixel of drag. Null means derive — see `stepFor`.
+    step: ?f32 = null,
+    decimals: u8 = 2,
+    /// Whether `decimals` came from the document. When it did not, the
+    /// seeding branch reads it off `initial` instead of leaving the
+    /// default in place. See `decimalsOf`.
+    decimals_explicit: bool = false,
+
+    gesture: Gesture = .none,
+    /// Where in the box the press landed, and the value the buffer held at
+    /// that moment. A scrub is always measured from the PRESS rather than
+    /// integrated move-to-move: integrating accumulates its own rounding,
+    /// so dragging out and back would not return the value you started
+    /// with. `:::trackball`'s dial learned this first.
+    press_x: f32 = 0,
+    press_value: f32 = 0,
+
     last_box: element.Box = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     /// Captured at create time. `onInput` reaches the registry +
     /// host state through it (Enter-fire dispatch + caret-blink dirty).
@@ -160,6 +310,24 @@ const Component = struct {
                 if (box_helpers.parseColor(attr.value)) |v| self.active_border = v;
             } else if (std.mem.eql(u8, attr.key, "width")) {
                 if (box_helpers.parseLength(attr.value)) |l| width_opt = l;
+            } else if (std.mem.eql(u8, attr.key, "numeric")) {
+                // A bare flag, like `:::frosted_glass {backdrop}`. An
+                // explicit `numeric=0` turns it off so a templated
+                // `numeric=${state.x}` can decide either way.
+                self.numeric = attr.value.len == 0 or !std.mem.eql(u8, attr.value, "0");
+            } else if (std.mem.eql(u8, attr.key, "min")) {
+                self.min = parseNumber(attr.value);
+            } else if (std.mem.eql(u8, attr.key, "max")) {
+                self.max = parseNumber(attr.value);
+            } else if (std.mem.eql(u8, attr.key, "step")) {
+                self.step = parseNumber(attr.value);
+            } else if (std.mem.eql(u8, attr.key, "decimals")) {
+                if (parseNumber(attr.value)) |d| {
+                    if (d >= 0 and d <= 3) {
+                        self.decimals = @intFromFloat(d);
+                        self.decimals_explicit = true;
+                    }
+                }
             } else if (std.mem.eql(u8, attr.key, "height")) {
                 if (box_helpers.parseLength(attr.value)) |l| {
                     height_opt = switch (l) {
@@ -196,6 +364,12 @@ const Component = struct {
             if (self.buffer.items.len == 0 and self.cursor == 0 and init_text.len > 0) {
                 try self.buffer.appendSlice(a, init_text);
                 self.cursor = init_text.len;
+                // Read the precision off the seed, ONCE, here — and only
+                // here. Doing it on every ingest would re-derive it from a
+                // buffer the user has since scrubbed, so a value that
+                // happened to land on a round number would drop a digit
+                // and never get it back.
+                if (!self.decimals_explicit) self.decimals = decimalsOf(init_text);
             }
         }
 
@@ -305,7 +479,12 @@ fn layoutAndRender(
     out: *element.DrawList,
 ) anyerror!element.Box {
     const c: *Component = @ptrCast(@alignCast(ctx));
-    const style = lc.theme.body;
+    // The mono face for a numeric field, and it is chosen HERE rather
+    // than at the draw call so the metrics, the caret height and the
+    // prefix measurement all come from the face the glyphs are in. A
+    // caret sized from the proportional face over mono text is the kind
+    // of half-applied change that looks like a rendering bug.
+    const style = if (c.numeric) lc.theme.applyCodeInline(lc.theme.body) else lc.theme.body;
 
     var arena = std.heap.ArenaAllocator.init(lc.allocator);
     defer arena.deinit();
@@ -346,7 +525,7 @@ fn layoutAndRender(
     });
 
     const baseline_y = origin[1] + (h - m.line_height) * 0.5 + m.ascender;
-    const text_x = origin[0] + PAD_X;
+    var text_x = origin[0] + PAD_X;
 
     // Draw buffer (or placeholder if empty).
     const show_buffer = c.buffer.items.len > 0;
@@ -356,6 +535,17 @@ fn layoutAndRender(
     var prefix_w: f32 = 0;
     if (display_text.len > 0) {
         const run = try shape.shapeUtf8(aa, hb, display_text);
+        if (c.numeric) {
+            // Right-aligned, so a column of fields lines its points up and
+            // a value growing a digit does not shuffle the ones beside it.
+            // Same reason `:::meter` right-aligns its readout.
+            var run_w: f32 = 0;
+            for (run.glyphs) |g| run_w += g.x_advance * fscale;
+            // …but never past the left pad: a number too long for the
+            // field runs off the RIGHT, where the digits that matter least
+            // are, rather than out of the left edge past the caret.
+            text_x = @max(origin[0] + w - PAD_X - run_w, origin[0] + PAD_X);
+        }
         _ = try text_layout.appendShapedRun(
             &out.glyphs,
         &out.glyph_targets,
@@ -457,8 +647,50 @@ fn onInput(
         .key_down => |k| {
             try handleKey(c, k, state_ptr);
         },
-        else => {},
+        .mouse_down => |m| {
+            // Cleared unconditionally: a press that is not the start of a
+            // scrub must not leave a stale latch for the NEXT drag over
+            // this field to pick up.
+            c.gesture = .none;
+            if (!c.numeric or m.button != 0) return;
+            // A field holding prose (or nothing) has no value to scrub
+            // from, so the press stays an ordinary click. Inventing a zero
+            // here would discard whatever was in it on the first drag.
+            const v = parseNumber(c.buffer.items) orelse return;
+            c.press_x = m.local[0];
+            c.press_value = v;
+            c.gesture = .pending;
+        },
+        .mouse_move => |m| {
+            if (c.gesture == .none or !m.button_down) return;
+            const dx = m.local[0] - c.press_x;
+            if (c.gesture == .pending) {
+                if (@abs(dx) < SCRUB_SLOP) return;
+                c.gesture = .scrubbing;
+            }
+            const v = scrubTo(c.press_value, dx, stepFor(c.step, c.min, c.max), c.min, c.max);
+            try commitNumeric(c, state_ptr, v);
+        },
+        .mouse_up => |m| {
+            if (m.button == 0) c.gesture = .none;
+        },
     }
+}
+
+/// Put `value` in the buffer and send it wherever the field points.
+///
+/// Order matters and is the same rule `handleKey`'s Enter arm follows:
+/// the buffer is written FIRST, because `dispatchBuffer` may re-enter
+/// `ingest` through a synchronous `State.set`, and nothing may touch `c`
+/// after that call.
+fn commitNumeric(c: *Component, state_ptr: *anyopaque, value: f32) !void {
+    var buf: [32]u8 = undefined;
+    const text = meter.formatValue(&buf, value, c.decimals, "");
+    c.buffer.clearRetainingCapacity();
+    try c.buffer.appendSlice(c.allocator, text);
+    c.cursor = c.buffer.items.len;
+    if (c.spark) |sp| sp.host_state.dirty = true;
+    dispatchBuffer(c, state_ptr);
 }
 
 fn insertCodepoint(c: *Component, cp: u32) !void {
@@ -524,43 +756,49 @@ fn handleKey(c: *Component, k: element.KeyEvent, state_ptr: *anyopaque) !void {
             c.cursor = c.buffer.items.len;
             if (c.spark) |sp| sp.host_state.dirty = true;
         },
-        KEY_ENTER, KEY_KP_ENTER => {
-            if (c.target.len == 0) return;
-
-            // State-target: `target=state.path` writes the buffer into
-            // the scope-local state — the same primitive `:::button`
-            // fires, with the typed text where the button's constant
-            // `body=` would be. A field inside a child
-            // `:::embedded-document` therefore mutates CHILD state, not
-            // the host's, which is what the walker's `Hit.state` is for.
-            if (std.mem.startsWith(u8, c.target, "state.")) {
-                const key = c.target["state.".len..];
-                if (key.len == 0) return;
-                const state: *state_mod.State = @ptrCast(@alignCast(state_ptr));
-
-                // Nothing may touch `c` after this line. `State.set`
-                // notifies synchronously, so a field bound to the path
-                // it writes re-enters its own `ingest` from inside this
-                // call — `adoptString` keeps that from freeing `key`
-                // mid-`set`, and returning immediately keeps us from
-                // needing anything more than that.
-                state.set(key, c.buffer.items) catch |e| {
-                    std.log.warn(":::input: state.set failed: err={s}", .{@errorName(e)});
-                };
-                return;
-            }
-
-            // Component-target.
-            if (c.action.len == 0) return;
-            const sp = c.spark orelse return;
-            sp.registry.handleUpdate(c.target, c.action, c.buffer.items) catch |e| {
-                std.log.warn(":::input: dispatch failed: target=#{s} action={s} err={s}", .{
-                    c.target, c.action, @errorName(e),
-                });
-            };
-        },
+        KEY_ENTER, KEY_KP_ENTER => dispatchBuffer(c, state_ptr),
         else => {},
     }
+}
+
+/// Send the buffer wherever the field points. Enter's arm and a numeric
+/// scrub are the same act with different triggers, so they are the same
+/// function — a scrub that reached the plane by a second route would be a
+/// second thing to keep in step with `target=`'s two arms.
+fn dispatchBuffer(c: *Component, state_ptr: *anyopaque) void {
+    if (c.target.len == 0) return;
+
+    // State-target: `target=state.path` writes the buffer into
+    // the scope-local state — the same primitive `:::button`
+    // fires, with the typed text where the button's constant
+    // `body=` would be. A field inside a child
+    // `:::embedded-document` therefore mutates CHILD state, not
+    // the host's, which is what the walker's `Hit.state` is for.
+    if (std.mem.startsWith(u8, c.target, "state.")) {
+        const key = c.target["state.".len..];
+        if (key.len == 0) return;
+        const state: *state_mod.State = @ptrCast(@alignCast(state_ptr));
+
+        // Nothing may touch `c` after this line. `State.set`
+        // notifies synchronously, so a field bound to the path
+        // it writes re-enters its own `ingest` from inside this
+        // call — `adoptString` keeps that from freeing `key`
+        // mid-`set`, and returning immediately keeps us from
+        // needing anything more than that.
+        state.set(key, c.buffer.items) catch |e| {
+            std.log.warn(":::input: state.set failed: err={s}", .{@errorName(e)});
+        };
+        return;
+    }
+
+    // Component-target.
+    if (c.action.len == 0) return;
+    const sp = c.spark orelse return;
+    sp.registry.handleUpdate(c.target, c.action, c.buffer.items) catch |e| {
+        std.log.warn(":::input: dispatch failed: target=#{s} action={s} err={s}", .{
+            c.target, c.action, @errorName(e),
+        });
+    };
 }
 
 /// Walk back from byte offset `pos` to the previous UTF-8 codepoint
@@ -826,4 +1064,210 @@ test "input: an ingest that changes nothing frees nothing" {
     try update(inst.ctx, &spec2);
     try testing.expectEqualStrings("state.y", c.target);
     try testing.expectEqualStrings("2.0", c.placeholder);
+}
+
+// ── numeric mode ────────────────────────────────────────────────────
+
+test "input: the numeric mode's arithmetic" {
+    // `stepFor`'s three answers, in precedence order.
+    try testing.expectEqual(@as(f32, 0.5), stepFor(0.5, 0, 200)); // explicit wins
+    try testing.expectEqual(@as(f32, 200.0 / SPAN_PX), stepFor(null, 0, 200));
+    try testing.expectEqual(DEFAULT_STEP, stepFor(null, null, null));
+    // A step of zero would render the field draggable and inert, which is
+    // worse than the default it tried to override.
+    try testing.expectEqual(DEFAULT_STEP, stepFor(0, null, null));
+    try testing.expectEqual(DEFAULT_STEP, stepFor(-1, null, null));
+    // An inverted or empty range cannot be spread over the travel.
+    try testing.expectEqual(DEFAULT_STEP, stepFor(null, 200, 0));
+    try testing.expectEqual(DEFAULT_STEP, stepFor(null, 5, 5));
+    // Only ONE bound is not enough to derive a range from.
+    try testing.expectEqual(DEFAULT_STEP, stepFor(null, 0, null));
+
+    // `scrubTo` clamps to whichever bounds exist, and to neither when
+    // there are none.
+    try testing.expectEqual(@as(f32, 15), scrubTo(10, 10, 0.5, null, null));
+    try testing.expectEqual(@as(f32, 0), scrubTo(10, -100, 1, 0, 200));
+    try testing.expectEqual(@as(f32, 200), scrubTo(10, 1000, 1, 0, 200));
+    try testing.expectEqual(@as(f32, -90), scrubTo(10, -100, 1, null, 200));
+
+    // `parseNumber` says no rather than zero — see its comment.
+    try testing.expectEqual(@as(?f32, 1.5), parseNumber("1.5"));
+    try testing.expectEqual(@as(?f32, -3), parseNumber("  -3 "));
+    try testing.expectEqual(@as(?f32, null), parseNumber(""));
+    try testing.expectEqual(@as(?f32, null), parseNumber("hello"));
+    try testing.expectEqual(@as(?f32, null), parseNumber("1.5m"));
+}
+
+test "input: decimalsOf reads a seed's precision, capped at what the formatter has" {
+    try testing.expectEqual(@as(u8, 3), decimalsOf("0.015"));
+    try testing.expectEqual(@as(u8, 1), decimalsOf("1.5"));
+    try testing.expectEqual(@as(u8, 0), decimalsOf("10"));
+    try testing.expectEqual(@as(u8, 0), decimalsOf(""));
+    // Capped at 3: `meter.formatValue` renders 0..3 and falls back to TWO
+    // above that, so returning 4 would quietly produce fewer digits than
+    // returning 3.
+    try testing.expectEqual(@as(u8, 3), decimalsOf("0.123456"));
+    // A trailing unit stops the count rather than being counted.
+    try testing.expectEqual(@as(u8, 2), decimalsOf("1.25ms"));
+}
+
+test "input: a click is not a scrub — the slop, end to end" {
+    // The bug this is paid for: a field that nudged its knob on every
+    // click would be unusable for the other half of its job, which is
+    // typing an exact value into it. Below SCRUB_SLOP nothing is written
+    // AT ALL — not the same value, nothing — because a write is what
+    // wakes the plane.
+    const attrs = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.speed" },
+        .{ .key = "initial", .value = "10" },
+        .{ .key = "min", .value = "0" },
+        .{ .key = "max", .value = "200" },
+    };
+    const spec: components.Spec = .{ .name = "input", .attrs = &attrs };
+    const inst = try create(&_test_spark, testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+    var state = state_mod.State.init(testing.allocator);
+    defer state.deinit();
+
+    try onInput(inst.ctx, .{ .mouse_down = .{ .local = .{ 50, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    // Two pixels: a click with a shaky hand.
+    try onInput(inst.ctx, .{ .mouse_move = .{ .local = .{ 52, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try testing.expect(state.get("speed") == null);
+
+    // Six: a drag. 200 over SPAN_PX is 1/1.2 per pixel, so six pixels is
+    // five units, and the seed `10` carries no decimals to render.
+    try onInput(inst.ctx, .{ .mouse_move = .{ .local = .{ 56, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try testing.expectEqualStrings("15", state.get("speed").?);
+}
+
+test "input: a scrub is absolute from the press — out and back returns the value it started with" {
+    // Integrating move-to-move would accumulate its own rounding, so a
+    // drag out and back would land NEAR the start rather than on it. On a
+    // knob you nudge all day, "near" is a value that walks.
+    const attrs = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.speed" },
+        .{ .key = "initial", .value = "10" },
+        .{ .key = "min", .value = "0" },
+        .{ .key = "max", .value = "200" },
+    };
+    const spec: components.Spec = .{ .name = "input", .attrs = &attrs };
+    const inst = try create(&_test_spark, testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+    var state = state_mod.State.init(testing.allocator);
+    defer state.deinit();
+
+    try onInput(inst.ctx, .{ .mouse_down = .{ .local = .{ 50, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try onInput(inst.ctx, .{ .mouse_move = .{ .local = .{ 74, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try testing.expectEqualStrings("30", state.get("speed").?);
+    // …and all the way home. The slop does not re-apply once the gesture
+    // has been promoted, or a drag back through the press point would go
+    // dead for six pixels either side of it.
+    try onInput(inst.ctx, .{ .mouse_move = .{ .local = .{ 50, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try testing.expectEqualStrings("10", state.get("speed").?);
+
+    // Both ends clamp, and the field stops there rather than remembering
+    // how far past it the pointer went.
+    try onInput(inst.ctx, .{ .mouse_move = .{ .local = .{ -900, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try testing.expectEqualStrings("0", state.get("speed").?);
+    try onInput(inst.ctx, .{ .mouse_move = .{ .local = .{ 900, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try testing.expectEqualStrings("200", state.get("speed").?);
+
+    // **Back to the press point after BOTH bounds, and it is 10 again.**
+    // This is the assertion that tells absolute from incremental, and the
+    // out-and-back above is not: with clean numbers the two agree, so the
+    // first draft of this gate passed against an incremental scrub. A
+    // clamp is where they diverge structurally — an incremental scrub
+    // folds the clamped value into its own origin, so dragging past a
+    // bound throws away where the gesture started and the knob never
+    // finds its way home. Every UI that has ever done this is annoying in
+    // exactly this way.
+    try onInput(inst.ctx, .{ .mouse_move = .{ .local = .{ 50, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try testing.expectEqualStrings("10", state.get("speed").?);
+}
+
+test "input: the release ends the gesture, and a plain text field never scrubs at all" {
+    // Rule 7 — the ordinary path is a test case too. Every field in the
+    // shell that is NOT numeric receives these same mouse events, and a
+    // scrub leaking into one would rewrite what the user typed.
+    //
+    // The seed is `42` and that is the whole point: this field must be
+    // stopped by the `numeric` guard, not by `parseNumber` failing. The
+    // first draft seeded it `hello`, which parses as nothing — so
+    // deleting the numeric check left the gate green and the gate was
+    // testing the other guard. A text field holding digits is also the
+    // realistic case: a name, a count, a port number.
+    const attrs = [_]components.Attr{
+        .{ .key = "target", .value = "state.msg" },
+        .{ .key = "initial", .value = "42" },
+    };
+    const spec: components.Spec = .{ .name = "input", .attrs = &attrs };
+    const inst = try create(&_test_spark, testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+    var state = state_mod.State.init(testing.allocator);
+    defer state.deinit();
+
+    try onInput(inst.ctx, .{ .mouse_down = .{ .local = .{ 50, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try onInput(inst.ctx, .{ .mouse_move = .{ .local = .{ 300, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try testing.expect(state.get("msg") == null);
+    const c: *Component = @ptrCast(@alignCast(inst.ctx));
+    try testing.expectEqualStrings("42", c.buffer.items);
+
+    // A numeric field holding prose has nothing to scrub FROM, so the
+    // press stays an ordinary click rather than inventing a zero.
+    const nattrs = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.n" },
+        .{ .key = "initial", .value = "not a number" },
+    };
+    const nspec: components.Spec = .{ .name = "input", .attrs = &nattrs };
+    const ninst = try create(&_test_spark, testing.allocator, &nspec);
+    defer deinit_(ninst.ctx, testing.allocator);
+    try onInput(ninst.ctx, .{ .mouse_down = .{ .local = .{ 50, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try onInput(ninst.ctx, .{ .mouse_move = .{ .local = .{ 300, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try testing.expect(state.get("n") == null);
+
+    // And the release clears the latch, so the next drag over the field
+    // starts from its own press instead of the previous one's.
+    const nc: *Component = @ptrCast(@alignCast(inst.ctx));
+    try onInput(inst.ctx, .{ .mouse_up = .{ .local = .{ 300, 10 }, .button = 0, .button_down = false } }, @ptrCast(&state));
+    try testing.expectEqual(Gesture.none, nc.gesture);
+}
+
+test "input: a numeric field scrubs at the precision it was seeded with" {
+    // `initial=${state.sens}` arrives as `0.015`. Defaulting to two
+    // decimals would write `0.02` back on the first drag — a digit the
+    // document had troubled itself to publish, gone, and not recoverable
+    // by dragging further.
+    const attrs = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.sens" },
+        .{ .key = "initial", .value = "0.015" },
+        .{ .key = "step", .value = "0.001" },
+    };
+    const spec: components.Spec = .{ .name = "input", .attrs = &attrs };
+    const inst = try create(&_test_spark, testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+    const c: *Component = @ptrCast(@alignCast(inst.ctx));
+    try testing.expectEqual(@as(u8, 3), c.decimals);
+
+    var state = state_mod.State.init(testing.allocator);
+    defer state.deinit();
+    try onInput(inst.ctx, .{ .mouse_down = .{ .local = .{ 50, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try onInput(inst.ctx, .{ .mouse_move = .{ .local = .{ 60, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try testing.expectEqualStrings("0.025", state.get("sens").?);
+
+    // An explicit `decimals=` still wins over the seed.
+    const eattrs = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.x" },
+        .{ .key = "initial", .value = "0.015" },
+        .{ .key = "decimals", .value = "1" },
+    };
+    const espec: components.Spec = .{ .name = "input", .attrs = &eattrs };
+    const einst = try create(&_test_spark, testing.allocator, &espec);
+    defer deinit_(einst.ctx, testing.allocator);
+    const ec: *Component = @ptrCast(@alignCast(einst.ctx));
+    try testing.expectEqual(@as(u8, 1), ec.decimals);
 }
