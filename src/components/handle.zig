@@ -246,7 +246,17 @@ fn onInput(
     const c: *Component = @ptrCast(@alignCast(ctx));
 
     switch (event) {
-        .mouse_down => |m| try startDrag(c, m.local),
+        // Primary only, and the `mouse_up` below is the evidence that it
+        // was always meant to be: a release only clears `drag_active`
+        // when it is button 0, so a press that started a drag on any
+        // other button could never end it. That asymmetry was invisible
+        // while every event claimed `button = 0`; the moment the
+        // dispatcher told the truth it became a right-press that latches
+        // a resize the mouse cannot let go of. `:::grip`, which this
+        // component is a sibling of, has always had the press guard.
+        .mouse_down => |m| if (m.button == 0) try startDrag(c, m.local),
+        // No button test needed here: `drag_active` is set only by the
+        // guarded press above, so a non-primary drag never gets past it.
         .mouse_move => |m| if (m.button_down and c.drag_active) try applyDrag(c, m.local),
         .mouse_up => |m| {
             if (m.button == 0) c.drag_active = false;

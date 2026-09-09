@@ -372,8 +372,24 @@ fn onInput(
     const state: *state_mod.State = @ptrCast(@alignCast(state_raw));
 
     switch (event) {
-        .mouse_down => |m| try applyDrag(c, state, m.local[0]),
-        .mouse_move => |m| if (m.button_down) try applyDrag(c, state, m.local[0]),
+        // Primary only. Not a guard this component ever had — every
+        // event used to arrive claiming `button = 0` whatever was
+        // actually pressed, so there was nothing to guard against. Now
+        // that the dispatcher reports the truth, a right-press here would
+        // capture the pointer and a right-drag would scrub the value: a
+        // gesture nobody asked for, arriving as a side effect of plumbing
+        // a field. `:::grip` next door has always written its press this
+        // way; this is the same line, added where the button was a lie.
+        .mouse_down => |m| if (m.button == 0) try applyDrag(c, state, m.local[0]),
+        // And the move needs it too, unlike every latched widget in this
+        // library. Capture is the DISPATCHER's decision and is taken by
+        // whichever button opened the gesture, so a right-press on the
+        // track still routes every following move here — the press guard
+        // above stops the first scrub and nothing stops the rest. A
+        // `:::grip` or a `:::curve` is saved by its own latch
+        // (`drag_active`, `grabbed`), which the guarded press never set;
+        // a slider keeps no latch, so the guard has to be repeated.
+        .mouse_move => |m| if (m.button == 0 and m.button_down) try applyDrag(c, state, m.local[0]),
         .mouse_up => {},
         // Keyboard / focus channels (stage 13c) — sliders don't take
         // focus; ignore.

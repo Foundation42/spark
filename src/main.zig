@@ -193,6 +193,41 @@ fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) 
 
 // ── Input plumbing ────────────────────────────────────────────────
 
+/// The buttons this host polls, in spark's index order: index 0 is
+/// left, 1 is right, 2 is middle. Left was the only one polled until
+/// the graph-editor beat, which is why every `if (m.button != 0)` in
+/// the component library was dead code — no event ever carried
+/// anything but 0. A graph editor wants right for the context menu and
+/// middle for the pan, so all three come through now.
+const POLLED_BUTTONS = [_]c_int{
+    win.c.GLFW_MOUSE_BUTTON_LEFT,
+    win.c.GLFW_MOUSE_BUTTON_RIGHT,
+    win.c.GLFW_MOUSE_BUTTON_MIDDLE,
+};
+
+/// The modifier mask, polled rather than taken from a callback.
+///
+/// GLFW hands a `mods` argument to its key and mouse-button CALLBACKS,
+/// but this host polls the pointer once a frame (see `processInput`),
+/// so there is no callback to take it from and both halves of a chord
+/// have to be read the same way. Each modifier is either of its two
+/// physical keys — a person holding right-Shift is holding Shift.
+fn pollMods(window: *win.Window) u32 {
+    const pairs = [_]struct { l: c_int, r: c_int, bit: u32 }{
+        .{ .l = win.c.GLFW_KEY_LEFT_SHIFT, .r = win.c.GLFW_KEY_RIGHT_SHIFT, .bit = win.c.GLFW_MOD_SHIFT },
+        .{ .l = win.c.GLFW_KEY_LEFT_CONTROL, .r = win.c.GLFW_KEY_RIGHT_CONTROL, .bit = win.c.GLFW_MOD_CONTROL },
+        .{ .l = win.c.GLFW_KEY_LEFT_ALT, .r = win.c.GLFW_KEY_RIGHT_ALT, .bit = win.c.GLFW_MOD_ALT },
+        .{ .l = win.c.GLFW_KEY_LEFT_SUPER, .r = win.c.GLFW_KEY_RIGHT_SUPER, .bit = win.c.GLFW_MOD_SUPER },
+    };
+    var mods: u32 = 0;
+    for (pairs) |p| {
+        const held = win.c.glfwGetKey(window.handle, p.l) == win.c.GLFW_PRESS or
+            win.c.glfwGetKey(window.handle, p.r) == win.c.GLFW_PRESS;
+        if (held) mods |= p.bit;
+    }
+    return mods;
+}
+
 fn processInput(window: *win.Window, h: *HostCtx) !void {
     var x_raw: f64 = 0;
     var y_raw: f64 = 0;
@@ -200,17 +235,35 @@ fn processInput(window: *win.Window, h: *HostCtx) !void {
     // Un-transform: screen → world (inverse of `screen = (world - scroll) * zoom`).
     const x: f32 = @as(f32, @floatCast(x_raw)) / h.zoom;
     const y: f32 = @as(f32, @floatCast(y_raw)) / h.zoom + h.scroll_y;
-    const button_now = win.c.glfwGetMouseButton(window.handle, win.c.GLFW_MOUSE_BUTTON_LEFT) == win.c.GLFW_PRESS;
 
-    if (button_now != h.spark.mouse_down) {
-        try h.spark.dispatchMouseButton(x, y, button_now);
-    } else if (button_now) {
+    // BEFORE any dispatch: the mask is ambient state the dispatcher
+    // stamps onto each event it builds, so a stale one would put the
+    // previous frame's Shift on this frame's click.
+    h.spark.setPointerMods(pollMods(window));
+
+    var transitioned = false;
+    for (POLLED_BUTTONS, 0..) |glfw_button, i| {
+        const idx: u8 = @intCast(i);
+        const now_down = win.c.glfwGetMouseButton(window.handle, glfw_button) == win.c.GLFW_PRESS;
+        const was_down = (h.spark.buttons_down & (@as(u8, 1) << @intCast(idx))) != 0;
+        if (now_down == was_down) continue;
+        try h.spark.dispatchMouseButtonN(x, y, now_down, idx);
+        transitioned = true;
+    }
+
+    // A transition frame sends no move, exactly as it did when only the
+    // left button existed: a `mouse_down` immediately followed by a
+    // `mouse_move` at the same point makes every drag handler run its
+    // first step twice.
+    if (transitioned) return;
+
+    if (h.spark.mouse_down) {
         // Held + position update → drag move.
         try h.spark.dispatchMouseMove(x, y);
     } else {
-        // No press, just update the position cache (used by future hover).
-        h.spark.mouse_x = x;
-        h.spark.mouse_y = y;
+        // No button held → the hover channel. It suppresses itself while
+        // a gesture is live, so the branch is belt and braces.
+        try h.spark.dispatchHover(x, y);
     }
 }
 

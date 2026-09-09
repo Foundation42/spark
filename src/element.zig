@@ -389,6 +389,29 @@ pub const ElementVTable = struct {
         event: ScrollEvent,
         state: *anyopaque,
     ) anyerror!bool = null,
+    /// Optional. The pointer is over this component with no button held
+    /// — `.enter` when it arrived, `.move` while it is there, `.leave`
+    /// when it went somewhere else. See `HoverEvent` for why this is a
+    /// slot of its own rather than an unpressed `mouse_move`.
+    ///
+    /// **Opt-in, and null means nothing changed.** A component that
+    /// leaves this null is dispatched to exactly as it was before hover
+    /// existed. It does still need a box on the hit layer, so a
+    /// hover-only component (no `on_input`, no `on_scroll`) counts as
+    /// interactive to the layout walker — see `element_layout.zig`.
+    ///
+    /// **One component at a time.** Hover targets the single deepest hit
+    /// under the pointer, exactly as a click does, so hover and click
+    /// never disagree about who the pointer is on. It does NOT bubble
+    /// the way `on_scroll` does; bubbling would light two nested
+    /// components at once and neither could tell it was the outer one.
+    /// If the deepest hit has no `on_hover`, hover has no target — the
+    /// previous holder gets its `.leave` and nothing is hovered.
+    on_hover: ?*const fn (
+        ctx: *anyopaque,
+        event: HoverEvent,
+        state: *anyopaque,
+    ) anyerror!void = null,
     /// True if this component wants keyboard focus on click. The
     /// element_layout walker stamps this onto the emitted `Hit` so
     /// the host's input dispatcher can wire focus correctly.
@@ -604,15 +627,95 @@ pub const ScrollEvent = struct {
     local: [2]f32,
     dx: f32 = 0,
     dy: f32,
+    /// Raw GLFW modifier bitmask, same contract as `MouseEvent.mods`.
+    /// Here so Ctrl+wheel can mean zoom without a component reaching for
+    /// a second copy of "is Ctrl down" that disagrees with the first.
+    mods: u32 = 0,
 };
 
 pub const MouseEvent = struct {
     local: [2]f32,
     /// 0 = primary (left), 1 = secondary (right), 2 = middle.
+    ///
+    /// Honest since the graph-editor beat. It was hardcoded to 0 by
+    /// `dispatchMouseButton` for every event the dispatcher ever built,
+    /// which made every `if (m.button != 0) return` in this library dead
+    /// code — a guard that reads like a decision and was in fact a
+    /// no-op. `Spark.dispatchMouseButtonN` threads the real index
+    /// through, so those guards now do what they say.
     button: u8,
     /// True while the corresponding button is held. Lets `mouse_move`
     /// double as a "drag" channel without a separate event kind.
     button_down: bool,
+    /// Modifier keys held at the instant of the event, as a **raw GLFW
+    /// bitmask** (`GLFW_MOD_SHIFT | GLFW_MOD_CONTROL | …`).
+    ///
+    /// Raw GLFW rather than a spark-owned bitset, and said out loud
+    /// rather than fallen into: `KeyEvent.mods` next door is already raw
+    /// GLFW, and a component that handles both `key_down` and
+    /// `mouse_down` — `:::textarea` does — would otherwise need two
+    /// different idioms for "is Shift down" inside one `switch`. A host
+    /// that is not GLFW synthesises the mask; matryoshka's
+    /// `hud_bridge.modifierMask` already does exactly that for
+    /// `dispatchKey`, so one value serves both channels.
+    ///
+    /// Defaults to 0 (nothing held) so every `MouseEvent` literal that
+    /// predates this field still compiles and still means what it meant.
+    mods: u32 = 0,
+    /// Which click of a run this is: 1 = single, 2 = double, 3 = triple.
+    /// Capped at 3 — nothing has ever wanted a quadruple-click.
+    ///
+    /// Derived once, in `Spark`, from `MULTI_CLICK_MS` / `MULTI_CLICK_SLOP`
+    /// (see there). It used to be derived privately inside
+    /// `:::textarea`; the next component to want a double-click would
+    /// have derived it again with its own constants, and the two would
+    /// have disagreed about what a double-click is on the same screen.
+    ///
+    /// Carried on `mouse_up` and on a dragging `mouse_move` too, holding
+    /// the run of the press that opened the gesture — that is what lets a
+    /// double-click-and-drag select by whole words.
+    ///
+    /// Defaults to 1: an event nobody stamped is a single click.
+    click_run: u8 = 1,
+};
+
+/// Which end of a hover the pointer is at.
+///
+/// Rejected names: `in` / `out` (unreadable beside `button_down`), and
+/// `enter` / `over` / `exit` — "leave" is what every toolkit calls the
+/// other half of "enter", and mixing the two vocabularies is how you get
+/// a component that handles three phases and forgets one.
+pub const HoverPhase = enum { enter, move, leave };
+
+/// The pointer is OVER a component, with no button held.
+///
+/// **Why this is not a `mouse_move` with `button_down = false`.** Every
+/// component in this library was written against "a move means a drag":
+/// `:::slider` scrubs on any move whose `button_down` is set, `:::handle`
+/// resized on any move at all. Starting to deliver moves with the button
+/// up would have quietly changed what a dozen existing `on_input`s mean,
+/// in ways that only show up as a widget twitching when you pass over it.
+/// A separate vtable slot cannot reach a component that did not ask for
+/// it: `on_hover == null` is byte-for-byte the behaviour that shipped
+/// before this existed.
+///
+/// **Enter and leave, not merely "still arriving".** A component that
+/// only hears "the pointer is at (x, y)" cannot tell "it moved two
+/// pixels" from "it left, and something else is lit now" — it can only
+/// guess from a timeout. So the phase is on the event.
+pub const HoverEvent = struct {
+    /// Pointer position relative to the component's laid-out top-left,
+    /// exactly like `MouseEvent.local`.
+    ///
+    /// On `.leave` this is where the pointer was when it left, which is
+    /// normally OUTSIDE the box — negative, or past the width. Do not
+    /// clamp it back inside and pretend the pointer is still there; that
+    /// the pointer is not there is the whole content of the phase.
+    local: [2]f32,
+    phase: HoverPhase,
+    /// Raw GLFW modifier bitmask, same contract as `MouseEvent.mods`.
+    /// A graph editor draws a different link preview with Ctrl held.
+    mods: u32 = 0,
 };
 
 pub const KeyEvent = struct {

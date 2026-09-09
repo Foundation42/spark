@@ -599,13 +599,46 @@ pub const Spark = struct {
     /// Last mouse position dispatched (world coords, pre-zoom).
     mouse_x: f32 = 0,
     mouse_y: f32 = 0,
+    /// True while ANY button is held. Derived from `buttons_down` and
+    /// kept as its own field because the reference host and matryoshka's
+    /// bridge both read it; it meant exactly this back when left was the
+    /// only button that reached spark at all.
     mouse_down: bool = false,
+    /// Which buttons are held, bit N for button N. Left is bit 0, so a
+    /// left-only host sees `buttons_down == 1` exactly when
+    /// `mouse_down` is true, which is what it saw before this existed.
+    buttons_down: u8 = 0,
+    /// Which button took `captured`. The capture belongs to the button
+    /// that opened the gesture and is released by that same button, so a
+    /// right-click during a left-drag cannot end the drag.
+    capture_button: u8 = 0,
+    /// Modifier keys the host says are held right now, as a raw GLFW
+    /// bitmask. Stamped onto every mouse, scroll and hover event this
+    /// dispatcher builds — see `setPointerMods` for why it is ambient
+    /// rather than a dispatch parameter.
+    pointer_mods: u32 = 0,
     /// Pointer-capture: whichever Hit the most recent mouse_down
     /// landed on receives every subsequent move + up until release.
     captured: ?element.Hit = null,
     /// Keyboard focus. Set when a click lands on a focusable hit;
     /// cleared on click-outside or Esc. Compared by ctx pointer.
     focused: ?element.Hit = null,
+    /// Whichever Hit currently has the pointer over it with no button
+    /// held. Holds the `.enter` it was sent, so the `.leave` can be
+    /// aimed at the same component. Compared by ctx pointer.
+    hovered: ?element.Hit = null,
+    /// Where the pointer was on the last hover dispatch, so a stationary
+    /// pointer costs nothing. A polling host calls `dispatchHover` every
+    /// frame whether the mouse moved or not.
+    hover_x: f32 = 0,
+    hover_y: f32 = 0,
+    /// The multi-click run in progress. See `ClickRun`.
+    click: ClickRun = .{},
+    /// Test seam: when non-null, this is "now" for the click run instead
+    /// of the wall clock. A gate that has to prove 500ms apart is NOT a
+    /// double-click cannot wait 500ms, and one that sleeps is a gate that
+    /// costs half a second every suite run forever.
+    click_clock_ms: ?i64 = null,
 
     /// Construct a Spark and all engine resources. The host gives
     /// raw Vulkan handles (via opts.vk_ctx + opts.color_format), an
@@ -3239,21 +3272,210 @@ pub const Spark = struct {
 
     // ── Input dispatch ──────────────────────────────────────────────
 
+    /// How many mouse buttons the dispatcher tracks. GLFW's
+    /// `GLFW_MOUSE_BUTTON_LAST` is 7, so a `u8` mask covers every button
+    /// the platform can report and there is nothing to grow into.
+    pub const MAX_MOUSE_BUTTONS: u8 = 8;
+
+    /// How long a gap still counts as part of the same click run. GLFW
+    /// does not report double-clicks, so somebody has to count them;
+    /// 400ms is where every toolkit's default lands. It was
+    /// `:::textarea`'s private constant until the graph editor wanted
+    /// double-click too — two components deriving this separately is two
+    /// answers to "what is a double-click" on one screen.
+    pub const MULTI_CLICK_MS: i64 = 400;
+
+    /// How far the pointer may travel between clicks of a run, in world
+    /// pixels. A double-click that drifted three pixels is still a
+    /// double-click; one that moved across the widget is two clicks.
+    pub const MULTI_CLICK_SLOP: f32 = 4;
+
+    /// The multi-click run in progress.
+    ///
+    /// **Measured in world pixels and per button.** Pixels rather than
+    /// byte offsets or hit identity because a person aiming a second
+    /// click aims at the same spot on the screen — whatever has since
+    /// moved under it. Per button because a left click followed by a
+    /// right click in the same place is two different intents, and
+    /// reporting the second as a double-click would open a context menu
+    /// that thinks a word is selected.
+    pub const ClickRun = struct {
+        /// 1 = single, 2 = double, 3 = triple. Capped at 3.
+        run: u8 = 1,
+        last_ms: i64 = 0,
+        last_x: f32 = 0,
+        last_y: f32 = 0,
+        /// Which button opened the previous click of the run. 0xFF is
+        /// "no previous click" — a real button index would make the very
+        /// first click of a session continue a run that never happened.
+        last_button: u8 = 0xFF,
+    };
+
+    /// The run a press at `(x, y)` with `button` opens, given the run
+    /// before it. Pure, so the three ways it can be wrong — too slow,
+    /// too far, the other button — are gated without a clock or a
+    /// window, which the wall-clock version inside `:::textarea` never
+    /// could be.
+    pub fn stepClickRun(prev: ClickRun, now_ms: i64, x: f32, y: f32, button: u8) ClickRun {
+        const near = button == prev.last_button and
+            (now_ms - prev.last_ms) < MULTI_CLICK_MS and
+            @abs(x - prev.last_x) < MULTI_CLICK_SLOP and
+            @abs(y - prev.last_y) < MULTI_CLICK_SLOP;
+        return .{
+            // Saturating at 3 rather than wrapping to 1: a fourth click
+            // in place means "still that line", not "back to a caret".
+            .run = if (!near) 1 else @min(prev.run + 1, 3),
+            .last_ms = now_ms,
+            .last_x = x,
+            .last_y = y,
+            .last_button = button,
+        };
+    }
+
+    fn nowMs(self: *const Spark) i64 {
+        return self.click_clock_ms orelse std.time.milliTimestamp();
+    }
+
+    /// Tell the dispatcher which modifier keys are held, as a raw GLFW
+    /// bitmask (`GLFW_MOD_SHIFT | GLFW_MOD_CONTROL | …`). Every mouse,
+    /// scroll and hover event built after this call carries it.
+    ///
+    /// **Ambient rather than a dispatch parameter, deliberately.** Mods
+    /// belong on a move and on the wheel as much as on a click —
+    /// Shift-drag constrains an axis, Ctrl+wheel zooms — and
+    /// `dispatchMouseMove(x, y)` and `dispatchScroll(x, y, dy, dx)` are
+    /// signatures matryoshka calls, so neither could grow a parameter
+    /// without breaking the embed. A host that never calls this reports
+    /// "nothing held", which is what every event said before this
+    /// existed.
+    ///
+    /// Rejected names: `setModifiers` (which device?), `setMouseMods`
+    /// (the wheel is not the mouse buttons), `setInputMods` (keyboard
+    /// events carry their own on the event, and this is not those).
+    pub fn setPointerMods(self: *Spark, mods: u32) void {
+        self.pointer_mods = mods;
+    }
+
+    /// Build the `MouseEvent` for `hit`, stamped with the ambient
+    /// modifier mask and the current click run. One place, so a channel
+    /// added later cannot forget half of it — every hardcoded
+    /// `.button = 0` this replaced was a field somebody forgot.
+    fn mouseEventFor(self: *const Spark, hit: element.Hit, x: f32, y: f32, button: u8, down: bool) element.MouseEvent {
+        return .{
+            .local = .{ x - hit.box.x, y - hit.box.y },
+            .button = button,
+            .button_down = down,
+            .mods = self.pointer_mods,
+            .click_run = self.click.run,
+        };
+    }
+
     /// Dispatch a mouse move. Position is in world coords (host
     /// un-transforms screen → world if it's applying a zoom/scroll).
-    /// Routes to captured Hit if a drag is in progress; otherwise
-    /// does nothing (hover is not currently dispatched).
+    /// Routes to the captured Hit if a drag is in progress; otherwise
+    /// does nothing. A pointer with no button held is `dispatchHover`,
+    /// a separate channel — see `element.HoverEvent` for why.
     pub fn dispatchMouseMove(self: *Spark, x: f32, y: f32) !void {
         self.mouse_x = x;
         self.mouse_y = y;
         if (self.mouse_down) {
             if (self.captured) |hit| {
-                try dispatchHit(hit, .{ .mouse_move = .{
-                    .local = .{ x - hit.box.x, y - hit.box.y },
-                    .button = 0,
-                    .button_down = true,
-                } }, self.host_state);
+                // The button is the one that took the capture, not 0.
+                // A move during a middle-drag that claimed to be button 0
+                // would defeat the very guards this beat turned on.
+                try dispatchHit(hit, .{
+                    .mouse_move = self.mouseEventFor(hit, x, y, self.capture_button, true),
+                }, self.host_state);
             }
+        }
+    }
+
+    /// Dispatch a pointer that is over the document with **no button
+    /// held**. Sends `.enter` / `.move` / `.leave` to components that
+    /// declared `on_hover`; components that did not are untouched.
+    ///
+    /// **Never while a button is held.** Pointer capture owns the
+    /// pointer for the length of a gesture — that is what makes a slider
+    /// dragged off its own box keep scrubbing — and a hover fired at a
+    /// third component mid-drag would put two components in a "the
+    /// pointer is mine" state at once. So a held button suppresses hover
+    /// entirely, whether or not the press found a target, and the press
+    /// itself leaves whatever was hovered.
+    ///
+    /// **Cost.** One `findHit` per call: a backwards linear scan of the
+    /// hit layer, which holds only interactive elements, with a rect test
+    /// each. That is the same scan `claimsPointer` already pays once a
+    /// frame in matryoshka's host, so hover doubles a cost that was
+    /// already noise. What is gated is the DISPATCH, not the scan: a
+    /// `.move` only goes out when the pointer actually moved, so a
+    /// stationary pointer over a live document costs the scan and
+    /// nothing else. The scan is not skipped for a stationary pointer on
+    /// purpose — the document can re-lay-out under a still cursor (a
+    /// `:::fold` opening), and the enter/leave that follows is real.
+    pub fn dispatchHover(self: *Spark, x: f32, y: f32) !void {
+        self.mouse_x = x;
+        self.mouse_y = y;
+
+        if (self.buttons_down != 0 or self.captured != null) {
+            try self.leaveHover(x, y);
+            return;
+        }
+
+        const hits = self.drawlist.hits.items;
+        const target: ?element.Hit = blk: {
+            const h = findHit(hits, x, y) orelse break :blk null;
+            // Deepest-hit-only, no bubbling: see `on_hover`'s contract.
+            break :blk if (h.vtable.on_hover != null) h else null;
+        };
+
+        if (self.hovered) |old| {
+            const same = if (target) |t| t.ctx == old.ctx else false;
+            if (same) {
+                const t = target.?;
+                // Refresh the box: the component may have moved or
+                // resized under a still pointer, and a stale box makes
+                // `local` drift further every relayout.
+                self.hovered = t;
+                if (x != self.hover_x or y != self.hover_y) {
+                    try dispatchHoverHit(t, .move, x, y, self.pointer_mods, self.host_state);
+                }
+                self.hover_x = x;
+                self.hover_y = y;
+                return;
+            }
+            try self.leaveHover(x, y);
+        }
+
+        self.hover_x = x;
+        self.hover_y = y;
+        if (target) |t| {
+            self.hovered = t;
+            try dispatchHoverHit(t, .enter, x, y, self.pointer_mods, self.host_state);
+        }
+    }
+
+    /// Send `.leave` to whoever holds the hover and forget them.
+    ///
+    /// `(x, y)` is where the pointer is NOW — outside the box being told
+    /// about, which is the point: a component reads which edge it went
+    /// out through. Not the last position it was inside at, which would
+    /// be a leave event whose position says the pointer is still there.
+    ///
+    /// **Only if they are still in the hit layer.** `hovered` is a COPY
+    /// of a Hit, so its `ctx` outlives the component when a `:::fold`
+    /// shuts under the cursor and frees its children. `captured` and
+    /// `focused` carry the same hazard and get away with it because they
+    /// are only ever set by a press and cleared on release; a hover
+    /// persists across every frame the pointer sits still, which is
+    /// exactly the window in which a document re-lays out. A component
+    /// that no longer exists cannot be left, so it is dropped silently.
+    fn leaveHover(self: *Spark, x: f32, y: f32) !void {
+        const old = self.hovered orelse return;
+        self.hovered = null;
+        for (self.drawlist.hits.items) |h| {
+            if (h.ctx != old.ctx) continue;
+            try dispatchHoverHit(old, .leave, x, y, self.pointer_mods, self.host_state);
+            return;
         }
     }
 
@@ -3305,22 +3527,79 @@ pub const Spark = struct {
             if (x < hit.box.x or x >= hit.box.x + hit.box.w) continue;
             if (y < hit.box.y or y >= hit.box.y + hit.box.h) continue;
             const eff: *anyopaque = hit.state orelse @ptrCast(self.host_state);
-            if (try on_scroll(hit.ctx, .{ .local = .{ x - hit.box.x, y - hit.box.y }, .dx = dx, .dy = dy }, eff)) {
+            if (try on_scroll(hit.ctx, .{
+                .local = .{ x - hit.box.x, y - hit.box.y },
+                .dx = dx,
+                .dy = dy,
+                .mods = self.pointer_mods,
+            }, eff)) {
                 return true;
             }
         }
         return false;
     }
 
-    /// Dispatch a primary-button transition. `down=true` on press,
+    /// Dispatch a **primary**-button transition. `down=true` on press,
     /// `down=false` on release. Manages pointer capture + focus.
+    ///
+    /// The shorthand, kept at this exact signature because matryoshka's
+    /// HUD calls it — and asserts it exists, in `hud.zig`'s embed
+    /// contract. `dispatchMouseButtonN` is the same thing with the
+    /// button named; this is it with the button assumed, which is what
+    /// every caller written before right and middle reached spark meant.
     pub fn dispatchMouseButton(self: *Spark, x: f32, y: f32, down: bool) !void {
+        return self.dispatchMouseButtonN(x, y, down, 0);
+    }
+
+    /// Dispatch a transition of button **N**. 0 = left, 1 = right,
+    /// 2 = middle; the mask is `MAX_MOUSE_BUTTONS` wide.
+    ///
+    /// Rejected names: `dispatchMouseButtonEx` (a Win32 tell that says
+    /// nothing about what was added), `dispatchButton` (reads as
+    /// `:::button`), `dispatchMousePress` (it dispatches the release
+    /// too). The `N` is the parameter that is new, which is the whole
+    /// difference from the three-argument form above.
+    ///
+    /// **Capture belongs to the button that opened it.** A press while
+    /// something is already captured goes straight to the holder — no
+    /// re-hit-test, no focus change — and a release only ends the
+    /// capture if it is the button that took it. So a right-click during
+    /// a left-drag reaches the component being dragged (which can cancel
+    /// the gesture, the usual convention) instead of ending it, and
+    /// releasing the right button afterwards does not drop the drag.
+    ///
+    /// **The click run advances on presses that open a gesture**, not on
+    /// a second button pressed during one: a modifier-ish press is part
+    /// of the gesture, not a click of its own.
+    pub fn dispatchMouseButtonN(self: *Spark, x: f32, y: f32, down: bool, button: u8) !void {
         self.mouse_x = x;
         self.mouse_y = y;
-        const prev_down = self.mouse_down;
-        self.mouse_down = down;
+        // Loud, not a guess: a button index off the end of the mask
+        // would silently alias onto button 0 and a side button would
+        // start clicking things.
+        if (button >= MAX_MOUSE_BUTTONS) return error.UnknownMouseButton;
+        const bit: u8 = @as(u8, 1) << @intCast(button);
 
-        if (down and !prev_down) {
+        const was_down = (self.buttons_down & bit) != 0;
+        if (down == was_down) return; // not a transition; nothing to do
+        if (down) self.buttons_down |= bit else self.buttons_down &= ~bit;
+        self.mouse_down = self.buttons_down != 0;
+
+        if (down) {
+            if (self.captured) |hit| {
+                try dispatchHit(hit, .{
+                    .mouse_down = self.mouseEventFor(hit, x, y, button, true),
+                }, self.host_state);
+                return;
+            }
+            // The pointer is about to belong to a gesture, so it stops
+            // belonging to a hover. Before the hit test, so a component
+            // that is both hovered and pressed sees `.leave` then
+            // `mouse_down` rather than the two interleaved.
+            try self.leaveHover(x, y);
+
+            self.click = stepClickRun(self.click, self.nowMs(), x, y, button);
+
             const maybe_hit = findHit(self.drawlist.hits.items, x, y);
             // Focus management.
             const new_focus_ctx: ?*anyopaque = blk: {
@@ -3335,21 +3614,26 @@ pub const Spark = struct {
             }
             if (maybe_hit) |hit| {
                 self.captured = hit;
-                try dispatchHit(hit, .{ .mouse_down = .{
-                    .local = .{ x - hit.box.x, y - hit.box.y },
-                    .button = 0,
-                    .button_down = true,
-                } }, self.host_state);
+                self.capture_button = button;
+                try dispatchHit(hit, .{
+                    .mouse_down = self.mouseEventFor(hit, x, y, button, true),
+                }, self.host_state);
             }
-        } else if (!down and prev_down) {
+        } else {
             if (self.captured) |hit| {
-                try dispatchHit(hit, .{ .mouse_up = .{
-                    .local = .{ x - hit.box.x, y - hit.box.y },
-                    .button = 0,
-                    .button_down = false,
-                } }, self.host_state);
-                self.captured = null;
+                try dispatchHit(hit, .{
+                    .mouse_up = self.mouseEventFor(hit, x, y, button, false),
+                }, self.host_state);
+                if (button == self.capture_button) self.captured = null;
             }
+            // The hand let go: whatever is under the pointer is hovered
+            // again, now, rather than on whichever later frame the mouse
+            // happens to twitch. Releasing a slider and having its thumb
+            // stay unlit until you jiggle looks like a dropped event.
+            // `hovered` is null here in every path — the press that
+            // opened this gesture left it — so this is an `.enter`, not
+            // a `.move` that a stale position could suppress.
+            if (self.buttons_down == 0) try self.dispatchHover(x, y);
         }
     }
 
@@ -3615,6 +3899,26 @@ fn dispatchHit(hit: element.Hit, event: element.InputEvent, default_state: *stat
     try on_input(hit.ctx, event, eff);
 }
 
+/// Deliver one hover phase to a Hit. Same state-routing rule as
+/// `dispatchHit` — an embedded document's components get that doc's
+/// state, not the host's root.
+fn dispatchHoverHit(
+    hit: element.Hit,
+    phase: element.HoverPhase,
+    x: f32,
+    y: f32,
+    mods: u32,
+    default_state: *state_mod.State,
+) !void {
+    const on_hover = hit.vtable.on_hover orelse return;
+    const eff: *anyopaque = hit.state orelse @ptrCast(default_state);
+    try on_hover(hit.ctx, .{
+        .local = .{ x - hit.box.x, y - hit.box.y },
+        .phase = phase,
+        .mods = mods,
+    }, eff);
+}
+
 fn findHit(hits: []const element.Hit, x: f32, y: f32) ?element.Hit {
     var i = hits.len;
     while (i > 0) {
@@ -3858,6 +4162,576 @@ test "Spark: testStub produces a usable shell for component tests" {
     const s = Spark.testStub(testing.allocator);
     try testing.expect(@sizeOf(@TypeOf(s)) > 0);
     // `glyph_cache_lock` is real (Mutex has no resources to free).
+}
+
+// ── Input dispatch: the button, the mods, the run, and hover ────────
+//
+// Three holes a `:::graph` span would have had to work around, plus a
+// multi-click derivation that was about to be copied out of
+// `:::textarea` into the second component that wanted a double-click.
+//
+// Every gate below names the mutation it was paid for, and each of those
+// mutations was executed and watched go red — a gate over a dispatcher
+// is very easy to write so that it passes against the old behaviour too,
+// because the old behaviour was "deliver something plausible".
+
+/// Records what a component was actually handed. Doubles as the `state`
+/// pointer on its own Hit so the gates never reach `host_state`.
+const InputProbe = struct {
+    const Kind = enum { down, up, move };
+    const Rec = struct { kind: Kind, ev: element.MouseEvent };
+
+    recs: [32]Rec = undefined,
+    n: usize = 0,
+    hovers: [32]element.HoverEvent = undefined,
+    hn: usize = 0,
+    /// Where this probe writes, when a gate needs two DISTINCT
+    /// components (hover identity is by `ctx`, so one probe behind two
+    /// Hits is one component) whose events are nevertheless interleaved
+    /// in one list. Ordering is the assertion in those gates and two
+    /// separate lists cannot express it.
+    sink: ?*InputProbe = null,
+
+    fn layoutAndRender(
+        _: *anyopaque,
+        _: [2]f32,
+        _: element.Constraints,
+        _: *element.LayoutCtx,
+        _: *element.DrawList,
+    ) anyerror!element.Box {
+        return .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+    }
+
+    fn onInput(ctx: *anyopaque, event: element.InputEvent, _: *anyopaque) anyerror!void {
+        const self: *InputProbe = @ptrCast(@alignCast(ctx));
+        const p = self.sink orelse self;
+        const rec: Rec = switch (event) {
+            .mouse_down => |m| .{ .kind = .down, .ev = m },
+            .mouse_up => |m| .{ .kind = .up, .ev = m },
+            .mouse_move => |m| .{ .kind = .move, .ev = m },
+            else => return,
+        };
+        if (p.n >= p.recs.len) return;
+        p.recs[p.n] = rec;
+        p.n += 1;
+    }
+
+    fn onHover(ctx: *anyopaque, event: element.HoverEvent, _: *anyopaque) anyerror!void {
+        const self: *InputProbe = @ptrCast(@alignCast(ctx));
+        const p = self.sink orelse self;
+        if (p.hn >= p.hovers.len) return;
+        p.hovers[p.hn] = event;
+        p.hn += 1;
+    }
+
+    /// The hover phases seen, as a slice that `expectEqualSlices` can
+    /// print — an assertion on a count alone passes for enter/enter.
+    fn phases(p: *const InputProbe, buf: []element.HoverPhase) []const element.HoverPhase {
+        for (p.hovers[0..p.hn], 0..) |h, i| buf[i] = h.phase;
+        return buf[0..p.hn];
+    }
+};
+
+const probe_input_only = element.ElementVTable{
+    .layout_and_render = InputProbe.layoutAndRender,
+    .on_input = InputProbe.onInput,
+};
+const probe_hover_too = element.ElementVTable{
+    .layout_and_render = InputProbe.layoutAndRender,
+    .on_input = InputProbe.onInput,
+    .on_hover = InputProbe.onHover,
+};
+
+fn probeHit(p: *InputProbe, vt: *const element.ElementVTable, x: f32, y: f32, w: f32, h: f32) element.Hit {
+    return .{
+        .box = .{ .x = x, .y = y, .w = w, .h = h },
+        .vtable = vt,
+        .ctx = @ptrCast(p),
+        .state = @ptrCast(p), // never dereferenced; keeps `host_state` out of it
+    };
+}
+
+test "dispatch: the event carries the button that was actually pressed" {
+    // The hole: `dispatchMouseButton` hardcoded `.button = 0` on every
+    // event it built, so `if (m.button != 0) return` — which eight
+    // components in this library write, some of them with a "primary
+    // only" comment beside it — could not fire. Dead code that reads
+    // like a decision.
+    //
+    // Mutation: put `.button = 0` back in `mouseEventFor`. Red on the
+    // first expectEqual (1 != 0), and red again on the release.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+
+    var p = InputProbe{};
+    try sp.drawlist.hits.append(probeHit(&p, &probe_input_only, 0, 0, 100, 50));
+
+    try sp.dispatchMouseButtonN(10, 10, true, 1); // right
+    try sp.dispatchMouseButtonN(10, 10, false, 1);
+    try testing.expectEqual(@as(usize, 2), p.n);
+    try testing.expectEqual(@as(u8, 1), p.recs[0].ev.button);
+    try testing.expectEqual(@as(u8, 1), p.recs[1].ev.button);
+
+    // And the three-argument form still means the primary button, which
+    // is what every call site written before this beat meant by it —
+    // matryoshka's `hud_bridge` among them.
+    p.n = 0;
+    try sp.dispatchMouseButton(10, 10, true);
+    try testing.expectEqual(@as(u8, 0), p.recs[0].ev.button);
+}
+
+test "dispatch: a drag reports the button that took the capture, not 0" {
+    // `dispatchMouseMove` hardcoded `.button = 0` too, and a move is
+    // where a drag actually happens. A middle-drag that claimed to be
+    // button 0 would defeat the very guards this beat turned on —
+    // `:::slider` reads `m.button` on the move for exactly this reason.
+    //
+    // Mutation: `.button = 0` in the `dispatchMouseMove` call to
+    // `mouseEventFor`. The move's button is 0, red.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+
+    var p = InputProbe{};
+    try sp.drawlist.hits.append(probeHit(&p, &probe_input_only, 0, 0, 100, 50));
+
+    try sp.dispatchMouseButtonN(10, 10, true, 2); // middle
+    try sp.dispatchMouseMove(20, 10);
+    try testing.expectEqual(@as(usize, 2), p.n);
+    try testing.expectEqual(InputProbe.Kind.move, p.recs[1].kind);
+    try testing.expectEqual(@as(u8, 2), p.recs[1].ev.button);
+    try testing.expect(p.recs[1].ev.button_down);
+}
+
+test "dispatch: a second button during a drag reaches the holder and does not end it" {
+    // Capture belongs to the button that opened the gesture. A
+    // right-click during a left-drag is the "cancel this" convention, so
+    // it has to REACH the component being dragged — and releasing it
+    // must not drop the drag, or the gesture dies in the user's hand.
+    //
+    // Mutation: clear `self.captured` on any release rather than on
+    // `button == self.capture_button`. The move after the right-release
+    // is never delivered, red on the final count.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+
+    var p = InputProbe{};
+    try sp.drawlist.hits.append(probeHit(&p, &probe_input_only, 0, 0, 100, 50));
+
+    try sp.dispatchMouseButtonN(10, 10, true, 0); // left press: takes capture
+    try sp.dispatchMouseButtonN(10, 10, true, 1); // right press during it
+    try testing.expectEqual(@as(u8, 1), p.recs[1].ev.button);
+    try sp.dispatchMouseButtonN(10, 10, false, 1); // right release
+    try testing.expect(sp.captured != null); // the left drag is still live
+    try sp.dispatchMouseMove(30, 10);
+    try testing.expectEqual(@as(usize, 4), p.n);
+    try testing.expectEqual(InputProbe.Kind.move, p.recs[3].kind);
+    try testing.expectEqual(@as(u8, 0), p.recs[3].ev.button); // still the left drag
+
+    try sp.dispatchMouseButtonN(30, 10, false, 0);
+    try testing.expect(sp.captured == null);
+}
+
+test "dispatch: a button index off the end of the mask is refused, not aliased" {
+    // Loud, never a guess. `1 << 8` on a `u8` mask is not a bug you find
+    // by reading; it is a side button that starts clicking things.
+    //
+    // Mutation: drop the bounds check and let `@intCast` shift. In Debug
+    // the shift traps rather than returning, which is a different red —
+    // so the gate asserts the ERROR, not merely "did not work".
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+
+    try testing.expectError(error.UnknownMouseButton, sp.dispatchMouseButtonN(0, 0, true, 8));
+}
+
+test "dispatch: the modifier mask the host set reaches every pointer event" {
+    // The hole `:::textarea`'s header prescribed the cure for: "there is
+    // no honest way to know whether Shift is down at the moment of a
+    // click. The cure is a `mods` field on MouseEvent, not a guess in
+    // here."
+    //
+    // Mutation: drop `.mods = self.pointer_mods` from `mouseEventFor`
+    // (the field defaults to 0, so it still compiles — which is exactly
+    // how a dropped field survives a review). Every assertion below goes
+    // red at 0.
+    const SHIFT: u32 = 0x0001; // GLFW_MOD_SHIFT
+    const CTRL: u32 = 0x0002; // GLFW_MOD_CONTROL
+
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+
+    var p = InputProbe{};
+    try sp.drawlist.hits.append(probeHit(&p, &probe_hover_too, 0, 0, 100, 50));
+
+    sp.setPointerMods(SHIFT | CTRL);
+    try sp.dispatchHover(10, 10);
+    try sp.dispatchMouseButtonN(10, 10, true, 0);
+    try sp.dispatchMouseMove(20, 10);
+    try sp.dispatchMouseButtonN(20, 10, false, 0);
+
+    try testing.expect(p.hn > 0);
+    try testing.expectEqual(SHIFT | CTRL, p.hovers[0].mods);
+    try testing.expectEqual(@as(usize, 3), p.n);
+    for (p.recs[0..p.n]) |r| try testing.expectEqual(SHIFT | CTRL, r.ev.mods);
+
+    // Rule 1: assert the ZERO before believing the mask — a field wired
+    // to a constant would satisfy every assertion above.
+    p.n = 0;
+    sp.setPointerMods(0);
+    try sp.dispatchMouseButtonN(10, 10, true, 0);
+    try testing.expectEqual(@as(u32, 0), p.recs[0].ev.mods);
+}
+
+test "stepClickRun: too slow, too far, or the other button is not a double-click" {
+    // Pure, so the three ways a multi-click derivation goes wrong are
+    // gated without a clock or a window. The wall-clock version inside
+    // `:::textarea` could not be gated this way at all, which is part of
+    // why it moved.
+    //
+    // Mutations, each executed:
+    //  * drop the `MULTI_CLICK_MS` term  → the 500ms pair reports 2, red
+    //  * drop the `MULTI_CLICK_SLOP` terms → the 20px pair reports 2, red
+    //  * drop the `last_button` term     → the left-then-right pair
+    //    reports 2, red
+    //  * `.run = prev.run + 1` uncapped  → the fourth click reports 4, red
+    const start = Spark.ClickRun{ .run = 1, .last_ms = 1000, .last_x = 50, .last_y = 50, .last_button = 0 };
+
+    // Same place, soon enough, same button: the run continues.
+    try testing.expectEqual(@as(u8, 2), Spark.stepClickRun(start, 1100, 50, 50, 0).run);
+    // Drifted three pixels — still a double-click, which is the whole
+    // reason there is a slop rather than an equality.
+    try testing.expectEqual(@as(u8, 2), Spark.stepClickRun(start, 1100, 52, 51, 0).run);
+
+    // 500ms apart: two single clicks.
+    try testing.expectEqual(@as(u8, 1), Spark.stepClickRun(start, 1500, 50, 50, 0).run);
+    // 20px apart: two single clicks, however fast.
+    try testing.expectEqual(@as(u8, 1), Spark.stepClickRun(start, 1001, 70, 50, 0).run);
+    try testing.expectEqual(@as(u8, 1), Spark.stepClickRun(start, 1001, 50, 70, 0).run);
+    // A left click then a right click in the same place is two intents,
+    // not a double-click — a context menu that opens thinking a word is
+    // selected is the visible form of getting this wrong.
+    try testing.expectEqual(@as(u8, 1), Spark.stepClickRun(start, 1001, 50, 50, 1).run);
+
+    // And the run saturates at 3: a fourth click in place still means
+    // "that line", not a wrap back round to a caret.
+    var run = start;
+    var t: i64 = 1000;
+    for (0..4) |_| {
+        t += 50;
+        run = Spark.stepClickRun(run, t, 50, 50, 0);
+    }
+    try testing.expectEqual(@as(u8, 3), run.run);
+
+    // The very first click of a session continues nothing. `last_button`
+    // starts at 0xFF for this: a plausible 0 would have made it a
+    // double-click of a click that never happened.
+    const fresh = Spark.ClickRun{};
+    try testing.expectEqual(@as(u8, 1), Spark.stepClickRun(fresh, 0, 0, 0, 0).run);
+}
+
+test "dispatch: the click run reaches the event, and the gesture after it" {
+    // The through-path. `click_clock_ms` drives the clock so the gate
+    // costs microseconds instead of half a second of real sleeping.
+    //
+    // Mutation: drop `.click_run = self.click.run` from `mouseEventFor`
+    // (it defaults to 1, so it compiles). The second press reports 1,
+    // red — and `:::textarea` would place a caret where a word should
+    // have been selected.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+
+    var p = InputProbe{};
+    try sp.drawlist.hits.append(probeHit(&p, &probe_input_only, 0, 0, 100, 50));
+
+    sp.click_clock_ms = 10_000;
+    try sp.dispatchMouseButtonN(10, 10, true, 0);
+    try sp.dispatchMouseButtonN(10, 10, false, 0);
+    sp.click_clock_ms = 10_100; // 100ms later, same place
+    try sp.dispatchMouseButtonN(10, 10, true, 0);
+    try sp.dispatchMouseMove(11, 10);
+
+    try testing.expectEqual(@as(u8, 1), p.recs[0].ev.click_run);
+    try testing.expectEqual(@as(u8, 1), p.recs[1].ev.click_run); // the release of the first
+    try testing.expectEqual(@as(u8, 2), p.recs[2].ev.click_run);
+    // The drag that follows a double-click carries the run too — that is
+    // what lets a word-drag extend by whole words.
+    try testing.expectEqual(InputProbe.Kind.move, p.recs[3].kind);
+    try testing.expectEqual(@as(u8, 2), p.recs[3].ev.click_run);
+
+    // A press 500ms after the last one starts over.
+    sp.click_clock_ms = 10_700;
+    try sp.dispatchMouseButtonN(11, 10, false, 0);
+    try sp.dispatchMouseButtonN(11, 10, true, 0);
+    try testing.expectEqual(@as(u8, 1), p.recs[p.n - 1].ev.click_run);
+}
+
+test "hover: an enter is matched by a leave when the pointer exits" {
+    // The whole content of the phase. A component that hears only "the
+    // pointer is at (x, y)" cannot tell a two-pixel move from the
+    // pointer having gone somewhere else, and a node in a graph editor
+    // that stays lit after you leave it is the visible form of that.
+    //
+    // Mutation: delete the `try self.leaveHover()` in `dispatchHover`'s
+    // "the target changed" branch. The phases are [enter] and the gate
+    // is red on the slice compare.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+
+    var p = InputProbe{};
+    try sp.drawlist.hits.append(probeHit(&p, &probe_hover_too, 0, 0, 100, 50));
+
+    try sp.dispatchHover(10, 10);
+    try sp.dispatchHover(20, 10);
+    try sp.dispatchHover(400, 400); // gone
+
+    var buf: [8]element.HoverPhase = undefined;
+    try testing.expectEqualSlices(
+        element.HoverPhase,
+        &.{ .enter, .move, .leave },
+        p.phases(&buf),
+    );
+    // The leave carries where the pointer was when it left, which is
+    // outside the box. Clamping it back inside would tell the component
+    // the pointer is still there on the event that says it is not.
+    try testing.expectEqual(@as(f32, 400), p.hovers[2].local[0]);
+    try testing.expect(sp.hovered == null);
+}
+
+test "hover: crossing between components leaves the first before entering the second" {
+    // Two components must never both believe the pointer is theirs. The
+    // ordering is the assertion — a leave that arrived AFTER the next
+    // component's enter would let a graph editor light two nodes.
+    //
+    // Mutation: move the `leaveHover()` call to after the `.enter`
+    // dispatch. Both probes still see one event each, and both counts
+    // still pass — only the interleaving changes, which is why this gate
+    // records into one shared list rather than counting per probe.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+
+    // Two DISTINCT components — hover identity is by `ctx`, so one probe
+    // behind two boxes would be one component and the crossing would be
+    // a `.move`. Both write into `log`, so the list IS the interleaving.
+    var log = InputProbe{};
+    var first = InputProbe{ .sink = &log };
+    var second = InputProbe{ .sink = &log };
+    try sp.drawlist.hits.append(probeHit(&first, &probe_hover_too, 0, 0, 50, 50));
+    try sp.drawlist.hits.append(probeHit(&second, &probe_hover_too, 60, 0, 50, 50));
+
+    try sp.dispatchHover(10, 10); // in the first
+    log.hn = 0;
+    try sp.dispatchHover(70, 10); // straight into the second
+
+    var buf: [8]element.HoverPhase = undefined;
+    try testing.expectEqualSlices(element.HoverPhase, &.{ .leave, .enter }, log.phases(&buf));
+    // `local` is measured against the box being told about, not the box
+    // the pointer is in: the leave belongs to the first Hit, at x = 0.
+    try testing.expectEqual(@as(f32, 70), log.hovers[0].local[0]); // 70 - 0
+    try testing.expectEqual(@as(f32, 10), log.hovers[1].local[0]); // 70 - 60
+}
+
+test "hover: a stationary pointer sends nothing, but a relayout under it still counts" {
+    // The cost gate. A polling host calls `dispatchHover` every frame
+    // whether the mouse moved or not, and a `.move` per frame per
+    // hovered component is a component redrawing itself sixty times a
+    // second for nothing.
+    //
+    // Mutation: dispatch `.move` unconditionally instead of on
+    // `x != hover_x or y != hover_y`. The second and third calls each
+    // add a `.move`, red on the count.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+
+    var p = InputProbe{};
+    try sp.drawlist.hits.append(probeHit(&p, &probe_hover_too, 0, 0, 100, 50));
+
+    try sp.dispatchHover(10, 10);
+    try sp.dispatchHover(10, 10);
+    try sp.dispatchHover(10, 10);
+    var buf: [8]element.HoverPhase = undefined;
+    try testing.expectEqualSlices(element.HoverPhase, &.{.enter}, p.phases(&buf));
+
+    // The scan is NOT skipped for a still pointer, on purpose: the
+    // document can re-lay-out under a stationary cursor — a `:::fold`
+    // opening is the everyday case — and the leave that follows is real.
+    //
+    // Mutation for this half: early-return from `dispatchHover` when the
+    // position is unchanged. No leave arrives, red.
+    sp.drawlist.hits.clearRetainingCapacity();
+    try sp.drawlist.hits.append(probeHit(&p, &probe_hover_too, 200, 200, 10, 10));
+    try sp.dispatchHover(10, 10);
+    try testing.expectEqualSlices(element.HoverPhase, &.{ .enter, .leave }, p.phases(&buf));
+}
+
+test "hover: nothing is dispatched while a drag holds the pointer" {
+    // Pointer capture owns the pointer for the length of a gesture —
+    // that is what makes a slider dragged off its own box keep scrubbing.
+    // A hover fired at a third component mid-drag would put two
+    // components in a "the pointer is mine" state at once.
+    //
+    // Mutation: drop the `buttons_down != 0 or captured != null` guard at
+    // the top of `dispatchHover`. The drag across the second component
+    // enters it while the first is still captured, red on the phases.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+
+    var p = InputProbe{};
+    try sp.drawlist.hits.append(probeHit(&p, &probe_hover_too, 0, 0, 50, 50));
+    try sp.drawlist.hits.append(probeHit(&p, &probe_hover_too, 60, 0, 50, 50));
+
+    try sp.dispatchHover(10, 10); // enter the first
+    p.hn = 0;
+    try sp.dispatchMouseButtonN(10, 10, true, 0);
+
+    // The press itself takes the hover away — the pointer now belongs to
+    // the gesture, and it says so rather than going quiet.
+    var buf: [8]element.HoverPhase = undefined;
+    try testing.expectEqualSlices(element.HoverPhase, &.{.leave}, p.phases(&buf));
+
+    p.hn = 0;
+    try sp.dispatchHover(70, 10); // a host that asks anyway
+    try sp.dispatchMouseMove(70, 10);
+    try sp.dispatchHover(70, 10);
+    try testing.expectEqual(@as(usize, 0), p.hn);
+
+    // …and the hand letting go hands the pointer back, in the same call
+    // rather than on whichever later frame the mouse happens to twitch.
+    // Mutation: drop the `dispatchHover` at the end of the release arm.
+    // No enter arrives, red.
+    try sp.dispatchMouseButtonN(70, 10, false, 0);
+    try testing.expectEqualSlices(element.HoverPhase, &.{.enter}, p.phases(&buf));
+}
+
+test "hover: the deepest hit takes it, and a component without on_hover takes it away" {
+    // Hover targets one component, the same one a click would — so hover
+    // and click can never disagree about who the pointer is on. It does
+    // NOT bubble the way the wheel does: two nested components both lit
+    // is a state neither can tell it is in.
+    //
+    // Mutation: fall back to scanning outward for a Hit that HAS an
+    // `on_hover` when the deepest one does not. The outer probe stays
+    // entered while the pointer is over the inner opaque one, red.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+
+    var outer = InputProbe{};
+    var inner = InputProbe{};
+    // The walker appends a container before its children, and `findHit`
+    // scans backwards — so the child is the later entry.
+    try sp.drawlist.hits.append(probeHit(&outer, &probe_hover_too, 0, 0, 100, 100));
+    try sp.drawlist.hits.append(probeHit(&inner, &probe_input_only, 40, 40, 20, 20));
+
+    try sp.dispatchHover(10, 10);
+    try testing.expectEqual(@as(usize, 1), outer.hn);
+    try testing.expectEqual(element.HoverPhase.enter, outer.hovers[0].phase);
+
+    try sp.dispatchHover(50, 50); // over the child, which declares no on_hover
+    try testing.expectEqual(@as(usize, 2), outer.hn);
+    try testing.expectEqual(element.HoverPhase.leave, outer.hovers[1].phase);
+    try testing.expectEqual(@as(usize, 0), inner.hn);
+    try testing.expect(sp.hovered == null);
+}
+
+test "hover: a component that left the hit layer is not sent a leave" {
+    // `hovered` is a COPY of a Hit, so its `ctx` outlives the component
+    // when a `:::fold` shuts under the cursor and frees its children.
+    // `captured` and `focused` carry the same hazard and get away with it
+    // because a press sets them and a release clears them; a hover
+    // persists across every frame the pointer sits still, which is
+    // exactly the window in which a document re-lays out.
+    //
+    // Mutation: drop the presence scan in `leaveHover` and dispatch
+    // straight to `old`. A leave is recorded for a component that is no
+    // longer in the layer — red here, a use-after-free in a real
+    // document, which is the failure this gate stands in for.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+
+    var p = InputProbe{};
+    try sp.drawlist.hits.append(probeHit(&p, &probe_hover_too, 0, 0, 100, 50));
+    try sp.dispatchHover(10, 10);
+    try testing.expectEqual(@as(usize, 1), p.hn);
+
+    // The component is gone from this frame's layer.
+    sp.drawlist.hits.clearRetainingCapacity();
+    try sp.dispatchHover(400, 400);
+    try testing.expectEqual(@as(usize, 1), p.hn); // no leave
+    try testing.expect(sp.hovered == null);
+}
+
+test "hover: a component that never declared on_hover is untouched by any of this" {
+    // The governing constraint of the beat, as a gate. An existing
+    // component sees the events it always saw and not one more — the
+    // whole reason hover is a vtable slot rather than a `mouse_move`
+    // with `button_down = false`.
+    //
+    // Mutation: deliver hover as `.mouse_move` through `on_input` when
+    // `on_hover` is null. `:::slider`, which scrubs on any move, would
+    // then move to wherever the pointer passed — and here, `p.n` is 3
+    // instead of 0, red.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+
+    var p = InputProbe{};
+    try sp.drawlist.hits.append(probeHit(&p, &probe_input_only, 0, 0, 100, 50));
+
+    try sp.dispatchHover(10, 10);
+    try sp.dispatchHover(20, 10);
+    try sp.dispatchHover(400, 400);
+    try testing.expectEqual(@as(usize, 0), p.n);
+    try testing.expectEqual(@as(usize, 0), p.hn);
 }
 
 // ── The host window (panels campaign, beat 3) ───────────────────────

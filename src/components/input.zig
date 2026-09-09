@@ -794,6 +794,18 @@ fn onInput(
             // Cleared unconditionally: a press that is not the start of a
             // scrub must not leave a stale latch for the NEXT drag over
             // this field to pick up.
+            //
+            // Since the dispatcher started reporting the real button,
+            // "unconditionally" reaches one more case than it used to: a
+            // right-press DURING a live left-scrub is delivered to the
+            // capture holder, lands here, and ends the scrub. That is the
+            // right-click-cancels convention and it is left as the
+            // comment above asks for — but it is a deliberate answer,
+            // not an accident, and it is the only one in the library:
+            // `:::curve`, `:::trackball` and `:::textarea` all test the
+            // button BEFORE touching their latch, so a foreign press
+            // leaves their gesture alone. Nothing has paid for making
+            // the four agree.
             c.gesture = .none;
             if (!c.numeric or m.button != 0) return;
             // A field holding prose (or nothing) has no value to scrub

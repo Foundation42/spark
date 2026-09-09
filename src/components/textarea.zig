@@ -77,11 +77,16 @@
 //!
 //! ### What is deliberately not here
 //!
-//! * **Shift+click to extend a selection.** `element.MouseEvent` carries
-//!   no modifier mask, and the host dispatches key events on press only, so
-//!   there is no honest way to know whether Shift is down at the moment of
-//!   a click. Drag-select and Shift+arrow both work. The cure is a `mods`
-//!   field on MouseEvent, not a guess in here.
+//! * **Shift+click to extend a selection.** This used to say the cure was
+//!   a `mods` field on MouseEvent rather than a guess in here. The field
+//!   has since landed — `MouseEvent.mods`, a raw GLFW mask stamped by the
+//!   dispatcher from `Spark.setPointerMods` — so the obstacle is gone and
+//!   only the work is left: on a `mouse_down` with `GLFW_MOD_SHIFT` set,
+//!   keep `anchor` and move `cursor` to the clicked offset instead of
+//!   collapsing both. Deliberately not taken in the beat that added the
+//!   field, which changed this file only far enough to prove the shared
+//!   click run (below) is the real one. Drag-select and Shift+arrow both
+//!   work meanwhile.
 //! * **IME / composition.** `char_input` is already post-IME, so typing in
 //!   a composed script works; the pre-edit underline does not exist.
 //! * **Bidi and complex-script caret motion.** The line model assumes
@@ -447,14 +452,10 @@ const Component = struct {
     focused: bool = false,
     /// A selection drag is live. Also keeps a synced `initial=` out.
     dragging: bool = false,
-    /// For double- and triple-click. Wall clock because there is no frame
-    /// counter down here and the gesture is measured in human time anyway.
-    last_click_ms: i64 = 0,
-    click_x: f32 = 0,
-    click_y: f32 = 0,
-    /// 1 = caret, 2 = word, 3 = line. GLFW reports no double-click, so
-    /// the run is counted here.
-    click_run: u8 = 0,
+    // No `last_click_ms` / `click_x` / `click_y` / `click_run` any more:
+    // 1 = caret, 2 = word, 3 = line arrives on `MouseEvent.click_run`,
+    // counted once for the whole library in `Spark.stepClickRun`. This
+    // widget holding its own copy is what made it worth centralising.
     /// When the last edit landed, so the caret can stay SOLID through a
     /// burst of typing instead of blinking out the character just made.
     last_edit_ms: i64 = 0,
@@ -1074,13 +1075,15 @@ fn onScroll(ctx: *anyopaque, ev: element.ScrollEvent, _: *anyopaque) anyerror!bo
     return took;
 }
 
-/// How long a gap still counts as part of the same click run. GLFW does
-/// not report double-clicks, so the widget has to; 400ms is the interval
-/// every toolkit's default lands within.
-const MULTI_CLICK_MS: i64 = 400;
-/// How far the pointer may move between clicks of a run. A double-click
-/// that drifted three pixels is still a double-click.
-const MULTI_CLICK_SLOP: f32 = 4;
+// The click run used to be derived HERE, from a private
+// `MULTI_CLICK_MS = 400` / `MULTI_CLICK_SLOP = 4` and a wall-clock read
+// at the top of the `mouse_down` arm. It has moved to
+// `Spark.stepClickRun`, and the constants with it, because this widget
+// was about to stop being the only one that wants a double-click: a
+// second component deriving its own would be two answers to "what is a
+// double-click" on one screen, and nobody would find out until the two
+// were side by side and behaved differently. The run now arrives on
+// `MouseEvent.click_run`.
 
 fn onInput(ctx: *anyopaque, event: element.InputEvent, state_ptr: *anyopaque) anyerror!void {
     const c: *Component = @ptrCast(@alignCast(ctx));
@@ -1105,20 +1108,13 @@ fn onInput(ctx: *anyopaque, event: element.InputEvent, state_ptr: *anyopaque) an
         .mouse_down => |mev| {
             if (mev.button != 0) return;
             const off = offsetAt(c, mev.local);
-            const now = std.time.milliTimestamp();
-            // Same place, soon enough: the run continues. Measured in
-            // PIXELS rather than in byte offsets, because a person aiming
-            // a second click aims at the same spot on screen and the byte
-            // under it may well have changed.
-            const near = (now - c.last_click_ms) < MULTI_CLICK_MS and
-                @abs(c.click_x - mev.local[0]) < MULTI_CLICK_SLOP and
-                @abs(c.click_y - mev.local[1]) < MULTI_CLICK_SLOP;
-            c.click_run = if (near and c.click_run < 3) c.click_run + 1 else if (near) 3 else 1;
-            c.last_click_ms = now;
-            c.click_x = mev.local[0];
-            c.click_y = mev.local[1];
-
-            switch (c.click_run) {
+            // The run comes from the dispatcher now — see the note above
+            // `onInput`. Clamped rather than trusted: `click_run` is a
+            // `u8` on a public event and a host that synthesises pointer
+            // events (matryoshka does) can stamp anything on it. A 0
+            // would fall through to the `else` arm and select the whole
+            // line on an ordinary click; a 4 would do the same.
+            switch (std.math.clamp(mev.click_run, 1, 3)) {
                 1 => {
                     c.cursor = off;
                     c.anchor = off;
@@ -1139,7 +1135,6 @@ fn onInput(ctx: *anyopaque, event: element.InputEvent, state_ptr: *anyopaque) an
                     c.anchor = ls.start;
                     c.cursor = ls.end;
                     c.dragging = false;
-                    c.click_run = 3;
                 },
             }
             c.goal_x = null;
@@ -2083,11 +2078,24 @@ fn placeBox(c: *Component, char_w: f32, content_w: f32) !void {
     try relayout(c, char_w, content_w);
 }
 
+/// A single click — `click_run = 1`, the default. Deterministic now that
+/// the run is fed rather than derived from a wall clock in here: two
+/// `clickAt`s in a row used to accumulate into a double-click if the test
+/// process happened to be quick, which is a gate that depends on the
+/// machine it runs on.
 fn clickAt(inst: component_mod.Instance, x: f32, y: f32) !void {
+    try clickRunAt(inst, x, y, 1);
+}
+
+/// A click that is the `run`-th of a run. Whether 400ms and 4px make a
+/// run is `Spark.stepClickRun`'s question and is gated there; what is
+/// gated here is only what this widget does with the answer.
+fn clickRunAt(inst: component_mod.Instance, x: f32, y: f32, run: u8) !void {
     try onInput(inst.ctx, .{ .mouse_down = .{
         .local = .{ x, y },
         .button = 0,
         .button_down = true,
+        .click_run = run,
     } }, @ptrCast(&_test_state));
 }
 
@@ -2142,23 +2150,36 @@ test "textarea: a double-click takes the word, a triple the whole hard line" {
     try placeBox(c, 10, 60);
     try testing.expect(c.lines.items.len > 1);
 
+    // The run is FED now, not counted in here. Mutation the version of
+    // this gate before the move would not have caught: deleting the
+    // widget's own `near`/`click_run` derivation entirely. It passed
+    // because three `clickAt`s inside one test process are three clicks
+    // 0ms and 0px apart, so the derivation and a hardcoded increment
+    // agreed. Feeding 1/2/3 is what makes the arms the subject.
     const x = c.content_x + 25; // inside "alpha" on row 0
     const y = c.content_y + 2;
-    try clickAt(inst, x, y);
+    try clickRunAt(inst, x, y, 1);
     try testing.expect(c.selection() == null);
-    try clickAt(inst, x, y);
+    try clickRunAt(inst, x, y, 2);
     const word = c.selection().?;
     try testing.expectEqual(@as(usize, 0), word.start);
     try testing.expectEqual(@as(usize, 5), word.end);
-    try clickAt(inst, x, y);
+    try clickRunAt(inst, x, y, 3);
     const line = c.selection().?;
     try testing.expectEqual(@as(usize, 0), line.start);
     try testing.expectEqual(@as(usize, 16), line.end);
 }
 
-test "textarea: a click far away starts a new run rather than continuing one" {
-    // Proximity is measured in PIXELS, not in byte offsets: a second click
-    // somewhere else is a new caret, however soon it came.
+test "textarea: a fed run of 1 is a caret however fast the clicks came" {
+    // The other half of the move: this widget must keep NO opinion of its
+    // own about what a double-click is. Two single clicks in a row —
+    // which is what the dispatcher reports for two clicks far apart, or
+    // slow, or on different buttons — leave a caret and no selection.
+    //
+    // Mutation: restore the old private derivation (`near` from a
+    // wall-clock read and `c.click_run + 1`). Both clicks land in the
+    // same test process microseconds apart at the same point, so the
+    // second becomes a double-click, `selection()` is "alpha", red.
     const attrs = [_]components.Attr{.{ .key = "wrap", .value = "none" }};
     const inst = try makeBox(&attrs, "alpha beta");
     defer deinit_(inst.ctx, testing.allocator);
@@ -2166,10 +2187,37 @@ test "textarea: a click far away starts a new run rather than continuing one" {
     try onInput(inst.ctx, .focus_gained, @ptrCast(&_test_state));
     try placeBox(c, 10, 200);
 
-    try clickAt(inst, c.content_x + 25, c.content_y + 2);
-    try clickAt(inst, c.content_x + 85, c.content_y + 2);
+    const x = c.content_x + 25;
+    const y = c.content_y + 2;
+    try clickAt(inst, x, y);
+    try clickAt(inst, x, y);
     try testing.expect(c.selection() == null);
-    try testing.expectEqual(@as(u8, 1), c.click_run);
+}
+
+test "textarea: a run of 0 or 4 from a host is a caret, not a line" {
+    // `click_run` is a `u8` on a public event and matryoshka synthesises
+    // pointer events, so the arms are clamped rather than trusted.
+    //
+    // Mutation: `switch (mev.click_run)` with the arms `1`, `2`, `else`.
+    // A 0 falls into `else` and selects the whole hard line on what the
+    // host meant as an ordinary click — red on the first assertion.
+    const attrs = [_]components.Attr{.{ .key = "wrap", .value = "none" }};
+    const inst = try makeBox(&attrs, "alpha beta");
+    defer deinit_(inst.ctx, testing.allocator);
+    const c: *Component = @ptrCast(@alignCast(inst.ctx));
+    try onInput(inst.ctx, .focus_gained, @ptrCast(&_test_state));
+    try placeBox(c, 10, 200);
+
+    const x = c.content_x + 25;
+    const y = c.content_y + 2;
+    try clickRunAt(inst, x, y, 0);
+    try testing.expect(c.selection() == null);
+    // And the top end saturates onto the line arm rather than wrapping
+    // back round to a caret.
+    try clickRunAt(inst, x, y, 9);
+    const line = c.selection().?;
+    try testing.expectEqual(@as(usize, 0), line.start);
+    try testing.expectEqual(@as(usize, 10), line.end);
 }
 
 test "textarea: dragging extends the selection from where the press landed" {

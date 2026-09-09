@@ -65,6 +65,11 @@ pub const Constraints = element.Constraints;
 pub const Box = element.Box;
 pub const InputEvent = element.InputEvent;
 pub const MouseEvent = element.MouseEvent;
+pub const ScrollEvent = element.ScrollEvent;
+/// The hover channel — a host-written component declares `on_hover` on
+/// its vtable and takes one of these. See `element.HoverEvent`.
+pub const HoverEvent = element.HoverEvent;
+pub const HoverPhase = element.HoverPhase;
 pub const KeyEvent = element.KeyEvent;
 pub const Hit = element.Hit;
 pub const IntrinsicMetrics = element.IntrinsicMetrics;

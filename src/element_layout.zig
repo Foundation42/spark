@@ -48,6 +48,21 @@ const jobs_mod = @import("common").jobs;
 const PARALLEL_MIN_CHILDREN: usize = 4;
 const PARALLEL_MIN_WALKS: usize = 2;
 
+/// Does this component need its laid-out box on `DrawList.hits`?
+///
+/// The hit layer is what the dispatcher scans; a component that is not
+/// on it is never clicked, never offered the wheel and never hovered.
+/// The three channels each answer yes, and the whole reason this is one
+/// named function rather than a condition written at each emit site is
+/// that it WAS written at each site and the two copies disagreed — the
+/// inline arm tested `on_input` alone, so an inline component wanting
+/// the wheel got no box and no error, just silence.
+pub fn wantsHitBox(vtable: *const element.ElementVTable) bool {
+    return vtable.on_input != null or
+        vtable.on_scroll != null or
+        vtable.on_hover != null;
+}
+
 pub const Error = error{
     /// `text` or `line_break` appeared at a position where only block
     /// elements are valid (e.g. as a direct child of a container).
@@ -304,10 +319,7 @@ pub fn layoutAndRender(
             // backwards. A container that returns a box covering its
             // children therefore swallows every one of them. See
             // `ElementVTable.emits_own_hits`.
-            // `on_scroll` counts as accepting input: a component that
-            // only wants the wheel still needs a box on the hit layer for
-            // the wheel to be offered against.
-            if ((cu.vtable.on_input != null or cu.vtable.on_scroll != null) and !cu.vtable.emits_own_hits) {
+            if (wantsHitBox(cu.vtable) and !cu.vtable.emits_own_hits) {
                 try out.hits.append(.{
                     .box = box,
                     .vtable = cu.vtable,
@@ -2417,7 +2429,17 @@ fn emitInlineObject(
     // mirrors the block-level `.custom` path, `emits_own_hits` and all.
     // Stamped with the current walker `state` so input dispatch routes
     // to the right scope.
-    if (obj.vtable.on_input != null and !obj.vtable.emits_own_hits) {
+    //
+    // This arm used to spell the test out itself, and spelled it
+    // DIFFERENTLY: `on_input` only, so an inline component that wanted
+    // the wheel or (once hover landed) the pointer passing over it got
+    // no box and was silently never dispatched to. Two copies of "is
+    // this interactive" is one copy too many; both call `wantsHitBox`
+    // now. Behaviour-neutral for `on_scroll` on the day it landed —
+    // `:::clip` and `:::textarea` are the only two that want the wheel
+    // and both take input as well — which is exactly why it was safe to
+    // unify rather than leave a trap for the third one.
+    if (wantsHitBox(obj.vtable) and !obj.vtable.emits_own_hits) {
         try out.hits.append(.{
             .box = box,
             .vtable = obj.vtable,
@@ -2431,6 +2453,55 @@ fn emitInlineObject(
 // ── Tests ───────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "walker: a hover-only component still asks for a hit box" {
+    // The trap `wantsHitBox` exists for. A component that declares only
+    // `on_hover` is interactive — it is just interactive in a channel
+    // that arrived last — and a walker that forgets it produces a
+    // component the pointer can never reach, with no error anywhere.
+    //
+    // Mutation: drop the `on_hover` term. The hover-only case reports
+    // false, red. (Dropping `on_scroll` is red on the wheel-only case,
+    // and returning a constant true is red on the decoration case — the
+    // NO is asserted before the yeses for exactly that reason.)
+    const noop = struct {
+        fn f(_: *anyopaque, _: [2]f32, _: element.Constraints, _: *element.LayoutCtx, _: *element.DrawList) anyerror!element.Box {
+            return .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+        }
+    }.f;
+
+    // Rule 1: the NO first. Decorative customs must stay off the hit
+    // layer — a predicate stuck at true would satisfy every yes below
+    // and put every quad in the document in the dispatcher's scan.
+    const decoration = element.ElementVTable{ .layout_and_render = noop };
+    try testing.expect(!wantsHitBox(&decoration));
+
+    const hover_only = element.ElementVTable{
+        .layout_and_render = noop,
+        .on_hover = struct {
+            fn f(_: *anyopaque, _: element.HoverEvent, _: *anyopaque) anyerror!void {}
+        }.f,
+    };
+    try testing.expect(wantsHitBox(&hover_only));
+
+    const wheel_only = element.ElementVTable{
+        .layout_and_render = noop,
+        .on_scroll = struct {
+            fn f(_: *anyopaque, _: element.ScrollEvent, _: *anyopaque) anyerror!bool {
+                return false;
+            }
+        }.f,
+    };
+    try testing.expect(wantsHitBox(&wheel_only));
+
+    const click_only = element.ElementVTable{
+        .layout_and_render = noop,
+        .on_input = struct {
+            fn f(_: *anyopaque, _: element.InputEvent, _: *anyopaque) anyerror!void {}
+        }.f,
+    };
+    try testing.expect(wantsHitBox(&click_only));
+}
 
 test "seam: two rows, dark above light, pair centred in the band" {
     // The old divider was ONE quad centred on its own thickness. Two
