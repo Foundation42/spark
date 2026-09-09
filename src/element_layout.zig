@@ -131,6 +131,14 @@ pub fn layoutAndRenderCached(
     // Miss: walk into the live DrawList at `origin`, then snapshot the
     // appended ranges back into the cache (translated to block-local
     // coordinates) so the next walk hits.
+    //
+    // Seal the clip index arrays at BOTH ends of the walk. They are
+    // filled lazily — `sealClips` catches them up to the primitives
+    // emitted so far — so without a seal here `q_start` is a boundary
+    // in `quads` and not in `quad_clips`, and the snapshot cannot slice
+    // the two together. See `layout_cache.Entry.clips`.
+    const outer_clip = ctx.current_clip;
+    try out.sealClips(outer_clip);
     const g_start = out.glyphs.items.len;
     const q_start = out.quads.items.len;
     const t_start = out.tris.items.len;
@@ -141,6 +149,11 @@ pub fn layoutAndRenderCached(
     const pd_start: u32 = if (ctx.pass_dispatches) |pd| @intCast(pd.items.len) else 0;
 
     const box = try layoutAndRender(elem, origin, constraints, ctx, out);
+    // The tail of the block: anything the walk left unsealed is under
+    // the clip in force now, which is the block's outer clip again —
+    // every clipping component restores `current_clip` before it
+    // returns.
+    try out.sealClips(ctx.current_clip);
 
     const pd_slice: []const element.PassDispatch = if (ctx.pass_dispatches) |pd|
         pd.items[pd_start..]
@@ -162,6 +175,7 @@ pub fn layoutAndRenderCached(
         pd_start,
         origin,
         box,
+        outer_clip,
     );
     return box;
 }
@@ -1300,7 +1314,7 @@ fn layoutStackVParallel(
                 // and drawlist primitives end up in the same
                 // (screen-space) coord system.
                 const pd_offset = try mergePrivatePassDispatches(ctx.pass_dispatches, spec.private_pd, child_origin);
-                try blitPrivate(out, spec.private_dl.?, child_origin, pd_offset);
+                try blitPrivate(out, spec.private_dl.?, ctx, child_origin, pd_offset);
                 if (spec.cache_key) |key| {
                     try snapshotFromPrivate(cache, key, spec.version, spec.private_dl.?, spec.private_pd, spec.box);
                 }
@@ -1315,7 +1329,7 @@ fn layoutStackVParallel(
                     continue;
                 }
                 const pd_offset = try mergePrivatePassDispatches(ctx.pass_dispatches, spec.private_pd, child_origin);
-                try blitPrivate(out, spec.private_dl.?, child_origin, pd_offset);
+                try blitPrivate(out, spec.private_dl.?, ctx, child_origin, pd_offset);
                 if (spec.box.w > max_w) max_w = spec.box.w;
                 y += spec.box.h;
             },
@@ -1413,6 +1427,13 @@ fn walkOneJob(job: *jobs_mod.Job) void {
         // state.
         worker_ctx.pass_dispatches = spec_ptr.private_pd;
         worker_ctx.current_target_dispatch_index = element.MAIN_TARGET;
+        // …and the clip resets for the same reason the target does. A
+        // clip index addresses THIS drawlist's table, and the private
+        // one starts empty — carrying the parent's index in would index
+        // a table that does not have that slot. `NO_CLIP` is the
+        // sentinel "whatever is in force where this gets blitted", which
+        // is exactly what `blitPrivate` resolves it to.
+        worker_ctx.current_clip = element.NO_CLIP;
         const box = layoutAndRender(
             wc.children[i],
             .{ 0, 0 },
@@ -1420,6 +1441,13 @@ fn walkOneJob(job: *jobs_mod.Job) void {
             &worker_ctx,
             pdl,
         ) catch |e| {
+            spec_ptr.err = e;
+            continue;
+        };
+        // Seal the tail here, on the worker, so the merge and the
+        // snapshot both see index arrays as long as the primitives they
+        // parallel. A short one reads as "unclipped from here on".
+        pdl.sealClips(element.NO_CLIP) catch |e| {
             spec_ptr.err = e;
             continue;
         };
@@ -1442,11 +1470,16 @@ fn walkOneJob(job: *jobs_mod.Job) void {
 fn blitPrivate(
     out: *element.DrawList,
     src: *const element.DrawList,
+    ctx: *const element.LayoutCtx,
     origin: [2]f32,
     pd_offset: u32,
 ) !void {
     const ox = origin[0];
     const oy = origin[1];
+
+    // Catch the clip index arrays up to what is already emitted before
+    // appending — same reason as `layout_cache.blitEntry`.
+    try out.sealClips(ctx.current_clip);
 
     const g_start = out.glyphs.items.len;
     try out.appendGlyphsPreservingTargets(src.glyphs.items, src.glyph_targets.items);
@@ -1463,6 +1496,40 @@ fn blitPrivate(
         q.dst_pos[1] += oy;
     }
     rebaseTargets(out.quad_targets.items[q_start..], pd_offset);
+
+    // Clips — the private table's rects re-pushed against the live one.
+    //
+    // A clip is an INDEX into a per-drawlist table, so copying the
+    // primitives without this copies them unclipped. Private slot 0 is
+    // the whole-surface rect `pushClip` seeds, which is `NO_CLIP` and
+    // resolves to whatever is in force here; every other slot is a real
+    // rect whose narrowing against its private ancestors is already
+    // baked in, so one `pushClip` against `ctx.current_clip` is the
+    // whole rebase. Wires are unaffected either way — there is no
+    // `tri_clips`, and `:::nodegraph` cuts its segments by hand.
+    std.debug.assert(src.quad_clips.items.len == src.quads.items.len);
+    std.debug.assert(src.glyph_clips.items.len == src.glyphs.items.len);
+    if (src.clips.items.len <= 1) {
+        try out.sealClips(ctx.current_clip);
+    } else {
+        const live_of = try ctx.allocator.alloc(u16, src.clips.items.len);
+        defer ctx.allocator.free(live_of);
+        live_of[element.NO_CLIP] = ctx.current_clip;
+        for (src.clips.items[1..], live_of[1..]) |r, *slot| {
+            slot.* = try out.pushClip(ctx.current_clip, .{
+                .x = r.x + ox,
+                .y = r.y + oy,
+                .w = r.w,
+                .h = r.h,
+            });
+        }
+        try out.quad_clips.ensureUnusedCapacity(src.quad_clips.items.len);
+        for (src.quad_clips.items) |local| out.quad_clips.appendAssumeCapacity(live_of[local]);
+        try out.glyph_clips.ensureUnusedCapacity(src.glyph_clips.items.len);
+        for (src.glyph_clips.items) |local| out.glyph_clips.appendAssumeCapacity(live_of[local]);
+        std.debug.assert(out.quad_clips.items.len == out.quads.items.len);
+        std.debug.assert(out.glyph_clips.items.len == out.glyphs.items.len);
+    }
 
     const tri_vertex_base: u32 = @intCast(out.tris.items.len);
     try out.appendTrisPreservingTargets(src.tris.items, src.tri_targets.items);
@@ -1640,8 +1707,36 @@ fn snapshotFromPrivate(
         try cache.allocator.alloc(element.PassDispatch, 0);
     errdefer cache.allocator.free(pds);
 
+    // Clips. The worker walked from `NO_CLIP`, so its table's slot 0 is
+    // the whole-surface sentinel and slots 1.. are the block's own —
+    // which is exactly `Entry.clips`' encoding shifted by one, so the
+    // per-primitive indices copy across verbatim. A worker that pushed
+    // nothing has a table of length 0 or 1 and stores none of this, and
+    // `blitEntry` inherits.
+    std.debug.assert(src.quad_clips.items.len == src.quads.items.len);
+    std.debug.assert(src.glyph_clips.items.len == src.glyphs.items.len);
+    const has_clips = src.clips.items.len > 1;
+    const clips = if (has_clips)
+        try cache.allocator.dupe(element.ClipRect, src.clips.items[1..])
+    else
+        try cache.allocator.alloc(element.ClipRect, 0);
+    errdefer cache.allocator.free(clips);
+    const quad_clips = if (has_clips)
+        try cache.allocator.dupe(u16, src.quad_clips.items)
+    else
+        try cache.allocator.alloc(u16, 0);
+    errdefer cache.allocator.free(quad_clips);
+    const glyph_clips = if (has_clips)
+        try cache.allocator.dupe(u16, src.glyph_clips.items)
+    else
+        try cache.allocator.alloc(u16, 0);
+    errdefer cache.allocator.free(glyph_clips);
+
     try cache.insert(key, .{
         .version = version,
+        .clips = clips,
+        .quad_clips = quad_clips,
+        .glyph_clips = glyph_clips,
         .glyphs = glyphs,
         .glyph_targets = glyph_targets,
         .quads = quads,
@@ -2542,4 +2637,64 @@ test "seam: rows snap to whole pixels off a fractional origin" {
     const tie = seamRows(20.5, 12, 1, 0.055);
     try testing.expectEqual(@as(f32, 26), tie.dark_y);
     try testing.expectEqual(tie.dark_y, @round(tie.dark_y));
+}
+
+test "parallel merge: a worker's scissor arrives with its quads, or a fanned-out block paints over its container" {
+    // The `blitEntry` half of this is gated in `layout_cache.zig`; this
+    // is the other route a block's primitives take into the frame's
+    // drawlist, and it had the identical hole — `blitPrivate` copied
+    // quads, glyphs, tris, images and hits and left the clip index
+    // arrays behind. A clip index addresses ONE drawlist's table, and a
+    // worker's private table is not the frame's, so the rects have to be
+    // re-pushed rather than the indices copied.
+    //
+    // Mutation: replace the `else` arm's body with
+    // `try out.sealClips(ctx.current_clip)`. The canvas quad comes back
+    // unclipped and the last expectation goes red.
+    //
+    // The fixture straddles on purpose: the second quad hangs below the
+    // clip, so the scissor has something to cut. One that fitted inside
+    // would keep every line here green while clipping nothing.
+    var ctx = element.LayoutCtx{
+        .allocator = testing.allocator,
+        .fonts = undefined,
+        .cache = undefined,
+        .mono_atlas = undefined,
+        .color_atlas = undefined,
+        .theme = undefined,
+    };
+
+    // What a worker produces: walked at (0, 0), from `NO_CLIP`.
+    var private = element.DrawList.init(testing.allocator);
+    defer private.deinit();
+    const q = qp.QuadInstance{ .dst_pos = .{ 0, 0 }, .dst_size = .{ 40, 10 }, .color = .{ 1, 1, 1, 1 }, .radius = 0 };
+    try private.appendQuad(&ctx, q); // chrome, unclipped
+    try private.sealClips(element.NO_CLIP);
+    const canvas = try private.pushClip(element.NO_CLIP, .{ .x = 0, .y = 20, .w = 100, .h = 50 });
+    ctx.current_clip = canvas;
+    var straddler = q;
+    straddler.dst_pos = .{ 5, 40 };
+    straddler.dst_size = .{ 40, 60 }; // 40..100, past the clip's 70
+    try private.appendQuad(&ctx, straddler);
+    try private.sealClips(canvas);
+    ctx.current_clip = element.NO_CLIP;
+
+    // The merge, at the child's origin in the frame.
+    var out = element.DrawList.init(testing.allocator);
+    defer out.deinit();
+    try out.appendQuad(&ctx, q); // an earlier sibling, so the blit is not at index 0
+    try blitPrivate(&out, &private, &ctx, .{ 200, 300 }, 0);
+    try out.sealClips(element.NO_CLIP);
+
+    try testing.expectEqual(out.quads.items.len, out.quad_clips.items.len);
+    try testing.expectEqual(@as(usize, 3), out.quads.items.len);
+    try testing.expectEqual(element.NO_CLIP, out.quad_clips.items[0]);
+    try testing.expectEqual(element.NO_CLIP, out.quad_clips.items[1]);
+
+    const r = out.clipRect(out.quad_clips.items[2]) orelse return error.NoClipRect;
+    try testing.expectEqual(@as(f32, 200), r.x);
+    try testing.expectEqual(@as(f32, 320), r.y);
+    try testing.expectEqual(@as(f32, 50), r.h);
+    const s = out.quads.items[2];
+    try testing.expect(s.dst_pos[1] + s.dst_size[1] > r.y + r.h);
 }

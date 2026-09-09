@@ -380,3 +380,165 @@ test "nodegraph: a drag redraws every frame and re-shapes nothing but the canvas
     }
     try testing.expectEqual(@as(usize, 0), idle);
 }
+
+// ── The panel's own chrome must not swallow the canvas's scissor ────
+
+/// The `hud graph roaches` panel, cut down to the four blocks the bug
+/// needs: a **cacheable** effect wrapper, a title, a canvas zoomed far
+/// enough that its nodes hang past its own edge, and a footer under it.
+///
+/// The wrapper is the whole point. `:::nodegraph` sets
+/// `disable_cache`, so it re-walks every frame and pushes its clip
+/// every frame — which is why spark's own `src/nodegraph.md`, where the
+/// canvas sits at document top level, clips correctly and always did.
+/// `:::frosted_glass` does NOT set it, so from the second frame on the
+/// whole panel comes out of the block cache, and whatever the cache
+/// fails to carry is simply not in the frame.
+const PANEL_DOC =
+    \\:::frosted_glass {backdrop blur=16 radius=12 tint=#2b2f3aD0 padding="10 14 14 14" align=start text_align=left}
+    \\
+    \\## roaches
+    \\
+    \\22 nodes, 19 wires, on the row plane
+    \\
+    \\:::nodegraph {#g width=420 height=150}
+    \\view pan=-20,-16 zoom=2.4
+    \\node id=a x=0   y=0   label="spawn1"
+    \\pin node=a id=o dir=out label="v"
+    \\node id=b x=0   y=76  label="gravity1"
+    \\pin node=b id=i dir=in  label="g"
+    \\node id=c x=0   y=152 label="collide1"
+    \\pin node=c id=i dir=in  label="at"
+    \\link from=a.o to=b.i
+    \\:::
+    \\
+    \\Generated from kernels/roaches.rill.
+    \\
+    \\:::
+    \\
+;
+
+/// Every quad of one frame as `(rect it draws, rect it is scissored
+/// to)`. Copied out because `beginFrame(.{ .reset = true })` clears the
+/// drawlist under us.
+const ClippedQuad = struct {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    clip: ?spark.element.ClipRect,
+};
+
+fn frameQuads(allocator: std.mem.Allocator, sp: *spark.Spark) ![]ClippedQuad {
+    const dl = &sp.drawlist;
+    // The tail of the frame is unsealed until the draw loop asks; do
+    // here what `endFrame` does, so a quad emitted last is not read as
+    // unclipped just because nobody has looked yet.
+    try dl.sealClips(spark.element.NO_CLIP);
+    const out = try allocator.alloc(ClippedQuad, dl.quads.items.len);
+    for (dl.quads.items, 0..) |q, i| {
+        out[i] = .{
+            .x = q.dst_pos[0],
+            .y = q.dst_pos[1],
+            .w = q.dst_size[0],
+            .h = q.dst_size[1],
+            .clip = dl.clipRect(dl.quad_clips.items[i]),
+        };
+    }
+    return out;
+}
+
+test "nodegraph: a canvas inside a cached panel is still scissored on the second frame" {
+    // Christian, 2026-09-10, `hud graph roaches` zoomed in: *"when
+    // zoomed there is a compositing/clipping problem. The graph paints
+    // on top of its container."* Node bodies and their labels over the
+    // panel's title, over its footer, past its left edge — and the wires
+    // cut exactly right, because `:::nodegraph` clips its link segments
+    // by hand (there is no `tri_clips`; the scissor never sees a
+    // triangle). Everything that relied on the GPU scissor escaped.
+    //
+    // The cause was one array the block cache did not carry. A clip is
+    // an INDEX into a per-frame table; `blitEntry` replayed the quads
+    // and the glyphs and neither the indices nor the table, so
+    // `DrawList.clips` was EMPTY for the whole frame and no scissor was
+    // ever set. Invisible at zoom 1 because nothing straddled the
+    // canvas edge — hence a fixture here that does.
+    //
+    // Mutation: `entry.clips = &.{}` in `snapshotEntry`, or drop the
+    // `else` arm of `blitEntry`'s clip replay. Frame 1 is unaffected
+    // (it is the walk) and frame 2 loses every clip — which is the
+    // shape of the bug and the reason one frame could never catch it.
+    const allocator = testing.allocator;
+    var fx = try fixture.Fixture.init(allocator);
+    defer fx.deinit();
+
+    const fonts = try fixture.makeFonts(allocator, fx.ft);
+    const theme = fixture.makeTheme(fonts);
+    var state = spark.State.init(allocator);
+    defer state.deinit();
+
+    var sp = try spark.Spark.init(allocator, .{
+        .vk_ctx = &fx.ctx,
+        .color_format = fx.swapchain.format,
+        .theme = &theme,
+        .fonts = fonts.registry,
+        .host_state = &state,
+    });
+    defer {
+        sp.deinit();
+        allocator.destroy(fonts.registry);
+    }
+    sp.attachToRegistry();
+    try spark.installCoreComponents(&sp);
+
+    var doc = try sp.loadDocument(PANEL_DOC, .{ .shared_state = &state });
+    defer doc.deinit();
+
+    var frames: [2][]ClippedQuad = undefined;
+    var hits_on_second: u64 = 0;
+    for (0..2) |f| {
+        try sp.beginFrame(
+            .{ .extent = .{ .width = 1280, .height = 720 }, .zoom = 1.0, .scroll_offset = .{ 0, 0 } },
+            .{ .reset = true },
+        );
+        const before_hits = sp.layout_cache.hits;
+        _ = try sp.layoutAndRender(&doc, .{ 40, 60 }, .{ .max_w = 520 });
+        if (f == 1) hits_on_second = sp.layout_cache.hits - before_hits;
+        frames[f] = try frameQuads(allocator, &sp);
+    }
+    defer for (frames) |f| allocator.free(f);
+
+    // The gate is on the CACHED path, so say so: a run where the second
+    // frame re-walked everything would pass every line below while
+    // testing nothing.
+    try testing.expect(hits_on_second > 0);
+    try testing.expectEqual(frames[0].len, frames[1].len);
+
+    // Frame 1 is the live walk and is the reference. It must contain a
+    // quad that is scissored AND hangs outside its scissor — the zoomed
+    // node past the canvas edge. Without this the fixture could sit
+    // wholly inside its own clip and the comparison below would be
+    // watching nothing at all; that is exactly how this bug survived
+    // two repos' gates and was found by eye.
+    var straddlers: usize = 0;
+    for (frames[0]) |q| {
+        const c = q.clip orelse continue;
+        if (q.y + q.h > c.y + c.h or q.x + q.w > c.x + c.w or q.y < c.y or q.x < c.x) straddlers += 1;
+    }
+    try testing.expect(straddlers > 0);
+
+    // And the second frame — the one that comes out of the cache — must
+    // scissor every quad exactly where the first one did.
+    for (frames[0], frames[1]) |a, b| {
+        try testing.expectEqual(a.x, b.x);
+        try testing.expectEqual(a.y, b.y);
+        try testing.expectEqual(a.clip == null, b.clip == null);
+        if (a.clip) |ca| {
+            const cb = b.clip.?;
+            try testing.expectEqual(ca.x, cb.x);
+            try testing.expectEqual(ca.y, cb.y);
+            try testing.expectEqual(ca.w, cb.w);
+            try testing.expectEqual(ca.h, cb.h);
+        }
+    }
+}

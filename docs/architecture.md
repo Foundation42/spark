@@ -341,6 +341,21 @@ dropped.
   break-anywhere fallback when content forces it.
 - **Code blocks bypass inline-flow.** Preformatted text needs
   whitespace preservation + no wrap, both inverted from prose.
+- **A clip is an index into a per-frame table, so anything that
+  replays primitives must re-intern the rect.** `DrawList.clips`
+  and the parallel `quad_clips` / `glyph_clips` are rebuilt every
+  frame; an index copied across a frame boundary means nothing.
+  There are three routes a primitive takes into the frame's
+  drawlist — the live walk, `layout_cache.blitEntry`, and
+  `element_layout.blitPrivate` — and all three have to carry it.
+  Two of them did not, and the symptom (2026-09-10, matryoshka's
+  `hud graph roaches` zoomed in) was a canvas painting over the
+  panel that contained it while its hand-clipped wires stayed
+  perfect: quads and glyphs are the only primitives the scissor
+  reaches, so they are the only ones that can lose it. The gates
+  are in `layout_cache.zig`, `element_layout.zig` and
+  `tests/nodegraph_render.zig`; every fixture straddles an edge,
+  because one that fits inside its own clip watches nothing.
 
 ## Known limitations (parked)
 

@@ -157,6 +157,49 @@ pub const Entry = struct {
     /// pattern / single_source dispatches were silently dropped on
     /// cache hit — patterns vanished after frame 1.
     pass_dispatches: []element.PassDispatch,
+    /// The block's OWN clip table, block-local: `x`/`y` relative to
+    /// (0, 0), `w`/`h` as pushed.
+    ///
+    /// A clip lives in the drawlist as an INDEX into a per-frame table,
+    /// and both the table and the index die at the frame boundary — so
+    /// replaying a block's primitives without replaying this replays
+    /// them *unclipped*. That is the `hud graph roaches` bug of
+    /// 2026-09-10: matryoshka's panel chrome is a cacheable
+    /// `:::frosted_glass`, so from the second frame on the whole panel
+    /// came out of here, and the `:::nodegraph` canvas clip inside it
+    /// was never pushed at all (`DrawList.clips` was empty). Zoomed in,
+    /// the node bodies and their labels painted over the panel's own
+    /// title and footer. The wires survived because `:::nodegraph`
+    /// clips its link segments by hand — there is no `tri_clips` — so
+    /// their geometry is already cut when it reaches the cache.
+    ///
+    /// EMPTY for the overwhelming majority of blocks, and deliberately:
+    /// a block that pushed no clip of its own has every primitive under
+    /// whatever was in force when the walk reached it, which is
+    /// CONTEXT and not content. `blitEntry` resolves that to
+    /// `lc.current_clip` at replay, so a cached subtree blitted inside
+    /// a different clip is clipped by that one.
+    ///
+    /// **Known conservative case, not built.** The rects stored here are
+    /// what `pushClip` INTERNED, which is the pushed rect already
+    /// narrowed by whatever was in force at snapshot. That keeps
+    /// clip-inside-clip *within* the block exact for free, and it is
+    /// exact outright whenever the block's outer clip is `NO_CLIP` —
+    /// which is every document either repo has. A block that pushes a
+    /// clip of its own INSIDE another clipping container, and then
+    /// moves relative to it while staying cached (a `:::textarea`
+    /// scrolling inside a `:::clip`), would replay carrying the old
+    /// container's narrowing: it clips MORE than it should, never less.
+    /// The trigger to fix it is that document existing; the fix is a
+    /// raw (un-narrowed) rect kept beside each interned one, plus the
+    /// parent's local index so the intra-block nesting can be rebuilt.
+    clips: []element.ClipRect,
+    /// Clip index parallel to `quads`. `0` is the sentinel "the clip in
+    /// force at block start"; `i > 0` means `clips[i - 1]`. Empty
+    /// exactly when `clips` is.
+    quad_clips: []u16,
+    /// Clip index parallel to `glyphs`. Same encoding as `quad_clips`.
+    glyph_clips: []u16,
     /// Measured layout box at origin (0, 0). `baseline` is also
     /// block-local (relative to the cached origin).
     box: element.Box,
@@ -199,6 +242,9 @@ pub const BlockCache = struct {
         self.allocator.free(e.image_targets);
         self.allocator.free(e.hits);
         self.allocator.free(e.pass_dispatches);
+        self.allocator.free(e.clips);
+        self.allocator.free(e.quad_clips);
+        self.allocator.free(e.glyph_clips);
     }
 
     /// Drop every cached entry. Call on full re-parse / theme swap.
@@ -461,6 +507,59 @@ pub fn aggregateRootVersion(root: element.Element) u64 {
     };
 }
 
+/// `snapshotEntry`'s scratch: the live clip indices a block used,
+/// interned into a block-local table.
+///
+/// A linear scan and not a hashmap on purpose — a block pushes zero or
+/// one clip of its own in every case anybody has written, and the scan
+/// is over a list that length.
+const LocalClips = struct {
+    /// Live drawlist index for local slot `i` — the local index is
+    /// `i + 1`, because 0 is the inherit sentinel.
+    live: std.ArrayList(u16),
+    rects: std.ArrayList(element.ClipRect),
+    /// The per-primitive local indices, built before anyone knows
+    /// whether there will be a table to index into.
+    quad_scratch: std.ArrayList(u16),
+    glyph_scratch: std.ArrayList(u16),
+
+    fn init(allocator: std.mem.Allocator) LocalClips {
+        return .{
+            .live = std.ArrayList(u16).init(allocator),
+            .rects = std.ArrayList(element.ClipRect).init(allocator),
+            .quad_scratch = std.ArrayList(u16).init(allocator),
+            .glyph_scratch = std.ArrayList(u16).init(allocator),
+        };
+    }
+
+    fn deinit(self: *LocalClips) void {
+        self.live.deinit();
+        self.rects.deinit();
+        self.quad_scratch.deinit();
+        self.glyph_scratch.deinit();
+    }
+
+    fn localFor(
+        self: *LocalClips,
+        out: *const element.DrawList,
+        live_idx: u16,
+        outer: u16,
+        ox: f32,
+        oy: f32,
+    ) !u16 {
+        if (live_idx == outer) return 0;
+        for (self.live.items, 0..) |l, i| if (l == live_idx) return @intCast(i + 1);
+        // `NO_CLIP` inside a block whose outer clip is something else
+        // would be a component that widened its parent's scissor, which
+        // `pushClip` cannot express. Treat it as inherit rather than
+        // bake an unbounded rect into the entry.
+        const r = out.clipRect(live_idx) orelse return 0;
+        try self.live.append(live_idx);
+        try self.rects.append(.{ .x = r.x - ox, .y = r.y - oy, .w = r.w, .h = r.h });
+        return @intCast(self.rects.items.len);
+    }
+};
+
 /// Blit a cached entry into `out`, translating every position by
 /// `origin`. Triangle indices are rebased against the current vertex
 /// count of `out.tris`. Returns the `Box` at `origin`.
@@ -486,6 +585,12 @@ pub fn blitEntry(
     // land at matching positions in the live list.
     const pd_base: u32 = if (lc.pass_dispatches) |out_pd| @intCast(out_pd.items.len) else 0;
 
+    // Clips are assigned LAZILY — `sealClips` fills the parallel index
+    // arrays up to the primitives emitted so far — so catch them up to
+    // whatever came before this block before appending anything. Miss
+    // this and the indices written below land on somebody else's tail.
+    try out.sealClips(lc.current_clip);
+
     // Glyphs — translate dst_pos.
     const g_start = out.glyphs.items.len;
     try out.appendGlyphsReplayingTargets(lc, entry.glyphs, entry.glyph_targets, pd_base);
@@ -500,6 +605,44 @@ pub fn blitEntry(
     for (out.quads.items[q_start..]) |*q| {
         q.dst_pos[0] += ox;
         q.dst_pos[1] += oy;
+    }
+
+    // Clips — replay the block's own scissors, or inherit.
+    //
+    // The whole point of `Entry.clips`: a clip index means nothing
+    // across frames, so the block's rects are re-pushed here and the
+    // parallel index arrays are rewritten against the fresh table.
+    // `pushClip` narrows against `lc.current_clip`, which is what makes
+    // a cached subtree replayed inside a NARROWER clip come out clipped
+    // by it rather than by the one it was snapshotted under.
+    if (entry.clips.len == 0) {
+        // Nothing in the block clipped. Every primitive inherits what
+        // is in force here — exactly what a live walk would have done,
+        // and what `sealClips` writes.
+        try out.sealClips(lc.current_clip);
+    } else {
+        std.debug.assert(entry.quad_clips.len == entry.quads.len);
+        std.debug.assert(entry.glyph_clips.len == entry.glyphs.len);
+        const live_of = try lc.allocator.alloc(u16, entry.clips.len);
+        defer lc.allocator.free(live_of);
+        for (entry.clips, live_of) |r, *slot| {
+            slot.* = try out.pushClip(lc.current_clip, .{
+                .x = r.x + ox,
+                .y = r.y + oy,
+                .w = r.w,
+                .h = r.h,
+            });
+        }
+        try out.quad_clips.ensureUnusedCapacity(entry.quad_clips.len);
+        for (entry.quad_clips) |local| {
+            out.quad_clips.appendAssumeCapacity(if (local == 0) lc.current_clip else live_of[local - 1]);
+        }
+        try out.glyph_clips.ensureUnusedCapacity(entry.glyph_clips.len);
+        for (entry.glyph_clips) |local| {
+            out.glyph_clips.appendAssumeCapacity(if (local == 0) lc.current_clip else live_of[local - 1]);
+        }
+        std.debug.assert(out.quad_clips.items.len == out.quads.items.len);
+        std.debug.assert(out.glyph_clips.items.len == out.glyphs.items.len);
     }
 
     // Triangles — translate vertex positions, rebase indices.
@@ -639,6 +782,11 @@ pub fn snapshotEntry(
     pd_start: u32,
     origin: [2]f32,
     box: element.Box,
+    /// The clip that was in force when the walk reached this block.
+    /// Everything under it is CONTEXT, so it snapshots as the `0`
+    /// sentinel and `blitEntry` resolves it against wherever the entry
+    /// is replayed. See `Entry.clips`.
+    outer_clip: u16,
 ) !void {
     const ox = origin[0];
     const oy = origin[1];
@@ -755,8 +903,54 @@ pub fn snapshotEntry(
         }
     }
 
+    // ── The block's own clips ───────────────────────────────────────
+    //
+    // Inverse of `blitEntry`'s replay. The caller sealed both index
+    // arrays at the block boundary and again after the walk, so the
+    // slices below are exactly as long as the primitives they belong
+    // to; assert it rather than tolerate a short one, because a short
+    // one silently means "unclipped from here on".
+    std.debug.assert(out.quad_clips.items.len == out.quads.items.len);
+    std.debug.assert(out.glyph_clips.items.len == out.glyphs.items.len);
+    //
+    // Interned into scratch first and duped into the entry only if the
+    // block turned out to clip anything. The common case — it did not —
+    // stores three empty slices and takes `blitEntry`'s
+    // inherit-everything path at no cost at all. Written this way round
+    // rather than allocate-then-free-on-empty because a free inside an
+    // `errdefer`'s reach is a double free the day `insert` fails.
+    var local = LocalClips.init(cache.allocator);
+    defer local.deinit();
+    try local.quad_scratch.resize(quads.len);
+    for (out.quad_clips.items[q_start..], local.quad_scratch.items) |live, *slot| {
+        slot.* = try local.localFor(out, live, outer_clip, ox, oy);
+    }
+    try local.glyph_scratch.resize(glyphs.len);
+    for (out.glyph_clips.items[g_start..], local.glyph_scratch.items) |live, *slot| {
+        slot.* = try local.localFor(out, live, outer_clip, ox, oy);
+    }
+    const has_clips = local.rects.items.len > 0;
+    const clips = if (has_clips)
+        try cache.allocator.dupe(element.ClipRect, local.rects.items)
+    else
+        try cache.allocator.alloc(element.ClipRect, 0);
+    errdefer cache.allocator.free(clips);
+    const quad_clips = if (has_clips)
+        try cache.allocator.dupe(u16, local.quad_scratch.items)
+    else
+        try cache.allocator.alloc(u16, 0);
+    errdefer cache.allocator.free(quad_clips);
+    const glyph_clips = if (has_clips)
+        try cache.allocator.dupe(u16, local.glyph_scratch.items)
+    else
+        try cache.allocator.alloc(u16, 0);
+    errdefer cache.allocator.free(glyph_clips);
+
     try cache.insert(key, .{
         .version = version,
+        .clips = clips,
+        .quad_clips = quad_clips,
+        .glyph_clips = glyph_clips,
         .glyphs = glyphs,
         .glyph_targets = glyph_targets,
         .quads = quads,
@@ -842,6 +1036,9 @@ test "BlockCache: insert/lookup roundtrip" {
 
     try cache.insert(key, .{
         .version = 1,
+        .clips = try testing.allocator.alloc(element.ClipRect, 0),
+        .quad_clips = try testing.allocator.alloc(u16, 0),
+        .glyph_clips = try testing.allocator.alloc(u16, 0),
         .glyphs = glyphs,
         .glyph_targets = glyph_targets,
         .quads = quads,
@@ -894,6 +1091,9 @@ test "BlockCache: insert replaces existing entry" {
         .image_targets = try testing.allocator.alloc(u32, 0),
         .hits = try testing.allocator.alloc(element.Hit, 0),
         .pass_dispatches = try testing.allocator.alloc(element.PassDispatch, 0),
+        .clips = try testing.allocator.alloc(element.ClipRect, 0),
+        .quad_clips = try testing.allocator.alloc(u16, 0),
+        .glyph_clips = try testing.allocator.alloc(u16, 0),
         .box = .{ .x = 0, .y = 0, .w = 1, .h = 1, .baseline = 0 },
     });
     // Insert again — first allocation must be freed by the cache.
@@ -911,6 +1111,9 @@ test "BlockCache: insert replaces existing entry" {
         .image_targets = try testing.allocator.alloc(u32, 0),
         .hits = try testing.allocator.alloc(element.Hit, 0),
         .pass_dispatches = try testing.allocator.alloc(element.PassDispatch, 0),
+        .clips = try testing.allocator.alloc(element.ClipRect, 0),
+        .quad_clips = try testing.allocator.alloc(u16, 0),
+        .glyph_clips = try testing.allocator.alloc(u16, 0),
         .box = .{ .x = 0, .y = 0, .w = 2, .h = 2, .baseline = 0 },
     });
 
@@ -945,6 +1148,9 @@ test "BlockCache: clear frees all entries" {
             .image_targets = try testing.allocator.alloc(u32, 0),
             .hits = try testing.allocator.alloc(element.Hit, 0),
             .pass_dispatches = try testing.allocator.alloc(element.PassDispatch, 0),
+            .clips = try testing.allocator.alloc(element.ClipRect, 0),
+            .quad_clips = try testing.allocator.alloc(u16, 0),
+            .glyph_clips = try testing.allocator.alloc(u16, 0),
             .box = .{ .x = 0, .y = 0, .w = 10, .h = 5, .baseline = 0 },
         });
     }
@@ -1194,4 +1400,204 @@ test "aggregateInlineVersions: reaches through emphasis, strong and links" {
         v.version = 2;
         try std.testing.expect(before != aggregateInlineVersions(&kids));
     }
+}
+
+// ── The scissor survives the cache ──────────────────────────────────
+//
+// Paid for by `hud graph roaches`, 2026-09-10. Christian zoomed the
+// canvas in and the node bodies and their labels painted over the
+// panel's own title and footer and past its left edge, while the wires
+// stayed cut exactly right. The component was innocent — it pushes its
+// clip, seals, and restores, textbook — and it clipped correctly in
+// spark's own demo host, where `:::nodegraph` sits at document top
+// level. What matryoshka puts around it is a `:::frosted_glass`, which
+// is a CACHEABLE block: from the second frame on the whole panel came
+// out of `blitEntry`, which replayed the quads and the glyphs and
+// nothing at all of the clip they were under. `DrawList.clips` was
+// empty for the entire frame — the scissor was never set, so it never
+// cut anything.
+//
+// The wires survived because there is no `tri_clips`: the GPU scissor
+// never sees a triangle, so `:::nodegraph` clips its link segments by
+// hand and their geometry is already cut when it reaches the cache.
+// That asymmetry is what made the bug's signature so specific, and it
+// is why a gate here has to be about QUADS.
+//
+// Two rules, and both fixtures STRADDLE an edge on purpose: a clip
+// gate whose content sits wholly inside its clip watches nothing,
+// which is exactly how this survived to be found by eye.
+
+/// A LayoutCtx good enough for the two functions under test. Neither
+/// `snapshotEntry` nor `blitEntry` touches a font, an atlas or a theme
+/// — they move numbers between arrays — so a device-free gate can say
+/// so rather than stand up a Vulkan context to prove it.
+fn clipTestCtx(cache: *BlockCache) element.LayoutCtx {
+    return .{
+        .allocator = testing.allocator,
+        .fonts = undefined,
+        .cache = undefined,
+        .mono_atlas = undefined,
+        .color_atlas = undefined,
+        .theme = undefined,
+        .cache_blocks = cache,
+    };
+}
+
+fn testQuad(x: f32, y: f32, w: f32, h: f32) qp.QuadInstance {
+    return .{
+        .dst_pos = .{ x, y },
+        .dst_size = .{ w, h },
+        .color = .{ 1, 1, 1, 1 },
+        .radius = 0,
+    };
+}
+
+const CLIP_KEY: Key = .{
+    .elem_id = 0x5C1550,
+    .max_w_bits = @bitCast(@as(f32, 400)),
+    .align_bits = 0,
+    .zoom_bits = @bitCast(@as(f32, 1)),
+    .theme_ptr = 0,
+    .pass_seed = 0,
+};
+
+/// Walk a block that pushes one clip and draws through it: a chrome
+/// quad outside the clip, then a canvas quad wholly inside and one
+/// hanging 40px BELOW the clip's bottom edge — the zoomed node that
+/// started all this. Snapshots into `cache` at `origin`.
+fn walkClippingBlock(cache: *BlockCache, dl: *element.DrawList, lc: *element.LayoutCtx, origin: [2]f32) !void {
+    const g_start = dl.glyphs.items.len;
+    const q_start = dl.quads.items.len;
+    const t_start = dl.tris.items.len;
+    const ti_start = dl.tri_indices.items.len;
+    const i_start = dl.images.items.len;
+    const h_start = dl.hits.items.len;
+    const outer = lc.current_clip;
+    try dl.sealClips(outer);
+
+    // The panel's own chrome — a title bar, unclipped.
+    try dl.appendQuad(lc, testQuad(origin[0], origin[1], 300, 20));
+    try dl.sealClips(outer);
+
+    // The canvas.
+    const canvas: element.ClipRect = .{ .x = origin[0], .y = origin[1] + 30, .w = 300, .h = 100 };
+    const clip = try dl.pushClip(outer, canvas);
+    lc.current_clip = clip;
+    try dl.appendQuad(lc, testQuad(origin[0] + 10, origin[1] + 40, 80, 20)); // inside
+    try dl.appendQuad(lc, testQuad(origin[0] + 10, origin[1] + 100, 80, 70)); // straddles the bottom
+    try dl.sealClips(clip);
+    lc.current_clip = outer;
+
+    // The footer, back outside.
+    try dl.appendQuad(lc, testQuad(origin[0], origin[1] + 140, 300, 14));
+    try dl.sealClips(outer);
+
+    try snapshotEntry(
+        cache,
+        CLIP_KEY,
+        1,
+        dl,
+        g_start,
+        q_start,
+        t_start,
+        ti_start,
+        i_start,
+        h_start,
+        @intCast(t_start),
+        &.{},
+        0,
+        origin,
+        .{ .x = origin[0], .y = origin[1], .w = 300, .h = 154, .baseline = 0 },
+        outer,
+    );
+}
+
+test "cache: a blitted block still carries its own scissor, or the canvas paints over the panel" {
+    // The `hud graph roaches` bug itself, at the grain where it lives.
+    //
+    // Mutation: delete the `else` arm of `blitEntry`'s clip replay (or
+    // make `snapshotEntry` always store `clips = &.{}`). The four quads
+    // come back with `clip == NO_CLIP`, `dl.clips` is empty, and both
+    // expectations below go red — which is precisely the picture
+    // Christian saw: nothing is scissored, so the node hanging past the
+    // canvas is drawn whole, over the chrome.
+    var cache = BlockCache.init(testing.allocator);
+    defer cache.deinit();
+    var lc = clipTestCtx(&cache);
+
+    var dl = element.DrawList.init(testing.allocator);
+    defer dl.deinit();
+    try walkClippingBlock(&cache, &dl, &lc, .{ 40, 60 });
+
+    // The next frame: a fresh drawlist, something ELSE drawn first (so
+    // the blit does not start at index 0 — the seal at the top of
+    // `blitEntry` is what keeps the indices on the right primitives),
+    // and the block replayed at a DIFFERENT origin.
+    dl.clearRetainingCapacity();
+    try dl.appendQuad(&lc, testQuad(0, 0, 5, 5));
+    const entry = cache.lookup(CLIP_KEY, 1) orelse return error.MissingEntry;
+    _ = try blitEntry(&dl, &lc, entry, .{ 140, 260 });
+    try dl.sealClips(element.NO_CLIP);
+
+    try testing.expectEqual(dl.quads.items.len, dl.quad_clips.items.len);
+    try testing.expectEqual(@as(usize, 5), dl.quads.items.len);
+
+    // The stranger and the chrome are unclipped; the two canvas quads
+    // are not, and they share one clip.
+    try testing.expectEqual(element.NO_CLIP, dl.quad_clips.items[0]);
+    try testing.expectEqual(element.NO_CLIP, dl.quad_clips.items[1]);
+    try testing.expectEqual(element.NO_CLIP, dl.quad_clips.items[4]);
+    const canvas_clip = dl.quad_clips.items[2];
+    try testing.expect(canvas_clip != element.NO_CLIP);
+    try testing.expectEqual(canvas_clip, dl.quad_clips.items[3]);
+
+    // …and it is the canvas, moved with the block: the snapshot was at
+    // (40, 60) and the replay at (140, 260), so +100, +200.
+    const r = dl.clipRect(canvas_clip) orelse return error.NoClipRect;
+    try testing.expectEqual(@as(f32, 140), r.x);
+    try testing.expectEqual(@as(f32, 290), r.y);
+    try testing.expectEqual(@as(f32, 300), r.w);
+    try testing.expectEqual(@as(f32, 100), r.h);
+
+    // The gate has work to do: the last canvas quad hangs 40px below
+    // the clip. Without this line a fixture that fits inside its own
+    // scissor could keep every expectation above green while clipping
+    // nothing — the shape of the hole this bug came through.
+    const straddler = dl.quads.items[3];
+    try testing.expect(straddler.dst_pos[1] + straddler.dst_size[1] > r.y + r.h);
+}
+
+test "cache: a block replayed inside a narrower clip is cut by that one, not by the one it was cached under" {
+    // The clip a block pushes is its own; the clip it is replayed INSIDE
+    // is context. `blitEntry` re-pushes through `pushClip(lc.current_clip,
+    // …)` so the two intersect, exactly as a live walk would.
+    //
+    // Mutation: `pushClip(element.NO_CLIP, …)` in `blitEntry`. The
+    // canvas clip comes back at its full 100px height and the block
+    // draws straight through the container that is supposed to be
+    // holding it.
+    var cache = BlockCache.init(testing.allocator);
+    defer cache.deinit();
+    var lc = clipTestCtx(&cache);
+
+    var dl = element.DrawList.init(testing.allocator);
+    defer dl.deinit();
+    try walkClippingBlock(&cache, &dl, &lc, .{ 40, 60 });
+
+    dl.clearRetainingCapacity();
+    // A scrolling container around the replay, whose bottom edge cuts
+    // the canvas in half.
+    const outer = try dl.pushClip(element.NO_CLIP, .{ .x = 0, .y = 0, .w = 1000, .h = 340 });
+    lc.current_clip = outer;
+    const entry = cache.lookup(CLIP_KEY, 1) orelse return error.MissingEntry;
+    _ = try blitEntry(&dl, &lc, entry, .{ 140, 260 });
+    try dl.sealClips(outer);
+    lc.current_clip = element.NO_CLIP;
+
+    // The chrome inherits the container's clip rather than nothing.
+    try testing.expectEqual(outer, dl.quad_clips.items[0]);
+
+    const r = dl.clipRect(dl.quad_clips.items[1]) orelse return error.NoClipRect;
+    try testing.expectEqual(@as(f32, 290), r.y);
+    try testing.expectEqual(@as(f32, 50), r.h); // 340 − 290, not 100
 }
