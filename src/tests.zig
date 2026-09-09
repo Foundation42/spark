@@ -36,6 +36,7 @@ test {
     _ = @import("components/textarea.zig");
     _ = @import("components/kbd.zig");
     _ = @import("components/meter.zig");
+    _ = @import("components/nodegraph.zig");
     _ = @import("components/progress.zig");
     _ = @import("extras/llm_stream.zig");
     _ = @import("components/svg.zig");
@@ -92,6 +93,7 @@ test {
     _ = @import("tests/two_instances.zig");
     _ = @import("tests/two_documents.zig");
     _ = @import("tests/integration_render.zig");
+    _ = @import("tests/nodegraph_render.zig");
     _ = @import("tests/buffer_growth.zig");
     _ = @import("tests/single_source_dispatch.zig");
     _ = @import("tests/placeholder_scene.zig");

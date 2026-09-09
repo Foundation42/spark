@@ -858,3 +858,140 @@ the plot's edge but not rewritten — a drag on one knot changes one knot.
 `0..max(data)`, read-only, no gestures, `data=` state-substitutable. It
 now accepts the bracketed array form above, so `data=${state.series}`
 over a plane-published array draws every sample.
+
+## `:::nodegraph` — a node canvas (graph-editor beat 1)
+
+A Softimage-ICE / Blueprints-shaped canvas: nodes with pins, wires
+between them, pan, zoom, drag, hover, select. **spark stays domain-free.**
+The canvas is fed a description of nodes, pins, links and positions and
+knows nothing about what any of it means; the host owns the language and
+translates both ways. Nothing in `src/components/nodegraph.zig` mentions
+rill.
+
+**Beat 1 is DRAW and NAVIGATE.** No palette, nothing creates a node,
+nothing makes or breaks a link, nothing deletes, no marquee, no drill-in,
+no undo. Those are later beats and each needs a decision that is not made
+yet. What this beat settles is what all of them inherit: the transform,
+the hit test, the layering and the wires.
+
+**The name.** `:::graph` was the working name and was rejected: spark
+already has `:::chart`, `:::sparkline` and `:::trend`, and a reader
+meeting `:::graph` in that company reads "another chart". `:::nodegraph`
+is what Blender, Houdini and Unreal all call the thing. Also rejected:
+`:::patch` (Max/PD's word; means "diff" to everyone else and spark has
+`:::diff`), `:::wires` (names the links, not the nodes), `:::canvas`
+(names the substrate — the right name for a future free-draw surface, so
+spending it here would be theft), `:::ice` (a private joke in a library
+that must stay domain-free).
+
+```markdown
+:::nodegraph {#chain width=100% height=460 positions=positions selected=selected}
+view pan=-24,-16 zoom=1
+node id=src  x=0   y=40 label="Source" tint=#4e7fd0
+node id=gain x=210 y=20 label="Gain"
+pin  node=src  id=v   dir=out label="v"
+pin  node=gain id=in  dir=in  label="in"
+link from=src.v to=gain.in
+:::
+```
+
+| attribute | meaning |
+|---|---|
+| `positions` | the state path the canvas **writes** moved node positions to. A bare path, as `:::slider {target=}`. Omit for a read-only canvas. |
+| `selected` | the state path the selected node's id is written to. Empty string when nothing is selected. |
+| `width` / `height` | pixel literal or `100%`; height in pixels. Defaults `100%` / `420`. |
+| `zoom` | initial zoom, clamped `0.2 .. 4`. The `view` record does the same thing from inside the description. |
+
+**The description.** Line-oriented, `kind key=value …`, the same shape as
+a `:::name {…}` header so an author reads it with the eye they already
+have. Blank lines and `#` comments are skipped. One entity per line, and
+the position on the entity's own line, so a drag changes exactly one line
+of a diff.
+
+| record | fields |
+|---|---|
+| `node` | `id= x= y= [w=] [h=] [label=] [tint=]`. Size defaults from the pin count; `w=`/`h=` override it. |
+| `pin` | `node= id= dir=in\|out [label=]`. Order within a direction is the order the lines appear in. |
+| `link` | `from=<node>.<pin> to=<node>.<pin> [tint=]`. Split on the **last** dot, so a node id may contain dots and a pin id may not. Resolved after the whole text is read, so link lines may precede the pins they name. |
+| `pos` | `id= x= y=`. Moves an existing node and declares nothing. |
+| `view` | `pan=x,y zoom=z`. Seeds the camera. |
+
+A line nobody can read is counted and shown as a strip along the bottom
+of the canvas rather than swallowed — a host that ships a malformed
+record should find out from the picture.
+
+**Two doors, one parser.** `Spec.body` is the static channel: a document
+with a graph in it is self-contained, so an author, a demo and a gate can
+each make one with no host at all, and `Body.adopt` makes the ordinary
+re-parse cost one hash. `Factory.handle_update` is the host's channel,
+for the two cases a body cannot serve — a host re-translating its program
+at streaming rate must not re-parse a whole markdown document to push a
+new graph, and must not round-trip a position echo through a document
+rewrite. `action=graph` replaces everything; `action=move` applies `pos`
+records only.
+
+**`pos` is its own record kind on purpose.** It is what the canvas writes
+back, so the write-back can be fed straight into `action=move` without
+erasing a single label. `node id=… x=… y=…` with the other fields left
+off would have looked the same and quietly destroyed them.
+
+**One write per gesture.** A drag is a single `state.set` at
+`mouse_up`, carrying **every** node's position — never one per frame and
+never one per node. Whole-set rather than just-the-mover so the host
+never accumulates: what arrives is the complete, current, idempotent
+layout. `State.set` re-enters the writing component synchronously through
+its own binding, so the same two guards the trackball and the curve keep
+are here: a path is never reallocated unless it changed, and the whole of
+`ingest` is refused while a gesture is latched. A push through
+`handle_update` mid-gesture is set aside and applied on release —
+applying it moves the graph out from under the finger, and dropping it
+loses structure a stream will never send twice. Between gestures the
+plane is the truth; during one, the widget is.
+
+**The transform.** There is no transform stack in this library, so the
+camera multiplies by hand exactly as `:::svg` does:
+
+    local  = (graph - pan) * zoom
+    graph  = pan + local / zoom
+    screen = origin + local
+
+`pan` is the graph point at the canvas's top-left; `zoom` is screen
+pixels per graph unit. **The boundary is `local`**: `on_input` and
+`on_hover` hand out `world - hit.box.xy`, so the origin cancels and every
+input path converts with `toGraph` alone. `toScreen` is the one place the
+origin appears. Two consequences that are easy to get wrong: `endFrame`
+scales a quad's `radius` by the HOST's zoom and knows nothing about this
+one, so every radius is pre-multiplied here; and a drag is
+`(local - press_local) / zoom`, a graph-space delta, which is invisible
+to any gate written at zoom 1.
+
+**Layering, obeyed rather than fought.** The renderer draws tris, then
+images, then quads, then glyphs, per layer in array order and not in
+emission order. So the ground and the grid are triangles (a quad ground
+would be drawn on top of every wire — the trackball's recessed dial
+again), the wires are triangles, node bodies and pins are rounded quads,
+labels are glyphs. That is links-under-nodes-under-labels for free, and
+the corollary is the trap: node chrome must never reach for `relief`.
+
+**Wires.** A cubic per link, flattened into segments off the **screen**
+chord so a zoomed-out graph costs proportionally less, each segment
+extended past both joints — `relief.stroke` feathers its caps, and
+segments that butt exactly leave a half-alpha seam down every join.
+`:::curve` hides its joints under pucks; a wire has none. `DrawList`
+scissors quads and glyphs and **not** triangles, so the canvas clips its
+own segments; a stroke running along the canvas edge still bleeds its
+half-width plus a feather.
+
+**Cost**, measured at fifty nodes, three pins each, forty-nine links, all
+on screen at zoom 1: 300 quads, 6132 triangle vertices (20208 indices),
+440 glyphs. Roughly 5900 of those vertices are wires — one link at ten
+segments is 160 vertices. Zoomed to 0.25 it is 4660 vertices and **zero**
+glyphs: labels stop below `LABEL_MIN_ZOOM`, which is the level-of-detail
+rule that makes a big graph cheap when it is pulled back to fit.
+
+**Recorded, not built.** Multi-select (trigger: a beat that moves two
+nodes at once); click-to-raise (a beat where overlapping nodes are
+normal); a camera bound to state (two views of one graph sharing it); a
+silhouette clip for the wires (a graph sitting flush against another
+panel); a measure pass so a node sizes to its label (a host whose labels
+do not fit `NODE_W`, whose answer today is `w=`).
