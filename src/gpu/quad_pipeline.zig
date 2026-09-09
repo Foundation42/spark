@@ -19,6 +19,7 @@
 const std = @import("std");
 const vk = @import("vk.zig");
 const display_mod = @import("display.zig");
+const growable = @import("growable.zig");
 const shaders = @import("shaders");
 
 const c = vk.c;
@@ -85,18 +86,20 @@ pub const QuadPipeline = struct {
     /// both — which keeps `deinit` from ever destroying an alias twice.
     pipeline_offscreen: c.VkPipeline = null,
 
-    quad_buffer: c.VkBuffer,
-    quad_memory: c.VkDeviceMemory,
-    quad_mapped: [*]QuadInstance,
-    quad_capacity: u32,
+    /// The instance SSBO, sized to whatever the frame turned out to
+    /// need. `initial_quads` at init is a starting point, not a budget —
+    /// see `growable.zig` for the black page that paid for that.
+    quads: Quads,
 
     device: c.VkDevice, // borrowed
+
+    pub const Quads = growable.Growable(QuadInstance, "quad", error.TooManyQuads);
 
     pub fn init(
         ctx: *const vk.Context,
         color_format: c.VkFormat,
         offscreen_format: c.VkFormat,
-        max_quads: u32,
+        initial_quads: u32,
     ) !QuadPipeline {
         const dev = ctx.device;
         var self: QuadPipeline = .{
@@ -105,40 +108,13 @@ pub const QuadPipeline = struct {
             .descriptor_set = null,
             .pipeline_layout = null,
             .pipeline = null,
-            .quad_buffer = null,
-            .quad_memory = null,
-            .quad_mapped = undefined,
-            .quad_capacity = max_quads,
+            .quads = .{},
             .device = dev,
         };
         errdefer self.deinit();
 
         // ── SSBO: host-visible, host-coherent ──────────────────────
-        const bytes: u64 = @as(u64, max_quads) * @sizeOf(QuadInstance);
-        var bci = std.mem.zeroes(c.VkBufferCreateInfo);
-        bci.sType = c.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        bci.size = bytes;
-        bci.usage = c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-        bci.sharingMode = c.VK_SHARING_MODE_EXCLUSIVE;
-        try vk.check(c.vkCreateBuffer(dev, &bci, null, &self.quad_buffer));
-
-        var req: c.VkMemoryRequirements = undefined;
-        c.vkGetBufferMemoryRequirements(dev, self.quad_buffer, &req);
-        const mt = try findMemoryType(
-            ctx.physical_device,
-            req.memoryTypeBits,
-            c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        );
-        var mai = std.mem.zeroes(c.VkMemoryAllocateInfo);
-        mai.sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        mai.allocationSize = req.size;
-        mai.memoryTypeIndex = mt;
-        try vk.check(c.vkAllocateMemory(dev, &mai, null, &self.quad_memory));
-        try vk.check(c.vkBindBufferMemory(dev, self.quad_buffer, self.quad_memory, 0));
-
-        var raw: ?*anyopaque = null;
-        try vk.check(c.vkMapMemory(dev, self.quad_memory, 0, bytes, 0, &raw));
-        self.quad_mapped = @ptrCast(@alignCast(raw.?));
+        self.quads = try Quads.init(ctx, c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, initial_quads);
 
         // ── Descriptor set layout — one SSBO binding ───────────────
         var binding = std.mem.zeroes(c.VkDescriptorSetLayoutBinding);
@@ -172,19 +148,7 @@ pub const QuadPipeline = struct {
         ds_ai.pSetLayouts = &self.descriptor_set_layout;
         try vk.check(c.vkAllocateDescriptorSets(dev, &ds_ai, &self.descriptor_set));
 
-        var buf_info = c.VkDescriptorBufferInfo{
-            .buffer = self.quad_buffer,
-            .offset = 0,
-            .range = bytes,
-        };
-        var write = std.mem.zeroes(c.VkWriteDescriptorSet);
-        write.sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        write.dstSet = self.descriptor_set;
-        write.dstBinding = 0;
-        write.descriptorCount = 1;
-        write.descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        write.pBufferInfo = &buf_info;
-        c.vkUpdateDescriptorSets(dev, 1, &write, 0, null);
+        self.pointDescriptorAtBuffer();
 
         // ── Pipeline layout ────────────────────────────────────────
         var pc_range = c.VkPushConstantRange{
@@ -304,12 +268,35 @@ pub const QuadPipeline = struct {
         };
     }
 
+    /// Bind the SSBO the pipeline currently owns into binding 0. Called
+    /// once at init and again after every grow — a grown buffer is a
+    /// NEW `VkBuffer`, and a descriptor still pointing at the old one
+    /// is a draw reading freed memory.
+    fn pointDescriptorAtBuffer(self: *QuadPipeline) void {
+        var buf_info = c.VkDescriptorBufferInfo{
+            .buffer = self.quads.buffer,
+            .offset = 0,
+            .range = c.VK_WHOLE_SIZE,
+        };
+        var write = std.mem.zeroes(c.VkWriteDescriptorSet);
+        write.sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = self.descriptor_set;
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.pBufferInfo = &buf_info;
+        c.vkUpdateDescriptorSets(self.device, 1, &write, 0, null);
+    }
+
+    /// Make room for `n` quads. See `Spark.reserveForDrawlist` for
+    /// where in the frame this is safe to call: before anything has
+    /// bound the descriptor set into the command buffer being recorded.
+    pub fn reserve(self: *QuadPipeline, n: usize) !void {
+        if (try self.quads.reserve(n)) self.pointDescriptorAtBuffer();
+    }
+
     pub fn deinit(self: *QuadPipeline) void {
-        if (self.quad_memory != null) {
-            c.vkUnmapMemory(self.device, self.quad_memory);
-            c.vkFreeMemory(self.device, self.quad_memory, null);
-        }
-        if (self.quad_buffer != null) c.vkDestroyBuffer(self.device, self.quad_buffer, null);
+        self.quads.deinit();
         if (self.pipeline_offscreen != null) c.vkDestroyPipeline(self.device, self.pipeline_offscreen, null);
         if (self.pipeline != null) c.vkDestroyPipeline(self.device, self.pipeline, null);
         if (self.pipeline_layout != null) c.vkDestroyPipelineLayout(self.device, self.pipeline_layout, null);
@@ -319,11 +306,14 @@ pub const QuadPipeline = struct {
     }
 
     /// Copy `quads` into the mapped SSBO. Memory is host-coherent so
-    /// the write is visible to the next submit without explicit
-    /// flush. Returns `error.SsboOverflow` if the slice doesn't fit.
+    /// the write is visible to the next submit without explicit flush.
+    ///
+    /// `error.SsboOverflow` is now a can't-happen — `reserve` ran at
+    /// the frame boundary and the buffer is already the right size —
+    /// but it is still checked, because a can't-happen that is checked
+    /// is a bug report and one that is not is a heap smash.
     pub fn writeQuads(self: *QuadPipeline, quads: []const QuadInstance) !void {
-        if (quads.len > self.quad_capacity) return error.SsboOverflow;
-        @memcpy(self.quad_mapped[0..quads.len], quads);
+        try self.quads.write(quads);
     }
 
     /// Bind + draw. Must run inside an active vkCmdBeginRendering
@@ -430,20 +420,4 @@ fn stageInfo(stage: c.VkShaderStageFlagBits, module: c.VkShaderModule) c.VkPipel
     s.module = module;
     s.pName = "main";
     return s;
-}
-
-fn findMemoryType(
-    pd: c.VkPhysicalDevice,
-    type_bits: u32,
-    required: c.VkMemoryPropertyFlags,
-) !u32 {
-    var props: c.VkPhysicalDeviceMemoryProperties = undefined;
-    c.vkGetPhysicalDeviceMemoryProperties(pd, &props);
-    var i: u32 = 0;
-    while (i < props.memoryTypeCount) : (i += 1) {
-        const bit: u32 = @as(u32, 1) << @intCast(i);
-        if ((type_bits & bit) == 0) continue;
-        if ((props.memoryTypes[i].propertyFlags & required) == required) return i;
-    }
-    return error.NoSuitableMemoryType;
 }

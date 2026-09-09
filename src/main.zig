@@ -176,13 +176,18 @@ fn drawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) 
 
     h.spark.endFrame() catch |err| {
         if (!h.overflow_logged) {
-            // Say what overflowed and by how much. The failure is total —
-            // a black page — so the one line that reports it had better
-            // carry the number that needs raising, or the next person to
-            // add a paragraph to `demo.md` is left guessing at a blank
-            // screen. It cost an afternoon once; it should cost a glance.
+            // Say what failed and how big the frame was. This used to
+            // end with "see max_glyphs / max_quads in Spark.init",
+            // because the failure was a fixed budget and the fix was to
+            // raise it by hand. The buffers grow themselves now, so
+            // there is nothing to raise: reaching here means either the
+            // hard ceiling refused a runaway (`TooManyGlyphs` and
+            // friends — the counts below say which and how far) or
+            // something else in the frame went wrong. The failure is
+            // still total — a black page — so the line still carries
+            // the numbers. It cost an afternoon once.
             std.debug.print(
-                "WARN: endFrame failed: {s} (drawlist: {d} glyphs, {d} quads — see max_glyphs / max_quads in Spark.init)\n",
+                "WARN: endFrame failed: {s} (drawlist: {d} glyphs, {d} quads)\n",
                 .{ @errorName(err), h.spark.drawlist.glyphs.items.len, h.spark.drawlist.quads.items.len },
             );
             h.overflow_logged = true;
@@ -552,21 +557,18 @@ pub fn main() !void {
         .theme = &theme,
         .fonts = fonts,
         .host_state = &host_state,
-        // **Raised because the demo document silently outgrew the
-        // default.** `demo.md` is a bench that only ever gets longer, and
-        // the whole of it is laid out every frame — nothing culls a
-        // paragraph for being scrolled off. At 27KB it crossed the
-        // default 16384 glyphs, and one glyph over budget does not clip
-        // or drop anything: `writeGlyphs` refuses the batch, `endFrame`
-        // returns `SsboOverflow`, and the ENTIRE page goes black with a
-        // single line on stderr. Adding a section to the demo should not
-        // be able to do that, so the bench gets headroom it will take
-        // years to spend — about 5MB of it.
+        // **No sizing knobs, on purpose.** This host used to carry
+        // `.max_glyphs = 65536, .max_quads = 8192` because `demo.md` is
+        // a bench that only ever gets longer and the whole of it is
+        // laid out every frame — at 27KB it crossed the default 16384
+        // glyphs, and one glyph over budget turned the ENTIRE page
+        // black. Raising the number by hand was the fix, and doing it
+        // again next time was the ritual.
         //
-        // The default is deliberately left alone: it is what every
-        // embedding host inherits, and matryoshka's panels are small.
-        .max_glyphs = 65536,
-        .max_quads = 8192,
+        // The buffers size themselves now (`gpu/growable.zig`): the
+        // first frame that needs more room takes it, once, and says so.
+        // Deleting these two lines is the proof — if the demo still
+        // renders, nobody has to pick a number.
     });
     defer {
         sp.deinit();

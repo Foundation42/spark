@@ -287,10 +287,38 @@ pub const InitOptions = struct {
     // ── Sizing knobs (defaults match the historical demo values) ──
     mono_atlas_size: u32 = 2048,
     color_atlas_size: u32 = 1024,
-    max_glyphs: u32 = 16384,
-    max_quads: u32 = 2048,
-    max_tri_vertices: u32 = 65536,
-    max_tri_indices: u32 = 196608,
+
+    /// **Starting sizes, not budgets — none of these four is a
+    /// ceiling.** They say how big the per-frame GPU buffers are on
+    /// frame one. A frame that needs more gets more: the finished
+    /// drawlist is measured and the buffer grown to fit before anything
+    /// is recorded (`Spark.reserveForDrawlist` → `gpu/growable.zig`).
+    /// Growth is once per size, logged once, and stops at a hard
+    /// ceiling that refuses by name rather than eating GPU memory.
+    ///
+    /// They were called `max_*` until the growth landed, and every host
+    /// that hit one raised it by hand — spark's own demo carried
+    /// `max_glyphs = 65536` for exactly that reason (`14aedd9`: the
+    /// document outgrew its glyph budget and the whole page went
+    /// black). The rename is the point. There is no number to raise.
+    ///
+    /// Set them only to skip a first-frame reallocation you can
+    /// predict — a host that KNOWS its panels are small can lower them
+    /// and keep the memory. Leaving them alone is correct.
+    initial_glyphs: u32 = 16384,
+    initial_quads: u32 = 2048,
+    initial_tri_vertices: u32 = 65536,
+    initial_tri_indices: u32 = 196608,
+
+    /// **This one IS a maximum**, and stays named like one. Unlike the
+    /// four above it sizes a descriptor POOL, not a buffer: one set per
+    /// live image texture, allocated when the image loads. A pool
+    /// cannot be resized in place the way a buffer can — growing it
+    /// means chaining a second pool and re-pointing every set — and its
+    /// overflow is local rather than total: the 33rd image fails to
+    /// load and does not draw, while the other 32 and all the text
+    /// render normally. A different failure from the black page, and
+    /// left for the beat that wants a pool chain.
     max_images: u32 = 32,
 
     /// Compute worker count. Null = cpu_count - 2 (matches demo).
@@ -594,6 +622,17 @@ pub const Spark = struct {
     /// (`beginFrame(.{ .reset = false })`) on non-dirty frames to
     /// reuse the previous frame's screen-space drawlist verbatim.
     drawlist_needs_transform: bool = false,
+    /// True once `dispatchOffscreenPasses` has recorded a draw into
+    /// this frame's command buffer. Cleared by `beginFrame`.
+    ///
+    /// It exists for one guard: after Phase 1 has bound a buffer handle
+    /// or a descriptor set into the cmd, spark can no longer replace
+    /// those buffers — the recorded binds would point at freed memory
+    /// and the host would submit them anyway (spark's own demo swallows
+    /// an `endFrame` error and lets `drawFrame` submit). So `endFrame`
+    /// asks whether a grow is still NEEDED at that point, and refuses
+    /// by name if it is. See `reserveForDrawlist`.
+    offscreen_recorded: bool = false,
 
     // ── Input state (managed by `dispatchMouseButton` etc.) ─────────
     /// Last mouse position dispatched (world coords, pre-zoom).
@@ -666,17 +705,17 @@ pub const Spark = struct {
             offscreen_format,
             &mono_atlas,
             &color_atlas,
-            opts.max_glyphs,
+            opts.initial_glyphs,
         );
         errdefer text_pipeline.deinit();
-        var quad_pipeline = try qp.QuadPipeline.init(opts.vk_ctx, opts.color_format, offscreen_format, opts.max_quads);
+        var quad_pipeline = try qp.QuadPipeline.init(opts.vk_ctx, opts.color_format, offscreen_format, opts.initial_quads);
         errdefer quad_pipeline.deinit();
         var tri_pipeline = try tri_pipeline_mod.TrianglePipeline.init(
             opts.vk_ctx,
             opts.color_format,
             offscreen_format,
-            opts.max_tri_vertices,
-            opts.max_tri_indices,
+            opts.initial_tri_vertices,
+            opts.initial_tri_indices,
         );
         errdefer tri_pipeline.deinit();
         const image_pipeline = try allocator.create(image_pipeline_mod.ImagePipeline);
@@ -1036,6 +1075,54 @@ pub const Spark = struct {
 
     // ── Frame cycle ─────────────────────────────────────────────────
 
+    /// Size every per-frame GPU buffer to the drawlist that is about to
+    /// be recorded. Idempotent, and on a settled document it is four
+    /// integer compares.
+    ///
+    /// **Measure, don't fail.** The CPU drawlist is an unbounded
+    /// `ArrayList` and it is COMPLETE by the time anything records —
+    /// the walk is over, `layoutAndRender` has returned. So the size
+    /// this frame needs is a number we can read, not a condition we
+    /// have to discover by having `writeGlyphs` refuse a batch and
+    /// return `SsboOverflow` out of `endFrame`, which is what used to
+    /// happen and which cost the whole page (`14aedd9`; `src/main.zig`
+    /// says it cost an afternoon).
+    ///
+    /// **Where it is safe to call, and why there are two call sites.**
+    /// A grow REPLACES `VkBuffer` handles. The tri pipeline binds its
+    /// VBO/IBO by handle at record time and the text/quad pipelines
+    /// bind a descriptor set whose contents Vulkan is allowed to
+    /// consume as early as `vkCmdBindDescriptorSets` is recorded. So
+    /// this has to run before ANY draw goes into the frame's command
+    /// buffer. Spark records in exactly two places, in this order:
+    ///
+    ///   1. `dispatchOffscreenPasses` — Phase 1, the offscreen passes.
+    ///   2. `endFrame` — Phase 2, the main pass.
+    ///
+    /// It is called at the top of both. The first call does the work;
+    /// the second is the no-op that covers a host with no effects,
+    /// which never calls `dispatchOffscreenPasses` at all. A host that
+    /// appends to the drawlist BETWEEN them is out of contract, and
+    /// `endFrame` refuses that by name rather than freeing buffers its
+    /// own command buffer already points at.
+    pub fn reserveForDrawlist(self: *Spark) !void {
+        const dl = &self.drawlist;
+        try self.text_pipeline.reserve(dl.glyphs.items.len);
+        try self.quad_pipeline.reserve(dl.quads.items.len);
+        try self.tri_pipeline.reserve(dl.tris.items.len, dl.tri_indices.items.len);
+    }
+
+    /// Whether `reserveForDrawlist` would actually allocate. Asked
+    /// before growing, never after — by the time a grow has run the old
+    /// buffer is gone and the question is too late to matter.
+    fn needsRoom(self: *const Spark) bool {
+        const dl = &self.drawlist;
+        return dl.glyphs.items.len > self.text_pipeline.glyphs.capacity or
+            dl.quads.items.len > self.quad_pipeline.quads.capacity or
+            dl.tris.items.len > self.tri_pipeline.vertices.capacity or
+            dl.tri_indices.items.len > self.tri_pipeline.indices.capacity;
+    }
+
     /// Attach to the host's command buffer for the upcoming frame.
     /// Cheap (no allocation in Phase 3 — `max_sets`/`max_descriptors`
     /// are reserved for a future library-owned descriptor pool).
@@ -1066,6 +1153,10 @@ pub const Spark = struct {
     /// dirty-tracking discipline that decides which mode to use.
     pub fn beginFrame(self: *Spark, info: FrameInfo, opts: BeginFrameOpts) !void {
         self.frame_info = info;
+        // Unconditional, both modes: this is a fact about the command
+        // buffer being recorded, and the host rotates that every frame
+        // whether or not it asked for a layout reset.
+        self.offscreen_recorded = false;
         if (opts.reset) {
             self.drawlist.clearRetainingCapacity();
             // Symmetry with drawlist — both per-frame lists clear
@@ -1223,6 +1314,17 @@ pub const Spark = struct {
     /// exercises the populated path.
     pub fn dispatchOffscreenPasses(self: *Spark, cmd: vk.c.VkCommandBuffer) !void {
         if (std.posix.getenv("SPARK_DUMP_PASSES") != null) self.dumpPassGraph();
+        // **First thing, before a single draw is recorded.** Phase 1
+        // binds the VBO/IBO by handle and the SSBO descriptor sets; a
+        // grow after that point would leave those binds pointing at
+        // freed memory. The drawlist is already complete here — the
+        // host's `layoutAndRender` calls have all returned — so the
+        // size is known and this is the earliest honest place to fix
+        // it. See `reserveForDrawlist`.
+        try self.reserveForDrawlist();
+        // From here on this frame's cmd may carry binds, which is what
+        // `endFrame`'s refusal keys on.
+        if (self.pass_dispatches.items.len > 0) self.offscreen_recorded = true;
         // Resize the dispatch_target_map to mirror pass_dispatches
         // and start every entry as null. Phase 1 fills in the
         // acquired handles at single_source positions; Phase 2 reads
@@ -2838,6 +2940,24 @@ pub const Spark = struct {
         // that never clipped anything. `sealClips` is idempotent, so this
         // costs nothing when the walker already sealed.
         try dl.sealClips(element.NO_CLIP);
+
+        // **Grow before writing, and before recording anything.** The
+        // drawlist is final, so the size it needs is a number rather
+        // than a failure to discover. On a settled document this is
+        // four integer compares; on the frame a document outgrows its
+        // starting size it is one reallocation, and the page renders
+        // instead of going black.
+        //
+        // The `needsRoom` question comes FIRST because a grow after
+        // Phase 1 has recorded binds would free memory this very
+        // command buffer already points at — and the host submits that
+        // command buffer whether or not `endFrame` returned an error
+        // (spark's own demo prints the error and lets `drawFrame`
+        // submit). So a host that appended to the drawlist between
+        // `dispatchOffscreenPasses` and here gets a named refusal and
+        // an intact frame, not a dangling handle.
+        if (self.offscreen_recorded and self.needsRoom()) return error.DrawlistGrewAfterDispatch;
+        try self.reserveForDrawlist();
 
         // Upload all per-pipeline SSBOs / VBOs. Host-coherent memory
         // makes these plain memcpys — visible to the next submit

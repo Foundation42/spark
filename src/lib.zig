@@ -123,6 +123,16 @@ pub const FontId = font.FontId;
 // ── Vulkan thin wrapper (host needs this for raw handle types) ─────
 pub const vk = @import("gpu/vk.zig");
 
+// ── The self-sizing per-frame buffers ──────────────────────────────
+// Exported for the ceilings, which are the one number in the growth
+// mechanism a host might want to READ: how big a frame can get before
+// spark refuses it by name. Nothing here is settable — see
+// `gpu/growable.zig` for why the ceiling is deliberately not a knob.
+pub const growable = @import("gpu/growable.zig");
+pub const TextPipeline = @import("gpu/text_pipeline.zig").TextPipeline;
+pub const QuadPipeline = @import("gpu/quad_pipeline.zig").QuadPipeline;
+pub const TrianglePipeline = @import("gpu/tri_pipeline.zig").TrianglePipeline;
+
 // ── Host-side scaffolding the demo uses ────────────────────────────
 // Real production hosts (matryoshka HUD, terminal app) will write
 // their own window + swapchain + renderer; these are re-exported so

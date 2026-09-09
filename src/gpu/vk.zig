@@ -68,6 +68,25 @@ fn hasInstanceLayer(name: []const u8) bool {
     return false;
 }
 
+/// ERROR-severity validation messages seen since the process started.
+///
+/// **What it is for.** Some claims about Vulkan legality cannot be
+/// gated by reading a value back. "This free did not release memory a
+/// submitted command buffer still refers to" has no return code, and
+/// "the grow left nothing behind" is only visible as an object still
+/// alive at `vkDestroyDevice` — in both cases the validation layer is
+/// the only witness. A gate snapshots this, does the thing, and asserts
+/// the number did not move; the mutation it is paid for makes the layer
+/// complain and the number moves. See `src/tests/buffer_growth.zig`.
+///
+/// Process-wide rather than per-`Context` on purpose: the messenger is
+/// per instance, the suite builds and tears down several, and a counter
+/// that died with its instance would miss exactly the messages emitted
+/// during teardown. Zig runs tests sequentially in one process so a
+/// before/after delta reads cleanly; it is atomic anyway, because the
+/// layer is free to call back from a driver thread.
+pub var validation_errors: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
 /// Per-instance debug-utils callback. Validation layer messages route
 /// here via the messenger registered in `Context.init`. We print to
 /// stderr (unconditionally — if a message reached us, the developer
@@ -82,6 +101,9 @@ fn debugCallback(
 ) callconv(.c) c.VkBool32 {
     _ = msg_type;
     _ = user_data;
+    if (severity & c.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT != 0) {
+        _ = validation_errors.fetchAdd(1, .monotonic);
+    }
     const sev_tag: []const u8 = if (severity & c.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT != 0)
         "ERROR"
     else if (severity & c.VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT != 0)

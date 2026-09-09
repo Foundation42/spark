@@ -11,6 +11,7 @@ test {
     _ = @import("markdown.zig");
     _ = @import("markdown_components.zig");
     _ = @import("params.zig");
+    _ = @import("gpu/growable.zig");
     _ = @import("pass/graph.zig");
     _ = @import("pass/shader_resolver.zig");
     _ = @import("pass/target_pool.zig");
@@ -91,6 +92,7 @@ test {
     _ = @import("tests/two_instances.zig");
     _ = @import("tests/two_documents.zig");
     _ = @import("tests/integration_render.zig");
+    _ = @import("tests/buffer_growth.zig");
     _ = @import("tests/single_source_dispatch.zig");
     _ = @import("tests/placeholder_scene.zig");
     _ = @import("tests/display_transform.zig");

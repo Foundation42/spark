@@ -15,14 +15,15 @@
 //!   * Viewport size in push constant.
 //!   * Premultiplied-alpha blend with srcFactor = ONE.
 //!
-//! Capacity: caller picks `max_vertices` / `max_indices` at init.
-//! `writeMesh(verts, idx)` returns SsboOverflow if either capacity
-//! is exceeded — same error sentinel as text / quad to keep host
-//! error-handling uniform.
+//! Capacity: caller picks the starting `initial_vertices` /
+//! `initial_indices` at init, and `reserve` grows both to fit whatever
+//! the frame turned out to hold — the same `growable.Growable` the text
+//! and quad SSBOs use.
 
 const std = @import("std");
 const vk = @import("vk.zig");
 const display_mod = @import("display.zig");
+const growable = @import("growable.zig");
 const shaders = @import("shaders");
 const tess = @import("../svg_tessellate.zig");
 
@@ -66,58 +67,37 @@ pub const TrianglePipeline = struct {
     /// both — which keeps `deinit` from ever destroying an alias twice.
     pipeline_offscreen: c.VkPipeline = null,
 
-    vertex_buffer: c.VkBuffer,
-    vertex_memory: c.VkDeviceMemory,
-    vertex_mapped: [*]Vertex,
-    vertex_capacity: u32,
-
-    index_buffer: c.VkBuffer,
-    index_memory: c.VkDeviceMemory,
-    index_mapped: [*]u32,
-    index_capacity: u32,
+    /// VBO + IBO, each sized to whatever the frame turned out to need.
+    /// `initial_vertices` / `initial_indices` at init are a starting
+    /// point, not a budget — see `growable.zig`.
+    vertices: Vertices,
+    indices: Indices,
 
     device: c.VkDevice, // borrowed
+
+    pub const Vertices = growable.Growable(Vertex, "tri vertex", error.TooManyTriVertices);
+    pub const Indices = growable.Growable(u32, "tri index", error.TooManyTriIndices);
 
     pub fn init(
         ctx: *const vk.Context,
         color_format: c.VkFormat,
         offscreen_format: c.VkFormat,
-        max_vertices: u32,
-        max_indices: u32,
+        initial_vertices: u32,
+        initial_indices: u32,
     ) !TrianglePipeline {
         const dev = ctx.device;
         var self: TrianglePipeline = .{
             .pipeline_layout = null,
             .pipeline = null,
-            .vertex_buffer = null,
-            .vertex_memory = null,
-            .vertex_mapped = undefined,
-            .vertex_capacity = max_vertices,
-            .index_buffer = null,
-            .index_memory = null,
-            .index_mapped = undefined,
-            .index_capacity = max_indices,
+            .vertices = .{},
+            .indices = .{},
             .device = dev,
         };
         errdefer self.deinit();
 
         // ── VBO + IBO ──────────────────────────────────────────────
-        try createMappedBuffer(
-            ctx,
-            @as(u64, max_vertices) * @sizeOf(Vertex),
-            c.VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-            &self.vertex_buffer,
-            &self.vertex_memory,
-            @ptrCast(&self.vertex_mapped),
-        );
-        try createMappedBuffer(
-            ctx,
-            @as(u64, max_indices) * @sizeOf(u32),
-            c.VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-            &self.index_buffer,
-            &self.index_memory,
-            @ptrCast(&self.index_mapped),
-        );
+        self.vertices = try Vertices.init(ctx, c.VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, initial_vertices);
+        self.indices = try Indices.init(ctx, c.VK_BUFFER_USAGE_INDEX_BUFFER_BIT, initial_indices);
 
         // ── Pipeline layout — push constant only, no descriptors ──
         var pc_range = c.VkPushConstantRange{
@@ -251,30 +231,34 @@ pub const TrianglePipeline = struct {
         };
     }
 
+    /// Make room for `n_verts` vertices and `n_indices` indices. No
+    /// descriptor to re-point: this pipeline binds its buffers by
+    /// handle at record time, which is exactly why the grow has to
+    /// happen BEFORE anything records a draw — see
+    /// `Spark.reserveForDrawlist`.
+    pub fn reserve(self: *TrianglePipeline, n_verts: usize, n_indices: usize) !void {
+        _ = try self.vertices.reserve(n_verts);
+        _ = try self.indices.reserve(n_indices);
+    }
+
     pub fn deinit(self: *TrianglePipeline) void {
-        if (self.vertex_memory != null) {
-            c.vkUnmapMemory(self.device, self.vertex_memory);
-            c.vkFreeMemory(self.device, self.vertex_memory, null);
-        }
-        if (self.vertex_buffer != null) c.vkDestroyBuffer(self.device, self.vertex_buffer, null);
-        if (self.index_memory != null) {
-            c.vkUnmapMemory(self.device, self.index_memory);
-            c.vkFreeMemory(self.device, self.index_memory, null);
-        }
-        if (self.index_buffer != null) c.vkDestroyBuffer(self.device, self.index_buffer, null);
+        self.vertices.deinit();
+        self.indices.deinit();
         if (self.pipeline_offscreen != null) c.vkDestroyPipeline(self.device, self.pipeline_offscreen, null);
         if (self.pipeline != null) c.vkDestroyPipeline(self.device, self.pipeline, null);
         if (self.pipeline_layout != null) c.vkDestroyPipelineLayout(self.device, self.pipeline_layout, null);
         self.* = undefined;
     }
 
-    /// Copy `verts` + `indices` into the mapped VBO/IBO. Host-
-    /// coherent memory → no flush needed before submit.
+    /// Copy `verts` + `indices` into the mapped VBO/IBO. Host-coherent
+    /// memory → no flush needed before submit.
+    ///
+    /// `error.SsboOverflow` is now a can't-happen — `reserve` ran at
+    /// the frame boundary — but it is still checked; see
+    /// `growable.Growable.write`.
     pub fn writeMesh(self: *TrianglePipeline, verts: []const Vertex, indices: []const u32) !void {
-        if (verts.len > self.vertex_capacity) return error.SsboOverflow;
-        if (indices.len > self.index_capacity) return error.SsboOverflow;
-        @memcpy(self.vertex_mapped[0..verts.len], verts);
-        @memcpy(self.index_mapped[0..indices.len], indices);
+        try self.vertices.write(verts);
+        try self.indices.write(indices);
     }
 
     /// Bind + draw `n_indices / 3` triangles. Records before quads /
@@ -340,46 +324,11 @@ pub const TrianglePipeline = struct {
         );
 
         var offsets = [_]c.VkDeviceSize{0};
-        c.vkCmdBindVertexBuffers(cmd, 0, 1, &self.vertex_buffer, &offsets);
-        c.vkCmdBindIndexBuffer(cmd, self.index_buffer, 0, c.VK_INDEX_TYPE_UINT32);
+        c.vkCmdBindVertexBuffers(cmd, 0, 1, &self.vertices.buffer, &offsets);
+        c.vkCmdBindIndexBuffer(cmd, self.indices.buffer, 0, c.VK_INDEX_TYPE_UINT32);
         c.vkCmdDrawIndexed(cmd, index_count, 1, first_index, 0, 0);
     }
 };
-
-fn createMappedBuffer(
-    ctx: *const vk.Context,
-    bytes: u64,
-    usage: c.VkBufferUsageFlags,
-    out_buffer: *c.VkBuffer,
-    out_memory: *c.VkDeviceMemory,
-    out_mapped: *[*]u8,
-) !void {
-    const dev = ctx.device;
-    var bci = std.mem.zeroes(c.VkBufferCreateInfo);
-    bci.sType = c.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bci.size = bytes;
-    bci.usage = usage;
-    bci.sharingMode = c.VK_SHARING_MODE_EXCLUSIVE;
-    try vk.check(c.vkCreateBuffer(dev, &bci, null, out_buffer));
-
-    var req: c.VkMemoryRequirements = undefined;
-    c.vkGetBufferMemoryRequirements(dev, out_buffer.*, &req);
-    const mt = try findMemoryType(
-        ctx.physical_device,
-        req.memoryTypeBits,
-        c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-    );
-    var mai = std.mem.zeroes(c.VkMemoryAllocateInfo);
-    mai.sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    mai.allocationSize = req.size;
-    mai.memoryTypeIndex = mt;
-    try vk.check(c.vkAllocateMemory(dev, &mai, null, out_memory));
-    try vk.check(c.vkBindBufferMemory(dev, out_buffer.*, out_memory.*, 0));
-
-    var raw: ?*anyopaque = null;
-    try vk.check(c.vkMapMemory(dev, out_memory.*, 0, bytes, 0, &raw));
-    out_mapped.* = @ptrCast(@alignCast(raw.?));
-}
 
 fn createShaderModule(dev: c.VkDevice, blob: []align(4) const u8) !c.VkShaderModule {
     var ci = std.mem.zeroes(c.VkShaderModuleCreateInfo);
@@ -400,18 +349,3 @@ fn stageInfo(stage: c.VkShaderStageFlagBits, module: c.VkShaderModule) c.VkPipel
     return s;
 }
 
-fn findMemoryType(
-    pd: c.VkPhysicalDevice,
-    type_bits: u32,
-    required: c.VkMemoryPropertyFlags,
-) !u32 {
-    var props: c.VkPhysicalDeviceMemoryProperties = undefined;
-    c.vkGetPhysicalDeviceMemoryProperties(pd, &props);
-    var i: u32 = 0;
-    while (i < props.memoryTypeCount) : (i += 1) {
-        const bit: u32 = @as(u32, 1) << @intCast(i);
-        if ((type_bits & bit) == 0) continue;
-        if ((props.memoryTypes[i].propertyFlags & required) == required) return i;
-    }
-    return error.NoSuitableMemoryType;
-}
