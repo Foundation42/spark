@@ -74,6 +74,15 @@ const HostCtx = struct {
 fn preDrawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2D) anyerror!void {
     const h: *HostCtx = @ptrCast(@alignCast(ctx.?));
 
+    // The two questions a host has to keep apart. `State.dirty` means
+    // "the document's layout changed"; `takeRedrawRequest` means "a
+    // dispatch changed what some component draws". A `:::slider` writes
+    // state on every drag step and so answers both, which is why this
+    // host survived without the second one — a component that redraws
+    // WITHOUT writing state (a node dragged in a `:::nodegraph`, a
+    // hover ring) would sit frozen until the gesture ended.
+    if (h.spark.takeRedrawRequest()) h.state.dirty = true;
+
     const extent_changed = extent.width != h.last_extent.width or extent.height != h.last_extent.height;
     h.last_extent = extent;
     const reset = h.state.dirty or extent_changed;
@@ -116,8 +125,10 @@ fn keyCb(window: ?*win.c.GLFWwindow, key: c_int, _: c_int, action: c_int, _: c_i
 /// Per-frame mouse plumbing. Reads GLFW state once, dispatches the
 /// edge (button-down or button-up) through Spark; on a held drag,
 /// dispatches the move so the slider's captured Hit gets updates.
-/// The state.dirty flag tripped inside Spark's dispatch path causes
-/// the next frame's `reset` to fire a re-layout.
+/// A dispatch that changes something raises either `State.dirty` (it
+/// wrote to the plane) or `Spark.redraw_requested` (it changed only its
+/// own picture); `preDrawCb` folds the second into the first and the
+/// next frame's `reset` fires a re-layout.
 fn processInput(window: *win.Window, h: *HostCtx) !void {
     var x_raw: f64 = 0;
     var y_raw: f64 = 0;

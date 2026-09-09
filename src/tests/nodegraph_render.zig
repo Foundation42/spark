@@ -239,3 +239,144 @@ test "nodegraph: an output pin's label is right-aligned INSIDE its node" {
         try testing.expect(g.dst_pos[0] >= origin_x - 1.0);
     }
 }
+
+/// A document with a graph in the middle of it and eighty paragraphs of
+/// prose around it — the shape the redraw question is actually asked in.
+/// A graph alone in a document cannot show what a redraw costs the rest
+/// of the page, which is the whole worry about redrawing during a drag.
+fn graphInProseDoc(allocator: std.mem.Allocator) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = buf.writer();
+    try w.writeAll("# A document with a graph in it\n\n");
+    for (0..40) |i| {
+        try w.print(
+            "Paragraph {d} — prose that has to be shaped, wrapped and turned\ninto glyphs before any of it can be drawn.\n\n",
+            .{i},
+        );
+    }
+    try w.writeAll(
+        \\:::nodegraph {#g width=600 height=300}
+        \\node id=a x=0 y=0 label="A"
+        \\node id=b x=220 y=40 label="B"
+        \\pin node=a id=out dir=out label="v"
+        \\pin node=b id=in dir=in label="a"
+        \\link from=a.out to=b.in
+        \\:::
+        \\
+        \\
+    );
+    for (40..80) |i| {
+        try w.print("Paragraph {d} — more prose under the canvas, so blocks are\nre-walked on both sides of it or on neither.\n\n", .{i});
+    }
+    return buf.toOwnedSlice();
+}
+
+test "nodegraph: a drag redraws every frame and re-shapes nothing but the canvas" {
+    // The cost of the redraw fix, measured rather than argued. A drag
+    // now asks the host for a frame on every move (`takeRedrawRequest`),
+    // and the fear that buys is "so a drag re-lays-out the whole
+    // document sixty times a second". It does re-WALK it — there is no
+    // partial-drawlist path, `beginFrame(.reset = false)` replays the
+    // previous frame verbatim or not at all — and the walk costs
+    // nothing, because every block around the canvas comes out of the
+    // block cache. This gate is that sentence executed.
+    //
+    // Two mutations, both executed:
+    //
+    //  * delete the `defer noteRedraw(sp, hit, before)` in
+    //    `Spark.dispatchHit` — 0 frames instead of 30, red, and that is
+    //    the bug Christian reported.
+    //  * `self.layout_cache.clear()` on `beginFrame`'s reset path, the
+    //    "reset means reset" symmetry the drawlist and pass_dispatches
+    //    already have — 2430 misses instead of 0, red. Every paragraph
+    //    on the page re-shaped for a node moving one pixel.
+    const allocator = testing.allocator;
+    var fx = try fixture.Fixture.init(allocator);
+    defer fx.deinit();
+
+    const src = try graphInProseDoc(allocator);
+    defer allocator.free(src);
+
+    const fonts = try fixture.makeFonts(allocator, fx.ft);
+    const theme = fixture.makeTheme(fonts);
+    var state = spark.State.init(allocator);
+    defer state.deinit();
+    var sp = try spark.Spark.init(allocator, .{
+        .vk_ctx = &fx.ctx,
+        .color_format = fx.swapchain.format,
+        .theme = &theme,
+        .fonts = fonts.registry,
+        .host_state = &state,
+    });
+    defer {
+        sp.deinit();
+        allocator.destroy(fonts.registry);
+    }
+    sp.attachToRegistry();
+    try spark.installCoreComponents(&sp);
+
+    var doc = try sp.loadDocument(src, .{ .shared_state = &state });
+    defer doc.deinit();
+
+    const fi = spark.FrameInfo{
+        .extent = .{ .width = 1280, .height = 900 },
+        .zoom = 1.0,
+        .scroll_offset = .{ 0, 0 },
+    };
+    const origin: [2]f32 = .{ 20, 20 };
+    const constraints: spark.Constraints = .{ .max_w = 1240 };
+
+    // Frame one is cold: eighty-odd blocks, every one a miss. Asserted
+    // so the zero below means "the cache absorbed it" and not "the cache
+    // was never asked".
+    try sp.beginFrame(fi, .{ .reset = true });
+    _ = try sp.layoutAndRender(&doc, origin, constraints);
+    try testing.expect(sp.layout_cache.misses > 50);
+
+    // The canvas's own hit is the only one in the document, so the
+    // press lands on the graph without guessing where it ended up.
+    const canvas = sp.drawlist.hits.items[0].box;
+    try sp.dispatchMouseButtonN(canvas.x + 20, canvas.y + 10, true, 0);
+    _ = sp.takeRedrawRequest();
+
+    var frames: usize = 0;
+    var misses: u64 = 0;
+    var hits: u64 = 0;
+    for (1..31) |i| {
+        const step: f32 = @floatFromInt(i);
+        try sp.dispatchMouseMove(canvas.x + 20 + step, canvas.y + 10);
+        if (!sp.takeRedrawRequest()) continue;
+        frames += 1;
+        sp.layout_cache.resetStats();
+        try sp.beginFrame(fi, .{ .reset = true });
+        _ = try sp.layoutAndRender(&doc, origin, constraints);
+        misses += sp.layout_cache.misses;
+        hits += sp.layout_cache.hits;
+    }
+
+    // Every move drew. This is the reported bug's gate at full scale.
+    try testing.expectEqual(@as(usize, 30), frames);
+    // And not one block of prose was re-shaped in any of the thirty.
+    // (Measured 2026-09-09: 4860 hits, 0 misses, ~0.21 ms a frame for
+    // this document. The canvas itself sets `disable_cache` and re-walks
+    // every frame on purpose — the camera is invisible to a cache key.)
+    try testing.expectEqual(@as(u64, 0), misses);
+    try testing.expect(hits > 100);
+
+    // The other half: let go, take the pointer off the graph, and a
+    // pointer wandering over prose asks for nothing at all. The first
+    // move off the canvas is a real change — it unlights the node the
+    // pointer left — so it is taken before the count starts.
+    try sp.dispatchMouseButtonN(canvas.x + 50, canvas.y + 10, false, 0);
+    try sp.dispatchHover(origin[0] + 10, origin[1] + 10);
+    _ = sp.takeRedrawRequest();
+
+    var idle: usize = 0;
+    for (0..30) |i| {
+        const step: f32 = @floatFromInt(i);
+        try sp.dispatchHover(origin[0] + 10 + step, origin[1] + 10);
+        if (sp.takeRedrawRequest()) idle += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), idle);
+}

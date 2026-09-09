@@ -679,6 +679,12 @@ pub const Spark = struct {
     /// costs half a second every suite run forever.
     click_clock_ms: ?i64 = null,
 
+    /// **Does anything need drawing again?** Raised by a dispatch that
+    /// actually changed a component's picture; read and cleared by
+    /// `takeRedrawRequest`. See that method for the whole argument, and
+    /// for why this is a flag rather than a `bool` off each dispatcher.
+    redraw_requested: bool = false,
+
     /// Construct a Spark and all engine resources. The host gives
     /// raw Vulkan handles (via opts.vk_ctx + opts.color_format), an
     /// owned FontRegistry, a borrowed Theme + root State, and
@@ -3490,11 +3496,54 @@ pub const Spark = struct {
         };
     }
 
+    /// **Does anything need drawing again?** Read-and-clear. True when a
+    /// dispatch since the last call actually changed a component's
+    /// picture — a node dragged, a hover moving from one node to the
+    /// next, a caret gained or lost, a wheel notch a `:::clip` took.
+    ///
+    /// This exists because a host has TWO questions and one flag, and
+    /// answering both with `State.dirty` gets one of them wrong. "Has
+    /// the document's layout changed?" is what `State.dirty` means. "Does
+    /// anything need drawing again?" is this — and until it existed, the
+    /// only input paths that answered it were the ones that happened to
+    /// write state on their way past. A node dragged inside a canvas
+    /// writes nothing until the button comes up, so the screen sat still
+    /// for the whole gesture and the node teleported on release. Hover
+    /// was broken the same way and nobody had noticed.
+    ///
+    /// **Only what CHANGED.** `dispatchHit` reads the target's
+    /// `content_version` either side of the handler, so a pointer moving
+    /// across empty canvas, or around inside the node it is already
+    /// hovering, raises nothing at all. Dirtying on every move instead
+    /// would make a moving mouse cost a document walk a frame, which is
+    /// the cure being worse than the disease.
+    ///
+    /// **A flag, not a `bool` off each dispatcher.** `dispatchScroll`
+    /// returns "someone took this" and the obvious symmetry is for
+    /// `dispatchMouseMove` and `dispatchHover` to do the same. They
+    /// cannot: matryoshka's host calls `dispatchMouseMove(x, y) catch {}`
+    /// as a statement, and a `!bool` breaks that embed at the call site.
+    /// One flag also covers the channels a bool per dispatcher would
+    /// have missed — key, char, focus — for free.
+    ///
+    /// Rejected names: `dirty` (the collision with `State.dirty` IS the
+    /// confusion this is here to end), `needsRedraw` (reads as a pure
+    /// query, and this one clears), `invalidate` (Win32/Qt's word for a
+    /// region, and there is no region here).
+    pub fn takeRedrawRequest(self: *Spark) bool {
+        defer self.redraw_requested = false;
+        return self.redraw_requested;
+    }
+
     /// Dispatch a mouse move. Position is in world coords (host
     /// un-transforms screen → world if it's applying a zoom/scroll).
     /// Routes to the captured Hit if a drag is in progress; otherwise
     /// does nothing. A pointer with no button held is `dispatchHover`,
     /// a separate channel — see `element.HoverEvent` for why.
+    ///
+    /// A move that moved something raises `redraw_requested` — see
+    /// `takeRedrawRequest`, which is what a host polls instead of
+    /// guessing that a held button means a redraw.
     pub fn dispatchMouseMove(self: *Spark, x: f32, y: f32) !void {
         self.mouse_x = x;
         self.mouse_y = y;
@@ -3503,7 +3552,7 @@ pub const Spark = struct {
                 // The button is the one that took the capture, not 0.
                 // A move during a middle-drag that claimed to be button 0
                 // would defeat the very guards this beat turned on.
-                try dispatchHit(hit, .{
+                try dispatchHit(self, hit, .{
                     .mouse_move = self.mouseEventFor(hit, x, y, self.capture_button, true),
                 }, self.host_state);
             }
@@ -3532,6 +3581,10 @@ pub const Spark = struct {
     /// nothing else. The scan is not skipped for a stationary pointer on
     /// purpose — the document can re-lay-out under a still cursor (a
     /// `:::fold` opening), and the enter/leave that follows is real.
+    ///
+    /// A hover that changed what a component draws raises
+    /// `redraw_requested`; one that merely slid around inside the same
+    /// node raises nothing. See `takeRedrawRequest`.
     pub fn dispatchHover(self: *Spark, x: f32, y: f32) !void {
         self.mouse_x = x;
         self.mouse_y = y;
@@ -3557,7 +3610,7 @@ pub const Spark = struct {
                 // `local` drift further every relayout.
                 self.hovered = t;
                 if (x != self.hover_x or y != self.hover_y) {
-                    try dispatchHoverHit(t, .move, x, y, self.pointer_mods, self.host_state);
+                    try dispatchHoverHit(self, t, .move, x, y, self.pointer_mods, self.host_state);
                 }
                 self.hover_x = x;
                 self.hover_y = y;
@@ -3570,7 +3623,7 @@ pub const Spark = struct {
         self.hover_y = y;
         if (target) |t| {
             self.hovered = t;
-            try dispatchHoverHit(t, .enter, x, y, self.pointer_mods, self.host_state);
+            try dispatchHoverHit(self, t, .enter, x, y, self.pointer_mods, self.host_state);
         }
     }
 
@@ -3594,7 +3647,7 @@ pub const Spark = struct {
         self.hovered = null;
         for (self.drawlist.hits.items) |h| {
             if (h.ctx != old.ctx) continue;
-            try dispatchHoverHit(old, .leave, x, y, self.pointer_mods, self.host_state);
+            try dispatchHoverHit(self, old, .leave, x, y, self.pointer_mods, self.host_state);
             return;
         }
     }
@@ -3647,12 +3700,17 @@ pub const Spark = struct {
             if (x < hit.box.x or x >= hit.box.x + hit.box.w) continue;
             if (y < hit.box.y or y >= hit.box.y + hit.box.h) continue;
             const eff: *anyopaque = hit.state orelse @ptrCast(self.host_state);
+            const before = versionOf(hit);
             if (try on_scroll(hit.ctx, .{
                 .local = .{ x - hit.box.x, y - hit.box.y },
                 .dx = dx,
                 .dy = dy,
                 .mods = self.pointer_mods,
             }, eff)) {
+                // Taking the notch is not the same as having moved: a
+                // `:::clip` already at its stop takes it and stays put.
+                // The version says which, same as every other channel.
+                noteRedraw(self, hit, before);
                 return true;
             }
         }
@@ -3707,7 +3765,7 @@ pub const Spark = struct {
 
         if (down) {
             if (self.captured) |hit| {
-                try dispatchHit(hit, .{
+                try dispatchHit(self, hit, .{
                     .mouse_down = self.mouseEventFor(hit, x, y, button, true),
                 }, self.host_state);
                 return;
@@ -3728,20 +3786,20 @@ pub const Spark = struct {
             };
             const old_focus_ctx: ?*anyopaque = if (self.focused) |f| f.ctx else null;
             if (new_focus_ctx != old_focus_ctx) {
-                if (self.focused) |old| dispatchHit(old, .focus_lost, self.host_state) catch {};
+                if (self.focused) |old| dispatchHit(self, old, .focus_lost, self.host_state) catch {};
                 self.focused = if (maybe_hit) |h| if (h.focusable) h else null else null;
-                if (self.focused) |new| dispatchHit(new, .focus_gained, self.host_state) catch {};
+                if (self.focused) |new| dispatchHit(self, new, .focus_gained, self.host_state) catch {};
             }
             if (maybe_hit) |hit| {
                 self.captured = hit;
                 self.capture_button = button;
-                try dispatchHit(hit, .{
+                try dispatchHit(self, hit, .{
                     .mouse_down = self.mouseEventFor(hit, x, y, button, true),
                 }, self.host_state);
             }
         } else {
             if (self.captured) |hit| {
-                try dispatchHit(hit, .{
+                try dispatchHit(self, hit, .{
                     .mouse_up = self.mouseEventFor(hit, x, y, button, false),
                 }, self.host_state);
                 if (button == self.capture_button) self.captured = null;
@@ -3762,7 +3820,7 @@ pub const Spark = struct {
     /// (raw GLFW keycode + mods).
     pub fn dispatchKey(self: *Spark, ev: element.KeyEvent) !void {
         if (self.focused) |hit| {
-            try dispatchHit(hit, .{ .key_down = ev }, self.host_state);
+            try dispatchHit(self, hit, .{ .key_down = ev }, self.host_state);
         }
     }
 
@@ -3770,7 +3828,7 @@ pub const Spark = struct {
     /// path). No-op when no focus.
     pub fn dispatchChar(self: *Spark, codepoint: u32) !void {
         if (self.focused) |hit| {
-            try dispatchHit(hit, .{ .char_input = codepoint }, self.host_state);
+            try dispatchHit(self, hit, .{ .char_input = codepoint }, self.host_state);
         }
     }
 
@@ -3779,7 +3837,7 @@ pub const Spark = struct {
     /// to take focus back (e.g. on click-outside the doc surface).
     pub fn clearFocus(self: *Spark) void {
         if (self.focused) |old| {
-            dispatchHit(old, .focus_lost, self.host_state) catch {};
+            dispatchHit(self, old, .focus_lost, self.host_state) catch {};
             self.focused = null;
         }
     }
@@ -4010,19 +4068,48 @@ fn registerEmbeddedPassShaders(
     try single_source.compile(pass_mod.shaderIdFromName("gbuffer.frag"), &shaders.gbuffer_frag);
 }
 
-fn dispatchHit(hit: element.Hit, event: element.InputEvent, default_state: *state_mod.State) !void {
+/// What a component says about its own picture right now, or `null` if
+/// it keeps no counter at all. The two calls either side of a handler
+/// are what `noteRedraw` compares.
+fn versionOf(hit: element.Hit) ?u64 {
+    const get = hit.vtable.content_version orelse return null;
+    return get(hit.ctx);
+}
+
+/// Raise `redraw_requested` iff the handler that just ran changed the
+/// component's picture. `before` is `versionOf(hit)` read before it ran.
+///
+/// **A component that cannot say is believed.** No `content_version`
+/// means both reads are null, and this counts that as changed. The other
+/// way round — assume unchanged — is a component that silently never
+/// redraws, which is the exact bug this whole seam exists to kill, one
+/// level further in and much harder to see.
+fn noteRedraw(sp: *Spark, hit: element.Hit, before: ?u64) void {
+    const after = versionOf(hit);
+    if (before == null or after == null or before.? != after.?) {
+        sp.redraw_requested = true;
+    }
+}
+
+fn dispatchHit(sp: *Spark, hit: element.Hit, event: element.InputEvent, default_state: *state_mod.State) !void {
     const on_input = hit.vtable.on_input orelse return;
     // Embedded-doc walks stamp the child state pointer onto the Hit;
     // top-level walks leave it null → fall back to the dispatcher's
     // default (the host's root State).
     const eff: *anyopaque = hit.state orelse @ptrCast(default_state);
+    // `defer`, not a line after the call: a handler that mutates and
+    // THEN fails has still changed the picture, and a frame that never
+    // runs is how the failure would have been hidden.
+    const before = versionOf(hit);
+    defer noteRedraw(sp, hit, before);
     try on_input(hit.ctx, event, eff);
 }
 
 /// Deliver one hover phase to a Hit. Same state-routing rule as
 /// `dispatchHit` — an embedded document's components get that doc's
-/// state, not the host's root.
+/// state, not the host's root — and the same redraw bookkeeping.
 fn dispatchHoverHit(
+    sp: *Spark,
     hit: element.Hit,
     phase: element.HoverPhase,
     x: f32,
@@ -4032,6 +4119,8 @@ fn dispatchHoverHit(
 ) !void {
     const on_hover = hit.vtable.on_hover orelse return;
     const eff: *anyopaque = hit.state orelse @ptrCast(default_state);
+    const before = versionOf(hit);
+    defer noteRedraw(sp, hit, before);
     try on_hover(hit.ctx, .{
         .local = .{ x - hit.box.x, y - hit.box.y },
         .phase = phase,
@@ -4312,6 +4401,26 @@ const InputProbe = struct {
     /// separate lists cannot express it.
     sink: ?*InputProbe = null,
 
+    /// What every shipped component keeps: a counter that moves when
+    /// this component's picture does. Only `probe_versioned` publishes
+    /// it — the other two vtables leave `content_version` null, which is
+    /// itself a case the redraw gates need.
+    version: u64 = 0,
+    /// Does an event actually change this probe's picture? The redraw
+    /// gates need both answers from the same code: a component that
+    /// moved, and one that was merely touched and has nothing new to
+    /// draw. A real component decides this per event; a probe is told.
+    moves: bool = true,
+
+    fn bump(self: *InputProbe) void {
+        if (self.moves) self.version +%= 1;
+    }
+
+    fn contentVersion(ctx: *anyopaque) u64 {
+        const self: *const InputProbe = @ptrCast(@alignCast(ctx));
+        return self.version;
+    }
+
     fn layoutAndRender(
         _: *anyopaque,
         _: [2]f32,
@@ -4324,6 +4433,10 @@ const InputProbe = struct {
 
     fn onInput(ctx: *anyopaque, event: element.InputEvent, _: *anyopaque) anyerror!void {
         const self: *InputProbe = @ptrCast(@alignCast(ctx));
+        // On `self`, never on the sink: `content_version` is read
+        // through this Hit's own `ctx`, and a probe that bumped its
+        // neighbour's counter would report the wrong component redrawn.
+        self.bump();
         const p = self.sink orelse self;
         const rec: Rec = switch (event) {
             .mouse_down => |m| .{ .kind = .down, .ev = m },
@@ -4338,6 +4451,7 @@ const InputProbe = struct {
 
     fn onHover(ctx: *anyopaque, event: element.HoverEvent, _: *anyopaque) anyerror!void {
         const self: *InputProbe = @ptrCast(@alignCast(ctx));
+        self.bump();
         const p = self.sink orelse self;
         if (p.hn >= p.hovers.len) return;
         p.hovers[p.hn] = event;
@@ -4360,6 +4474,22 @@ const probe_hover_too = element.ElementVTable{
     .layout_and_render = InputProbe.layoutAndRender,
     .on_input = InputProbe.onInput,
     .on_hover = InputProbe.onHover,
+};
+/// The same probe, publishing a `content_version` the way every shipped
+/// component does. The redraw gates want this one; the two above stay
+/// version-less because "a component that cannot say" is its own case.
+const probe_versioned = element.ElementVTable{
+    .layout_and_render = InputProbe.layoutAndRender,
+    .on_input = InputProbe.onInput,
+    .on_hover = InputProbe.onHover,
+    .content_version = InputProbe.contentVersion,
+};
+/// Versioned, and deaf to the pointer: no `on_hover` at all. A hover
+/// over one of these must cost nothing, which is most of the document.
+const probe_versioned_no_hover = element.ElementVTable{
+    .layout_and_render = InputProbe.layoutAndRender,
+    .on_input = InputProbe.onInput,
+    .content_version = InputProbe.contentVersion,
 };
 
 fn probeHit(p: *InputProbe, vt: *const element.ElementVTable, x: f32, y: f32, w: f32, h: f32) element.Hit {
@@ -4852,6 +4982,177 @@ test "hover: a component that never declared on_hover is untouched by any of thi
     try sp.dispatchHover(400, 400);
     try testing.expectEqual(@as(usize, 0), p.n);
     try testing.expectEqual(@as(usize, 0), p.hn);
+}
+
+// ── The redraw request: "does anything need drawing again?" ─────────
+//
+// Reported by Christian against `:::nodegraph`: *"dragging nodes doesn't
+// update the display until you let go of the mouse."* Hover was broken
+// the same way and nobody had noticed yet.
+//
+// The cause was one flag answering two questions. `processInput` was the
+// only input path in the reference host that never set `State.dirty` —
+// `keyCb`, `charCb` and `scrollCb` all did — so a drag re-laid nothing
+// out, and the `State.set` at `mouse_up` finally dirtied it and the node
+// appeared where it had already been for half a second.
+//
+// The cure is not "dirty on every move". That is the same mistake with
+// the sign flipped: a pointer wandering across a document would cost a
+// walk a frame forever. So the three gates below come in a set — two
+// that the picture updates, and one that a pointer over nothing costs
+// NOTHING. Delete the third and the first two are satisfied by
+// `redraw_requested = true` at the top of every dispatcher.
+
+test "redraw: a drag asks for a frame mid-gesture, not only at mouse_up" {
+    // THE reported bug. The gate is the seam under the host loop rather
+    // than the loop itself: `main.zig` can be rewritten around this and
+    // the promise still holds.
+    //
+    // Mutation: delete the `defer noteRedraw(sp, hit, before)` in
+    // `dispatchHit`. Every move below reports false and the gate is red
+    // three times over — which is exactly the shipped behaviour, so the
+    // gate is watching the bug and not a paraphrase of the fix.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+
+    var p = InputProbe{};
+    try sp.drawlist.hits.append(probeHit(&p, &probe_versioned, 0, 0, 100, 50));
+
+    try sp.dispatchMouseButtonN(10, 10, true, 0);
+    try testing.expect(sp.takeRedrawRequest()); // the press itself
+    // and it CLEARS: a request that stayed raised would make the two
+    // assertions below pass against a dispatcher that does nothing.
+    try testing.expect(!sp.takeRedrawRequest());
+
+    var step: f32 = 11;
+    while (step <= 13) : (step += 1) {
+        try sp.dispatchMouseMove(step, 10);
+        try testing.expect(sp.takeRedrawRequest());
+    }
+
+    try sp.dispatchMouseButtonN(13, 10, false, 0);
+    try testing.expect(sp.takeRedrawRequest());
+}
+
+test "redraw: a hover that changes target asks for a frame" {
+    // The half nobody had noticed. A node in a graph editor lights on
+    // enter and unlights on leave, and both were invisible until the
+    // mouse happened to do something that wrote state.
+    //
+    // Mutation: delete the `defer noteRedraw(sp, hit, before)` in
+    // `dispatchHoverHit`. Both assertions go red — and the third gate
+    // below stays green, which is how you tell the two apart.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+
+    var a = InputProbe{};
+    var b = InputProbe{};
+    try sp.drawlist.hits.append(probeHit(&a, &probe_versioned, 0, 0, 100, 50));
+    try sp.drawlist.hits.append(probeHit(&b, &probe_versioned, 100, 0, 100, 50));
+
+    try sp.dispatchHover(10, 10); // enter a
+    try testing.expect(sp.takeRedrawRequest());
+    try sp.dispatchHover(150, 10); // leave a, enter b
+    try testing.expect(sp.takeRedrawRequest());
+    try sp.dispatchHover(400, 400); // leave b
+    try testing.expect(sp.takeRedrawRequest());
+}
+
+test "redraw: a pointer over nothing costs no frames at all" {
+    // The cost half, and the reason this is a version comparison rather
+    // than "a dispatch happened". Counted rather than asserted one at a
+    // time, because the number is the point: this is what a host would
+    // have re-laid-out.
+    //
+    // Mutation: `self.redraw_requested = true` at the top of
+    // `dispatchHover` and `dispatchMouseMove` — i.e. dirty
+    // unconditionally, the fix everyone reaches for first. The three
+    // counts below become 30, 30 and 30, red on all three, while both
+    // gates above stay green.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+
+    // Over nothing whatsoever: no hit under the pointer at all.
+    var frames: usize = 0;
+    for (0..30) |i| {
+        const x: f32 = 400 + @as(f32, @floatFromInt(i));
+        try sp.dispatchHover(x, 400);
+        if (sp.takeRedrawRequest()) frames += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), frames);
+
+    // Over something that is simply not interested in the pointer, which
+    // is most of a document: a paragraph, a heading, a button that only
+    // cares about clicks.
+    var deaf = InputProbe{};
+    try sp.drawlist.hits.append(probeHit(&deaf, &probe_versioned_no_hover, 0, 0, 100, 50));
+    frames = 0;
+    for (0..30) |i| {
+        const x: f32 = 10 + @as(f32, @floatFromInt(i));
+        try sp.dispatchHover(x, 10);
+        if (sp.takeRedrawRequest()) frames += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), frames);
+    try testing.expectEqual(@as(usize, 0), deaf.hn);
+
+    // And the sharp one: a component that HEARS the move and has nothing
+    // new to draw — the pointer wandering around inside the node it is
+    // already hovering. `:::nodegraph` is exactly this: its `on_hover`
+    // bumps its version only when the pick changes.
+    var still = InputProbe{ .moves = false };
+    sp.drawlist.hits.clearRetainingCapacity();
+    sp.hovered = null;
+    try sp.drawlist.hits.append(probeHit(&still, &probe_versioned, 0, 0, 100, 50));
+    frames = 0;
+    for (0..30) |i| {
+        const x: f32 = 10 + @as(f32, @floatFromInt(i));
+        try sp.dispatchHover(x, 10);
+        if (sp.takeRedrawRequest()) frames += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), frames);
+    // Rule 1: assert it was actually LISTENING. Without this the gate
+    // passes just as well against a hover channel that dispatches
+    // nothing, which is not what is being claimed.
+    try testing.expectEqual(@as(usize, 30), still.hn);
+}
+
+test "redraw: a component with no content_version is believed, not assumed still" {
+    // The safe direction of the version comparison, made explicit. A
+    // component that keeps no counter cannot say whether it changed, and
+    // guessing "unchanged" would be this same bug one level in — silent,
+    // and per-component instead of global.
+    //
+    // Mutation: in `noteRedraw`, `if (before != null and after != null
+    // and before.? != after.?)`. Red here; green everywhere else in the
+    // suite, because every shipped component keeps a version.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+
+    var p = InputProbe{ .moves = false }; // and `probe_hover_too` has no getter
+    try sp.drawlist.hits.append(probeHit(&p, &probe_hover_too, 0, 0, 100, 50));
+
+    try sp.dispatchHover(10, 10);
+    try testing.expect(sp.takeRedrawRequest());
+    try sp.dispatchMouseButtonN(10, 10, true, 0);
+    try testing.expect(sp.takeRedrawRequest());
+    try sp.dispatchMouseMove(20, 10);
+    try testing.expect(sp.takeRedrawRequest());
 }
 
 // ── The host window (panels campaign, beat 3) ───────────────────────

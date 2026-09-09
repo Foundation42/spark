@@ -100,6 +100,19 @@ fn preDrawCb(ctx: ?*anyopaque, cmd: vk.c.VkCommandBuffer, extent: vk.c.VkExtent2
         h.state.dirty = true;
     }
 
+    // Two questions, and until `takeRedrawRequest` existed the host
+    // answered both with `State.dirty`. "Has the document's layout
+    // changed?" is what that flag means, and every input path that
+    // writes state raises it on the way past. "Does anything need
+    // drawing again?" is the other one, and a node dragged inside a
+    // `:::nodegraph` answers yes to it while writing nothing at all —
+    // which is why a drag used to sit frozen until the button came up
+    // and then teleport. Spark answers the second question itself now;
+    // folding it into `dirty` here (rather than into `re_layout`) means
+    // a frame that fails to lay out retries on the next one instead of
+    // swallowing the request.
+    if (h.spark.takeRedrawRequest()) h.state.dirty = true;
+
     const extent_changed = extent.width != h.last_extent.width or extent.height != h.last_extent.height;
     const re_layout = extent_changed or h.state.dirty;
     h.last_extent = extent;

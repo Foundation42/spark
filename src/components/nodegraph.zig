@@ -2063,6 +2063,109 @@ test "nodegraph: a hover change bumps the content version" {
     try testing.expect(c.version != before);
 }
 
+// ── The screen actually updating ───────────────────────────────────
+//
+// The version bump above is half the story and was, for one release,
+// the whole of it: the component computed a new picture every move and
+// the host never ran a frame to draw it. Christian, using this
+// component: *"dragging nodes doesn't update the display until you let
+// go of the mouse."* `Spark.takeRedrawRequest` is the seam that fixes
+// it and `spark.zig` gates the seam; these two gates are the CUSTOMER's
+// side of it — the real component, the real vtable, the real
+// dispatcher, no window.
+
+test "nodegraph: a drag through the dispatcher asks for a frame on every move" {
+    // Mutation: delete the `defer noteRedraw(sp, hit, before)` in
+    // `Spark.dispatchHit`. Five moves, zero frames, red — and the node
+    // has still moved, which is exactly what the bug looked like: the
+    // graph was right and the screen was a second behind it.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = spark_mod.Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+
+    const c = try makeGraph(two_node_graph, &.{});
+    defer dropGraph(c);
+    c.view = .{ .pan = .{ 0, 0 }, .zoom = 1 };
+
+    // Canvas at the world origin, so world coords and `local` coincide
+    // and the gate is about the redraw and not about the transform.
+    try sp.drawlist.hits.append(.{
+        .box = .{ .x = 0, .y = 0, .w = 600, .h = 400 },
+        .vtable = &vtable,
+        .ctx = @ptrCast(c),
+        .state = @ptrCast(&st),
+    });
+
+    const start = c.nodes.items[0].pos;
+    const press = c.view.toLocal(.{ start[0] + 10, start[1] + 6 });
+    try sp.dispatchMouseButtonN(press[0], press[1], true, 0);
+    try testing.expect(c.grab == .node);
+    _ = sp.takeRedrawRequest(); // the press: not what this gate is about
+
+    var frames: usize = 0;
+    for (1..6) |i| {
+        const step: f32 = @floatFromInt(i);
+        try sp.dispatchMouseMove(press[0] + step * 4, press[1]);
+        if (sp.takeRedrawRequest()) frames += 1;
+    }
+    try testing.expectEqual(@as(usize, 5), frames);
+    // The node moved too — otherwise this gate would pass just as well
+    // against a dispatcher that raises the flag and delivers nothing.
+    try testing.expectApproxEqAbs(start[0] + 20, c.nodes.items[0].pos[0], 1e-3);
+}
+
+test "nodegraph: a pointer wandering inside the node it already hovers asks for nothing" {
+    // The cost half at the customer. `onHover` bumps the version only
+    // when the PICK changes, so twenty moves inside one node are twenty
+    // frames nobody needs — and the naive cure (dirty on every move)
+    // hands the host exactly those twenty.
+    //
+    // Mutation: drop the `if (!std.meta.eql(before, c.hovered))` guard in
+    // `onHover` and bump unconditionally. Red at 20, and the picture is
+    // identical in all twenty.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = spark_mod.Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+
+    const c = try makeGraph(two_node_graph, &.{});
+    defer dropGraph(c);
+    c.view = .{ .pan = .{ 0, 0 }, .zoom = 1 };
+    try sp.drawlist.hits.append(.{
+        .box = .{ .x = 0, .y = 0, .w = 600, .h = 400 },
+        .vtable = &vtable,
+        .ctx = @ptrCast(c),
+        .state = @ptrCast(&st),
+    });
+
+    // Arriving on the node is a change and costs a frame.
+    const n0 = c.nodes.items[0];
+    try sp.dispatchHover(n0.pos[0] + 6, n0.pos[1] + 6);
+    try testing.expect(sp.takeRedrawRequest());
+    try testing.expect(c.hovered == .node);
+
+    // Wandering about inside it is not. The walk stays clear of the
+    // pins, which stand proud of the body and ARE a different pick.
+    var frames: usize = 0;
+    for (0..20) |i| {
+        const dx: f32 = 20 + @as(f32, @floatFromInt(i)) * 4;
+        try sp.dispatchHover(n0.pos[0] + dx, n0.pos[1] + 8);
+        if (sp.takeRedrawRequest()) frames += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), frames);
+
+    // Leaving for the canvas is a change again — otherwise the ring
+    // stays lit on a node the pointer left, which is the bug the
+    // enter/leave pairing gate above exists for.
+    try sp.dispatchHover(n0.pos[0] + 6, n0.pos[1] + 300);
+    try testing.expect(sp.takeRedrawRequest());
+}
+
 // ── The wheel ──────────────────────────────────────────────────────
 
 test "nodegraph: the wheel zooms, and gives the notch back at the clamp" {
