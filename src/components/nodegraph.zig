@@ -30,7 +30,7 @@
 //! language; it translates a parsed program into the grammar below and
 //! translates edits back. Nothing in this file mentions rill.
 //!
-//! ## The grammar — one parser, two doors
+//! ## The grammar — one parser, three doors
 //!
 //! Line-oriented, `kind key=value …`, the same shape as a `:::name {…}`
 //! header so an author reads it with the eye they already have. Blank
@@ -80,6 +80,15 @@
 //!     a document rewrite. `action=graph` replaces everything;
 //!     `action=move` applies `pos` records only and leaves the structure
 //!     alone.
+//!   * `readDescription(gpa, text)` is the door with no component behind
+//!     it at all, for the caller that WRITES this grammar rather than
+//!     reading it. matryoshka generates a payload from a parsed rill
+//!     program and wanted to assert that its nodes and links survive
+//!     spark's parser; the only alternative was a second parser over
+//!     there, and two answers to "what does this line mean" drift the
+//!     first time either side gains a rule. `Description` is what the
+//!     component holds and what that door hands out — same struct, same
+//!     `read`, one implementation.
 //!
 //! ## The transform, and where graph space stops
 //!
@@ -543,132 +552,114 @@ pub fn clipSegment(seg: Seg, r: Rect) ?Seg {
     };
 }
 
-// ── Component ───────────────────────────────────────────────────────
+// ── The description, and the public door to it ──────────────────────
 
-/// What a press grabbed, latched at `mouse_down` and held until the
-/// button comes up.
+/// Everything a description text says, and nothing about who is reading
+/// it: the nodes, the pins, the links, the camera, and the count of
+/// lines nobody could read.
 ///
-/// The latch is not a convenience. It is the gate on `ingest`: while a
-/// grab is live the widget is the truth and a description arriving from
-/// the plane is refused, because `State.set` notifies synchronously and
-/// a re-parse landing between a drag's two writes would move the node
-/// out from under the finger holding it. Between gestures the plane is
-/// the truth; during one, we are.
-const Grab = union(enum) {
-    none,
-    /// A node is being dragged. `press_local` and `start_pos` together
-    /// make the drag a pure graph-space delta, so it tracks the cursor
-    /// at any zoom and does not accumulate error over a long drag.
-    node: struct {
-        index: u32,
-        press_local: [2]f32,
-        start_pos: [2]f32,
-        moved: bool,
-    },
-    /// The canvas is being panned.
-    pan: struct {
-        press_local: [2]f32,
-        start_pan: [2]f32,
-    },
-    /// A pin is held. It moves nothing in this beat — making and
-    /// breaking links is a later one — and it exists anyway so that
-    /// EVERY press latches something.
-    ///
-    /// Without it a press on a pin is the one route into
-    /// `writeSelection` that runs with `ingest` still open, which is
-    /// three quarters of a guard. The beat that makes this press start
-    /// a link drag would have inherited that hole with no sign of it.
-    pin: u32,
-};
-
-pub const Hover = union(enum) {
-    none,
-    node: u32,
-    pin: u32,
-};
-
-const Component = struct {
-    allocator: std.mem.Allocator,
+/// **One implementation, two callers.** `:::nodegraph` holds one of
+/// these and puts a reader in front of it — a selection, a hover, a
+/// gesture latch, a content version. `readDescription` hands one
+/// straight to a caller that has no component and no document, which is
+/// what a host GENERATING this grammar needs in order to assert that
+/// what it emitted survives spark's own parser. Without that door the
+/// host writes a second parser, and two answers to "what does this line
+/// mean" drift the first time either side gains a rule.
+///
+/// The alternative offered was making `Component` public. That is
+/// weaker: it exposes a whole component — its gesture latch, its bound
+/// state paths, its write-back — to get at a parser.
+///
+/// Rejected names: `Graph` (this file already means something by that
+/// word; `Node`, `Pin` and `Link` ARE the graph, and a thing holding a
+/// camera and a bad-line count is not one), `ParsedDescription` (the
+/// `read` is what parses — a description is what it produced), `Payload`
+/// (what the host calls the text going IN, not the shape coming out).
+pub const Description = struct {
+    /// Where the three lists live, and where the arena is freed from.
+    gpa: std.mem.Allocator,
     /// Owns every string the description produced. Reset wholesale on
-    /// re-parse; the three lists below keep their capacity across it.
+    /// re-read; the three lists below keep their capacity across it.
+    /// Heap-allocated, so a `Description` can be returned by value
+    /// without the vended arena allocator pointing at a dead stack slot.
     arena: *std.heap.ArenaAllocator,
 
     nodes: std.ArrayList(Node),
     pins: std.ArrayList(Pin),
     links: std.ArrayList(Link),
 
-    body: component_mod.Body = .{},
+    /// The camera a `view` record seeds. In-out across a read: a `view`
+    /// line names only the fields it mentions and the rest keep what
+    /// they had, which for a live component is wherever the reader has
+    /// panned to.
     view: View = .{},
-    width: box_helpers.Length = .{ .percent = 1.0 },
-    height: f32 = 420,
 
-    /// Bare state paths, `:::slider {target=}`-style. Empty means "not
-    /// bound", and an unbound channel is simply never written.
-    positions_path: []u8,
-    selected_path: []u8,
-
-    selected: ?u32 = null,
-    hovered: Hover = .none,
-    grab: Grab = .none,
-
-    /// What we last wrote to each path, so a write that would change
-    /// nothing is not made at all — the same gate `:::trackball`
-    /// keeps, and for the same reason.
-    last_selected_written: []u8,
-
-    /// Set aside by `handleUpdate` when a push lands mid-gesture, applied
-    /// when the gesture ends. The body channel needs no such queue: it is
-    /// re-delivered on every re-parse, and the drag's own `State.set`
-    /// guarantees one. A `handle_update` is a one-shot, so dropping it
-    /// would be data loss.
-    pending: ?[]u8 = null,
-    pending_positions_only: bool = false,
-
-    /// Unreadable description lines, shown as a strip rather than
-    /// swallowed. A host that ships a malformed record should find out
-    /// from the picture.
+    /// Unreadable description lines, counted rather than swallowed. The
+    /// component draws a strip; a host asserting on its own output reads
+    /// the number. A `link` naming a pin nobody declared lands here too,
+    /// which is why the count is only final once the links resolve.
     bad_lines: u32 = 0,
 
-    version: u64 = 0,
-
-    fn gesturing(self: *const Component) bool {
-        return self.grab != .none;
+    pub fn init(gpa: std.mem.Allocator) !Description {
+        const arena = try gpa.create(std.heap.ArenaAllocator);
+        errdefer gpa.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(gpa);
+        return .{
+            .gpa = gpa,
+            .arena = arena,
+            .nodes = std.ArrayList(Node).init(gpa),
+            .pins = std.ArrayList(Pin).init(gpa),
+            .links = std.ArrayList(Link).init(gpa),
+        };
     }
 
-    // ── Reading the description ────────────────────────────────────
+    pub fn deinit(self: *Description) void {
+        self.nodes.deinit();
+        self.pins.deinit();
+        self.links.deinit();
+        self.arena.deinit();
+        self.gpa.destroy(self.arena);
+    }
 
-    fn clearGraph(self: *Component) void {
+    /// Forget every node, pin and link, and every string they hold.
+    /// The camera survives: `pan` and `zoom` are where the reader is
+    /// looking, and a description that does not mention `view` must not
+    /// throw that away.
+    fn clearGraph(self: *Description) void {
         self.nodes.clearRetainingCapacity();
         self.pins.clearRetainingCapacity();
         self.links.clearRetainingCapacity();
-        self.selected = null;
-        self.hovered = .none;
         _ = self.arena.reset(.retain_capacity);
     }
 
-    fn findNode(self: *const Component, id: []const u8) ?u32 {
+    fn findNode(self: *const Description, id: []const u8) ?u32 {
         for (self.nodes.items, 0..) |n, i| {
             if (std.mem.eql(u8, n.id, id)) return @intCast(i);
         }
         return null;
     }
 
-    fn findPin(self: *const Component, node: u32, id: []const u8) ?u32 {
+    fn findPin(self: *const Description, node: u32, id: []const u8) ?u32 {
         for (self.pins.items, 0..) |p, i| {
             if (p.node == node and std.mem.eql(u8, p.id, id)) return @intCast(i);
         }
         return null;
     }
 
-    /// Parse `text`. `positions_only` applies `pos` records to the graph
-    /// that is already there and ignores everything else — the `move`
-    /// action, and the shape that makes an echoed write-back a no-op.
-    fn parse(self: *Component, text: []const u8, positions_only: bool) !void {
+    /// Read `text` into this description, replacing what was there.
+    /// `positions_only` applies `pos` records to the graph already held
+    /// and ignores everything else — the `move` action, and the shape
+    /// that makes an echoed write-back a no-op.
+    ///
+    /// The one parser. `readDescription` is this plus an owner;
+    /// `Component.parse` is this plus a reader.
+    pub fn read(self: *Description, text: []const u8, positions_only: bool) !void {
         const a = self.arena.allocator();
         if (!positions_only) self.clearGraph();
         self.bad_lines = 0;
 
-        var pending = std.ArrayList(PendingLink).init(self.allocator);
+        var pending = std.ArrayList(PendingLink).init(self.gpa);
         defer pending.deinit();
 
         var lines = std.mem.splitScalar(u8, text, '\n');
@@ -816,10 +807,9 @@ const Component = struct {
                 try self.links.append(.{ .from = from, .to = to, .tint = pl.tint });
             }
         }
-        self.version +%= 1;
     }
 
-    fn resolveRef(self: *const Component, ref: []const u8) ?u32 {
+    fn resolveRef(self: *const Description, ref: []const u8) ?u32 {
         const parts = splitRef(ref) orelse return null;
         const node = self.findNode(parts.node) orelse return null;
         return self.findPin(node, parts.pin);
@@ -828,7 +818,7 @@ const Component = struct {
     /// Size every node that did not state its own. Runs after the whole
     /// description is read, because the pin count that drives the height
     /// is not known until then.
-    fn finalise(self: *Component) void {
+    fn finalise(self: *Description) void {
         for (self.nodes.items) |*n| {
             if (!n.w_given) n.size[0] = NODE_W;
             if (!n.h_given) {
@@ -840,7 +830,7 @@ const Component = struct {
     }
 
     /// A pin's centre, in graph space.
-    pub fn pinCentre(self: *const Component, pin: u32) [2]f32 {
+    pub fn pinCentre(self: *const Description, pin: u32) [2]f32 {
         const p = self.pins.items[pin];
         const n = self.nodes.items[p.node];
         const y = n.pos[1] + HEADER_H + PIN_TOP + @as(f32, @floatFromInt(p.slot)) * PIN_PITCH;
@@ -852,7 +842,7 @@ const Component = struct {
     /// of the body and their targets deliberately overlap it — then
     /// nodes in reverse declaration order, so the one drawn last (on
     /// top) is the one picked.
-    pub fn pick(self: *const Component, g: [2]f32) Hover {
+    pub fn pick(self: *const Description, g: [2]f32) Hover {
         var i = self.pins.items.len;
         while (i > 0) {
             i -= 1;
@@ -867,6 +857,141 @@ const Component = struct {
             if (rectContains(nodeRect(self.nodes.items[j]), g)) return .{ .node = @intCast(j) };
         }
         return .none;
+    }
+};
+
+/// Read a `:::nodegraph` description and hand back what it says.
+///
+/// The door the parser was behind. spark RENDERS this grammar and a host
+/// GENERATES it, and until now the only way for that host to check its
+/// own output was to write a parser of its own. Same text, same rules,
+/// one implementation.
+///
+/// The returned `Description` owns every string in it — nothing points
+/// back into `text` — and the caller `deinit`s it.
+///
+/// Unreadable lines are counted in `bad_lines`, exactly as the component
+/// counts them, and are never an error: a description is a picture with
+/// a strip along the bottom, not a refusal. A caller that wants a
+/// refusal checks the count.
+///
+/// Rejected names: `parse` (a bare verb, and spark has a dozen of them),
+/// `parseDescription` (the same one word longer), `readGraph` (the thing
+/// that comes back is not a graph — see `Description`).
+pub fn readDescription(gpa: std.mem.Allocator, text: []const u8) !Description {
+    var d = try Description.init(gpa);
+    errdefer d.deinit();
+    try d.read(text, false);
+    return d;
+}
+
+// ── Component ───────────────────────────────────────────────────────
+
+/// What a press grabbed, latched at `mouse_down` and held until the
+/// button comes up.
+///
+/// The latch is not a convenience. It is the gate on `ingest`: while a
+/// grab is live the widget is the truth and a description arriving from
+/// the plane is refused, because `State.set` notifies synchronously and
+/// a re-parse landing between a drag's two writes would move the node
+/// out from under the finger holding it. Between gestures the plane is
+/// the truth; during one, we are.
+const Grab = union(enum) {
+    none,
+    /// A node is being dragged. `press_local` and `start_pos` together
+    /// make the drag a pure graph-space delta, so it tracks the cursor
+    /// at any zoom and does not accumulate error over a long drag.
+    node: struct {
+        index: u32,
+        press_local: [2]f32,
+        start_pos: [2]f32,
+        moved: bool,
+    },
+    /// The canvas is being panned.
+    pan: struct {
+        press_local: [2]f32,
+        start_pan: [2]f32,
+    },
+    /// A pin is held. It moves nothing in this beat — making and
+    /// breaking links is a later one — and it exists anyway so that
+    /// EVERY press latches something.
+    ///
+    /// Without it a press on a pin is the one route into
+    /// `writeSelection` that runs with `ingest` still open, which is
+    /// three quarters of a guard. The beat that makes this press start
+    /// a link drag would have inherited that hole with no sign of it.
+    pin: u32,
+};
+
+pub const Hover = union(enum) {
+    none,
+    node: u32,
+    pin: u32,
+};
+
+const Component = struct {
+    allocator: std.mem.Allocator,
+
+    /// What the description text says — nodes, pins, links, the camera
+    /// and the unreadable-line count. Everything below is the READER in
+    /// front of it: which node is selected, which is under the pointer,
+    /// what the hand is doing, where the edits are written back to.
+    ///
+    /// The split is the whole of `readDescription`: a host that GENERATES
+    /// this grammar wants the description and has no use for the reader.
+    desc: Description,
+
+    body: component_mod.Body = .{},
+    width: box_helpers.Length = .{ .percent = 1.0 },
+    height: f32 = 420,
+
+    /// Bare state paths, `:::slider {target=}`-style. Empty means "not
+    /// bound", and an unbound channel is simply never written.
+    positions_path: []u8,
+    selected_path: []u8,
+
+    selected: ?u32 = null,
+    hovered: Hover = .none,
+    grab: Grab = .none,
+
+    /// What we last wrote to each path, so a write that would change
+    /// nothing is not made at all — the same gate `:::trackball`
+    /// keeps, and for the same reason.
+    last_selected_written: []u8,
+
+    /// Set aside by `handleUpdate` when a push lands mid-gesture, applied
+    /// when the gesture ends. The body channel needs no such queue: it is
+    /// re-delivered on every re-parse, and the drag's own `State.set`
+    /// guarantees one. A `handle_update` is a one-shot, so dropping it
+    /// would be data loss.
+    pending: ?[]u8 = null,
+    pending_positions_only: bool = false,
+
+    version: u64 = 0,
+
+    fn gesturing(self: *const Component) bool {
+        return self.grab != .none;
+    }
+
+    // ── Reading the description ────────────────────────────────────
+
+    /// Read `text` into this component. The parse itself is
+    /// `Description.read`, which `readDescription` calls too; what is
+    /// added here is what a READER has and a description does not.
+    ///
+    /// Both additions are load-bearing. `selected` and `hovered` name
+    /// nodes by INDEX into a list the read is about to rebuild, so a
+    /// full read has to drop them or they point at whatever now sits in
+    /// that slot. And `version` is what the block cache is keyed on: a
+    /// new description that did not bump it is a graph that changed and
+    /// was drawn from the cache anyway.
+    fn parse(self: *Component, text: []const u8, positions_only: bool) !void {
+        if (!positions_only) {
+            self.selected = null;
+            self.hovered = .none;
+        }
+        try self.desc.read(text, positions_only);
+        self.version +%= 1;
     }
 
     // ── Attributes ─────────────────────────────────────────────────
@@ -905,7 +1030,7 @@ const Component = struct {
                 }
             } else if (std.mem.eql(u8, k, "zoom")) {
                 if (parseNum(attr.value)) |v| {
-                    self.view.zoom = std.math.clamp(v, ZOOM_MIN, ZOOM_MAX);
+                    self.desc.view.zoom = std.math.clamp(v, ZOOM_MIN, ZOOM_MAX);
                 }
             }
         }
@@ -932,7 +1057,7 @@ const Component = struct {
         var buf = std.ArrayList(u8).init(self.allocator);
         defer buf.deinit();
         const w = buf.writer();
-        for (self.nodes.items) |n| {
+        for (self.desc.nodes.items) |n| {
             try w.print("pos id={s} x={d:.2} y={d:.2}\n", .{ n.id, n.pos[0], n.pos[1] });
         }
         try state.set(self.positions_path, buf.items);
@@ -940,7 +1065,7 @@ const Component = struct {
 
     fn writeSelection(self: *Component, state: *state_mod.State) !void {
         if (self.selected_path.len == 0) return;
-        const id: []const u8 = if (self.selected) |i| self.nodes.items[i].id else "";
+        const id: []const u8 = if (self.selected) |i| self.desc.nodes.items[i].id else "";
         if (std.mem.eql(u8, id, self.last_selected_written)) return;
         const dup = try self.allocator.dupe(u8, id);
         self.allocator.free(self.last_selected_written);
@@ -976,15 +1101,9 @@ fn create(
     const c = try allocator.create(Component);
     errdefer allocator.destroy(c);
 
-    const arena = try allocator.create(std.heap.ArenaAllocator);
-    errdefer allocator.destroy(arena);
-    arena.* = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
-
     // Each owned string gets its own errdefer BEFORE it lands in the
     // struct. Duping them inline in the initialiser reads better and
-    // leaks the earlier ones when a later one fails — and leaks all
-    // three, plus the lists, when `ingest` does.
+    // leaks the earlier ones when a later one fails.
     const positions = try allocator.dupe(u8, "");
     errdefer allocator.free(positions);
     const selected = try allocator.dupe(u8, "");
@@ -992,21 +1111,20 @@ fn create(
     const last_selected = try allocator.dupe(u8, "");
     errdefer allocator.free(last_selected);
 
+    // The description is built INSIDE the assignment, deliberately.
+    // Building it a line earlier needs an `errdefer desc.deinit()` that
+    // is still armed after `c.desc` holds the same arena and the same
+    // three lists — and an `ingest` failure then runs both and frees it
+    // twice. There is no window here: one owner from the moment it
+    // exists, and the errdefer below is that owner's.
     c.* = .{
         .allocator = allocator,
-        .arena = arena,
-        .nodes = std.ArrayList(Node).init(allocator),
-        .pins = std.ArrayList(Pin).init(allocator),
-        .links = std.ArrayList(Link).init(allocator),
+        .desc = try Description.init(allocator),
         .positions_path = positions,
         .selected_path = selected,
         .last_selected_written = last_selected,
     };
-    errdefer {
-        c.nodes.deinit();
-        c.pins.deinit();
-        c.links.deinit();
-    }
+    errdefer c.desc.deinit();
     try c.ingest(spec);
     return .{ .vtable = &vtable, .ctx = @ptrCast(c) };
 }
@@ -1018,15 +1136,11 @@ fn update(ctx: *anyopaque, spec: *const components.Spec) anyerror!void {
 
 fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     const c: *Component = @ptrCast(@alignCast(ctx));
-    c.nodes.deinit();
-    c.pins.deinit();
-    c.links.deinit();
+    c.desc.deinit();
     allocator.free(c.positions_path);
     allocator.free(c.selected_path);
     allocator.free(c.last_selected_written);
     if (c.pending) |p| allocator.free(p);
-    c.arena.deinit();
-    allocator.destroy(c.arena);
     allocator.destroy(c);
 }
 
@@ -1136,7 +1250,7 @@ fn drawCanvas(
     out: *element.DrawList,
 ) !void {
     const origin = [2]f32{ canvas.x, canvas.y };
-    const z = c.view.zoom;
+    const z = c.desc.view.zoom;
 
     // ── Ground and grid: TRIANGLES ─────────────────────────────────
     // A quad ground would be drawn on top of every wire, because the
@@ -1148,14 +1262,14 @@ fn drawCanvas(
 
     // ── Links: TRIANGLES, over the ground, under everything else ───
     var seg_buf: [LINK_MAX_SEGS]Seg = undefined;
-    for (c.links.items) |l| {
-        const g0 = c.pinCentre(l.from);
-        const g1 = c.pinCentre(l.to);
-        const from_dir = c.pins.items[l.from].dir;
-        const to_dir = c.pins.items[l.to].dir;
+    for (c.desc.links.items) |l| {
+        const g0 = c.desc.pinCentre(l.from);
+        const g1 = c.desc.pinCentre(l.to);
+        const from_dir = c.desc.pins.items[l.from].dir;
+        const to_dir = c.desc.pins.items[l.to].dir;
 
-        const p0 = c.view.toScreen(origin, g0);
-        const p1 = c.view.toScreen(origin, g1);
+        const p0 = c.desc.view.toScreen(origin, g0);
+        const p1 = c.desc.view.toScreen(origin, g1);
 
         // Cheap reject: a link whose control hull cannot touch the
         // canvas costs one rect test instead of twenty-four strokes.
@@ -1180,8 +1294,8 @@ fn drawCanvas(
     }
 
     // ── Nodes: QUADS, which puts them over every wire for free ─────
-    for (c.nodes.items, 0..) |n, i| {
-        const tl = c.view.toScreen(origin, n.pos);
+    for (c.desc.nodes.items, 0..) |n, i| {
+        const tl = c.desc.view.toScreen(origin, n.pos);
         const sw = n.size[0] * z;
         const sh = n.size[1] * z;
         if (tl[0] + sw < canvas.x or tl[0] > canvas.x + canvas.w) continue;
@@ -1195,7 +1309,7 @@ fn drawCanvas(
         const r = NODE_RADIUS * z;
         const lit = switch (c.hovered) {
             .node => |hn| hn == i,
-            .pin => |hp| c.pins.items[hp].node == i,
+            .pin => |hp| c.desc.pins.items[hp].node == i,
             .none => false,
         };
         const is_sel = c.selected != null and c.selected.? == i;
@@ -1223,8 +1337,8 @@ fn drawCanvas(
     }
 
     // ── Pins: QUADS with a radius, so they are anti-aliased discs ──
-    for (c.pins.items, 0..) |p, i| {
-        const sc = c.view.toScreen(origin, c.pinCentre(@intCast(i)));
+    for (c.desc.pins.items, 0..) |p, i| {
+        const sc = c.desc.view.toScreen(origin, c.desc.pinCentre(@intCast(i)));
         const r = PIN_R * z;
         if (sc[0] + r < canvas.x or sc[0] - r > canvas.x + canvas.w) continue;
         if (sc[1] + r < canvas.y or sc[1] - r > canvas.y + canvas.h) continue;
@@ -1244,7 +1358,7 @@ fn drawCanvas(
     // ── Labels: GLYPHS, over everything ────────────────────────────
     if (z >= LABEL_MIN_ZOOM) try drawLabels(c, canvas, lc, out);
 
-    if (c.bad_lines > 0) try drawErrorStrip(c, canvas, lc, out);
+    if (c.desc.bad_lines > 0) try drawErrorStrip(c, canvas, lc, out);
 }
 
 /// A dot-free line grid, in the triangle layer with the ground.
@@ -1255,17 +1369,17 @@ fn drawCanvas(
 /// is both a look and the reason a zoomed-out fifty-node graph does not
 /// pay for two hundred rules.
 fn drawGrid(c: *Component, canvas: Rect, lc: *element.LayoutCtx, out: *element.DrawList) !void {
-    const step_px = GRID_STEP * c.view.zoom;
+    const step_px = GRID_STEP * c.desc.view.zoom;
     if (step_px < GRID_MIN_PX) return;
 
-    const g0 = c.view.toGraph(.{ 0, 0 });
-    const g1 = c.view.toGraph(.{ canvas.w, canvas.h });
+    const g0 = c.desc.view.toGraph(.{ 0, 0 });
+    const g1 = c.desc.view.toGraph(.{ canvas.w, canvas.h });
 
     var ix: i32 = @intFromFloat(@floor(g0[0] / GRID_STEP));
     const ix_end: i32 = @intFromFloat(@ceil(g1[0] / GRID_STEP));
     while (ix <= ix_end) : (ix += 1) {
         const gx = @as(f32, @floatFromInt(ix)) * GRID_STEP;
-        const sx = canvas.x + (gx - c.view.pan[0]) * c.view.zoom;
+        const sx = canvas.x + (gx - c.desc.view.pan[0]) * c.desc.view.zoom;
         if (sx < canvas.x or sx > canvas.x + canvas.w) continue;
         const major = @rem(ix, @as(i32, @intCast(GRID_MAJOR))) == 0;
         try relief.rect(out, lc, sx, canvas.y, 1, canvas.h, if (major) GRID_COLOR_MAJOR else GRID_COLOR);
@@ -1275,7 +1389,7 @@ fn drawGrid(c: *Component, canvas: Rect, lc: *element.LayoutCtx, out: *element.D
     const iy_end: i32 = @intFromFloat(@ceil(g1[1] / GRID_STEP));
     while (iy <= iy_end) : (iy += 1) {
         const gy = @as(f32, @floatFromInt(iy)) * GRID_STEP;
-        const sy = canvas.y + (gy - c.view.pan[1]) * c.view.zoom;
+        const sy = canvas.y + (gy - c.desc.view.pan[1]) * c.desc.view.zoom;
         if (sy < canvas.y or sy > canvas.y + canvas.h) continue;
         const major = @rem(iy, @as(i32, @intCast(GRID_MAJOR))) == 0;
         try relief.rect(out, lc, canvas.x, sy, canvas.w, 1, if (major) GRID_COLOR_MAJOR else GRID_COLOR);
@@ -1363,12 +1477,12 @@ fn centredBaseline(m: anytype, cy: f32, scale: f32) f32 {
 
 fn drawLabels(c: *Component, canvas: Rect, lc: *element.LayoutCtx, out: *element.DrawList) !void {
     const origin = [2]f32{ canvas.x, canvas.y };
-    const z = c.view.zoom;
+    const z = c.desc.view.zoom;
     const style = lc.theme.body;
     const m = lc.fonts.metrics(style.font_id);
 
-    for (c.nodes.items) |n| {
-        const tl = c.view.toScreen(origin, n.pos);
+    for (c.desc.nodes.items) |n| {
+        const tl = c.desc.view.toScreen(origin, n.pos);
         const sw = n.size[0] * z;
         if (tl[0] + sw < canvas.x or tl[0] > canvas.x + canvas.w) continue;
         if (tl[1] + HEADER_H * z < canvas.y or tl[1] > canvas.y + canvas.h) continue;
@@ -1376,9 +1490,9 @@ fn drawLabels(c: *Component, canvas: Rect, lc: *element.LayoutCtx, out: *element
         _ = try appendLabel(lc, out, n.label, style.font_id, style.color, tl[0] + LABEL_PAD_X * z, baseline, z, .left);
     }
 
-    for (c.pins.items, 0..) |p, i| {
+    for (c.desc.pins.items, 0..) |p, i| {
         if (p.label.len == 0) continue;
-        const sc = c.view.toScreen(origin, c.pinCentre(@intCast(i)));
+        const sc = c.desc.view.toScreen(origin, c.desc.pinCentre(@intCast(i)));
         if (sc[0] < canvas.x - 80 or sc[0] > canvas.x + canvas.w + 80) continue;
         if (sc[1] < canvas.y or sc[1] > canvas.y + canvas.h) continue;
         const baseline = centredBaseline(m, sc[1], z);
@@ -1405,7 +1519,7 @@ fn drawErrorStrip(c: *Component, canvas: Rect, lc: *element.LayoutCtx, out: *ele
         .radius = 0,
     });
     var buf: [96]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "{d} unreadable line(s) in the graph description", .{c.bad_lines}) catch return;
+    const msg = std.fmt.bufPrint(&buf, "{d} unreadable line(s) in the graph description", .{c.desc.bad_lines}) catch return;
     _ = try appendLabel(lc, out, msg, style.font_id, .{ 1, 1, 1, 1 }, canvas.x + 8, centredBaseline(m, y + ERR_STRIP_H * 0.5, 1.0), 1.0, .left);
 }
 
@@ -1423,7 +1537,7 @@ fn onInput(ctx: *anyopaque, event: element.InputEvent, state_raw: *anyopaque) an
     switch (event) {
         .mouse_down => |mev| {
             if (mev.button == PAN_BUTTON) {
-                c.grab = .{ .pan = .{ .press_local = mev.local, .start_pan = c.view.pan } };
+                c.grab = .{ .pan = .{ .press_local = mev.local, .start_pan = c.desc.view.pan } };
                 return;
             }
             if (mev.button != 0) return;
@@ -1431,14 +1545,14 @@ fn onInput(ctx: *anyopaque, event: element.InputEvent, state_raw: *anyopaque) an
             // `local` is canvas-local screen pixels; the graph is one
             // `toGraph` away and the canvas origin never enters. This is
             // THE boundary — everything below is graph space.
-            const g = c.view.toGraph(mev.local);
-            const hit = c.pick(g);
+            const g = c.desc.view.toGraph(mev.local);
+            const hit = c.desc.pick(g);
             switch (hit) {
                 .node => |i| {
                     c.grab = .{ .node = .{
                         .index = i,
                         .press_local = mev.local,
-                        .start_pos = c.nodes.items[i].pos,
+                        .start_pos = c.desc.nodes.items[i].pos,
                         .moved = false,
                     } };
                     c.selected = i;
@@ -1452,12 +1566,12 @@ fn onInput(ctx: *anyopaque, event: element.InputEvent, state_raw: *anyopaque) an
                     // below runs behind the same closed `ingest` every
                     // other press does.
                     c.grab = .{ .pin = i };
-                    c.selected = c.pins.items[i].node;
+                    c.selected = c.desc.pins.items[i].node;
                     c.hovered = hit;
                 },
                 .none => {
                     c.selected = null;
-                    c.grab = .{ .pan = .{ .press_local = mev.local, .start_pan = c.view.pan } };
+                    c.grab = .{ .pan = .{ .press_local = mev.local, .start_pan = c.desc.view.pan } };
                 },
             }
             c.version +%= 1;
@@ -1474,16 +1588,16 @@ fn onInput(ctx: *anyopaque, event: element.InputEvent, state_raw: *anyopaque) an
                     // left. In graph units, because a pan measured in
                     // screen pixels drifts under the cursor at any zoom
                     // but 1.
-                    c.view.pan = .{
-                        p.start_pan[0] - (mev.local[0] - p.press_local[0]) / c.view.zoom,
-                        p.start_pan[1] - (mev.local[1] - p.press_local[1]) / c.view.zoom,
+                    c.desc.view.pan = .{
+                        p.start_pan[0] - (mev.local[0] - p.press_local[0]) / c.desc.view.zoom,
+                        p.start_pan[1] - (mev.local[1] - p.press_local[1]) / c.desc.view.zoom,
                     };
                     c.version +%= 1;
                 },
                 .node => |*d| {
-                    const dx = (mev.local[0] - d.press_local[0]) / c.view.zoom;
-                    const dy = (mev.local[1] - d.press_local[1]) / c.view.zoom;
-                    c.nodes.items[d.index].pos = .{ d.start_pos[0] + dx, d.start_pos[1] + dy };
+                    const dx = (mev.local[0] - d.press_local[0]) / c.desc.view.zoom;
+                    const dy = (mev.local[1] - d.press_local[1]) / c.desc.view.zoom;
+                    c.desc.nodes.items[d.index].pos = .{ d.start_pos[0] + dx, d.start_pos[1] + dy };
                     if (dx != 0 or dy != 0) d.moved = true;
                     c.version +%= 1;
                     // NO write here. A drag is one gesture and gets one
@@ -1519,7 +1633,7 @@ fn onHover(ctx: *anyopaque, event: element.HoverEvent, state_raw: *anyopaque) an
         // outside the canvas. Picking there would light whatever node
         // happens to lie under a point the pointer has already left.
         .leave => .none,
-        .enter, .move => c.pick(c.view.toGraph(event.local)),
+        .enter, .move => c.desc.pick(c.desc.view.toGraph(event.local)),
     };
     if (!std.meta.eql(before, c.hovered)) c.version +%= 1;
 }
@@ -1534,11 +1648,11 @@ fn onScroll(ctx: *anyopaque, event: element.ScrollEvent, state_raw: *anyopaque) 
     _ = state_raw;
     const c: *Component = @ptrCast(@alignCast(ctx));
     if (c.gesturing()) return true;
-    const before = c.view.zoom;
+    const before = c.desc.view.zoom;
     const factor = @exp(-event.dy * ZOOM_PER_PX);
     const next = std.math.clamp(before * factor, ZOOM_MIN, ZOOM_MAX);
     if (next == before) return false;
-    c.view.zoomAbout(event.local, next);
+    c.desc.view.zoomAbout(event.local, next);
     c.version +%= 1;
     return true;
 }
@@ -1644,14 +1758,14 @@ test "nodegraph: the wheel keeps the point under the cursor still" {
 test "nodegraph: the description parses into nodes, pins and links" {
     const c = try makeGraph(two_node_graph, &.{});
     defer dropGraph(c);
-    try testing.expectEqual(@as(usize, 2), c.nodes.items.len);
-    try testing.expectEqual(@as(usize, 4), c.pins.items.len);
-    try testing.expectEqual(@as(usize, 1), c.links.items.len);
-    try testing.expectEqual(@as(u32, 0), c.bad_lines);
-    try testing.expectEqualStrings("Multiply", c.nodes.items[1].label);
+    try testing.expectEqual(@as(usize, 2), c.desc.nodes.items.len);
+    try testing.expectEqual(@as(usize, 4), c.desc.pins.items.len);
+    try testing.expectEqual(@as(usize, 1), c.desc.links.items.len);
+    try testing.expectEqual(@as(u32, 0), c.desc.bad_lines);
+    try testing.expectEqualStrings("Multiply", c.desc.nodes.items[1].label);
     // The link resolved to real pin indices, not to strings.
-    try testing.expectEqual(Dir.out, c.pins.items[c.links.items[0].from].dir);
-    try testing.expectEqual(Dir.in, c.pins.items[c.links.items[0].to].dir);
+    try testing.expectEqual(Dir.out, c.desc.pins.items[c.desc.links.items[0].from].dir);
+    try testing.expectEqual(Dir.in, c.desc.pins.items[c.desc.links.items[0].to].dir);
 }
 
 test "nodegraph: a link may be written before the pins it names" {
@@ -1666,8 +1780,8 @@ test "nodegraph: a link may be written before the pins it names" {
         \\pin node=dst id=in dir=in
     , &.{});
     defer dropGraph(c);
-    try testing.expectEqual(@as(usize, 1), c.links.items.len);
-    try testing.expectEqual(@as(u32, 0), c.bad_lines);
+    try testing.expectEqual(@as(usize, 1), c.desc.links.items.len);
+    try testing.expectEqual(@as(u32, 0), c.desc.bad_lines);
 }
 
 test "nodegraph: a ref splits on the LAST dot, so a node id may contain dots" {
@@ -1677,8 +1791,8 @@ test "nodegraph: a ref splits on the LAST dot, so a node id may contain dots" {
         \\link from=math.mul.out to=math.mul.out
     , &.{});
     defer dropGraph(c);
-    try testing.expectEqual(@as(usize, 1), c.links.items.len);
-    try testing.expectEqual(@as(u32, 0), c.bad_lines);
+    try testing.expectEqual(@as(usize, 1), c.desc.links.items.len);
+    try testing.expectEqual(@as(u32, 0), c.desc.bad_lines);
 }
 
 test "nodegraph: a line nobody can read is counted, not swallowed" {
@@ -1691,15 +1805,15 @@ test "nodegraph: a line nobody can read is counted, not swallowed" {
         \\pin node=nowhere id=p dir=in
     , &.{});
     defer dropGraph(c);
-    try testing.expectEqual(@as(usize, 1), c.nodes.items.len);
-    try testing.expectEqual(@as(u32, 2), c.bad_lines);
+    try testing.expectEqual(@as(usize, 1), c.desc.nodes.items.len);
+    try testing.expectEqual(@as(u32, 2), c.desc.bad_lines);
 }
 
 test "nodegraph: a quoted label keeps its spaces" {
     const c = try makeGraph("node id=a x=0 y=0 label=\"Two Words\" tint=#ff0000", &.{});
     defer dropGraph(c);
-    try testing.expectEqualStrings("Two Words", c.nodes.items[0].label);
-    try testing.expectApproxEqAbs(@as(f32, 1.0), c.nodes.items[0].tint[0], 1e-3);
+    try testing.expectEqualStrings("Two Words", c.desc.nodes.items[0].label);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), c.desc.nodes.items[0].tint[0], 1e-3);
 }
 
 test "nodegraph: node height follows the busier side's pin count" {
@@ -1712,11 +1826,138 @@ test "nodegraph: node height follows the busier side's pin count" {
         \\pin node=b id=o dir=out
     , &.{});
     defer dropGraph(c);
-    try testing.expect(c.nodes.items[1].size[1] > c.nodes.items[0].size[1]);
+    try testing.expect(c.desc.nodes.items[1].size[1] > c.desc.nodes.items[0].size[1]);
     // And an explicit `h=` is left alone.
     const d = try makeGraph("node id=a x=0 y=0 h=300", &.{});
     defer dropGraph(d);
-    try testing.expectApproxEqAbs(@as(f32, 300), d.nodes.items[0].size[1], 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 300), d.desc.nodes.items[0].size[1], 1e-3);
+}
+
+// ── The public door ────────────────────────────────────────────────
+
+/// A payload in the shape a HOST emits, rather than the shape an author
+/// writes by hand. matryoshka's generator projects a parsed rill program
+/// into this, and every awkward rule of the grammar is in here on
+/// purpose: node ids carrying dots AND colons (`read:row.seed`), so a
+/// `link` ref has to split on the last dot and not the first; labels
+/// with spaces, which have to be quoted or they truncate; a `view`
+/// record; a tint per node.
+const host_payload =
+    \\view pan=-24,-24 zoom=0.6
+    \\node id=read:row.seed x=0 y=0 label="row.seed" tint=#3d5a6e
+    \\node id=near1 x=230 y=0 label="near1" tint=#8a5cf0
+    \\node id=mul1 x=460 y=0 label="mul1 (k = 0.5)" tint=#4c8fbf
+    \\pin node=read:row.seed id=o0 dir=out label="seed"
+    \\pin node=near1 id=i0 dir=in label="radius"
+    \\pin node=near1 id=o0 dir=out label="count"
+    \\pin node=mul1 id=i0 dir=in label="a"
+    \\pin node=mul1 id=i1 dir=in label="b"
+    \\pin node=mul1 id=o0 dir=out label="v"
+    \\link from=read:row.seed.o0 to=near1.i0
+    \\link from=near1.o0 to=mul1.i0
+;
+
+/// Every field of a description, compared. A count-only comparison is
+/// the shape of gate that lets a divergence through: two parsers can
+/// agree on how MANY nodes there are and disagree about where they sit.
+fn expectSameDescription(a: *const Description, b: *const Description) !void {
+    try testing.expectEqual(a.bad_lines, b.bad_lines);
+    try testing.expectApproxEqAbs(a.view.zoom, b.view.zoom, 1e-6);
+    try testing.expectApproxEqAbs(a.view.pan[0], b.view.pan[0], 1e-6);
+    try testing.expectApproxEqAbs(a.view.pan[1], b.view.pan[1], 1e-6);
+
+    try testing.expectEqual(a.nodes.items.len, b.nodes.items.len);
+    for (a.nodes.items, b.nodes.items) |x, y| {
+        try testing.expectEqualStrings(x.id, y.id);
+        try testing.expectEqualStrings(x.label, y.label);
+        try testing.expectEqualSlices(f32, &x.pos, &y.pos);
+        try testing.expectEqualSlices(f32, &x.size, &y.size);
+        try testing.expectEqualSlices(f32, &x.tint, &y.tint);
+        try testing.expectEqual(x.in_count, y.in_count);
+        try testing.expectEqual(x.out_count, y.out_count);
+    }
+
+    try testing.expectEqual(a.pins.items.len, b.pins.items.len);
+    for (a.pins.items, b.pins.items) |x, y| {
+        try testing.expectEqual(x.node, y.node);
+        try testing.expectEqualStrings(x.id, y.id);
+        try testing.expectEqualStrings(x.label, y.label);
+        try testing.expectEqual(x.dir, y.dir);
+        try testing.expectEqual(x.slot, y.slot);
+    }
+
+    try testing.expectEqual(a.links.items.len, b.links.items.len);
+    for (a.links.items, b.links.items) |x, y| {
+        try testing.expectEqual(x.from, y.from);
+        try testing.expectEqual(x.to, y.to);
+    }
+}
+
+test "nodegraph: readDescription and the component read the same text the same way" {
+    // The point of the split, executed. There is one parser and two
+    // callers, and this is what "one" means: every field, not a count.
+    //
+    // Mutation — give the component its own copy of one rule, which is
+    // exactly the drift a second parser in the host repo would be. In
+    // `Component.parse`, after the read:
+    //
+    //     for (self.desc.nodes.items) |*n| if (!n.w_given) n.size[0] = 200;
+    //
+    // A single-caller gate cannot see that: every existing test in this
+    // file goes through the component and would agree with itself. Here
+    // it is red on the first node's size.
+    const c = try makeGraph(host_payload, &.{});
+    defer dropGraph(c);
+
+    var d = try readDescription(testing.allocator, host_payload);
+    defer d.deinit();
+
+    try expectSameDescription(&c.desc, &d);
+
+    // Rule 1: assert the CONTENT before believing the agreement — two
+    // empty descriptions agree perfectly.
+    try testing.expectEqual(@as(usize, 3), d.nodes.items.len);
+    try testing.expectEqual(@as(usize, 6), d.pins.items.len);
+    try testing.expectEqual(@as(usize, 2), d.links.items.len);
+    try testing.expectEqual(@as(u32, 0), d.bad_lines);
+    // The last-dot rule survived the trip: the first link starts at the
+    // node whose id has two dots and a colon in it.
+    try testing.expectEqualStrings("read:row.seed", d.nodes.items[d.pins.items[d.links.items[0].from].node].id);
+    try testing.expectEqualStrings("mul1 (k = 0.5)", d.nodes.items[2].label);
+}
+
+test "nodegraph: readDescription counts the lines nobody can read, and never refuses" {
+    // `bad_lines` surviving the split is not a detail: it is how a host
+    // finds out that what it emitted was not read. A door that returned
+    // an error on the first bad line would be a different contract from
+    // the component's — the component draws a strip and keeps going —
+    // and a host would then get a picture and a gate that disagree.
+    //
+    // Mutation: `if (d.bad_lines > 0) return error.BadDescription;` in
+    // `readDescription`. Red — and the disagreement is the point, not
+    // the error.
+    const src =
+        \\node id=a x=0 y=0
+        \\nodes id=b x=0 y=0
+        \\node x=10 y=10 label="no id at all"
+        \\pin node=nowhere id=p dir=in
+        \\link from=a.missing to=a.missing
+        \\pos id=ghost x=1 y=1
+    ;
+    var d = try readDescription(testing.allocator, src);
+    defer d.deinit();
+
+    // One good node; five records nobody could resolve — an unknown
+    // kind, a node with no id, a pin on a node nobody declared, a link
+    // whose pin does not exist, and a `pos` for a ghost.
+    try testing.expectEqual(@as(usize, 1), d.nodes.items.len);
+    try testing.expectEqual(@as(u32, 5), d.bad_lines);
+
+    // And the component agrees, line for line — the count is one
+    // implementation too.
+    const c = try makeGraph(src, &.{});
+    defer dropGraph(c);
+    try expectSameDescription(&c.desc, &d);
 }
 
 // ── Hit testing ────────────────────────────────────────────────────
@@ -1730,12 +1971,12 @@ test "nodegraph: a click lands on the node under the cursor at a real pan AND zo
     // here.
     const c = try makeGraph(two_node_graph, &.{});
     defer dropGraph(c);
-    c.view = .{ .pan = .{ -100, -50 }, .zoom = 1.6 };
+    c.desc.view = .{ .pan = .{ -100, -50 }, .zoom = 1.6 };
 
     // The centre of `mul`, taken the long way round: graph → local.
-    const n = c.nodes.items[1];
+    const n = c.desc.nodes.items[1];
     const centre = [2]f32{ n.pos[0] + n.size[0] * 0.5, n.pos[1] + n.size[1] * 0.5 };
-    const local = c.view.toLocal(centre);
+    const local = c.desc.view.toLocal(centre);
 
     try onInput(@ptrCast(c), .{ .mouse_down = .{
         .local = local,
@@ -1753,11 +1994,11 @@ test "nodegraph: a pin wins over the node body it overlaps" {
     defer dropGraph(c);
     // `mul`'s first input pin sits ON the node's left edge, so a pick
     // there is ambiguous unless pins are tested first.
-    const g = c.pinCentre(1);
-    try testing.expect(c.pick(.{ g[0] + 2, g[1] }) == .pin);
+    const g = c.desc.pinCentre(1);
+    try testing.expect(c.desc.pick(.{ g[0] + 2, g[1] }) == .pin);
     // And two pitches down the body, past every pin, is the node.
-    const n = c.nodes.items[1];
-    try testing.expect(c.pick(.{ n.pos[0] + n.size[0] * 0.5, n.pos[1] + 4 }) == .node);
+    const n = c.desc.nodes.items[1];
+    try testing.expect(c.desc.pick(.{ n.pos[0] + n.size[0] * 0.5, n.pos[1] + 4 }) == .node);
 }
 
 test "nodegraph: the topmost node wins where two overlap" {
@@ -1767,7 +2008,7 @@ test "nodegraph: the topmost node wins where two overlap" {
     , &.{});
     defer dropGraph(c);
     // Both rects contain this point; `over` is drawn last, so it wins.
-    try testing.expectEqual(Hover{ .node = 1 }, c.pick(.{ 40, 20 }));
+    try testing.expectEqual(Hover{ .node = 1 }, c.desc.pick(.{ 40, 20 }));
 }
 
 // ── Dragging ───────────────────────────────────────────────────────
@@ -1785,9 +2026,9 @@ test "nodegraph: a press on a pin latches too, so the write is guarded" {
     });
     defer dropGraph(c);
 
-    const g = c.pinCentre(1); // `mul`'s first input
+    const g = c.desc.pinCentre(1); // `mul`'s first input
     try onInput(@ptrCast(c), .{ .mouse_down = .{
-        .local = c.view.toLocal(g),
+        .local = c.desc.view.toLocal(g),
         .button = 0,
         .button_down = true,
     } }, @ptrCast(&st));
@@ -1796,15 +2037,15 @@ test "nodegraph: a press on a pin latches too, so the write is guarded" {
     try testing.expectEqualStrings("mul", st.get("sel").?);
 
     // And it moves nothing, whatever the pointer does next.
-    const before = c.nodes.items[1].pos;
-    const pan_before = c.view.pan;
+    const before = c.desc.nodes.items[1].pos;
+    const pan_before = c.desc.view.pan;
     try onInput(@ptrCast(c), .{ .mouse_move = .{
         .local = .{ 900, 900 },
         .button = 0,
         .button_down = true,
     } }, @ptrCast(&st));
-    try testing.expectEqual(before, c.nodes.items[1].pos);
-    try testing.expectEqual(pan_before, c.view.pan);
+    try testing.expectEqual(before, c.desc.nodes.items[1].pos);
+    try testing.expectEqual(pan_before, c.desc.view.pan);
 
     try onInput(@ptrCast(c), .{ .mouse_up = .{ .local = .{ 900, 900 }, .button = 0, .button_down = false } }, @ptrCast(&st));
     try testing.expect(c.grab == .none);
@@ -1817,11 +2058,11 @@ test "nodegraph: a drag moves the node by the pointer's delta in GRAPH space" {
     // zoom 1 the mutation is invisible.
     const c = try makeGraph(two_node_graph, &.{});
     defer dropGraph(c);
-    c.view = .{ .pan = .{ 0, 0 }, .zoom = 2.0 };
+    c.desc.view = .{ .pan = .{ 0, 0 }, .zoom = 2.0 };
 
-    const n0 = c.nodes.items[0];
+    const n0 = c.desc.nodes.items[0];
     const start = n0.pos;
-    const press = c.view.toLocal(.{ n0.pos[0] + 10, n0.pos[1] + 6 });
+    const press = c.desc.view.toLocal(.{ n0.pos[0] + 10, n0.pos[1] + 6 });
 
     try onInput(@ptrCast(c), .{ .mouse_down = .{ .local = press, .button = 0, .button_down = true } }, @ptrCast(&_test_state));
     // 80 screen pixels right, 40 down — 40 and 20 in graph units.
@@ -1831,16 +2072,16 @@ test "nodegraph: a drag moves the node by the pointer's delta in GRAPH space" {
         .button_down = true,
     } }, @ptrCast(&_test_state));
 
-    try testing.expectApproxEqAbs(start[0] + 40, c.nodes.items[0].pos[0], 1e-3);
-    try testing.expectApproxEqAbs(start[1] + 20, c.nodes.items[0].pos[1], 1e-3);
+    try testing.expectApproxEqAbs(start[0] + 40, c.desc.nodes.items[0].pos[0], 1e-3);
+    try testing.expectApproxEqAbs(start[1] + 20, c.desc.nodes.items[0].pos[1], 1e-3);
 }
 
 test "nodegraph: a drag on empty canvas pans, in graph units" {
     const c = try makeGraph(two_node_graph, &.{});
     defer dropGraph(c);
-    c.view = .{ .pan = .{ 0, 0 }, .zoom = 0.5 };
+    c.desc.view = .{ .pan = .{ 0, 0 }, .zoom = 0.5 };
     // Far below every node.
-    const press = c.view.toLocal(.{ 40, 900 });
+    const press = c.desc.view.toLocal(.{ 40, 900 });
     try onInput(@ptrCast(c), .{ .mouse_down = .{ .local = press, .button = 0, .button_down = true } }, @ptrCast(&_test_state));
     try testing.expect(c.grab == .pan);
     try onInput(@ptrCast(c), .{ .mouse_move = .{
@@ -1850,7 +2091,7 @@ test "nodegraph: a drag on empty canvas pans, in graph units" {
     } }, @ptrCast(&_test_state));
     // 50 screen pixels at zoom 0.5 is 100 graph units, and the camera
     // moves the OTHER way so the content follows the hand.
-    try testing.expectApproxEqAbs(@as(f32, -100), c.view.pan[0], 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, -100), c.desc.view.pan[0], 1e-3);
 }
 
 test "nodegraph: exactly one State.set per drag gesture" {
@@ -1866,7 +2107,7 @@ test "nodegraph: exactly one State.set per drag gesture" {
     });
     defer dropGraph(c);
 
-    const press = c.view.toLocal(.{ 10, 6 });
+    const press = c.desc.view.toLocal(.{ 10, 6 });
     try onInput(@ptrCast(c), .{ .mouse_down = .{ .local = press, .button = 0, .button_down = true } }, @ptrCast(&st));
     counter.mark();
     var i: usize = 1;
@@ -1922,7 +2163,7 @@ test "nodegraph: a drag that did not move writes nothing" {
         .{ .key = "positions", .value = "graph.pos" },
     });
     defer dropGraph(c);
-    const press = c.view.toLocal(.{ 10, 6 });
+    const press = c.desc.view.toLocal(.{ 10, 6 });
     try onInput(@ptrCast(c), .{ .mouse_down = .{ .local = press, .button = 0, .button_down = true } }, @ptrCast(&st));
     try onInput(@ptrCast(c), .{ .mouse_up = .{ .local = press, .button = 0, .button_down = false } }, @ptrCast(&st));
     try testing.expect(st.get("graph.pos") == null);
@@ -1941,28 +2182,28 @@ test "nodegraph: an ingest arriving mid-gesture does not move the node" {
     const c = try makeGraph(two_node_graph, &.{});
     defer dropGraph(c);
 
-    const press = c.view.toLocal(.{ 10, 6 });
+    const press = c.desc.view.toLocal(.{ 10, 6 });
     try onInput(@ptrCast(c), .{ .mouse_down = .{ .local = press, .button = 0, .button_down = true } }, @ptrCast(&st));
     try onInput(@ptrCast(c), .{ .mouse_move = .{
         .local = .{ press[0] + 60, press[1] + 30 },
         .button = 0,
         .button_down = true,
     } }, @ptrCast(&st));
-    const dragged = c.nodes.items[0].pos;
+    const dragged = c.desc.nodes.items[0].pos;
     try testing.expectApproxEqAbs(@as(f32, 60), dragged[0], 1e-3);
 
     // A whole re-parse lands mid-drag, with the node at its old home.
     const spec = specOf(&.{}, two_node_graph ++ "\npos id=src x=0 y=0");
     try update(@ptrCast(c), &spec);
-    try testing.expectApproxEqAbs(dragged[0], c.nodes.items[0].pos[0], 1e-3);
-    try testing.expectApproxEqAbs(dragged[1], c.nodes.items[0].pos[1], 1e-3);
+    try testing.expectApproxEqAbs(dragged[0], c.desc.nodes.items[0].pos[0], 1e-3);
+    try testing.expectApproxEqAbs(dragged[1], c.desc.nodes.items[0].pos[1], 1e-3);
 
     // Between gestures the plane is the truth again, and because the
     // refusal did NOT adopt the digest, the same body lands the moment
     // the button is up and the document is re-delivered.
     try onInput(@ptrCast(c), .{ .mouse_up = .{ .local = .{ press[0] + 60, press[1] + 30 }, .button = 0, .button_down = false } }, @ptrCast(&st));
     try update(@ptrCast(c), &spec);
-    try testing.expectApproxEqAbs(@as(f32, 0), c.nodes.items[0].pos[0], 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 0), c.desc.nodes.items[0].pos[0], 1e-3);
 }
 
 test "nodegraph: a body that has not changed is not re-parsed" {
@@ -1974,10 +2215,10 @@ test "nodegraph: a body that has not changed is not re-parsed" {
     defer st.deinit();
     const c = try makeGraph(two_node_graph, &.{});
     defer dropGraph(c);
-    c.nodes.items[0].pos = .{ 500, 500 };
+    c.desc.nodes.items[0].pos = .{ 500, 500 };
     const spec = specOf(&.{}, two_node_graph);
     try update(@ptrCast(c), &spec);
-    try testing.expectApproxEqAbs(@as(f32, 500), c.nodes.items[0].pos[0], 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 500), c.desc.nodes.items[0].pos[0], 1e-3);
 }
 
 // ── The host's door ────────────────────────────────────────────────
@@ -1986,14 +2227,14 @@ test "nodegraph: handle_update replaces the graph, and `move` only moves" {
     const c = try makeGraph(two_node_graph, &.{});
     defer dropGraph(c);
     try handleUpdate(@ptrCast(c), "move", "pos id=mul x=1000 y=2000");
-    try testing.expectApproxEqAbs(@as(f32, 1000), c.nodes.items[1].pos[0], 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 1000), c.desc.nodes.items[1].pos[0], 1e-3);
     // The labels survived, which is the point of `pos` being its own
     // record kind rather than a `node` line with fields left off.
-    try testing.expectEqualStrings("Multiply", c.nodes.items[1].label);
+    try testing.expectEqualStrings("Multiply", c.desc.nodes.items[1].label);
 
     try handleUpdate(@ptrCast(c), "graph", "node id=only x=5 y=5");
-    try testing.expectEqual(@as(usize, 1), c.nodes.items.len);
-    try testing.expectEqual(@as(usize, 0), c.links.items.len);
+    try testing.expectEqual(@as(usize, 1), c.desc.nodes.items.len);
+    try testing.expectEqual(@as(usize, 0), c.desc.links.items.len);
 
     try testing.expectError(error.UnknownGraphAction, handleUpdate(@ptrCast(c), "wat", ""));
 }
@@ -2008,16 +2249,16 @@ test "nodegraph: a push mid-gesture is set aside and lands when the hand lets go
     const c = try makeGraph(two_node_graph, &.{});
     defer dropGraph(c);
 
-    const press = c.view.toLocal(.{ 10, 6 });
+    const press = c.desc.view.toLocal(.{ 10, 6 });
     try onInput(@ptrCast(c), .{ .mouse_down = .{ .local = press, .button = 0, .button_down = true } }, @ptrCast(&st));
     try onInput(@ptrCast(c), .{ .mouse_move = .{ .local = .{ press[0] + 30, press[1] }, .button = 0, .button_down = true } }, @ptrCast(&st));
 
     try handleUpdate(@ptrCast(c), "graph", "node id=late x=9 y=9");
-    try testing.expectEqual(@as(usize, 2), c.nodes.items.len); // still ours
+    try testing.expectEqual(@as(usize, 2), c.desc.nodes.items.len); // still ours
 
     try onInput(@ptrCast(c), .{ .mouse_up = .{ .local = .{ press[0] + 30, press[1] }, .button = 0, .button_down = false } }, @ptrCast(&st));
-    try testing.expectEqual(@as(usize, 1), c.nodes.items.len);
-    try testing.expectEqualStrings("late", c.nodes.items[0].id);
+    try testing.expectEqual(@as(usize, 1), c.desc.nodes.items.len);
+    try testing.expectEqualStrings("late", c.desc.nodes.items[0].id);
 }
 
 // ── Hover ──────────────────────────────────────────────────────────
@@ -2029,11 +2270,11 @@ test "nodegraph: hover enters and leaves in pairs across node boundaries" {
     const c = try makeGraph(two_node_graph, &.{});
     defer dropGraph(c);
 
-    const a = c.nodes.items[0];
-    const b = c.nodes.items[1];
-    const in_a = c.view.toLocal(.{ a.pos[0] + a.size[0] * 0.5, a.pos[1] + 4 });
-    const in_b = c.view.toLocal(.{ b.pos[0] + b.size[0] * 0.5, b.pos[1] + 4 });
-    const gap = c.view.toLocal(.{ a.pos[0] + a.size[0] + 30, a.pos[1] + 4 });
+    const a = c.desc.nodes.items[0];
+    const b = c.desc.nodes.items[1];
+    const in_a = c.desc.view.toLocal(.{ a.pos[0] + a.size[0] * 0.5, a.pos[1] + 4 });
+    const in_b = c.desc.view.toLocal(.{ b.pos[0] + b.size[0] * 0.5, b.pos[1] + 4 });
+    const gap = c.desc.view.toLocal(.{ a.pos[0] + a.size[0] + 30, a.pos[1] + 4 });
 
     try onHover(@ptrCast(c), .{ .local = in_a, .phase = .enter }, @ptrCast(&_test_state));
     try testing.expectEqual(Hover{ .node = 0 }, c.hovered);
@@ -2054,10 +2295,10 @@ test "nodegraph: a hover change bumps the content version" {
     // unlit frame back. Mutation: drop the `version +%= 1` in `onHover`.
     const c = try makeGraph(two_node_graph, &.{});
     defer dropGraph(c);
-    const a = c.nodes.items[0];
+    const a = c.desc.nodes.items[0];
     const before = c.version;
     try onHover(@ptrCast(c), .{
-        .local = c.view.toLocal(.{ a.pos[0] + 10, a.pos[1] + 4 }),
+        .local = c.desc.view.toLocal(.{ a.pos[0] + 10, a.pos[1] + 4 }),
         .phase = .enter,
     }, @ptrCast(&_test_state));
     try testing.expect(c.version != before);
@@ -2088,7 +2329,7 @@ test "nodegraph: a drag through the dispatcher asks for a frame on every move" {
 
     const c = try makeGraph(two_node_graph, &.{});
     defer dropGraph(c);
-    c.view = .{ .pan = .{ 0, 0 }, .zoom = 1 };
+    c.desc.view = .{ .pan = .{ 0, 0 }, .zoom = 1 };
 
     // Canvas at the world origin, so world coords and `local` coincide
     // and the gate is about the redraw and not about the transform.
@@ -2099,8 +2340,8 @@ test "nodegraph: a drag through the dispatcher asks for a frame on every move" {
         .state = @ptrCast(&st),
     });
 
-    const start = c.nodes.items[0].pos;
-    const press = c.view.toLocal(.{ start[0] + 10, start[1] + 6 });
+    const start = c.desc.nodes.items[0].pos;
+    const press = c.desc.view.toLocal(.{ start[0] + 10, start[1] + 6 });
     try sp.dispatchMouseButtonN(press[0], press[1], true, 0);
     try testing.expect(c.grab == .node);
     _ = sp.takeRedrawRequest(); // the press: not what this gate is about
@@ -2114,7 +2355,7 @@ test "nodegraph: a drag through the dispatcher asks for a frame on every move" {
     try testing.expectEqual(@as(usize, 5), frames);
     // The node moved too — otherwise this gate would pass just as well
     // against a dispatcher that raises the flag and delivers nothing.
-    try testing.expectApproxEqAbs(start[0] + 20, c.nodes.items[0].pos[0], 1e-3);
+    try testing.expectApproxEqAbs(start[0] + 20, c.desc.nodes.items[0].pos[0], 1e-3);
 }
 
 test "nodegraph: a pointer wandering inside the node it already hovers asks for nothing" {
@@ -2135,7 +2376,7 @@ test "nodegraph: a pointer wandering inside the node it already hovers asks for 
 
     const c = try makeGraph(two_node_graph, &.{});
     defer dropGraph(c);
-    c.view = .{ .pan = .{ 0, 0 }, .zoom = 1 };
+    c.desc.view = .{ .pan = .{ 0, 0 }, .zoom = 1 };
     try sp.drawlist.hits.append(.{
         .box = .{ .x = 0, .y = 0, .w = 600, .h = 400 },
         .vtable = &vtable,
@@ -2144,7 +2385,7 @@ test "nodegraph: a pointer wandering inside the node it already hovers asks for 
     });
 
     // Arriving on the node is a change and costs a frame.
-    const n0 = c.nodes.items[0];
+    const n0 = c.desc.nodes.items[0];
     try sp.dispatchHover(n0.pos[0] + 6, n0.pos[1] + 6);
     try testing.expect(sp.takeRedrawRequest());
     try testing.expect(c.hovered == .node);
@@ -2172,15 +2413,15 @@ test "nodegraph: the wheel zooms, and gives the notch back at the clamp" {
     const c = try makeGraph(two_node_graph, &.{});
     defer dropGraph(c);
     try testing.expect(try onScroll(@ptrCast(c), .{ .local = .{ 100, 100 }, .dy = -120 }, @ptrCast(&_test_state)));
-    try testing.expect(c.view.zoom > 1);
+    try testing.expect(c.desc.view.zoom > 1);
 
     // Pinned at the top, a further notch belongs to the page behind —
     // the `on_scroll` contract read literally. Mutation: `return true`
     // unconditionally, and a graph in the middle of a document becomes a
     // hole you cannot scroll past.
-    c.view.zoom = ZOOM_MAX;
+    c.desc.view.zoom = ZOOM_MAX;
     try testing.expect(!try onScroll(@ptrCast(c), .{ .local = .{ 100, 100 }, .dy = -120 }, @ptrCast(&_test_state)));
-    c.view.zoom = ZOOM_MIN;
+    c.desc.view.zoom = ZOOM_MIN;
     try testing.expect(!try onScroll(@ptrCast(c), .{ .local = .{ 100, 100 }, .dy = 120 }, @ptrCast(&_test_state)));
 }
 
@@ -2322,7 +2563,7 @@ test "nodegraph: links are TRIANGLES and node chrome is QUADS" {
     // screen is a node with the wires running over the top of it.
     const c = try makeGraph(two_node_graph, &.{});
     defer dropGraph(c);
-    c.view = .{ .pan = .{ 0, 0 }, .zoom = GRIDLESS_ZOOM };
+    c.desc.view = .{ .pan = .{ 0, 0 }, .zoom = GRIDLESS_ZOOM };
 
     var dl = element.DrawList.init(testing.allocator);
     defer dl.deinit();
@@ -2330,8 +2571,8 @@ test "nodegraph: links are TRIANGLES and node chrome is QUADS" {
     const canvas = Rect{ .x = 0, .y = 0, .w = 600, .h = 400 };
     try drawCanvas(c, canvas, &lc, &dl);
 
-    const l = c.links.items[0];
-    const segs = segmentCount(c.pinCentre(l.from), c.pinCentre(l.to), c.view.zoom);
+    const l = c.desc.links.items[0];
+    const segs = segmentCount(c.desc.pinCentre(l.from), c.desc.pinCentre(l.to), c.desc.view.zoom);
 
     // Triangles: the ground's 4 vertices and 16 per link segment. No
     // grid at this zoom, no labels, and — the point — nothing from a
@@ -2341,7 +2582,7 @@ test "nodegraph: links are TRIANGLES and node chrome is QUADS" {
 
     // Quads: ring + body + header per node, one per pin.
     try testing.expectEqual(
-        @as(usize, 3 * c.nodes.items.len + c.pins.items.len),
+        @as(usize, 3 * c.desc.nodes.items.len + c.desc.pins.items.len),
         dl.quads.items.len,
     );
     try testing.expectEqual(@as(usize, 0), dl.glyphs.items.len);
@@ -2358,7 +2599,7 @@ test "nodegraph: a quad's radius carries the graph zoom itself" {
     const c = try makeGraph("node id=a x=0 y=0", &.{});
     defer dropGraph(c);
     const z: f32 = 0.4;
-    c.view = .{ .pan = .{ 0, 0 }, .zoom = z };
+    c.desc.view = .{ .pan = .{ 0, 0 }, .zoom = z };
 
     var dl = element.DrawList.init(testing.allocator);
     defer dl.deinit();
@@ -2380,7 +2621,7 @@ test "nodegraph: selection and hover reach the picture" {
     // unconditionally for the ring quad. Red on both arms.
     const c = try makeGraph(two_node_graph, &.{});
     defer dropGraph(c);
-    c.view = .{ .pan = .{ 0, 0 }, .zoom = GRIDLESS_ZOOM };
+    c.desc.view = .{ .pan = .{ 0, 0 }, .zoom = GRIDLESS_ZOOM };
     const canvas = Rect{ .x = 0, .y = 0, .w = 600, .h = 400 };
 
     var lc = testCtx();
@@ -2415,7 +2656,7 @@ test "nodegraph: selection and hover reach the picture" {
         var dl = element.DrawList.init(testing.allocator);
         defer dl.deinit();
         try drawCanvas(c, canvas, &lc, &dl);
-        const owner = c.pins.items[1].node;
+        const owner = c.desc.pins.items[1].node;
         try testing.expectEqual(NODE_RING_HOVER, dl.quads.items[3 * owner].color);
     }
 }
@@ -2425,7 +2666,7 @@ test "nodegraph: a node panned off the canvas costs nothing" {
     // and at fifty nodes on a small canvas it is most of the frame.
     const c = try makeGraph(two_node_graph, &.{});
     defer dropGraph(c);
-    c.view = .{ .pan = .{ 100_000, 100_000 }, .zoom = GRIDLESS_ZOOM };
+    c.desc.view = .{ .pan = .{ 100_000, 100_000 }, .zoom = GRIDLESS_ZOOM };
 
     var dl = element.DrawList.init(testing.allocator);
     defer dl.deinit();
