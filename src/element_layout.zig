@@ -1467,6 +1467,32 @@ fn walkOneJob(job: *jobs_mod.Job) void {
 /// non-sentinel target tag in src's parallel arrays needs the same
 /// slide. `MAIN_TARGET` is the sentinel for "main color attachment,
 /// no dispatch" and stays unmodified. Phase B.5 polish.
+///
+/// **Recorded, not built: the target sentinel does not resolve the way
+/// the clip sentinel does, and it should.** `walkOneJob` starts every
+/// worker at `current_target_dispatch_index = MAIN_TARGET` *and* at
+/// `current_clip = NO_CLIP`, for the same stated reason — a private
+/// drawlist has no ancestry. The clip half is then resolved below:
+/// `live_of[NO_CLIP] = ctx.current_clip`, so a worker's "unclipped"
+/// becomes "whatever clip is in force where this gets blitted". The
+/// target half is not — `rebaseTargets` passes `MAIN_TARGET` through
+/// verbatim, so a worker's "no effect" stays "no effect" even when the
+/// blit lands INSIDE one.
+///
+/// The consequence, measured 2026-09-10: matryoshka's `hud graph`
+/// panel wraps four children in a `:::drop_shadow`, four is
+/// `PARALLEL_MIN_CHILDREN`, so the whole panel is walked by workers and
+/// every one of its 102 glyphs comes back tagged MAIN. They are drawn
+/// straight onto the surface, over the composite — the drop shadow is
+/// cast by an empty target, and any filter wrapping parallel-walked
+/// content silently does not apply to it. Three children and the same
+/// document routes offscreen correctly, which is why this had never
+/// been seen.
+///
+/// Not fixed here because the fix changes what the screen shows for
+/// every effect over a wide subtree, and that wants its own beat with
+/// its own captures. The trigger is that beat, or the next report of an
+/// effect that "does nothing on a big panel".
 fn blitPrivate(
     out: *element.DrawList,
     src: *const element.DrawList,

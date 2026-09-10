@@ -343,12 +343,18 @@ pub const QuadPipeline = struct {
     /// offscreen-target callers pass `compose_region.xy` so the
     /// world-space drawlist coords resolve to target-local coords
     /// inside the shader (Phase B.5).
-    /// `scissor_px` is `{x, y, w, h}` in surface pixels, or null for the
-    /// whole surface. The caller computes it — `element.scissorFor` turns
-    /// a world-space clip into one using the frame's scroll and zoom,
-    /// which the pipeline has no access to. A zero-area scissor is drawn
-    /// as-is rather than skipped: Vulkan handles it, and the branch would
-    /// have to be repeated in every caller.
+    /// `scissor_px` is `{x, y, w, h}` in the pixels of whatever `extent`
+    /// names — the surface on the main path, the offscreen target on
+    /// Phase 1's — or null for all of it. The caller computes it, because
+    /// the pipeline can see neither the frame's scroll and zoom nor the
+    /// target's origin: `element.scissorOf` turns a screen-space clip into
+    /// one, and `Spark.offscreenScissor` is the Phase 1 wrapper that gets
+    /// it into the target's frame first. **Both attachments must pass
+    /// one.** They did not for a while, and a clipped subtree routed into
+    /// an effect target lost its clip entirely.
+    /// A zero-area scissor is drawn as-is rather than skipped: Vulkan
+    /// handles it, and the branch would have to be repeated in every
+    /// caller.
     pub fn recordDrawRange(
         self: *const QuadPipeline,
         cmd: c.VkCommandBuffer,

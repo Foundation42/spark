@@ -98,4 +98,5 @@ test {
     _ = @import("tests/single_source_dispatch.zig");
     _ = @import("tests/placeholder_scene.zig");
     _ = @import("tests/display_transform.zig");
+    _ = @import("tests/offscreen_clip.zig");
 }

@@ -1282,6 +1282,66 @@ pub const Spark = struct {
         self.layout_cache.clear();
     }
 
+    /// A drawlist clip index as a scissor in an OFFSCREEN TARGET's own
+    /// pixels — the Phase 1 counterpart of `element.scissorOf` against
+    /// `extent` on the main path.
+    ///
+    /// **Two changes of frame, and neither is optional.**
+    ///
+    /// 1. *World → screen.* The clip table rides the drawlist's
+    ///    world→screen transform, and that transform runs in `endFrame`
+    ///    — AFTER Phase 1. A quad's `dst_pos` reaches the GPU already
+    ///    transformed because the SSBO is uploaded later (the routing
+    ///    block below spells out that timing); a scissor does NOT,
+    ///    because `vkCmdSetScissor` bakes its numbers into the command
+    ///    buffer the moment it is recorded. So Phase 1 has to do the
+    ///    transform itself, with the same scroll and zoom `endFrame`
+    ///    will use. `drawlist_needs_transform` is the flag `endFrame`
+    ///    keys on, so the two cannot disagree: on a `.reset = false`
+    ///    frame the table already holds the previous frame's
+    ///    screen-space rects and transforming again would
+    ///    double-multiply.
+    ///
+    /// 2. *Screen → target-local.* `quad.vert` and `text.vert` compute
+    ///    `px = dst_pos - world_offset`, so target-local IS screen minus
+    ///    the very `world_offset` these draws are being recorded with.
+    ///    Taking it from the caller rather than recomputing
+    ///    `(compose_region - scroll) * zoom` here is the whole point:
+    ///    one derivation, shared with the shader, so the scissor cannot
+    ///    drift from the geometry it is cutting.
+    ///
+    /// Clamped to the TARGET's extent, not the surface's — an offscreen
+    /// target is compose-region-sized, and Vulkan refuses a scissor
+    /// reaching outside the framebuffer it is set on. A clip entirely
+    /// off the target clamps to zero area, which draws nothing: the
+    /// right answer, and not a case worth branching for.
+    ///
+    /// At `zoom != 1` this inherits the limitation the primitives
+    /// already have — see the `TODO(zoom)` at the routing block:
+    /// `target_size` is world-sized while screen coords are
+    /// zoom-scaled, so a zoomed effect's content overruns its target
+    /// either way. What has to hold is that the scissor lands in the
+    /// SAME space as the geometry, and it does; sizing the target for
+    /// zoom fixes both at once.
+    fn offscreenScissor(
+        self: *const Spark,
+        clip: u16,
+        world_offset: [2]f32,
+        target_extent: vk.c.VkExtent2D,
+    ) ?[4]u32 {
+        const rect = self.drawlist.clipRect(clip) orelse return null;
+        const screen = if (self.drawlist_needs_transform)
+            rect.toScreen(self.frame_info.scroll_offset, self.frame_info.zoom)
+        else
+            rect;
+        return element.scissorOf(.{
+            .x = screen.x - world_offset[0],
+            .y = screen.y - world_offset[1],
+            .w = screen.w,
+            .h = screen.h,
+        }, target_extent.width, target_extent.height);
+    }
+
     /// Effects-spec Phase B.4.b.3 — Phase 1 of the three-phase
     /// dispatch processor. Records every top-level single-source
     /// effect's offscreen render pass into `cmd`, recursively
@@ -1320,6 +1380,15 @@ pub const Spark = struct {
     /// exercises the populated path.
     pub fn dispatchOffscreenPasses(self: *Spark, cmd: vk.c.VkCommandBuffer) !void {
         if (std.posix.getenv("SPARK_DUMP_PASSES") != null) self.dumpPassGraph();
+        // **Seal here as well as in `endFrame`.** Phase 1 reads
+        // `quad_clips` / `glyph_clips` to scissor its offscreen draws,
+        // and the walker only seals at clip boundaries — whatever was
+        // emitted after the last one is still uncovered at this point.
+        // The run iterator reads a short array as unclipped, which is
+        // the same answer, but "the same answer by fallback" is not a
+        // thing to lean on when those arrays are about to decide what
+        // gets cut. Idempotent, so `endFrame`'s seal stays a no-op.
+        try self.drawlist.sealClips(element.NO_CLIP);
         // **First thing, before a single draw is recorded.** Phase 1
         // binds the VBO/IBO by handle and the SSBO descriptor sets; a
         // grow after that point would leave those binds pointing at
@@ -1762,16 +1831,27 @@ pub const Spark = struct {
                     }
                 }
             }
+            // Clipping reaches INSIDE an effect, and the runs split for
+            // it exactly as the main pass's do. A scissor is per-draw
+            // dynamic state, so a run has to be uniform in its clip or
+            // the last rect set wins over primitives that wanted a
+            // different one — and one rect per dispatch is not enough
+            // for the shape every real customer has: matryoshka's HUD
+            // panel is a title, a clipped `:::nodegraph` canvas, and a
+            // footer, all inside one `:::drop_shadow`, so the canvas's
+            // rect must apply to the canvas and to nothing else.
             {
-                var it = element.runs(dl_p1.quad_targets.items, dispatch_index_u32);
+                var it = element.clippedRuns(dl_p1.quad_targets.items, dl_p1.quad_clips.items, dispatch_index_u32);
                 while (it.next()) |run| {
-                    self.quad_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen, .offscreen, null);
+                    const sc = self.offscreenScissor(run.clip, world_offset_target, target_extent_render);
+                    self.quad_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen, .offscreen, sc);
                 }
             }
             {
-                var it = element.runs(dl_p1.glyph_targets.items, dispatch_index_u32);
+                var it = element.clippedRuns(dl_p1.glyph_targets.items, dl_p1.glyph_clips.items, dispatch_index_u32);
                 while (it.next()) |run| {
-                    self.text_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen, .offscreen, null);
+                    const sc = self.offscreenScissor(run.clip, world_offset_target, target_extent_render);
+                    self.text_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen, .offscreen, sc);
                 }
             }
 
@@ -2150,16 +2230,24 @@ pub const Spark = struct {
                     }
                 }
             }
+            // Clipped runs, same as the single_source arm above and for
+            // the same reason — see the note there. This is the arm the
+            // HUD panel actually takes: `:::drop_shadow` and a
+            // non-backdrop `:::frosted_glass` are chains, and a
+            // `{backdrop}` chain nested inside one leaves its children
+            // on the ENCLOSING tag, which is this pool[0].
             {
-                var it = element.runs(dl_p1.quad_targets.items, dispatch_index_u32);
+                var it = element.clippedRuns(dl_p1.quad_targets.items, dl_p1.quad_clips.items, dispatch_index_u32);
                 while (it.next()) |run| {
-                    self.quad_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen, .offscreen, null);
+                    const sc = self.offscreenScissor(run.clip, world_offset_target, target_extent_render);
+                    self.quad_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen, .offscreen, sc);
                 }
             }
             {
-                var it = element.runs(dl_p1.glyph_targets.items, dispatch_index_u32);
+                var it = element.clippedRuns(dl_p1.glyph_targets.items, dl_p1.glyph_clips.items, dispatch_index_u32);
                 while (it.next()) |run| {
-                    self.text_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen, .offscreen, null);
+                    const sc = self.offscreenScissor(run.clip, world_offset_target, target_extent_render);
+                    self.text_pipeline.recordDrawRange(cmd, target_extent_render, world_offset_target, run.first, run.count, display_mod.Push.offscreen, .offscreen, sc);
                 }
             }
 
@@ -3327,12 +3415,24 @@ pub const Spark = struct {
                         }
                     }
                 }
-                // Clipping applies on the MAIN attachment only. The two
-                // offscreen paths pass null: an effect target has its own
-                // coordinate frame and its own extent, so a world-space
-                // scissor would need rebasing into it, and nothing clips
-                // inside an effect yet. Documented rather than silently
-                // half-working.
+                // Clipping on the MAIN attachment. `extent` and
+                // `main_world_offset = (0,0)` make this the identity case
+                // of the same arithmetic Phase 1 does in
+                // `offscreenScissor` — the clip table is already in
+                // screen space by the time this runs, and the main
+                // attachment IS screen space, so there is nothing to
+                // rebase and no clamp target but the surface.
+                //
+                // This note used to say the two offscreen paths passed
+                // null because "nothing clips inside an effect yet". That
+                // premise died the day matryoshka's HUD wrapped a
+                // `:::nodegraph` canvas in `:::drop_shadow`: the panel's
+                // whole subtree routes into the chain's pool[0], the
+                // canvas's scissor went with it, and node bodies and
+                // labels painted over the panel's own title and footer.
+                // Wires clipped throughout, which is the tell — the
+                // nodegraph cuts its link segments on the CPU, and only
+                // quads and glyphs ever depended on the scissor.
                 {
                     const base = layer.quads[0];
                     var it = element.clippedRuns(

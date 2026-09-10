@@ -356,6 +356,21 @@ dropped.
   are in `layout_cache.zig`, `element_layout.zig` and
   `tests/nodegraph_render.zig`; every fixture straddles an edge,
   because one that fits inside its own clip watches nothing.
+- **Carrying the clip index is half of it; RECORDING it is the
+  other half.** A correct index still has to reach
+  `vkCmdSetScissor`, and Phase 1 — the offscreen passes — recorded
+  every quad and glyph draw with no scissor at all. So a clipped
+  subtree routed into an effect target lost its clip whatever the
+  drawlist said, and every gate that inspected the drawlist agreed
+  it was fine. `Spark.offscreenScissor` puts the rect into the
+  target's own frame: world→screen with the same scroll and zoom
+  `endFrame` will use (Phase 1 records BEFORE that transform, and
+  a scissor is baked into the command buffer where an SSBO is
+  not), then minus the `world_offset` the shader subtracts, then
+  clamped to the target's extent. The runs split on the clip in
+  both arms, exactly as the main pass's do — one rect per dispatch
+  cuts the effect's unclipped siblings too. Gates:
+  `tests/offscreen_clip.zig`, and they render.
 
 ## Known limitations (parked)
 
