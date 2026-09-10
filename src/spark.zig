@@ -1504,6 +1504,39 @@ pub const Spark = struct {
     /// into freed memory to still be comparable, and the blunt version
     /// costs nothing real: `openOverlay` cleared all three on the way
     /// in, so there is no page gesture left for this to interrupt.
+    /// **Forget the hit layer, and every pointer into a component.**
+    ///
+    /// For a host about to tear a `Document` down while a frame's hits still
+    /// reference its components. Those hits outlive the teardown — they are
+    /// cleared at the next `beginFrame`, and a host that dispatches input
+    /// before its next draw is dispatching into freed memory.
+    ///
+    /// matryoshka found this the hard way: `Panel.close` already cleared
+    /// `captured`, with the comment *"a drag in flight was on an element that
+    /// no longer exists"* — the right thought, stopped one step short. A
+    /// right-click, a menu, a pick, and the panel it rebuilt left the OLD
+    /// canvas in `hits`; the next hover walked a freed `Description` and read
+    /// `0xAAAAAAAA` out of a poisoned pin.
+    ///
+    /// **Call it BEFORE the teardown.** Nothing here notifies — a component
+    /// about to be destroyed has no use for `focus_lost`, and calling out to
+    /// one that is already gone is the bug this exists to prevent. That is the
+    /// difference from `closeOverlay`, which owns its document's lifetime and
+    /// so can afford to be polite first.
+    ///
+    /// The overlay's recorded hit range is reset too. It is a pair of INDICES
+    /// into the list being emptied, and a later `closeOverlay` would splice at
+    /// them; it clamps, so this is belt-and-braces, and a stale range that
+    /// clamps to a wrong-but-legal splice is worse than a crash because
+    /// nothing says it happened.
+    pub fn forgetHits(self: *Spark) void {
+        self.drawlist.hits.clearRetainingCapacity();
+        if (self.overlay) |*ov| ov.hits = .{ 0, 0 };
+        self.captured = null;
+        self.hovered = null;
+        self.focused = null;
+    }
+
     pub fn closeOverlay(self: *Spark) void {
         var ov = self.overlay orelse return;
         self.overlay = null;
@@ -6729,4 +6762,44 @@ test "context: the record lands in the state of the element that claimed it" {
         panel.get("ui.context").?,
     );
     try testing.expect(root.get("ui.context") == null);
+}
+
+test "spark: forgetHits drops every pointer a torn-down document left behind" {
+    // The contract, field by field. The SCENARIO — dispatch after a teardown —
+    // cannot be gated here without performing the use-after-free it prevents,
+    // so what is gated is that nothing survives the call, and the host's own
+    // `Panel.close` is where it is wired.
+    //
+    // Mutation: drop the `drawlist.hits.clearRetainingCapacity()`. Red. Same
+    // for each of the other three, one line each.
+    var sp = Spark.testStub(testing.allocator);
+    // `testStub` leaves most of a Spark `undefined` — it exists for gates that
+    // only touch a field or two. The drawlist is one this gate touches.
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+
+    var dummy: u8 = 0;
+    const vt = element.ElementVTable{ .layout_and_render = struct {
+        fn f(_: *anyopaque, o: [2]f32, _: element.Constraints, _: *element.LayoutCtx, _: *element.DrawList) anyerror!element.Box {
+            return .{ .x = o[0], .y = o[1], .w = 0, .h = 0, .baseline = o[1] };
+        }
+    }.f };
+    const fake = element.Hit{
+        .box = .{ .x = 0, .y = 0, .w = 10, .h = 10 },
+        .vtable = &vt,
+        .ctx = @ptrCast(&dummy),
+        .state = @ptrCast(&dummy),
+    };
+    try sp.drawlist.hits.append(fake);
+    try sp.drawlist.hits.append(fake);
+    sp.captured = fake;
+    sp.hovered = fake;
+    sp.focused = fake;
+
+    sp.forgetHits();
+
+    try testing.expectEqual(@as(usize, 0), sp.drawlist.hits.items.len);
+    try testing.expect(sp.captured == null);
+    try testing.expect(sp.hovered == null);
+    try testing.expect(sp.focused == null);
 }
