@@ -1605,7 +1605,31 @@ pub const Spark = struct {
     /// narrow context menu and a wide inspector — at which point it
     /// becomes a field on `LoadOpts`-shaped options rather than a
     /// constant.
-    pub const OVERLAY_MAX_W: f32 = 260;
+    ///
+    /// **260 → 680 on 2026-09-10, and it is PROVISIONAL.** matryoshka's
+    /// palette menu carries a sentence per operator, and at 260 every
+    /// one of them wrapped to three or four lines: sixteen tags with one
+    /// open ran the length of the screen. Christian, with the capture:
+    /// *"make that context window wider for now though so the
+    /// descriptions don't wrap and force a long panel."*
+    ///
+    /// The number was found by widening and LOOKING, not by measuring a
+    /// font: 480 halved the height and still broke three sentences, 580
+    /// left `choose` wrapping onto a lone full stop, 680 puts all nine
+    /// of `array`'s on one line each. Half a 1280 window is a lot for a
+    /// menu, and is the right trade while this one is a palette.
+    ///
+    /// Provisional because the trigger above is about to fire rather
+    /// than because the number is a guess. The palette is moving out of
+    /// the overlay and into a docked, selection-sensitive region — his
+    /// call, the same afternoon: *"this region at the top generalizes
+    /// across different selections… it isn't just a palette."* What is
+    /// left in an overlay after that is an OPERATIONS menu — Cut, Copy,
+    /// Delete, Replace with — which is a column of short verbs and wants
+    /// 260 again. So this is one line to change back, and the beat that
+    /// changes it is the one that makes two shapes exist at once and so
+    /// settles the recorded question properly.
+    pub const OVERLAY_MAX_W: f32 = 680;
 
     /// Measure the overlay, place it, and walk it into this frame's
     /// DrawList as its own paint layer. No-op when nothing is open.

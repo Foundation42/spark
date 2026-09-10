@@ -205,8 +205,18 @@ test "overlay render: the menu's ground is drawn where the menu is" {
     // translation applied once and then re-applied.
     var frame: usize = 0;
     while (frame < 2) : (frame += 1) {
+        // **The surface is 1280 wide so the menu is NOT at a flip.** This
+        // gate's subject is the TRANSLATION of a cached compose region,
+        // not the placement — but it asserts a literal (200, 150), so a
+        // surface narrow enough for `overlay.place` to flip the menu
+        // makes it fail for a reason it is not about. At 800 wide it did
+        // exactly that the moment `OVERLAY_MAX_W` went from 260 to 680:
+        // 200 + 680 overhangs, `place` flips to the left edge, and the
+        // region lands at 0. A gate that breaks when an unrelated
+        // constant moves is a gate that will be "fixed" by loosening its
+        // assertion. Room on both axes at any plausible width instead.
         try h.sp.beginFrame(
-            .{ .extent = .{ .width = 800, .height = 600 } },
+            .{ .extent = .{ .width = 1280, .height = 720 } },
             .{ .reset = true },
         );
         _ = try h.sp.layoutAndRender(&page_doc, .{ 20, 20 }, .{ .max_w = 720 });
@@ -226,7 +236,8 @@ test "overlay render: the menu's ground is drawn where the menu is" {
             else => continue,
         };
         // The overlay was anchored top-left at (200, 150) with room on
-        // both axes, so `overlay.place` leaves it there.
+        // both axes at this surface size, so `overlay.place` leaves it
+        // there — see the extent above.
         if (r.x == 200 and r.y == 150) found_at_menu = true;
         try testing.expect(r.w > 0 and r.h > 0);
     }
