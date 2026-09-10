@@ -1539,6 +1539,22 @@ pub const Spark = struct {
         return self.overlay != null;
     }
 
+    /// Where the open overlay sits, or null.
+    ///
+    /// For a host REPLACING one menu with another: a second-level menu is
+    /// chosen with the cursor inside the first, so re-anchoring to the pointer
+    /// would walk the menu down the screen one level at a time. Asking where
+    /// the open one is keeps it put.
+    ///
+    /// The box is `{0,0,0,0}` until the first `layoutAndRenderOverlay`, so a
+    /// host that opens two in one frame gets the origin it asked for rather
+    /// than a corner — which is right, and is why this returns the box's
+    /// position rather than a promise about it.
+    pub fn overlayOrigin(self: *const Spark) ?[2]f32 {
+        const ov = self.overlay orelse return null;
+        return .{ ov.box.x, ov.box.y };
+    }
+
     /// The width an overlay document is laid out against.
     ///
     /// A menu has a width; prose in spark claims whatever `max_w` it is
