@@ -1,12 +1,14 @@
 //! `:::nodegraph` — a pannable, zoomable canvas of nodes, pins and links.
 //!
-//! Beat 1 of the graph editor: **draw and navigate**. Pan, zoom, drag a
-//! node, hover, select, write the moved positions back out. There is no
-//! palette, nothing creates or breaks a link, nothing is deleted, there
-//! is no marquee and no drill-in. Each of those needs a decision that is
-//! not made yet, and the four things this beat DOES settle — the
+//! Beat 1 settled **draw and navigate**: pan, zoom, drag a node, hover,
+//! select, write the moved positions back out. Its four decisions — the
 //! transform, hit testing, layering, link rendering — are the four
 //! everything after inherits.
+//!
+//! Beat 2 is **wiring**: a wire is dragged off a pin, every pin in the
+//! graph says at once whether it would take it, and the release asks the
+//! host to join them. Still no palette, nothing is deleted, there is no
+//! marquee and no drill-in.
 //!
 //! ## The name
 //!
@@ -52,12 +54,15 @@
 //!   * `node id= x= y= [w=] [h=] [label=] [tint=]` — declares a node at a
 //!     graph-space top-left. `w`/`h` override the size the pin count
 //!     would otherwise pick.
-//!   * `pin node= id= dir=in|out [label=]` — hangs a pin on a declared
-//!     node. Order within a direction is the order the lines appear in.
+//!   * `pin node= id= dir=in|out [label=] [type=<token>]` — hangs a pin
+//!     on a declared node. Order within a direction is the order the
+//!     lines appear in. `type` is an OPAQUE token; see below.
 //!   * `link from=<node>.<pin> to=<node>.<pin> [tint=]` — split on the
 //!     LAST dot, so a node id may contain dots and a pin id may not.
 //!     Resolved after the whole text is read, so link lines may precede
 //!     the pins they name.
+//!   * `accept from=<token> to=<token> [mode=exact|coerce]` — one
+//!     declared compatibility pair. See "Reachability" below.
 //!   * `pos id= x= y=` — MOVES an existing node and declares nothing.
 //!     This is the write-back's own record, and the reason it is a
 //!     separate kind: the positions this component emits can be fed
@@ -89,6 +94,63 @@
 //!     first time either side gains a rule. `Description` is what the
 //!     component holds and what that door hands out — same struct, same
 //!     `read`, one implementation.
+//!
+//! ## Reachability, and how a type system reaches spark without
+//! ## spark learning one
+//!
+//! With a wire in hand every pin in the graph answers the same question
+//! — *can this land on you* — and there are **three** answers, not two.
+//! The third is the one worth having: Blade3D's `OutputPort.cs` lit a
+//! port LIME when the classes matched and ORANGE when they only matched
+//! through `AnyTypeConverter.IsConvertible`, so *yes, and a conversion
+//! gets inserted* was visible before you let go. That is a different
+//! answer from both yes and no and a reader wants it.
+//!
+//! spark cannot compute it, because computing it means knowing what a
+//! type is. So the host declares the relation as **data**:
+//!
+//!   * each pin carries an opaque `type=` token — spark only ever
+//!     compares two of them for equality or looks the pair up;
+//!   * `accept from= to= mode=` rows say which ordered pairs are legal
+//!     and at what cost.
+//!
+//! An earlier design gave pins a token and made the rule *"equal, or
+//! either side is `*`"*. It is smaller and it cannot express orange: a
+//! relation is not recoverable from equality. rill's whole type table is
+//! eight builtins, so declaring the relation costs a handful of rows.
+//!
+//! Two properties keep this from becoming a trap. **No `accept` rows at
+//! all means everything reaches everything** — a description written
+//! before this record existed behaves as it always did, and a host with
+//! no type system pays nothing. And an **empty token still reaches**,
+//! because a pin the host said nothing about is not a pin the host
+//! refused. spark refuses only what it was told to refuse.
+//!
+//! Two rules ARE spark's own, because they are facts about a canvas and
+//! not about a language: a wire joins opposite directions, and a pin
+//! does not reach its own node. Longer cycles are not caught here —
+//! whether a cycle is even illegal is the host's question (rill refuses
+//! one; a modular synth patch is made of them) — and come back as
+//! whatever graph the host returns.
+//!
+//! ## The edit channel: the canvas asks, the host answers
+//!
+//! `positions=` is an echo: the canvas moved the node, and nothing else
+//! could have computed where it went. A WIRE is not like that. Whether
+//! two pins may be joined is a question about the host's language, so
+//! the release writes a REQUEST to `edits=` and the host answers with a
+//! whole new graph. The canvas does not apply the edit to itself.
+//!
+//! That asymmetry is what makes a refusal free. There is no "no" to
+//! send, no error path, no rollback: the graph you already had simply
+//! arrives again, and because the canvas never diverged there is
+//! nothing to reconcile.
+//!
+//! **Every record is an assignment, never a toggle.** `link` sets an
+//! input's source; `unlink` clears one. Applying either twice is
+//! applying it once — so a host re-reading the path on a repeated
+//! notification cannot double-apply, and the channel needs no sequence
+//! number and no acknowledgement.
 //!
 //! ## The transform, and where graph space stops
 //!
@@ -227,6 +289,30 @@ const PIN_IN_COLOR: [4]f32 = .{ 0.55, 0.72, 0.95, 1.0 };
 const PIN_OUT_COLOR: [4]f32 = .{ 0.62, 0.86, 0.68, 1.0 };
 const PIN_HOVER_COLOR: [4]f32 = .{ 1.0, 0.95, 0.72, 1.0 };
 
+// ── While a wire is in hand ─────────────────────────────────────────
+// Three states, and the third is the one worth having: a pin that can
+// be reached only through a conversion is a DIFFERENT answer from both
+// yes and no, and saying so before the button comes up is the whole
+// point. Blade3D flashed lime and orange and left everything else dark;
+// this is that, minus the pulse (see `Reach`).
+//
+// Neither of these is `PIN_OUT_COLOR`'s pastel green, deliberately: an
+// idle out-pin is already greenish, so a reachable pin has to be
+// unmistakably MORE than that, not a shade of it.
+const PIN_REACH_EXACT: [4]f32 = .{ 0.40, 0.98, 0.45, 1.0 };
+const PIN_REACH_COERCE: [4]f32 = .{ 1.0, 0.62, 0.16, 1.0 };
+/// What an unreachable pin fades to while a wire is out. Colour alone
+/// would be enough on this palette; it is not enough for every reader,
+/// which is why a reachable pin also GROWS (`PIN_REACH_R`). Two cues,
+/// one of them not colour.
+const PIN_DIM: f32 = 0.22;
+/// Radius of a reachable pin while a wire is in hand. The size cue.
+const PIN_REACH_R: f32 = 6.0;
+/// The wire in hand, before it is over anything that will take it.
+/// Blade3D's teal, one notch cooler than this palette's link grey so it
+/// reads as "live" rather than "drawn".
+const WIRE_LOOSE: [4]f32 = .{ 0.40, 0.80, 0.85, 0.95 };
+
 const LINK_COLOR: [4]f32 = .{ 0.62, 0.70, 0.84, 0.85 };
 /// Link stroke width, in SCREEN pixels — a wire is chrome, so it keeps
 /// its weight when you zoom out and the graph does not turn to fog.
@@ -350,7 +436,46 @@ pub const Pin = struct {
     dir: Dir,
     /// Row within this node's pins of the same direction.
     slot: u32,
+    /// **An opaque compatibility token.** spark does not know what it
+    /// means and must never learn: the host names its own types, and
+    /// this file only ever compares two of these for equality or looks
+    /// the pair up in the `accept` table the host declared beside them.
+    ///
+    /// Empty is "the host said nothing about this pin", which is not
+    /// the same as a type called "" — see `reachOf`, where it is the
+    /// difference between refusing and declining to guess.
+    ty: []const u8 = "",
 };
+
+/// One declared compatibility pair: a wire leaving a `from` pin may
+/// land on a `to` pin, and `mode` says at what cost.
+///
+/// **This is how a lattice reaches spark without spark learning one.**
+/// The first design gave each pin a token and made the rule "equal, or
+/// either side is `*`" — which cannot express Blade3D's orange, the
+/// answer that means *yes, and a conversion is inserted*. A relation
+/// cannot be recovered from equality, so the host declares the relation
+/// itself, as data, for the pairs its graph actually contains. rill's
+/// whole type table is eight builtins, so this is a handful of rows.
+pub const Accept = struct {
+    from: []const u8,
+    to: []const u8,
+    mode: Reach,
+};
+
+/// What a wire in hand may do to a pin. Ordered by permissiveness so
+/// `@intFromEnum` can be compared if that is ever wanted.
+///
+/// **Why this is not a pulse.** Blade3D drove the same three states as
+/// a flashing tint out of `gameTime.TotalGameTime`, and a fourth speed
+/// for the port under the cursor. spark has no clock at draw time and
+/// should not grow one by reading the wall — spindrift's rule ("time is
+/// fed, never read") is the house rule and this library is downstream of
+/// the same discipline. The information content is identical without the
+/// pulse: three colours, a size step, and the pin under the cursor is
+/// already `hovered`. If spark is ever fed a frame time, a pulse is one
+/// multiply here and nothing else changes.
+pub const Reach = enum { none, exact, coerce };
 
 pub const Link = struct {
     from: u32,
@@ -588,6 +713,12 @@ pub const Description = struct {
     nodes: std.ArrayList(Node),
     pins: std.ArrayList(Pin),
     links: std.ArrayList(Link),
+    /// The host's declared compatibility pairs. EMPTY means the host
+    /// declared no lattice at all, which `reachOf` reads as "everything
+    /// reaches everything" — not as "nothing does". A description
+    /// written before this record existed keeps working unchanged, and
+    /// that is the point: spark refuses nothing it was not told about.
+    accepts: std.ArrayList(Accept),
 
     /// The camera a `view` record seeds. In-out across a read: a `view`
     /// line names only the fields it mentions and the rest keep what
@@ -611,6 +742,7 @@ pub const Description = struct {
             .nodes = std.ArrayList(Node).init(gpa),
             .pins = std.ArrayList(Pin).init(gpa),
             .links = std.ArrayList(Link).init(gpa),
+            .accepts = std.ArrayList(Accept).init(gpa),
         };
     }
 
@@ -618,6 +750,7 @@ pub const Description = struct {
         self.nodes.deinit();
         self.pins.deinit();
         self.links.deinit();
+        self.accepts.deinit();
         self.arena.deinit();
         self.gpa.destroy(self.arena);
     }
@@ -630,6 +763,7 @@ pub const Description = struct {
         self.nodes.clearRetainingCapacity();
         self.pins.clearRetainingCapacity();
         self.links.clearRetainingCapacity();
+        self.accepts.clearRetainingCapacity();
         _ = self.arena.reset(.retain_capacity);
     }
 
@@ -739,6 +873,8 @@ pub const Description = struct {
                         p.label = try a.dupe(u8, f.value);
                     } else if (std.mem.eql(u8, f.key, "dir")) {
                         p.dir = if (std.mem.eql(u8, f.value, "out")) .out else .in;
+                    } else if (std.mem.eql(u8, f.key, "type")) {
+                        p.ty = try a.dupe(u8, f.value);
                     }
                 }
                 const owner = self.findNode(node_id) orelse {
@@ -776,6 +912,31 @@ pub const Description = struct {
                     continue;
                 }
                 try pending.append(pl);
+            } else if (std.mem.eql(u8, kind, "accept")) {
+                var ac = Accept{ .from = "", .to = "", .mode = .exact };
+                while (it.next()) |f| {
+                    if (std.mem.eql(u8, f.key, "from")) {
+                        ac.from = try a.dupe(u8, f.value);
+                    } else if (std.mem.eql(u8, f.key, "to")) {
+                        ac.to = try a.dupe(u8, f.value);
+                    } else if (std.mem.eql(u8, f.key, "mode")) {
+                        // `exact` is the default and needs no spelling.
+                        // An unknown mode is a BAD LINE, not a silent
+                        // demotion to exact: a host that misspells
+                        // `coerce` would otherwise get green pins where
+                        // it asked for amber and never find out.
+                        if (std.mem.eql(u8, f.value, "coerce")) {
+                            ac.mode = .coerce;
+                        } else if (!std.mem.eql(u8, f.value, "exact")) {
+                            ac.mode = .none;
+                        }
+                    }
+                }
+                if (ac.from.len == 0 or ac.to.len == 0 or ac.mode == .none) {
+                    self.bad_lines += 1;
+                    continue;
+                }
+                try self.accepts.append(ac);
             } else if (std.mem.eql(u8, kind, "view")) {
                 while (it.next()) |f| {
                     if (std.mem.eql(u8, f.key, "zoom")) {
@@ -827,6 +988,100 @@ pub const Description = struct {
                 n.size[1] = @max(h, NODE_MIN_H);
             }
         }
+    }
+
+    /// The link, if any, feeding this INPUT pin.
+    ///
+    /// An input takes at most one source — that is not a convention
+    /// this file invented, it is what a dataflow slot IS, and Blade3D
+    /// enforced it by deleting any existing connection to a target pin
+    /// before making a new one. Here it is what makes picking a wire up
+    /// off an input unambiguous: there is only ever one to pick up.
+    pub fn linkInto(self: *const Description, pin: u32) ?u32 {
+        for (self.links.items, 0..) |l, i| {
+            if (l.to == pin) return @intCast(i);
+        }
+        return null;
+    }
+
+    /// **Can a wire anchored at `anchor` land on `pin`?**
+    ///
+    /// Three rules, and only the third is the host's business:
+    ///
+    ///   1. *Direction.* An out reaches an in and an in reaches an out.
+    ///      A wire between two inputs is not a thing a graph can mean.
+    ///   2. *Not its own node.* Blade3D refused this at
+    ///      `ReferenceEquals(inputBlock, outputBlock)` and so do we. An
+    ///      operator feeding itself is a cycle of length one, and the
+    ///      one cycle a canvas can catch without knowing the language.
+    ///   3. *The token.* With no `accept` records the host declared no
+    ///      lattice, so every pair is `.exact` — a graph drawn before
+    ///      this record existed behaves as it always did. With records,
+    ///      an EMPTY token on either side still reaches: an untyped pin
+    ///      is one the host said nothing about, and refusing it would be
+    ///      a guess. Everything else must be declared.
+    ///
+    /// Longer cycles are NOT caught here and deliberately so: whether a
+    /// cycle is even illegal is a question about the host's language
+    /// (rill refuses one; a modular synth patch is made of them), and a
+    /// canvas that decided it would be deciding for every host. That
+    /// answer comes back with the graph the host returns.
+    ///
+    /// Pure, and takes the description rather than the component, so
+    /// every case above is gated without a device.
+    pub fn reachOf(self: *const Description, anchor: u32, pin: u32) Reach {
+        if (anchor >= self.pins.items.len or pin >= self.pins.items.len) return .none;
+        const a = self.pins.items[anchor];
+        const b = self.pins.items[pin];
+        if (a.dir == b.dir) return .none;
+        if (a.node == b.node) return .none;
+        if (self.accepts.items.len == 0) return .exact;
+
+        // The pair is always read source-to-sink, whichever end the
+        // reader happened to grab. Without this, dragging backwards off
+        // an input would look the pair up the wrong way round and a
+        // one-directional coercion would light the wrong pins.
+        const from = if (a.dir == .out) a.ty else b.ty;
+        const to = if (a.dir == .out) b.ty else a.ty;
+        if (from.len == 0 or to.len == 0) return .exact;
+        for (self.accepts.items) |ac| {
+            if (std.mem.eql(u8, ac.from, from) and std.mem.eql(u8, ac.to, to)) return ac.mode;
+        }
+        return .none;
+    }
+
+    /// The reachable pin nearest `g` on node `node`, or null.
+    ///
+    /// Releasing a wire has to be forgiving. A pin dot is four graph
+    /// units across and aiming at one at 0.4 zoom is a game, not an
+    /// edit — so a release anywhere on a node's BODY lands on that
+    /// node's nearest pin that would take the wire. Blueprints does
+    /// this; Blade3D did not, and its `GetControlAt` returning anything
+    /// but an `InputPort` simply dropped the wire.
+    pub fn nearestReachable(self: *const Description, anchor: u32, node: u32, g: [2]f32) ?u32 {
+        var best: ?u32 = null;
+        var best_d2: f32 = std.math.floatMax(f32);
+        for (self.pins.items, 0..) |p, i| {
+            if (p.node != node) continue;
+            if (self.reachOf(anchor, @intCast(i)) == .none) continue;
+            const c = self.pinCentre(@intCast(i));
+            const dx = g[0] - c[0];
+            const dy = g[1] - c[1];
+            const d2 = dx * dx + dy * dy;
+            if (d2 < best_d2) {
+                best_d2 = d2;
+                best = @intCast(i);
+            }
+        }
+        return best;
+    }
+
+    /// `<node id>.<pin id>`, the spelling `link from=`/`to=` uses.
+    /// Written into the caller's buffer via a writer so the edit channel
+    /// composes without a second allocation per record.
+    pub fn writeRef(self: *const Description, w: anytype, pin: u32) !void {
+        const p = self.pins.items[pin];
+        try w.print("{s}.{s}", .{ self.nodes.items[p.node].id, p.id });
     }
 
     /// A pin's centre, in graph space.
@@ -912,15 +1167,33 @@ const Grab = union(enum) {
         press_local: [2]f32,
         start_pan: [2]f32,
     },
-    /// A pin is held. It moves nothing in this beat — making and
-    /// breaking links is a later one — and it exists anyway so that
-    /// EVERY press latches something.
+    /// A wire is in hand.
     ///
-    /// Without it a press on a pin is the one route into
-    /// `writeSelection` that runs with `ingest` still open, which is
-    /// three quarters of a guard. The beat that makes this press start
-    /// a link drag would have inherited that hole with no sign of it.
-    pin: u32,
+    /// **`anchor` is the end that is NOT moving**, and it is not always
+    /// the pin that was pressed. Pressing an OUTPUT starts a new wire
+    /// anchored there. Pressing an INPUT that already has a link picks
+    /// that link UP: the anchor becomes the link's far end and
+    /// `detached` remembers which link left the picture, so releasing
+    /// over nothing means *disconnect* rather than *nothing happened*.
+    /// Pressing a bare input starts a new wire backwards from it.
+    ///
+    /// Blade3D dragged from outputs only (`InputPort.cs` is fifty-four
+    /// lines and does nothing but pulse). Dragging from either end is
+    /// free here for the reason the one-source rule makes it free: an
+    /// input holds exactly one wire, so "the wire on this input" is
+    /// never ambiguous and there is nothing to disambiguate.
+    wire: struct {
+        anchor: u32,
+        /// The link this drag lifted off an input, if any.
+        detached: ?u32,
+        /// Live cursor, in GRAPH space, so the preview wire is drawn on
+        /// the same terms as every real one and needs no second path.
+        cursor: [2]f32,
+        /// What the cursor is over right now — recomputed on move
+        /// rather than read off `hovered`, because hover events are not
+        /// guaranteed while a button is held.
+        over: Hover,
+    },
 };
 
 pub const Hover = union(enum) {
@@ -949,6 +1222,7 @@ const Component = struct {
     /// bound", and an unbound channel is simply never written.
     positions_path: []u8,
     selected_path: []u8,
+    edits_path: []u8,
 
     selected: ?u32 = null,
     hovered: Hover = .none,
@@ -1022,6 +1296,8 @@ const Component = struct {
                 try component_mod.adoptString(a, &self.positions_path, attr.value);
             } else if (std.mem.eql(u8, k, "selected")) {
                 try component_mod.adoptString(a, &self.selected_path, attr.value);
+            } else if (std.mem.eql(u8, k, "edits")) {
+                try component_mod.adoptString(a, &self.edits_path, attr.value);
             } else if (std.mem.eql(u8, k, "width")) {
                 if (box_helpers.parseLength(attr.value)) |l| self.width = l;
             } else if (std.mem.eql(u8, k, "height")) {
@@ -1061,6 +1337,98 @@ const Component = struct {
             try w.print("pos id={s} x={d:.2} y={d:.2}\n", .{ n.id, n.pos[0], n.pos[1] });
         }
         try state.set(self.positions_path, buf.items);
+    }
+
+    /// **The edit channel: what the canvas ASKS the host to do.**
+    ///
+    /// The canvas does not apply a structural edit to itself. It moves a
+    /// node itself — nothing else can compute where a node goes — but
+    /// whether two pins may be joined is a question about the host's
+    /// language, so the wire is a REQUEST and the host answers with a
+    /// whole new graph. A refusal is therefore not a protocol: it is the
+    /// graph you already had, arriving again. There is no divergence to
+    /// reconcile because the canvas never diverged.
+    ///
+    /// **Every record is an assignment, never a toggle**, and that is
+    /// what makes the channel safe to re-deliver. `link` SETS an input's
+    /// source, replacing whatever was there; `unlink` CLEARS one. Apply
+    /// either twice and you have applied it once. A host that re-reads
+    /// this path on every notification — which is what `State.set`
+    /// subscribers do — cannot double-apply an edit, so the channel
+    /// needs no sequence number and no acknowledgement.
+    ///
+    ///     link from=near1.out to=mul3.a
+    ///     unlink to=mul3.a
+    ///
+    /// A gesture may write both: rehoming a wire clears where it was and
+    /// sets where it went, and the two name different inputs so their
+    /// order does not matter either.
+    ///
+    /// The kinds this channel will grow, named here so the grammar is
+    /// designed rather than accreted — `add op= x= y=` when the palette
+    /// lands, `drop id=` when deletion does. Both are assignments too.
+    fn writeEdits(self: *Component, state: *state_mod.State, text: []const u8) !void {
+        if (self.edits_path.len == 0 or text.len == 0) return;
+        try state.set(self.edits_path, text);
+    }
+
+    /// Where a wire in hand ends up, and what that asks the host for.
+    ///
+    /// Four outcomes, and each is a deliberate answer to "what did the
+    /// reader mean":
+    ///
+    ///   * **on a reachable pin** — join them. If the wire was lifted
+    ///     off another input, that input is cleared in the same write.
+    ///   * **on a node's body** — the nearest pin on it that would take
+    ///     the wire (`nearestReachable`). A four-unit dot is not a
+    ///     target at 0.4 zoom.
+    ///   * **over nothing, carrying a lifted wire** — disconnect. That
+    ///     is what picking it up was FOR, and it is why `detached` is
+    ///     remembered rather than the drag simply re-anchoring.
+    ///   * **over nothing, carrying a new wire** — nothing at all. No
+    ///     record is written, so a host subscribed to this path is not
+    ///     woken to be told the reader changed their mind.
+    ///
+    /// Dropped back onto the input it came from is the fourth case by
+    /// arithmetic rather than by a branch: the clear and the set name
+    /// the same input, so `unlink` is suppressed and `link` restores
+    /// exactly what was there. Cancel needs no key, which is why this
+    /// component still takes no keyboard focus.
+    fn releaseWire(self: *Component, state: *state_mod.State, w: anytype) !void {
+        const landed: ?u32 = switch (w.over) {
+            .pin => |i| if (self.desc.reachOf(w.anchor, i) != .none) i else null,
+            .node => |n| self.desc.nearestReachable(w.anchor, n, w.cursor),
+            .none => null,
+        };
+
+        const lifted_from: ?u32 = if (w.detached) |li| self.desc.links.items[li].to else null;
+        if (landed == null and lifted_from == null) return;
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        const out = buf.writer();
+
+        if (lifted_from) |old_in| {
+            if (landed == null or landed.? != old_in) {
+                try out.writeAll("unlink to=");
+                try self.desc.writeRef(out, old_in);
+                try out.writeByte('\n');
+            }
+        }
+        if (landed) |target| {
+            // Whichever end was grabbed, the record is written
+            // source-to-sink. A host reading `from=` should never have
+            // to ask which way the reader happened to drag.
+            const anchor_out = self.desc.pins.items[w.anchor].dir == .out;
+            const src = if (anchor_out) w.anchor else target;
+            const dst = if (anchor_out) target else w.anchor;
+            try out.writeAll("link from=");
+            try self.desc.writeRef(out, src);
+            try out.writeAll(" to=");
+            try self.desc.writeRef(out, dst);
+            try out.writeByte('\n');
+        }
+        try self.writeEdits(state, buf.items);
     }
 
     fn writeSelection(self: *Component, state: *state_mod.State) !void {
@@ -1108,6 +1476,8 @@ fn create(
     errdefer allocator.free(positions);
     const selected = try allocator.dupe(u8, "");
     errdefer allocator.free(selected);
+    const edits = try allocator.dupe(u8, "");
+    errdefer allocator.free(edits);
     const last_selected = try allocator.dupe(u8, "");
     errdefer allocator.free(last_selected);
 
@@ -1122,6 +1492,7 @@ fn create(
         .desc = try Description.init(allocator),
         .positions_path = positions,
         .selected_path = selected,
+        .edits_path = edits,
         .last_selected_written = last_selected,
     };
     errdefer c.desc.deinit();
@@ -1139,6 +1510,7 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     c.desc.deinit();
     allocator.free(c.positions_path);
     allocator.free(c.selected_path);
+    allocator.free(c.edits_path);
     allocator.free(c.last_selected_written);
     if (c.pending) |p| allocator.free(p);
     allocator.destroy(c);
@@ -1201,6 +1573,63 @@ fn tinted(c: [4]f32, f: f32) [4]f32 {
     return .{ c[0] * f, c[1] * f, c[2] * f, c[3] };
 }
 
+/// A pin that cannot take the wire in hand. Fades the ALPHA and leaves
+/// the hue, so a dimmed in-pin still reads as an in-pin — the graph goes
+/// quiet, it does not go grey.
+fn dimmed(c: [4]f32) [4]f32 {
+    return .{ c[0], c[1], c[2], c[3] * PIN_DIM };
+}
+
+/// The wire between the anchor and the cursor, coloured by what the
+/// cursor is over.
+///
+/// The colour is the answer BEFORE the button comes up, which is the
+/// half of Blade3D's model that made it feel like an editor: teal while
+/// it is over nothing, and the target's own green or amber the moment it
+/// is over something that would take it. You never have to release to
+/// find out.
+fn drawWireInHand(
+    c: *Component,
+    canvas: Rect,
+    lc: *element.LayoutCtx,
+    out: *element.DrawList,
+    origin: [2]f32,
+    w: @TypeOf(@as(Grab, undefined).wire),
+) !void {
+    const anchor_dir = c.desc.pins.items[w.anchor].dir;
+    const landed: ?u32 = switch (w.over) {
+        .pin => |i| if (c.desc.reachOf(w.anchor, i) != .none) i else null,
+        .node => |n| c.desc.nearestReachable(w.anchor, n, w.cursor),
+        .none => null,
+    };
+
+    // Snapping the drawn end onto the pin it would land on is not
+    // decoration: with body-drop the pin taking the wire is often not
+    // the one under the cursor, and a wire drawn to the cursor would
+    // not say which.
+    const far_g = if (landed) |i| c.desc.pinCentre(i) else w.cursor;
+    const col: [4]f32 = if (landed) |i| switch (c.desc.reachOf(w.anchor, i)) {
+        .coerce => PIN_REACH_COERCE,
+        else => PIN_REACH_EXACT,
+    } else WIRE_LOOSE;
+
+    const g_anchor = c.desc.pinCentre(w.anchor);
+    // The far end's direction is the anchor's opposite, so the curve
+    // leaves and arrives the way a finished one would and the wire does
+    // not change shape at the instant it lands.
+    const far_dir: Dir = if (anchor_dir == .out) .in else .out;
+    var seg_buf: [LINK_MAX_SEGS]Seg = undefined;
+    try strokeWire(lc, out, &seg_buf, canvas, c.desc.view.zoom, .{
+        .p0 = c.desc.view.toScreen(origin, g_anchor),
+        .p1 = c.desc.view.toScreen(origin, far_g),
+        .from_dir = anchor_dir,
+        .to_dir = far_dir,
+        .g0 = g_anchor,
+        .g1 = far_g,
+        .color = col,
+    });
+}
+
 fn layoutAndRender(
     ctx: *anyopaque,
     origin: [2]f32,
@@ -1243,6 +1672,55 @@ fn layoutAndRender(
     return .{ .x = canvas.x, .y = canvas.y, .w = w, .h = h, .baseline = canvas.y + h };
 }
 
+/// One wire, from screen point to screen point, curved and clipped and
+/// stroked.
+///
+/// It is a function rather than two copies because the wire IN HAND and
+/// a finished one have to agree about the curve. They did not, in the
+/// first draft: the preview used a straight tangent and the wire visibly
+/// changed shape at the instant it landed, which reads as the editor
+/// deciding something rather than the reader.
+fn strokeWire(
+    lc: *element.LayoutCtx,
+    out: *element.DrawList,
+    seg_buf: []Seg,
+    canvas: Rect,
+    z: f32,
+    w: struct {
+        p0: [2]f32,
+        p1: [2]f32,
+        from_dir: Dir,
+        to_dir: Dir,
+        /// Graph-space ends, used only to choose how many segments the
+        /// curve is worth. Screen-space would make the count depend on
+        /// where the canvas happens to sit on the page.
+        g0: [2]f32,
+        g1: [2]f32,
+        color: [4]f32,
+    },
+) !void {
+    // Cheap reject: a wire whose control hull cannot touch the canvas
+    // costs one rect test instead of twenty-four strokes.
+    const pad = LINK_TANGENT_MAX * z + LINK_W;
+    if (@max(w.p0[0], w.p1[0]) < canvas.x - pad or @min(w.p0[0], w.p1[0]) > canvas.x + canvas.w + pad) return;
+    if (@max(w.p0[1], w.p1[1]) < canvas.y - pad or @min(w.p0[1], w.p1[1]) > canvas.y + canvas.h + pad) return;
+
+    // Tangents follow the PIN's direction rather than the wire's, so a
+    // description that wires an output to an output still draws a curve
+    // that reads, instead of a knot.
+    const gap = @abs(w.p1[0] - w.p0[0]);
+    const k = std.math.clamp(gap * LINK_TANGENT_FRAC, LINK_TANGENT_MIN * z, LINK_TANGENT_MAX * z);
+    const c0: [2]f32 = .{ w.p0[0] + (if (w.from_dir == .out) k else -k), w.p0[1] };
+    const c1: [2]f32 = .{ w.p1[0] + (if (w.to_dir == .out) k else -k), w.p1[1] };
+
+    const n = segmentCount(w.g0, w.g1, z);
+    const segs = linkSegments(seg_buf, w.p0, c0, c1, w.p1, n, LINK_JOINT_OVERLAP);
+    for (segs) |sg| {
+        const vis = clipSegment(sg, canvas) orelse continue;
+        try relief.stroke(out, lc, vis.a, vis.b, LINK_W, w.color);
+    }
+}
+
 fn drawCanvas(
     c: *Component,
     canvas: Rect,
@@ -1261,8 +1739,20 @@ fn drawCanvas(
     try drawGrid(c, canvas, lc, out);
 
     // ── Links: TRIANGLES, over the ground, under everything else ───
+    //
+    // A link lifted off an input is IN HAND and is not drawn where it
+    // used to be. Leaving it there would draw two wires from one source
+    // while the reader holds one of them, and the picture would say the
+    // disconnect had not happened until the button came up — which is
+    // the opposite of what dragging a wire off a pin is supposed to
+    // look like.
+    const held_link: ?u32 = switch (c.grab) {
+        .wire => |w| w.detached,
+        else => null,
+    };
     var seg_buf: [LINK_MAX_SEGS]Seg = undefined;
-    for (c.desc.links.items) |l| {
+    for (c.desc.links.items, 0..) |l, li| {
+        if (held_link) |h| if (h == li) continue;
         const g0 = c.desc.pinCentre(l.from);
         const g1 = c.desc.pinCentre(l.to);
         const from_dir = c.desc.pins.items[l.from].dir;
@@ -1271,26 +1761,15 @@ fn drawCanvas(
         const p0 = c.desc.view.toScreen(origin, g0);
         const p1 = c.desc.view.toScreen(origin, g1);
 
-        // Cheap reject: a link whose control hull cannot touch the
-        // canvas costs one rect test instead of twenty-four strokes.
-        const pad = LINK_TANGENT_MAX * z + LINK_W;
-        if (@max(p0[0], p1[0]) < canvas.x - pad or @min(p0[0], p1[0]) > canvas.x + canvas.w + pad) continue;
-        if (@max(p0[1], p1[1]) < canvas.y - pad or @min(p0[1], p1[1]) > canvas.y + canvas.h + pad) continue;
-
-        // Tangents follow the PIN's direction rather than the link's, so
-        // a description that wires an output to an output still draws a
-        // curve that reads, instead of a knot.
-        const gap = @abs(p1[0] - p0[0]);
-        const k = std.math.clamp(gap * LINK_TANGENT_FRAC, LINK_TANGENT_MIN * z, LINK_TANGENT_MAX * z);
-        const c0: [2]f32 = .{ p0[0] + (if (from_dir == .out) k else -k), p0[1] };
-        const c1: [2]f32 = .{ p1[0] + (if (to_dir == .out) k else -k), p1[1] };
-
-        const n = segmentCount(g0, g1, z);
-        const segs = linkSegments(&seg_buf, p0, c0, c1, p1, n, LINK_JOINT_OVERLAP);
-        for (segs) |s| {
-            const vis = clipSegment(s, canvas) orelse continue;
-            try relief.stroke(out, lc, vis.a, vis.b, LINK_W, l.tint);
-        }
+        try strokeWire(lc, out, &seg_buf, canvas, z, .{
+            .p0 = p0,
+            .p1 = p1,
+            .from_dir = from_dir,
+            .to_dir = to_dir,
+            .g0 = g0,
+            .g1 = g1,
+            .color = l.tint,
+        });
     }
 
     // ── Nodes: QUADS, which puts them over every wire for free ─────
@@ -1337,16 +1816,40 @@ fn drawCanvas(
     }
 
     // ── Pins: QUADS with a radius, so they are anti-aliased discs ──
+    //
+    // With a wire in hand every pin answers the same question — *can
+    // this land on you* — and the graph goes quiet so the ones that can
+    // are the only thing left lit. That sweep is Blade3D's
+    // `CollectInputPorts`, which walked every port in the graph at
+    // mouse-down and set `Flash` on the ones that matched. Here it is
+    // recomputed rather than cached: it is O(pins × accepts) with both
+    // small, and a cache would have to be invalidated by every path
+    // that can change the graph mid-gesture. Trigger for caching it into
+    // the grab: a graph where this shows up in a frame time.
+    const wire: ?@TypeOf(c.grab.wire) = switch (c.grab) {
+        .wire => |w| w,
+        else => null,
+    };
     for (c.desc.pins.items, 0..) |p, i| {
+        const reach: Reach = if (wire) |w| c.desc.reachOf(w.anchor, @intCast(i)) else .none;
+        const r = (if (wire != null and reach != .none) PIN_REACH_R else PIN_R) * z;
         const sc = c.desc.view.toScreen(origin, c.desc.pinCentre(@intCast(i)));
-        const r = PIN_R * z;
         if (sc[0] + r < canvas.x or sc[0] - r > canvas.x + canvas.w) continue;
         if (sc[1] + r < canvas.y or sc[1] - r > canvas.y + canvas.h) continue;
         const hot = switch (c.hovered) {
             .pin => |hp| hp == i,
             else => false,
         };
-        const col: [4]f32 = if (hot) PIN_HOVER_COLOR else if (p.dir == .in) PIN_IN_COLOR else PIN_OUT_COLOR;
+        var col: [4]f32 = if (hot) PIN_HOVER_COLOR else if (p.dir == .in) PIN_IN_COLOR else PIN_OUT_COLOR;
+        if (wire) |w| {
+            col = switch (reach) {
+                .exact => PIN_REACH_EXACT,
+                .coerce => PIN_REACH_COERCE,
+                // The anchor itself is unreachable by rule 2 and must
+                // still be visible: it is the end you are holding.
+                .none => if (i == w.anchor) col else dimmed(col),
+            };
+        }
         try out.appendQuad(lc, .{
             .dst_pos = .{ sc[0] - r, sc[1] - r },
             .dst_size = .{ 2 * r, 2 * r },
@@ -1354,6 +1857,19 @@ fn drawCanvas(
             .radius = r,
         });
     }
+
+    // ── The wire in hand ───────────────────────────────────────────
+    //
+    // Drawn LAST and as a quad-layer stroke would sink under the nodes,
+    // so it is `relief.stroke` like every other wire — which puts it in
+    // the triangle layer, UNDER the node bodies. That is the right
+    // place: a wire dragged across a node should pass behind it, exactly
+    // as a connected one does, or the picture says the wire is on top of
+    // something it is not attached to.
+    //
+    // It is emitted after the node loop only because the triangle layer
+    // does not care; the order here is for a reader, not the renderer.
+    if (wire) |w| try drawWireInHand(c, canvas, lc, out, origin, w);
 
     // ── Labels: GLYPHS, over everything ────────────────────────────
     if (z >= LABEL_MIN_ZOOM) try drawLabels(c, canvas, lc, out);
@@ -1559,13 +2075,25 @@ fn onInput(ctx: *anyopaque, event: element.InputEvent, state_raw: *anyopaque) an
                     c.hovered = hit;
                 },
                 .pin => |i| {
-                    // A press on a pin selects its node and moves
-                    // nothing. It must not fall through to a pan, which
-                    // would slide the whole canvas out from under a
-                    // deliberate aim — and it latches, so the write
-                    // below runs behind the same closed `ingest` every
-                    // other press does.
-                    c.grab = .{ .pin = i };
+                    // A press on a pin takes a wire in hand. It must not
+                    // fall through to a pan, which would slide the whole
+                    // canvas out from under a deliberate aim — and it
+                    // latches, so the write below runs behind the same
+                    // closed `ingest` every other press does.
+                    //
+                    // Pressing an INPUT that already has a wire picks
+                    // that wire up rather than starting a second one,
+                    // because an input holds exactly one source and a
+                    // second would have to evict the first anyway. What
+                    // you get in hand is the far end.
+                    const held = c.desc.linkInto(i);
+                    const anchor = if (held) |li| c.desc.links.items[li].from else i;
+                    c.grab = .{ .wire = .{
+                        .anchor = anchor,
+                        .detached = held,
+                        .cursor = g,
+                        .over = hit,
+                    } };
                     c.selected = c.desc.pins.items[i].node;
                     c.hovered = hit;
                 },
@@ -1582,7 +2110,12 @@ fn onInput(ctx: *anyopaque, event: element.InputEvent, state_raw: *anyopaque) an
         .mouse_move => |mev| {
             if (!mev.button_down) return;
             switch (c.grab) {
-                .none, .pin => {},
+                .none => {},
+                .wire => |*w| {
+                    w.cursor = c.desc.view.toGraph(mev.local);
+                    w.over = c.desc.pick(w.cursor);
+                    c.version +%= 1;
+                },
                 .pan => |p| {
                     // Drag right, content goes right, so the camera goes
                     // left. In graph units, because a pan measured in
@@ -1606,7 +2139,17 @@ fn onInput(ctx: *anyopaque, event: element.InputEvent, state_raw: *anyopaque) an
             }
         },
         .mouse_up => |mev| {
-            _ = mev;
+            // Where the button came up is the truth about where the wire
+            // landed. The last `mouse_move` is USUALLY the same point
+            // and is not guaranteed to be: a host that coalesces motion,
+            // a tablet that reports a press-and-lift with no move
+            // between them, or a release delivered after the pointer
+            // left the canvas all give a stale `over`. Re-picking here
+            // costs one hit test per gesture.
+            if (c.grab == .wire) {
+                c.grab.wire.cursor = c.desc.view.toGraph(mev.local);
+                c.grab.wire.over = c.desc.pick(c.grab.wire.cursor);
+            }
             const was = c.grab;
             // Both of these run with the latch STILL SET, so the
             // synchronous subscriber storm a `State.set` kicks off finds
@@ -1614,6 +2157,7 @@ fn onInput(ctx: *anyopaque, event: element.InputEvent, state_raw: *anyopaque) an
             // under the hand that just moved it.
             switch (was) {
                 .node => |d| if (d.moved) try c.writePositions(state),
+                .wire => |w| try c.releaseWire(state, w),
                 else => {},
             }
             try c.drainPending();
@@ -2015,10 +2559,14 @@ test "nodegraph: the topmost node wins where two overlap" {
 
 test "nodegraph: a press on a pin latches too, so the write is guarded" {
     // Three quarters of a guard is the shape a later beat inherits and
-    // cannot see. Mutation: drop `c.grab = .{ .pin = i };` from the
-    // `.pin` arm — red, and `writeSelection` then runs with `ingest`
-    // open, which is the window `State.set`'s synchronous notify lands
-    // in.
+    // cannot see. Mutation: drop the `c.grab = .{ .wire = … };`
+    // assignment from the `.pin` arm — red, and `writeSelection` then
+    // runs with `ingest` open, which is the window `State.set`'s
+    // synchronous notify lands in.
+    //
+    // It also still asserts what a press on a pin does NOT do. Beat 2
+    // gave that press a wire to carry; it must not have quietly given it
+    // a node drag or a pan as well.
     var st = state_mod.State.init(testing.allocator);
     defer st.deinit();
     const c = try makeGraph(two_node_graph, &.{
@@ -2032,7 +2580,7 @@ test "nodegraph: a press on a pin latches too, so the write is guarded" {
         .button = 0,
         .button_down = true,
     } }, @ptrCast(&st));
-    try testing.expect(c.grab == .pin);
+    try testing.expect(c.grab == .wire);
     try testing.expect(c.gesturing());
     try testing.expectEqualStrings("mul", st.get("sel").?);
 
@@ -2695,4 +3243,480 @@ test "nodegraph: a segment is trimmed to the canvas, because tris are not scisso
     const inside = clipSegment(.{ .a = .{ 120, 120 }, .b = .{ 280, 180 } }, r).?;
     try testing.expectApproxEqAbs(@as(f32, 120), inside.a[0], 1e-3);
     try testing.expectApproxEqAbs(@as(f32, 280), inside.b[0], 1e-3);
+}
+
+// ── Beat 2: reachability and the wire ───────────────────────────────
+
+/// Two nodes, one wire already in place, and a declared lattice with one
+/// coercion in it. `number → tight` is exact both ways; `number → wide`
+/// is a coercion; `colour` reaches nothing, which is what makes an
+/// unreachable pin gateable at all.
+const typed_graph =
+    \\node id=src x=0 y=0 label="Source"
+    \\node id=mul x=200 y=60 label="Multiply"
+    \\pin node=src id=out dir=out label="v" type=number
+    \\pin node=src id=hue dir=out label="hue" type=colour
+    \\pin node=mul id=a dir=in label="a" type=number
+    \\pin node=mul id=b dir=in label="b" type=ratio
+    \\pin node=mul id=out dir=out label="v" type=number
+    \\link from=src.out to=mul.a
+    \\accept from=number to=number
+    \\accept from=number to=ratio mode=coerce
+;
+
+/// Index of the pin `<node>.<pin>` in `typed_graph`-shaped descriptions,
+/// so a gate names pins the way the document does and does not go wrong
+/// when a fixture gains a line.
+fn pinAt(c: *Component, node: []const u8, pin: []const u8) u32 {
+    var buf: [64]u8 = undefined;
+    const ref = std.fmt.bufPrint(&buf, "{s}.{s}", .{ node, pin }) catch unreachable;
+    return c.desc.resolveRef(ref).?;
+}
+
+fn pressPin(c: *Component, st: *state_mod.State, pin: u32) !void {
+    const l = c.desc.view.toLocal(c.desc.pinCentre(pin));
+    try onInput(@ptrCast(c), .{ .mouse_down = .{ .local = l, .button = 0, .button_down = true } }, @ptrCast(st));
+}
+
+fn dragTo(c: *Component, st: *state_mod.State, g: [2]f32) !void {
+    const l = c.desc.view.toLocal(g);
+    try onInput(@ptrCast(c), .{ .mouse_move = .{ .local = l, .button = 0, .button_down = true } }, @ptrCast(st));
+}
+
+fn releaseAt(c: *Component, st: *state_mod.State, g: [2]f32) !void {
+    const l = c.desc.view.toLocal(g);
+    try onInput(@ptrCast(c), .{ .mouse_up = .{ .local = l, .button = 0, .button_down = false } }, @ptrCast(st));
+}
+
+test "nodegraph: reach is a direction, a node and a declared pair" {
+    // The three rules, each mutated separately because each has its own
+    // way of being wrong.
+    //
+    // Mutation 1: drop `if (a.dir == b.dir) return .none` — an output
+    // reaches another output and the second case goes red.
+    // Mutation 2: drop `if (a.node == b.node) return .none` — `mul.out`
+    // reaches `mul.a`, a cycle of length one, and the third goes red.
+    // Mutation 3: `return .exact` instead of consulting `accepts` — the
+    // colour pin reaches a number port and the last two go red.
+    const c = try makeGraph(typed_graph, &.{});
+    defer dropGraph(c);
+    const src_out = pinAt(c, "src", "out");
+    const src_hue = pinAt(c, "src", "hue");
+    const mul_a = pinAt(c, "mul", "a");
+    const mul_b = pinAt(c, "mul", "b");
+    const mul_out = pinAt(c, "mul", "out");
+
+    try testing.expectEqual(Reach.exact, c.desc.reachOf(src_out, mul_a));
+    // Two outputs are not a wire, whichever way round they are asked.
+    try testing.expectEqual(Reach.none, c.desc.reachOf(src_out, mul_out));
+    // A node feeding itself is the one cycle a canvas can catch without
+    // knowing the host's language.
+    try testing.expectEqual(Reach.none, c.desc.reachOf(mul_out, mul_a));
+    // Declared, and declared as a coercion — the answer that is neither
+    // yes nor no, and the whole reason `accept` carries a mode.
+    try testing.expectEqual(Reach.coerce, c.desc.reachOf(src_out, mul_b));
+    // `colour → number` was never declared, so it is refused.
+    try testing.expectEqual(Reach.none, c.desc.reachOf(src_hue, mul_a));
+}
+
+test "nodegraph: the pair is read source-to-sink, whichever end was grabbed" {
+    // Dragging BACKWARDS off an input must ask the same question as
+    // dragging forwards onto it. The lattice is directed — `number`
+    // reaches `ratio` and nothing here says `ratio` reaches `number` —
+    // so an implementation that looked the pair up as (grabbed, other)
+    // would light the wrong pins on exactly half of all drags.
+    //
+    // Mutation: in `reachOf`, use `a.ty`/`b.ty` for `from`/`to` instead
+    // of ordering them by `dir`. Red — grabbing `mul.b` and asking about
+    // `src.out` returns `.none`, so an input you can wire INTO cannot be
+    // wired FROM.
+    const c = try makeGraph(typed_graph, &.{});
+    defer dropGraph(c);
+    const src_out = pinAt(c, "src", "out");
+    const mul_b = pinAt(c, "mul", "b");
+
+    try testing.expectEqual(Reach.coerce, c.desc.reachOf(src_out, mul_b));
+    try testing.expectEqual(Reach.coerce, c.desc.reachOf(mul_b, src_out));
+}
+
+test "nodegraph: a host that declared no lattice gets no refusals" {
+    // The compatibility argument, and it is what lets every description
+    // written before `accept` existed keep working. An empty table is
+    // "nothing was said", not "nothing is allowed".
+    //
+    // Mutation: delete the `if (self.accepts.items.len == 0) return
+    // .exact;` early-out. Red — with no rows declared the loop below it
+    // finds nothing and every pin goes dark, so a wire can never be made
+    // in any document that predates this beat.
+    //
+    // **The pins here are TYPED and that is the whole fixture.** Written
+    // against `two_node_graph`, whose pins carry no `type=`, this gate
+    // passed the mutation: the empty-TOKEN early-out further down caught
+    // it and the gate could not tell which of the two rules it was
+    // watching. Two independent rules need two fixtures — found by the
+    // mutation surviving, which is the only way that is ever found.
+    const c = try makeGraph(
+        \\node id=src x=0 y=0
+        \\node id=mul x=200 y=0
+        \\pin node=src id=out dir=out type=number
+        \\pin node=mul id=b dir=in type=ratio
+    , &.{});
+    defer dropGraph(c);
+    try testing.expectEqual(@as(usize, 0), c.desc.accepts.items.len);
+    try testing.expectEqual(Reach.exact, c.desc.reachOf(
+        pinAt(c, "src", "out"),
+        pinAt(c, "mul", "b"),
+    ));
+}
+
+test "nodegraph: an untyped pin beside a declared lattice still reaches" {
+    // A pin the host said nothing about is not a pin the host refused.
+    // Guessing either way is worse than the rule: refuse it and a host
+    // that types most of its pins finds the rest mysteriously dead.
+    //
+    // Mutation: delete the `if (from.len == 0 or to.len == 0) return
+    // .exact;` line. Red — `plain` reaches nothing.
+    const c = try makeGraph(
+        \\node id=src x=0 y=0
+        \\node id=dst x=200 y=0
+        \\pin node=src id=out dir=out type=number
+        \\pin node=dst id=plain dir=in
+        \\accept from=number to=number
+    , &.{});
+    defer dropGraph(c);
+    try testing.expectEqual(Reach.exact, c.desc.reachOf(
+        pinAt(c, "src", "out"),
+        pinAt(c, "dst", "plain"),
+    ));
+}
+
+test "nodegraph: a misspelled accept mode is a bad line, not a silent demotion" {
+    // A host that writes `mode=coerse` asked for amber and would
+    // otherwise get green, with nothing anywhere saying so.
+    //
+    // Mutation: make the unknown-mode arm leave `ac.mode` at `.exact`
+    // instead of setting `.none`. Red — the row is accepted and
+    // `bad_lines` stays 0.
+    const c = try makeGraph(
+        \\node id=src x=0 y=0
+        \\node id=dst x=200 y=0
+        \\pin node=src id=out dir=out type=number
+        \\pin node=dst id=in dir=in type=ratio
+        \\accept from=number to=ratio mode=coerse
+    , &.{});
+    defer dropGraph(c);
+    try testing.expectEqual(@as(u32, 1), c.desc.bad_lines);
+    try testing.expectEqual(@as(usize, 0), c.desc.accepts.items.len);
+}
+
+test "nodegraph: a wire in hand lights what would take it and dims the rest" {
+    // Blade3D's `CollectInputPorts`, which is the half of its wiring
+    // model that made it feel like an editor — and the thing Christian
+    // went looking for in this canvas and did not find.
+    //
+    // Mutation: in the pin loop, drop the `if (wire) |w|` re-colour so
+    // pins keep their idle tint. Red on every arm — the graph says
+    // nothing at all about where the wire may land.
+    const c = try makeGraph(typed_graph, &.{});
+    defer dropGraph(c);
+    c.desc.view = .{ .pan = .{ -20, -20 }, .zoom = GRIDLESS_ZOOM };
+    const canvas = Rect{ .x = 0, .y = 0, .w = 600, .h = 400 };
+
+    const src_out = pinAt(c, "src", "out");
+    c.grab = .{ .wire = .{
+        .anchor = src_out,
+        .detached = null,
+        .cursor = .{ 100, 100 },
+        .over = .none,
+    } };
+
+    var lc = testCtx();
+    var dl = element.DrawList.init(testing.allocator);
+    defer dl.deinit();
+    try drawCanvas(c, canvas, &lc, &dl);
+
+    // Three quads a node, then one a pin, in pin declaration order.
+    const pin_q = 3 * c.desc.nodes.items.len;
+    const q = dl.quads.items;
+    try testing.expectEqual(PIN_REACH_EXACT, q[pin_q + pinAt(c, "mul", "a")].color);
+    try testing.expectEqual(PIN_REACH_COERCE, q[pin_q + pinAt(c, "mul", "b")].color);
+    // Unreachable fades but keeps its hue: the graph goes quiet, not grey.
+    const hue_q = q[pin_q + pinAt(c, "src", "hue")].color;
+    try testing.expectEqual(dimmed(PIN_OUT_COLOR), hue_q);
+    // The end in your hand stays lit — it is not a target, and a dark
+    // anchor reads as the wire having come loose.
+    try testing.expectEqual(PIN_OUT_COLOR, q[pin_q + src_out].color);
+}
+
+test "nodegraph: a reachable pin GROWS, so the cue is not colour alone" {
+    // Mutation: use `PIN_R` unconditionally for the radius. Red — the
+    // reachable pin is the same size as the dead one, and a reader who
+    // cannot separate amber from grey has nothing left to go on.
+    const c = try makeGraph(typed_graph, &.{});
+    defer dropGraph(c);
+    // Below `LABEL_MIN_ZOOM`, so no glyph is shaped and the gate needs
+    // no font device — the same reason every other draw gate here picks
+    // this zoom.
+    const z = GRIDLESS_ZOOM;
+    c.desc.view = .{ .pan = .{ -20, -20 }, .zoom = z };
+    const canvas = Rect{ .x = 0, .y = 0, .w = 600, .h = 400 };
+    c.grab = .{ .wire = .{
+        .anchor = pinAt(c, "src", "out"),
+        .detached = null,
+        .cursor = .{ 100, 100 },
+        .over = .none,
+    } };
+
+    var lc = testCtx();
+    var dl = element.DrawList.init(testing.allocator);
+    defer dl.deinit();
+    try drawCanvas(c, canvas, &lc, &dl);
+
+    const pin_q = 3 * c.desc.nodes.items.len;
+    const q = dl.quads.items;
+    try testing.expectApproxEqAbs(
+        2 * PIN_REACH_R * z,
+        q[pin_q + pinAt(c, "mul", "a")].dst_size[0],
+        1e-3,
+    );
+    try testing.expectApproxEqAbs(
+        2 * PIN_R * z,
+        q[pin_q + pinAt(c, "src", "hue")].dst_size[0],
+        1e-3,
+    );
+}
+
+test "nodegraph: releasing on a reachable pin asks the host to join them" {
+    // Mutation: have `releaseWire` write only when `landed` is null.
+    // Red — the whole gesture produces nothing and the canvas is a
+    // viewer again.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    const c = try makeGraph(typed_graph, &.{.{ .key = "edits", .value = "g.edits" }});
+    defer dropGraph(c);
+
+    const src_out = pinAt(c, "src", "out");
+    const mul_b = pinAt(c, "mul", "b");
+    try pressPin(c, &st, src_out);
+    try dragTo(c, &st, c.desc.pinCentre(mul_b));
+    try releaseAt(c, &st, c.desc.pinCentre(mul_b));
+
+    try testing.expectEqualStrings("link from=src.out to=mul.b\n", st.get("g.edits").?);
+}
+
+test "nodegraph: the record is written source-to-sink however it was dragged" {
+    // Dragging backwards off an unwired input must produce the same
+    // record as dragging forwards onto it. A host reading `from=` should
+    // never have to work out which way the reader's hand went.
+    //
+    // Mutation: write `from=` as the anchor unconditionally. Red — the
+    // record comes out `link from=mul.b to=src.out`, which names an
+    // input as a source.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    const c = try makeGraph(typed_graph, &.{.{ .key = "edits", .value = "g.edits" }});
+    defer dropGraph(c);
+
+    const mul_b = pinAt(c, "mul", "b");
+    try pressPin(c, &st, mul_b);
+    try dragTo(c, &st, c.desc.pinCentre(pinAt(c, "src", "out")));
+    try releaseAt(c, &st, c.desc.pinCentre(pinAt(c, "src", "out")));
+
+    try testing.expectEqualStrings("link from=src.out to=mul.b\n", st.get("g.edits").?);
+}
+
+test "nodegraph: pressing a wired input picks the wire UP and rehoming clears it" {
+    // The reason `detached` exists rather than the press simply
+    // re-anchoring. Both halves of a rehome are one write, and they name
+    // different inputs so their order does not matter.
+    //
+    // Mutation: set `.detached = null` at the press site. Red — the
+    // `unlink` is gone and the source ends up feeding both inputs, which
+    // is a graph the reader never asked for.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    const c = try makeGraph(typed_graph, &.{.{ .key = "edits", .value = "g.edits" }});
+    defer dropGraph(c);
+
+    const mul_a = pinAt(c, "mul", "a"); // already fed by src.out
+    const mul_b = pinAt(c, "mul", "b");
+    try pressPin(c, &st, mul_a);
+    // What is in hand is the FAR end — the source — not the input.
+    try testing.expectEqual(pinAt(c, "src", "out"), c.grab.wire.anchor);
+    try dragTo(c, &st, c.desc.pinCentre(mul_b));
+    try releaseAt(c, &st, c.desc.pinCentre(mul_b));
+
+    try testing.expectEqualStrings(
+        "unlink to=mul.a\nlink from=src.out to=mul.b\n",
+        st.get("g.edits").?,
+    );
+}
+
+test "nodegraph: a lifted wire dropped on nothing DISCONNECTS; a new one does nothing" {
+    // The two halves of "released over empty canvas", which mean
+    // opposite things and are told apart only by `detached`.
+    //
+    // Mutation: `if (landed == null) return;` at the top of
+    // `releaseWire`. Red on the first arm — a wire dragged off a pin and
+    // dropped springs back, so there is no way to break a link at all.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    const c = try makeGraph(typed_graph, &.{.{ .key = "edits", .value = "g.edits" }});
+    defer dropGraph(c);
+
+    try pressPin(c, &st, pinAt(c, "mul", "a"));
+    try dragTo(c, &st, .{ 400, 300 });
+    try releaseAt(c, &st, .{ 400, 300 });
+    try testing.expectEqualStrings("unlink to=mul.a\n", st.get("g.edits").?);
+
+    // A NEW wire abandoned in space writes nothing — a host subscribed
+    // to this path is not woken to be told the reader changed their
+    // mind. A second, untouched state, because "nothing was written" is
+    // only readable on a path that has never been written.
+    var st2 = state_mod.State.init(testing.allocator);
+    defer st2.deinit();
+    const c2 = try makeGraph(typed_graph, &.{.{ .key = "edits", .value = "g.edits" }});
+    defer dropGraph(c2);
+    try pressPin(c2, &st2, pinAt(c2, "src", "out"));
+    try dragTo(c2, &st2, .{ 400, 300 });
+    try releaseAt(c2, &st2, .{ 400, 300 });
+    try testing.expect(st2.get("g.edits") == null);
+}
+
+test "nodegraph: a lifted wire put back where it came from is a no-op" {
+    // Cancel, with no key and no focus. The clear and the set name the
+    // same input, so the `unlink` is suppressed and the `link` restores
+    // exactly what was there — the host applies an assignment that was
+    // already true.
+    //
+    // Mutation: drop the `landed.? != old_in` condition. Red — the write
+    // becomes `unlink to=mul.a` followed by the same link, which is
+    // still correct but tells the host to take a wire out and put it
+    // back; and a host that logs its edits now logs a change that did
+    // not happen.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    const c = try makeGraph(typed_graph, &.{.{ .key = "edits", .value = "g.edits" }});
+    defer dropGraph(c);
+
+    const mul_a = pinAt(c, "mul", "a");
+    try pressPin(c, &st, mul_a);
+    try dragTo(c, &st, .{ 400, 300 });
+    try releaseAt(c, &st, c.desc.pinCentre(mul_a));
+    try testing.expectEqualStrings("link from=src.out to=mul.a\n", st.get("g.edits").?);
+}
+
+test "nodegraph: released on a node's BODY, the wire finds its nearest pin" {
+    // A pin is four graph units across. At 0.4 zoom that is under two
+    // screen pixels, and aiming at it is a game rather than an edit.
+    //
+    // Mutation: make the `.node` arm of `releaseWire` return null. Red —
+    // a release anywhere but exactly on the dot does nothing.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    const c = try makeGraph(typed_graph, &.{.{ .key = "edits", .value = "g.edits" }});
+    defer dropGraph(c);
+
+    // Low in the node's body: `b` is the lower of its two inputs, so the
+    // nearest REACHABLE pin there is `b` and not `a`.
+    const mul = c.desc.nodes.items[c.desc.pins.items[pinAt(c, "mul", "b")].node];
+    const deep: [2]f32 = .{ mul.pos[0] + mul.size[0] * 0.5, mul.pos[1] + mul.size[1] - 2 };
+
+    try pressPin(c, &st, pinAt(c, "src", "out"));
+    try dragTo(c, &st, deep);
+    try releaseAt(c, &st, deep);
+    try testing.expectEqualStrings("link from=src.out to=mul.b\n", st.get("g.edits").?);
+}
+
+test "nodegraph: the wire in hand is not also drawn where it came from" {
+    // Two wires out of one source while the reader holds one of them
+    // would say the disconnect had not happened yet, which is the
+    // opposite of what dragging a wire off a pin should look like.
+    //
+    // Mutation: delete the `if (held_link) |h| if (h == li) continue;`
+    // skip. Red — the segment count goes back up by a whole wire.
+    const c = try makeGraph(typed_graph, &.{});
+    defer dropGraph(c);
+    c.desc.view = .{ .pan = .{ -20, -20 }, .zoom = GRIDLESS_ZOOM };
+    const canvas = Rect{ .x = 0, .y = 0, .w = 600, .h = 400 };
+    var lc = testCtx();
+
+    var idle = element.DrawList.init(testing.allocator);
+    defer idle.deinit();
+    try drawCanvas(c, canvas, &lc, &idle);
+
+    // The same graph with that one link in hand, held at its own far
+    // end so the preview wire is exactly where the real one was: the
+    // ONLY difference between the two pictures is the skip.
+    const mul_a = pinAt(c, "mul", "a");
+    c.grab = .{ .wire = .{
+        .anchor = pinAt(c, "src", "out"),
+        .detached = c.desc.linkInto(mul_a),
+        .cursor = c.desc.pinCentre(mul_a),
+        .over = .{ .pin = mul_a },
+    } };
+    var held = element.DrawList.init(testing.allocator);
+    defer held.deinit();
+    try drawCanvas(c, canvas, &lc, &held);
+
+    try testing.expectEqual(idle.tris.items.len, held.tris.items.len);
+}
+
+test "nodegraph: the wire in hand takes the colour of what it is over" {
+    // The answer before the button comes up, which is the other half of
+    // Blade3D's model: teal over nothing, the target's own colour the
+    // moment it is over something that would take it.
+    //
+    // Mutation: always use `WIRE_LOOSE`. Red on the second and third
+    // arms — the wire never says yes and never distinguishes a
+    // conversion from a clean join.
+    const c = try makeGraph(typed_graph, &.{});
+    defer dropGraph(c);
+    c.desc.view = .{ .pan = .{ -20, -20 }, .zoom = GRIDLESS_ZOOM };
+    const canvas = Rect{ .x = 0, .y = 0, .w = 600, .h = 400 };
+    var lc = testCtx();
+    const src_out = pinAt(c, "src", "out");
+
+    const cases = [_]struct { over: Hover, want: [4]f32 }{
+        .{ .over = .none, .want = WIRE_LOOSE },
+        .{ .over = .{ .pin = pinAt(c, "mul", "a") }, .want = PIN_REACH_EXACT },
+        .{ .over = .{ .pin = pinAt(c, "mul", "b") }, .want = PIN_REACH_COERCE },
+        // Over a pin that would refuse it, the wire stays loose — the
+        // picture must not promise a join that the release will not make.
+        .{ .over = .{ .pin = pinAt(c, "src", "hue") }, .want = WIRE_LOOSE },
+    };
+    for (cases) |case| {
+        c.grab = .{ .wire = .{
+            .anchor = src_out,
+            .detached = null,
+            .cursor = .{ 260, 140 },
+            .over = case.over,
+        } };
+        var dl = element.DrawList.init(testing.allocator);
+        defer dl.deinit();
+        try drawCanvas(c, canvas, &lc, &dl);
+        // Probe by colour, not by position: `relief.stroke` feathers,
+        // so the last triangle in the layer is an edge at alpha zero and
+        // the wire's own colour is several triangles back.
+        try testing.expect(hasTriColor(&dl, case.want));
+        // …and the colours it is NOT. Without this the gate passes for
+        // an implementation that draws all four at once.
+        for (cases) |other| {
+            if (std.meta.eql(other.want, case.want)) continue;
+            try testing.expect(!hasTriColor(&dl, other.want));
+        }
+    }
+}
+
+/// Does the triangle layer carry a stroke of exactly this colour?
+///
+/// `relief.stroke` lays a solid core and feathers out to alpha zero, so
+/// every stroke contributes triangles at the colour AND triangles at
+/// every alpha down to nothing. Asking "is this colour present" is the
+/// only question about a feathered stroke that has a stable answer.
+fn hasTriColor(dl: *const element.DrawList, want: [4]f32) bool {
+    for (dl.tris.items) |t| {
+        if (std.meta.eql(t.color, want)) return true;
+    }
+    return false;
 }
