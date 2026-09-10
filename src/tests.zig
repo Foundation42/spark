@@ -100,4 +100,5 @@ test {
     _ = @import("tests/placeholder_scene.zig");
     _ = @import("tests/display_transform.zig");
     _ = @import("tests/offscreen_clip.zig");
+    _ = @import("tests/overlay_render.zig");
 }

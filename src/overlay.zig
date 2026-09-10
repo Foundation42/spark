@@ -162,6 +162,32 @@ pub const Overlay = struct {
     /// frame's list.
     scratch: element.DrawList,
 
+    /// The pass dispatches the MEASURE pass throws away — sibling to
+    /// `scratch`, and for the same reason: the measure walk must not
+    /// append to the frame's list, or every effect in the menu would
+    /// dispatch twice.
+    ///
+    /// **It is a list and not a `null`, and that distinction is the
+    /// whole of the 2026-09-10 "effects do not render inside an
+    /// overlay" bug.** The measure walk used to be handed
+    /// `pass_dispatches = null`, which reads as "this walk has no
+    /// interest in passes" and is in fact "this walk cannot tell the
+    /// truth about passes". It still populates the BLOCK CACHE, and a
+    /// block walked with nowhere to put its dispatches snapshots an
+    /// entry whose `pass_dispatches` is empty. The real walk that
+    /// follows hits that entry and replays quads, glyphs and hits with
+    /// no dispatch at all — so matryoshka's palette menu drew its
+    /// buttons over the bare 3D scene with no panel ground behind them,
+    /// while a plain `:::box` in the same document painted perfectly.
+    ///
+    /// With a real list here the measure walk snapshots a COMPLETE
+    /// entry (dispatches rebased block-local, child primitives tagged
+    /// with the effect's local index), and the real walk's cache hit
+    /// replays the lot at the placed origin. `layout_cache.blitEntry`
+    /// has done that translation since Phase B.6; it was simply never
+    /// given anything to translate.
+    scratch_pd: std.ArrayList(element.PassDispatch),
+
     /// Where the last render actually put it, in world coords. Zero
     /// until the first `layoutAndRenderOverlay`, which is deliberate:
     /// an overlay that has never been drawn has no rect, and
@@ -321,6 +347,7 @@ test "overlay: contains is false until the first render" {
         .at = .{ 100, 100 },
         .corner = .top_left,
         .scratch = undefined,
+        .scratch_pd = undefined,
     };
     try testing.expect(!ov.contains(100, 100));
 

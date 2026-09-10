@@ -174,6 +174,34 @@ pub fn layoutAndRenderCached(
     // returns.
     try out.sealClips(ctx.current_clip);
 
+    // **A walk with nowhere to put its dispatches must not mint an
+    // entry.** `Entry.pass_dispatches` is filled from
+    // `ctx.pass_dispatches[pd_start..]`, so a null one used to snapshot
+    // an EMPTY list — and an entry saying "this block emits no passes"
+    // is indistinguishable from one that is telling the truth. The next
+    // walk hits it and replays the block's quads, glyphs and hits with
+    // the effect silently gone.
+    //
+    // That is the whole of the 2026-09-10 "effects do not render inside
+    // an overlay" bug: `Spark.layoutAndRenderOverlay`'s measure walk
+    // passed `null`, and its own second walk read back the lie the first
+    // had just written — matryoshka's palette menu drew its buttons over
+    // the bare 3D scene with no frosted-glass ground behind them, while
+    // a plain `:::box` in the same document painted perfectly.
+    //
+    // The overlay now carries a real scratch list (`Overlay.scratch_pd`)
+    // and nothing in the library reaches this arm; it is the guard that
+    // stops the trap being re-armed by the next caller who reads
+    // `pass_dispatches: ?*…` as meaning "optional". Only the WRITE is
+    // refused — the lookup above still runs, because an entry minted by
+    // a truthful walk is truthful whoever reads it, and `blitEntry`
+    // already skips the dispatch merge when the reader has no list.
+    // Counted as `skipped`, not as a miss: nothing was cached, so
+    // nothing was missed.
+    if (ctx.pass_dispatches == null) {
+        cache.skipped += 1;
+        return box;
+    }
     const pd_slice: []const element.PassDispatch = if (ctx.pass_dispatches) |pd|
         pd.items[pd_start..]
     else
@@ -2754,4 +2782,93 @@ test "parallel merge: a worker's scissor arrives with its quads, or a fanned-out
     try testing.expectEqual(@as(f32, 50), r.h);
     const s = out.quads.items[2];
     try testing.expect(s.dst_pos[1] + s.dst_size[1] > r.y + r.h);
+}
+
+test "cache: a walk with no dispatch list must not mint an entry that says the block has no passes" {
+    // The seam the 2026-09-10 overlay-effects bug ran through, gated on
+    // its own rather than through the overlay — because it is not an
+    // overlay rule. `Entry.pass_dispatches` is sliced out of
+    // `ctx.pass_dispatches`, so a NULL one snapshots an empty list, and
+    // "this block emits no passes" then reads back as fact. Any later
+    // walk hits it and the effect is gone with nothing logged.
+    //
+    // The fixture is the minimum that can show it: one `.custom`
+    // element with `pass_kind = 1` (a pattern), walked twice through one
+    // cache — first with no dispatch list, then with one. What the
+    // second walk reports is the whole assertion.
+    //
+    // Mutation: delete the `if (ctx.pass_dispatches == null) return
+    // box;` guard before `snapshotEntry` in `layoutAndRenderCached`.
+    // Compiles — the `pd_slice` expression below it already has an
+    // `else` arm handing `snapshotEntry` an empty slice, which is
+    // exactly the lie. The dispatch-list walk then hits the poisoned
+    // entry, reports 0, and the last expectEqual goes red. Watched.
+    const Fake = struct {
+        fn render(_: *anyopaque, origin: [2]f32, _: element.Constraints, _: *element.LayoutCtx, _: *element.DrawList) anyerror!element.Box {
+            return .{ .x = origin[0], .y = origin[1], .w = 64, .h = 32 };
+        }
+        fn uniforms(_: *anyopaque, out: []u8) usize {
+            out[0] = 1;
+            return 4;
+        }
+    };
+    const vt = element.ElementVTable{
+        .layout_and_render = Fake.render,
+        .snapshot_uniforms = Fake.uniforms,
+    };
+    // The ctx pointer is the cache's identity for this element, so it
+    // has to be a real, stable address — `undefined` would key the
+    // entry on garbage and the two walks might not meet.
+    var instance: u8 = 0;
+    const elem = element.Element{ .custom = .{
+        .vtable = &vt,
+        .ctx = @ptrCast(&instance),
+        .pass_kind = 1,
+        .shader_id = [_]u8{7} ** 16,
+    } };
+
+    var cache = layout_cache.BlockCache.init(testing.allocator);
+    defer cache.deinit();
+    var theme = element.Theme{
+        .body = .{ .font_id = 0, .color = .{ 1, 1, 1, 1 } },
+        .heading = [_]element.Style{.{ .font_id = 0, .color = .{ 1, 1, 1, 1 } }} ** 6,
+        .code_block = .{ .font_id = 0, .color = .{ 1, 1, 1, 1 } },
+        .list_marker = .{ .font_id = 0, .color = .{ 1, 1, 1, 1 } },
+        .emphasis_font_id = 0,
+        .strong_font_id = 0,
+        .bold_italic_font_id = 0,
+        .code_inline_font_id = 0,
+    };
+
+    var out = element.DrawList.init(testing.allocator);
+    defer out.deinit();
+
+    // Walk 1 — a measure, with nowhere to put dispatches. This is the
+    // walk that used to poison the cache.
+    var measure_ctx = element.LayoutCtx{
+        .allocator = testing.allocator,
+        .fonts = undefined,
+        .cache = undefined,
+        .mono_atlas = undefined,
+        .color_atlas = undefined,
+        .theme = &theme,
+        .cache_blocks = &cache,
+        .pass_dispatches = null,
+    };
+    _ = try layoutAndRenderCached(elem, .{ 0, 0 }, .{}, &measure_ctx, &out);
+
+    // Walk 2 — the real one, with a list. It must see the pattern,
+    // whether by a fresh walk (guard present) or by a truthful entry.
+    var pd = std.ArrayList(element.PassDispatch).init(testing.allocator);
+    defer pd.deinit();
+    var live_ctx = measure_ctx;
+    live_ctx.pass_dispatches = &pd;
+    _ = try layoutAndRenderCached(elem, .{ 200, 150 }, .{}, &live_ctx, &out);
+
+    try testing.expectEqual(@as(usize, 1), pd.items.len);
+    // …and at the origin it was actually walked at, not the measure's.
+    switch (pd.items[0]) {
+        .pattern => |p| try testing.expectEqual(@as(i32, 200), p.layout_region.x),
+        else => return error.WrongDispatchKind,
+    }
 }

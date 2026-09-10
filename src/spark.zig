@@ -1461,6 +1461,8 @@ pub const Spark = struct {
         errdefer fresh.deinit();
         var scratch = element.DrawList.init(self.allocator);
         errdefer scratch.deinit();
+        var scratch_pd = std.ArrayList(element.PassDispatch).init(self.allocator);
+        errdefer scratch_pd.deinit();
 
         // **An overlay opening takes the pointer AND the keyboard.**
         // `dispatchMouseMove` routes to `captured` without consulting
@@ -1483,6 +1485,7 @@ pub const Spark = struct {
             .at = at,
             .corner = corner,
             .scratch = scratch,
+            .scratch_pd = scratch_pd,
         };
     }
 
@@ -1563,6 +1566,7 @@ pub const Spark = struct {
         // the document is about to free.
         self.registry.deinitScope(overlay_mod.SCOPE);
         ov.scratch.deinit();
+        ov.scratch_pd.deinit();
         ov.doc.deinit();
     }
 
@@ -1633,13 +1637,47 @@ pub const Spark = struct {
     /// mostly a replay of the first. The alternative, placing from last
     /// frame's size, shows as a menu that jumps on its first frame.
     ///
-    /// The measure walk is given `pass_dispatches = null` so a menu
-    /// containing an effect does not emit its dispatches twice. Not
-    /// tried, and recorded here rather than discovered: a document whose
-    /// layout REGISTERS constraints with the kiwi solver (`:::grid`) is
-    /// walked through one `LayoutContext.beginPass` twice by this, and
-    /// nobody has put a grid in a menu. The fix if it bites is a
-    /// measure-only walk that does not touch the solver.
+    /// The measure walk is given the overlay's OWN dispatch list
+    /// (`Overlay.scratch_pd`), sibling to its own DrawList, so a menu
+    /// containing an effect does not emit its dispatches twice — and,
+    /// just as importantly, so the block-cache entry that walk mints is
+    /// a truthful one. It used to be handed `null`, which cost every
+    /// effect in every overlay: see `Overlay.scratch_pd` for the whole
+    /// mechanism and `src/tests/overlay_render.zig` for the gates.
+    ///
+    /// **The second walk being a CACHE HIT is load-bearing, and that is
+    /// worth saying out loud.** The note that used to live here said a
+    /// document registering kiwi constraints (`:::grid`) would be walked
+    /// twice through one `LayoutContext.beginPass`, and that nobody had
+    /// put a grid in a menu. Both halves were understated. `:::box` is
+    /// the component that registers with the solver
+    /// (`box.layoutViaConstraints` — and it is the only one), so every
+    /// menu with a box in it is that document; and the reason it does
+    /// not fire is that the second walk never reaches the solver,
+    /// because `layoutAndRenderCached` answers it out of the entry the
+    /// measure walk just snapshotted. Take the cache out of the measure
+    /// walk and the very next line is
+    /// `error.UnsatisfiableConstraint` from `addConstraint` —
+    /// `x_min == 0` from the measure, `x_min == 200` from the placement,
+    /// both `required`. Measured 2026-09-10, not reasoned about.
+    ///
+    /// So the double walk survives on the cache, and any overlay block
+    /// that misses on the real walk is a crash waiting for a document.
+    /// The honest fix is to stop walking twice: walk ONCE at (0, 0)
+    /// into `ov.scratch` + `ov.scratch_pd`, place from the returned box,
+    /// then merge into the frame at the placed origin with
+    /// `element_layout.blitPrivate` + `mergePrivatePassDispatches` —
+    /// the machinery `layoutStackV`'s parallel arm already uses to move
+    /// a worker's private drawlist into the frame, translation of hits,
+    /// clips and pass regions included. Recorded, not built: it moves a
+    /// whole document's input routing and clip replay onto a path only
+    /// workers have exercised, which is more than this beat can gate.
+    /// **Trigger:** an overlay document whose top-level block is
+    /// `disable_cache` (a `:::input` search box, a `:::clip`) and which
+    /// also contains a `:::box` — that combination reaches the solver
+    /// twice. `src/tests/overlay_render.zig`'s plain-quad gate pins the
+    /// invariant it would break, so it goes red here rather than in a
+    /// host.
     pub fn layoutAndRenderOverlay(self: *Spark) !void {
         // `&self.overlay.?`, not `&(self.overlay orelse return)` — the
         // latter takes the address of a COPY of the payload, and every
@@ -1651,9 +1689,12 @@ pub const Spark = struct {
 
         const constraints: element.Constraints = .{ .max_w = OVERLAY_MAX_W };
 
-        // Pass 1 — measure. Scratch list, no pass dispatches, result
-        // discarded except for the box.
+        // Pass 1 — measure. Scratch drawlist and scratch dispatch list,
+        // both discarded except for the box they produce — and except
+        // for the block-cache entries they leave behind, which is the
+        // part that has to be complete.
         ov.scratch.clearRetainingCapacity();
+        ov.scratch_pd.clearRetainingCapacity();
         const effective_theme = ov.doc.theme orelse self.theme;
         const effective_state = ov.doc.state orelse self.host_state;
         var measure_lc = element.LayoutCtx{
@@ -1669,7 +1710,7 @@ pub const Spark = struct {
             .glyph_cache_lock = &self.glyph_cache_lock,
             .zoom = self.frame_info.zoom,
             .layout_context = self.layout_context,
-            .pass_dispatches = null,
+            .pass_dispatches = &ov.scratch_pd,
         };
         const measured = try element_layout.layoutAndRenderCached(
             ov.doc.root,
