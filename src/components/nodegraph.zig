@@ -126,12 +126,20 @@
 //! because a pin the host said nothing about is not a pin the host
 //! refused. spark refuses only what it was told to refuse.
 //!
-//! Two rules ARE spark's own, because they are facts about a canvas and
-//! not about a language: a wire joins opposite directions, and a pin
-//! does not reach its own node. Longer cycles are not caught here —
-//! whether a cycle is even illegal is the host's question (rill refuses
-//! one; a modular synth patch is made of them) — and come back as
-//! whatever graph the host returns.
+//! Three rules ARE spark's own, because they are facts about a canvas
+//! and not about a language: a wire joins opposite directions, a pin
+//! does not reach its own node, and **a wire does not close a loop**.
+//!
+//! That third one was left out at first, on the argument that whether a
+//! cycle is legal is the host's question — rill refuses one, a modular
+//! synth patch is made of them. Christian, on seeing it: *"when I start
+//! dragging a port, nodes upstream from the node port I'm dragging show
+//! as being able to accept. That's cycles — I'm not sure we should be
+//! allowing those."* The argument does not survive, because rule 2 is
+//! already a cycle of length one: refusing length one and shrugging at
+//! length two is not a policy, it is an accident of how far the check
+//! happened to look. A host that WANTS feedback opts in — recorded, not
+//! built, the trigger being the first such host.
 //!
 //! ## The edit channel: the canvas asks, the host answers
 //!
@@ -461,6 +469,42 @@ pub const Accept = struct {
     from: []const u8,
     to: []const u8,
     mode: Reach,
+};
+
+/// **A wire in hand, and everything a pin needs to answer it.**
+///
+/// The anchor alone was not enough. Christian, 2026-09-10, watching the
+/// first version: *"when I start dragging a port, nodes upstream from
+/// the node port I'm dragging show as being able to accept. That's
+/// cycles — I'm not sure we should be allowing those."*
+///
+/// He is right, and the argument I had for leaving them is the one that
+/// does not survive: this file ALREADY refuses a pin reaching its own
+/// node, and that is a cycle of length one. Refusing length one and
+/// allowing length two is not a policy, it is an accident of how far
+/// the check happened to look. Whether a cycle is legal is still the
+/// host's question in principle — a modular-synth patch is made of them
+/// — but the honest shape for that is a host that OPTS IN, not a canvas
+/// that refuses one length and shrugs at the rest. Recorded, not built;
+/// the trigger is the first host that wants feedback.
+///
+/// So `blocked` is one bit per node, filled once when the wire is
+/// picked up. It is computed rather than passed as a rule because the
+/// answer depends on which END is in hand: an OUT anchor is the wire's
+/// source, so everything already feeding it is blocked (walk upstream);
+/// an IN anchor is its sink, so everything it already feeds is blocked
+/// (walk downstream). One walk either way.
+pub const Probe = struct {
+    anchor: u32,
+    /// True where a wire from `anchor` would close a loop. Empty is a
+    /// legitimate answer meaning "nothing is blocked" — a graph with no
+    /// links at all, and what a gate passes when the subject is a rule
+    /// other than this one.
+    blocked: []const bool = &.{},
+
+    fn blocks(self: Probe, node: u32) bool {
+        return node < self.blocked.len and self.blocked[node];
+    }
 };
 
 /// What a wire in hand may do to a pin. Ordered by permissiveness so
@@ -1004,6 +1048,63 @@ pub const Description = struct {
         return null;
     }
 
+    /// **Which nodes a wire from `anchor` must not land on**, because it
+    /// would close a loop. Fills `out` with one bool per node.
+    ///
+    /// The direction of the walk is the direction the wire is NOT going.
+    /// An out-anchor is the wire's source, so a landing on anything that
+    /// already feeds it closes the loop — walk upstream. An in-anchor is
+    /// its sink, so a landing on anything it already feeds does — walk
+    /// downstream. The anchor's own node is marked either way, which
+    /// costs nothing and makes rule 2 and this rule agree instead of
+    /// overlapping by accident.
+    ///
+    /// **A wire that is IN HAND needs no special case, and finding out
+    /// why is the reason this comment is here.** The first version took
+    /// a `lifted` link to skip, on the argument that walking through a
+    /// wire the reader is holding would refuse a rehome that is legal
+    /// once it is gone. It is inert, and provably so: a lifted link runs
+    /// `anchor's node → the pin that was picked up`, the walk starts by
+    /// marking the anchor's node, and traversing that link backwards
+    /// arrives at exactly that already-marked node. The visited check
+    /// skips it every time, in every graph, cyclic or not. Written,
+    /// gated, and the gate could not be made to fail — so the parameter
+    /// is gone rather than kept as a comment with an argument list.
+    ///
+    /// Iterative, with `out` doubling as the visited set, so a graph
+    /// with a loop already in it (a host may hand us one) terminates. A
+    /// naive O(nodes x links) scan per step: 22 nodes and 19 links on
+    /// the exemplar, filled once per gesture rather than per frame.
+    /// Trigger for an adjacency index: a graph where this shows up.
+    pub fn blockCycles(
+        self: *const Description,
+        out: *std.ArrayList(bool),
+        anchor: u32,
+    ) !void {
+        out.clearRetainingCapacity();
+        try out.appendNTimes(false, self.nodes.items.len);
+        if (anchor >= self.pins.items.len) return;
+        const up = self.pins.items[anchor].dir == .out;
+
+        var stack = std.ArrayList(u32).init(self.gpa);
+        defer stack.deinit();
+        const start = self.pins.items[anchor].node;
+        out.items[start] = true;
+        try stack.append(start);
+
+        while (stack.pop()) |node| {
+            for (self.links.items) |l| {
+                const near = if (up) l.to else l.from;
+                const far = if (up) l.from else l.to;
+                if (self.pins.items[near].node != node) continue;
+                const next = self.pins.items[far].node;
+                if (out.items[next]) continue;
+                out.items[next] = true;
+                try stack.append(next);
+            }
+        }
+    }
+
     /// **Can a wire anchored at `anchor` land on `pin`?**
     ///
     /// Three rules, and only the third is the host's business:
@@ -1012,8 +1113,7 @@ pub const Description = struct {
     ///      A wire between two inputs is not a thing a graph can mean.
     ///   2. *Not its own node.* Blade3D refused this at
     ///      `ReferenceEquals(inputBlock, outputBlock)` and so do we. An
-    ///      operator feeding itself is a cycle of length one, and the
-    ///      one cycle a canvas can catch without knowing the language.
+    ///      operator feeding itself is a cycle of length one.
     ///   3. *The token.* With no `accept` records the host declared no
     ///      lattice, so every pair is `.exact` — a graph drawn before
     ///      this record existed behaves as it always did. With records,
@@ -1021,20 +1121,21 @@ pub const Description = struct {
     ///      is one the host said nothing about, and refusing it would be
     ///      a guess. Everything else must be declared.
     ///
-    /// Longer cycles are NOT caught here and deliberately so: whether a
-    /// cycle is even illegal is a question about the host's language
-    /// (rill refuses one; a modular synth patch is made of them), and a
-    /// canvas that decided it would be deciding for every host. That
-    /// answer comes back with the graph the host returns.
+    ///   2b. *No loop.* `probe.blocked` says which nodes a wire from this
+    ///      anchor would close a loop through — see `Probe`. Rule 2 is
+    ///      the length-one case of this one, kept as its own line
+    ///      because it holds even when nobody filled the mask.
     ///
     /// Pure, and takes the description rather than the component, so
     /// every case above is gated without a device.
-    pub fn reachOf(self: *const Description, anchor: u32, pin: u32) Reach {
+    pub fn reachOf(self: *const Description, probe: Probe, pin: u32) Reach {
+        const anchor = probe.anchor;
         if (anchor >= self.pins.items.len or pin >= self.pins.items.len) return .none;
         const a = self.pins.items[anchor];
         const b = self.pins.items[pin];
         if (a.dir == b.dir) return .none;
         if (a.node == b.node) return .none;
+        if (probe.blocks(b.node)) return .none;
         if (self.accepts.items.len == 0) return .exact;
 
         // The pair is always read source-to-sink, whichever end the
@@ -1058,12 +1159,12 @@ pub const Description = struct {
     /// node's nearest pin that would take the wire. Blueprints does
     /// this; Blade3D did not, and its `GetControlAt` returning anything
     /// but an `InputPort` simply dropped the wire.
-    pub fn nearestReachable(self: *const Description, anchor: u32, node: u32, g: [2]f32) ?u32 {
+    pub fn nearestReachable(self: *const Description, probe: Probe, node: u32, g: [2]f32) ?u32 {
         var best: ?u32 = null;
         var best_d2: f32 = std.math.floatMax(f32);
         for (self.pins.items, 0..) |p, i| {
             if (p.node != node) continue;
-            if (self.reachOf(anchor, @intCast(i)) == .none) continue;
+            if (self.reachOf(probe, @intCast(i)) == .none) continue;
             const c = self.pinCentre(@intCast(i));
             const dx = g[0] - c[0];
             const dy = g[1] - c[1];
@@ -1228,6 +1329,14 @@ const Component = struct {
     hovered: Hover = .none,
     grab: Grab = .none,
 
+    /// `Probe.blocked` for the wire currently in hand — one bool per
+    /// node, filled at the press and read by every `reachOf` until the
+    /// release. It lives on the component rather than in the `Grab` so
+    /// it keeps its capacity across gestures: a reader wiring a graph up
+    /// does this once a second, and a fresh allocation per press is a
+    /// cost with nothing to show for it.
+    cycle_block: std.ArrayList(bool),
+
     /// What we last wrote to each path, so a write that would change
     /// nothing is not made at all — the same gate `:::trackball`
     /// keeps, and for the same reason.
@@ -1245,6 +1354,14 @@ const Component = struct {
 
     fn gesturing(self: *const Component) bool {
         return self.grab != .none;
+    }
+
+    /// The wire in hand, as every `reachOf` wants it.
+    fn probe(self: *const Component) ?Probe {
+        return switch (self.grab) {
+            .wire => |w| .{ .anchor = w.anchor, .blocked = self.cycle_block.items },
+            else => null,
+        };
     }
 
     // ── Reading the description ────────────────────────────────────
@@ -1395,9 +1512,10 @@ const Component = struct {
     /// exactly what was there. Cancel needs no key, which is why this
     /// component still takes no keyboard focus.
     fn releaseWire(self: *Component, state: *state_mod.State, w: anytype) !void {
+        const pr = Probe{ .anchor = w.anchor, .blocked = self.cycle_block.items };
         const landed: ?u32 = switch (w.over) {
-            .pin => |i| if (self.desc.reachOf(w.anchor, i) != .none) i else null,
-            .node => |n| self.desc.nearestReachable(w.anchor, n, w.cursor),
+            .pin => |i| if (self.desc.reachOf(pr, i) != .none) i else null,
+            .node => |n| self.desc.nearestReachable(pr, n, w.cursor),
             .none => null,
         };
 
@@ -1490,6 +1608,7 @@ fn create(
     c.* = .{
         .allocator = allocator,
         .desc = try Description.init(allocator),
+        .cycle_block = std.ArrayList(bool).init(allocator),
         .positions_path = positions,
         .selected_path = selected,
         .edits_path = edits,
@@ -1509,6 +1628,7 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     const c: *Component = @ptrCast(@alignCast(ctx));
     c.desc.deinit();
     allocator.free(c.positions_path);
+    c.cycle_block.deinit();
     allocator.free(c.selected_path);
     allocator.free(c.edits_path);
     allocator.free(c.last_selected_written);
@@ -1597,9 +1717,10 @@ fn drawWireInHand(
     w: @TypeOf(@as(Grab, undefined).wire),
 ) !void {
     const anchor_dir = c.desc.pins.items[w.anchor].dir;
+    const pr = Probe{ .anchor = w.anchor, .blocked = c.cycle_block.items };
     const landed: ?u32 = switch (w.over) {
-        .pin => |i| if (c.desc.reachOf(w.anchor, i) != .none) i else null,
-        .node => |n| c.desc.nearestReachable(w.anchor, n, w.cursor),
+        .pin => |i| if (c.desc.reachOf(pr, i) != .none) i else null,
+        .node => |n| c.desc.nearestReachable(pr, n, w.cursor),
         .none => null,
     };
 
@@ -1608,7 +1729,7 @@ fn drawWireInHand(
     // the one under the cursor, and a wire drawn to the cursor would
     // not say which.
     const far_g = if (landed) |i| c.desc.pinCentre(i) else w.cursor;
-    const col: [4]f32 = if (landed) |i| switch (c.desc.reachOf(w.anchor, i)) {
+    const col: [4]f32 = if (landed) |i| switch (c.desc.reachOf(pr, i)) {
         .coerce => PIN_REACH_COERCE,
         else => PIN_REACH_EXACT,
     } else WIRE_LOOSE;
@@ -1830,8 +1951,9 @@ fn drawCanvas(
         .wire => |w| w,
         else => null,
     };
+    const pr = c.probe();
     for (c.desc.pins.items, 0..) |p, i| {
-        const reach: Reach = if (wire) |w| c.desc.reachOf(w.anchor, @intCast(i)) else .none;
+        const reach: Reach = if (pr) |q| c.desc.reachOf(q, @intCast(i)) else .none;
         const r = (if (wire != null and reach != .none) PIN_REACH_R else PIN_R) * z;
         const sc = c.desc.view.toScreen(origin, c.desc.pinCentre(@intCast(i)));
         if (sc[0] + r < canvas.x or sc[0] - r > canvas.x + canvas.w) continue;
@@ -2088,6 +2210,11 @@ fn onInput(ctx: *anyopaque, event: element.InputEvent, state_raw: *anyopaque) an
                     // you get in hand is the far end.
                     const held = c.desc.linkInto(i);
                     const anchor = if (held) |li| c.desc.links.items[li].from else i;
+                    // Once, here — not per pin and not per frame. The
+                    // graph cannot change while a gesture is latched
+                    // (`ingest` is closed), so the answer cannot go stale
+                    // between this press and its release.
+                    try c.desc.blockCycles(&c.cycle_block, anchor);
                     c.grab = .{ .wire = .{
                         .anchor = anchor,
                         .detached = held,
@@ -3306,17 +3433,17 @@ test "nodegraph: reach is a direction, a node and a declared pair" {
     const mul_b = pinAt(c, "mul", "b");
     const mul_out = pinAt(c, "mul", "out");
 
-    try testing.expectEqual(Reach.exact, c.desc.reachOf(src_out, mul_a));
+    try testing.expectEqual(Reach.exact, c.desc.reachOf(.{ .anchor = src_out }, mul_a));
     // Two outputs are not a wire, whichever way round they are asked.
-    try testing.expectEqual(Reach.none, c.desc.reachOf(src_out, mul_out));
+    try testing.expectEqual(Reach.none, c.desc.reachOf(.{ .anchor = src_out }, mul_out));
     // A node feeding itself is the one cycle a canvas can catch without
     // knowing the host's language.
-    try testing.expectEqual(Reach.none, c.desc.reachOf(mul_out, mul_a));
+    try testing.expectEqual(Reach.none, c.desc.reachOf(.{ .anchor = mul_out }, mul_a));
     // Declared, and declared as a coercion — the answer that is neither
     // yes nor no, and the whole reason `accept` carries a mode.
-    try testing.expectEqual(Reach.coerce, c.desc.reachOf(src_out, mul_b));
+    try testing.expectEqual(Reach.coerce, c.desc.reachOf(.{ .anchor = src_out }, mul_b));
     // `colour → number` was never declared, so it is refused.
-    try testing.expectEqual(Reach.none, c.desc.reachOf(src_hue, mul_a));
+    try testing.expectEqual(Reach.none, c.desc.reachOf(.{ .anchor = src_hue }, mul_a));
 }
 
 test "nodegraph: the pair is read source-to-sink, whichever end was grabbed" {
@@ -3335,8 +3462,8 @@ test "nodegraph: the pair is read source-to-sink, whichever end was grabbed" {
     const src_out = pinAt(c, "src", "out");
     const mul_b = pinAt(c, "mul", "b");
 
-    try testing.expectEqual(Reach.coerce, c.desc.reachOf(src_out, mul_b));
-    try testing.expectEqual(Reach.coerce, c.desc.reachOf(mul_b, src_out));
+    try testing.expectEqual(Reach.coerce, c.desc.reachOf(.{ .anchor = src_out }, mul_b));
+    try testing.expectEqual(Reach.coerce, c.desc.reachOf(.{ .anchor = mul_b }, src_out));
 }
 
 test "nodegraph: a host that declared no lattice gets no refusals" {
@@ -3364,7 +3491,7 @@ test "nodegraph: a host that declared no lattice gets no refusals" {
     defer dropGraph(c);
     try testing.expectEqual(@as(usize, 0), c.desc.accepts.items.len);
     try testing.expectEqual(Reach.exact, c.desc.reachOf(
-        pinAt(c, "src", "out"),
+        .{ .anchor = pinAt(c, "src", "out") },
         pinAt(c, "mul", "b"),
     ));
 }
@@ -3385,7 +3512,7 @@ test "nodegraph: an untyped pin beside a declared lattice still reaches" {
     , &.{});
     defer dropGraph(c);
     try testing.expectEqual(Reach.exact, c.desc.reachOf(
-        pinAt(c, "src", "out"),
+        .{ .anchor = pinAt(c, "src", "out") },
         pinAt(c, "dst", "plain"),
     ));
 }
@@ -3719,4 +3846,117 @@ fn hasTriColor(dl: *const element.DrawList, want: [4]f32) bool {
         if (std.meta.eql(t.color, want)) return true;
     }
     return false;
+}
+
+// ── Loops ───────────────────────────────────────────────────────────
+
+/// A chain: a → b → c, plus a spare node nothing is wired to.
+const chain_graph =
+    \\node id=a x=0 y=0
+    \\node id=b x=200 y=0
+    \\node id=c x=400 y=0
+    \\node id=free x=200 y=200
+    \\pin node=a id=in dir=in
+    \\pin node=a id=out dir=out
+    \\pin node=b id=in dir=in
+    \\pin node=b id=out dir=out
+    \\pin node=c id=in dir=in
+    \\pin node=c id=out dir=out
+    \\pin node=free id=in dir=in
+    \\pin node=free id=out dir=out
+    \\link from=a.out to=b.in
+    \\link from=b.out to=c.in
+;
+
+test "nodegraph: a wire out of c cannot land back on a or b" {
+    // Christian, 2026-09-10, on the first version: *"when I start dragging a
+    // port, nodes upstream from the node port I'm dragging show as being able
+    // to accept. That's cycles — I'm not sure we should be allowing those."*
+    //
+    // The argument for leaving them was that a cycle might be legal in some
+    // host's language. It does not survive contact with the code: rule 2
+    // already refuses a pin reaching its own node, which is a cycle of length
+    // ONE. Refusing length one and shrugging at length two is not a policy.
+    //
+    // Mutation: drop `if (probe.blocks(b.node)) return .none;` from `reachOf`.
+    // Red on both upstream arms — `c`'s output reaches `a`'s and `b`'s inputs,
+    // which is a graph that cannot be evaluated in any order.
+    const c = try makeGraph(chain_graph, &.{});
+    defer dropGraph(c);
+    var mask = std.ArrayList(bool).init(testing.allocator);
+    defer mask.deinit();
+
+    const c_out = pinAt(c, "c", "out");
+    try c.desc.blockCycles(&mask, c_out);
+    const pr = Probe{ .anchor = c_out, .blocked = mask.items };
+
+    try testing.expectEqual(Reach.none, c.desc.reachOf(pr, pinAt(c, "a", "in")));
+    try testing.expectEqual(Reach.none, c.desc.reachOf(pr, pinAt(c, "b", "in")));
+    // …and a node NOT in the chain is untouched. Without this the gate passes
+    // for a mask that blocks everything, which is a canvas you cannot wire.
+    try testing.expectEqual(Reach.exact, c.desc.reachOf(pr, pinAt(c, "free", "in")));
+
+    // **The mask is the whole answer, including the anchor's own node.**
+    // Asserted on the MASK rather than through `reachOf`, deliberately: rule 2
+    // refuses that node anyway, so a `reachOf` assertion here passes whether
+    // the walk seeds it or not — which is exactly what happened. Dropping
+    // `out.items[start] = true` survived a `reachOf`-shaped gate and changes
+    // nothing about what a reader sees; it changes what `Probe.blocked` MEANS,
+    // from "every node this wire must not reach" to "…except one, which
+    // another rule happens to cover". A palette asking the mask "where could
+    // this wire go" would get the wrong answer for one node and have no way
+    // to know. Mutation: delete that line. Red, here and only here.
+    try testing.expect(mask.items[c.desc.pins.items[c_out].node]);
+}
+
+test "nodegraph: dragged backwards off an input, the block walks the other way" {
+    // The direction of the walk is the direction the wire is NOT going. An
+    // out-anchor is the wire's source and everything feeding it is blocked; an
+    // IN-anchor is its sink, so everything it already FEEDS is blocked
+    // instead. Same loop, opposite walk, and an implementation that only ever
+    // walked upstream would let a reader draw it from the other end.
+    //
+    // Mutation: make `blockCycles` walk upstream unconditionally (`const up =
+    // true;`). Red — `a`'s input accepts a wire from `c`'s output, which is
+    // the same cycle the gate above refuses, reached by dragging the other way.
+    const c = try makeGraph(chain_graph, &.{});
+    defer dropGraph(c);
+    var mask = std.ArrayList(bool).init(testing.allocator);
+    defer mask.deinit();
+
+    const a_in = pinAt(c, "a", "in");
+    try c.desc.blockCycles(&mask, a_in);
+    const pr = Probe{ .anchor = a_in, .blocked = mask.items };
+
+    try testing.expectEqual(Reach.none, c.desc.reachOf(pr, pinAt(c, "b", "out")));
+    try testing.expectEqual(Reach.none, c.desc.reachOf(pr, pinAt(c, "c", "out")));
+    try testing.expectEqual(Reach.exact, c.desc.reachOf(pr, pinAt(c, "free", "out")));
+}
+
+test "nodegraph: a graph that already loops does not hang the walk" {
+    // A host may hand us anything, and a description is a picture rather than
+    // a refusal — `bad_lines` is a count, not an error. So the walk must
+    // terminate on a graph that already contains a loop.
+    //
+    // Mutation: drop the `if (out.items[next]) continue;` visited check. The
+    // gate does not go red, it HANGS — which is the failure being prevented,
+    // and is why this one is written as a bounded assertion rather than a
+    // comparison. Confirmed by running it with the check removed and killing
+    // the runner.
+    const c = try makeGraph(
+        \\node id=a x=0 y=0
+        \\node id=b x=200 y=0
+        \\pin node=a id=in dir=in
+        \\pin node=a id=out dir=out
+        \\pin node=b id=in dir=in
+        \\pin node=b id=out dir=out
+        \\link from=a.out to=b.in
+        \\link from=b.out to=a.in
+    , &.{});
+    defer dropGraph(c);
+    var mask = std.ArrayList(bool).init(testing.allocator);
+    defer mask.deinit();
+    try c.desc.blockCycles(&mask, pinAt(c, "a", "out"));
+    try testing.expectEqual(@as(usize, 2), mask.items.len);
+    try testing.expect(mask.items[0] and mask.items[1]);
 }
