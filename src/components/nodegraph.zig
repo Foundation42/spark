@@ -138,8 +138,17 @@
 //! allowing those."* The argument does not survive, because rule 2 is
 //! already a cycle of length one: refusing length one and shrugging at
 //! length two is not a policy, it is an accident of how far the check
-//! happened to look. A host that WANTS feedback opts in — recorded, not
-//! built, the trigger being the first such host.
+//! happened to look.
+//!
+//! Christian, on the ruling: *"I think it is the right call — for now.
+//! Maybe in future we allow cycles, but with special user facing
+//! machinery."* That is the shape, and it is how everyone who allows
+//! loops actually does it: Max, Reaktor and Bitwig all make you SAY so,
+//! with an explicit unit-delay standing where the loop closes. So the
+//! recorded-not-built thing is not a host flag that switches this rule
+//! off — it is a node kind whose input is declared to be last tick's
+//! value, which the walk then treats as no edge at all. Trigger: a host
+//! with such a node.
 //!
 //! ## The edit channel: the canvas asks, the host answers
 //!
@@ -1329,6 +1338,13 @@ const Component = struct {
     hovered: Hover = .none,
     grab: Grab = .none,
 
+    /// Where `contextSubject` writes its answer. Long enough for the
+    /// longest of them — a `pin:` with a node id and a pin id, both of
+    /// which a host mints — and a `bufPrint` that will not fit returns
+    /// null, which reads as "nothing claims this point" and is the right
+    /// answer for a subject nobody could have parsed anyway.
+    subject_buf: [256]u8 = undefined,
+
     /// `Probe.blocked` for the wire currently in hand — one bool per
     /// node, filled at the press and read by every `reachOf` until the
     /// release. It lives on the component rather than in the `Grab` so
@@ -1674,6 +1690,7 @@ const vtable: element.ElementVTable = .{
     .on_input = onInput,
     .on_hover = onHover,
     .on_scroll = onScroll,
+    .context_subject = contextSubject,
     .content_version = contentVersion,
     // The canvas appends its own hit, for the reason `emits_own_hits`
     // exists: the walker's hit lands AFTER anything inside and
@@ -1997,6 +2014,63 @@ fn drawCanvas(
     if (z >= LABEL_MIN_ZOOM) try drawLabels(c, canvas, lc, out);
 
     if (c.desc.bad_lines > 0) try drawErrorStrip(c, canvas, lc, out);
+}
+
+/// **What is under this point, in the words the host uses.**
+///
+/// The `context_subject` hook: a right-click asks, spark carries the
+/// answer to the host, and the host decides what a menu for it holds.
+/// Three answers, exactly the three `pick` can give, and the third has
+/// a twist in it:
+///
+///     node:near1
+///     pin:near1.i0
+///     canvas@120.50,88.00
+///
+/// No `link:` answer, because `pick` has no link arm — a wire is a
+/// stroke in the triangle layer with no hit box, and giving it one is
+/// the beat that also wants "delete this wire" and a hover highlight on
+/// it. Recorded, not built.
+///
+/// **The canvas answer carries the GRAPH POINT.** A menu that creates a
+/// node has to put it where the reader clicked, and the reader clicked
+/// in graph space — which only this component can compute, because only
+/// this component holds the camera. The alternative is the host doing
+/// the transform, which means the host holding a copy of `pan` and
+/// `zoom` and getting it wrong by a frame whenever the two disagree.
+/// Putting it in the subject costs nothing: the subject is opaque to
+/// spark, so a component may say whatever its host understands, and
+/// this component's host is the one that wrote both halves.
+///
+/// Two decimal places, and the separator is `@` rather than `:` so a
+/// host can split the KIND off every subject with one rule.
+///
+/// The buffer is the component's own and is overwritten by the next
+/// call — same lifetime rule as the rest of this vtable, and the
+/// dispatcher copies what it needs into the state record immediately.
+fn contextSubject(ctx: *anyopaque, local: [2]f32) ?[]const u8 {
+    const c: *Component = @ptrCast(@alignCast(ctx));
+    const g = c.desc.view.toGraph(local);
+    return switch (c.desc.pick(g)) {
+        .node => |i| std.fmt.bufPrint(
+            &c.subject_buf,
+            "node:{s}",
+            .{c.desc.nodes.items[i].id},
+        ) catch null,
+        .pin => |i| blk: {
+            const p = c.desc.pins.items[i];
+            break :blk std.fmt.bufPrint(
+                &c.subject_buf,
+                "pin:{s}.{s}",
+                .{ c.desc.nodes.items[p.node].id, p.id },
+            ) catch null;
+        },
+        .none => std.fmt.bufPrint(
+            &c.subject_buf,
+            "canvas@{d:.2},{d:.2}",
+            .{ g[0], g[1] },
+        ) catch null,
+    };
 }
 
 /// A dot-free line grid, in the triangle layer with the ground.
@@ -3959,4 +4033,73 @@ test "nodegraph: a graph that already loops does not hang the walk" {
     try c.desc.blockCycles(&mask, pinAt(c, "a", "out"));
     try testing.expectEqual(@as(usize, 2), mask.items.len);
     try testing.expect(mask.items[0] and mask.items[1]);
+}
+
+// ── The context question ────────────────────────────────────────────
+
+test "nodegraph: right-click names what is under it, and the canvas names WHERE" {
+    // The host has to put a created node where the reader clicked, and the
+    // reader clicked in GRAPH space — which only this component can compute,
+    // because only this component holds the camera. A host doing the transform
+    // itself needs a copy of `pan` and `zoom` and gets it wrong by a frame
+    // whenever the two disagree.
+    //
+    // Mutation: return `local` instead of `g` in the `.none` arm — i.e. hand
+    // back canvas pixels and let the host sort it out. Red at any pan or zoom
+    // but the identity one, which is why this gate sets both.
+    const c = try makeGraph(two_node_graph, &.{});
+    defer dropGraph(c);
+    c.desc.view = .{ .pan = .{ 40, 25 }, .zoom = 2.0 };
+
+    // **Through the vtable, not through the function.** Calling
+    // `contextSubject` directly gates the answer and not the WIRING, and
+    // deleting `.context_subject = contextSubject` from the vtable then leaves
+    // every gate here green while a right-click reaches nothing at all. Found
+    // by that mutation surviving.
+    const ask = vtable.context_subject orelse return error.HookNotRegistered;
+
+    // A node.
+    const on_node = c.desc.view.toLocal(.{ 10, 6 });
+    try testing.expectEqualStrings("node:src", ask(@ptrCast(c), on_node).?);
+
+    // A pin — named as the DESCRIPTION spells it, so a host that generated
+    // the payload recognises its own ids coming back.
+    const on_pin = c.desc.view.toLocal(c.desc.pinCentre(1));
+    const p = c.desc.pins.items[1];
+    var want: [64]u8 = undefined;
+    try testing.expectEqualStrings(
+        try std.fmt.bufPrint(&want, "pin:{s}.{s}", .{ c.desc.nodes.items[p.node].id, p.id }),
+        ask(@ptrCast(c), on_pin).?,
+    );
+
+    // Empty canvas: the answer carries the graph point, not the screen one.
+    const empty_g: [2]f32 = .{ 620.5, 410.25 };
+    const on_empty = c.desc.view.toLocal(empty_g);
+    try testing.expectEqualStrings(
+        "canvas@620.50,410.25",
+        ask(@ptrCast(c), on_empty).?,
+    );
+}
+
+test "nodegraph: a subject too long to write is no subject at all" {
+    // `bufPrint` failing must not truncate — a half-written `node:` names a
+    // node that may well exist, and the host would open a menu about the
+    // wrong thing. Returning null reads as "nothing claims this point", which
+    // is the only safe answer for an id nobody could have parsed.
+    //
+    // Mutation: `catch unreachable`. The gate does not go red, it PANICS,
+    // which is the failure being prevented; confirmed by running it that way.
+    // The compiling, non-panicking mutation is `catch "node:"`, and that is
+    // red here.
+    var long: [400]u8 = undefined;
+    @memset(&long, 'n');
+    var body = std.ArrayList(u8).init(testing.allocator);
+    defer body.deinit();
+    try body.writer().print("node id={s} x=0 y=0\n", .{long});
+
+    const c = try makeGraph(body.items, &.{});
+    defer dropGraph(c);
+    try testing.expectEqual(@as(usize, 1), c.desc.nodes.items.len);
+    const ask = vtable.context_subject orelse return error.HookNotRegistered;
+    try testing.expect(ask(@ptrCast(c), .{ 4, 4 }) == null);
 }
