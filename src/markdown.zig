@@ -374,6 +374,7 @@ fn mapBlock(
                     // spec's own, and the spec lives in the same arena
                     // as the Element tree.
                     const context_attr = contextAttr(spec_ptr.attrs);
+                    const drag_attr = dragAttr(spec_ptr.attrs);
                     if (mc.registry) |reg| {
                         if (try reg.resolve(spec_ptr, idx, mc.state, mc.scope)) |inst| {
                             return .{ .custom = .{
@@ -382,6 +383,7 @@ fn mapBlock(
                                 .pass_kind = inst.pass_kind,
                                 .shader_id = inst.shader_id,
                                 .context = context_attr,
+                                .drag = drag_attr,
                             } };
                         }
                     }
@@ -394,6 +396,7 @@ fn mapBlock(
                         .vtable = &components.placeholder_vtable,
                         .ctx = @ptrCast(@constCast(spec_ptr)),
                         .context = context_attr,
+                        .drag = drag_attr,
                     } };
                 }
             }
@@ -410,23 +413,43 @@ fn mapBlock(
 
 /// The `context="…"` attribute of a `:::` block, or null.
 ///
-/// **`context` is the one attribute the element layer reads and no
-/// factory sees**, which is what lets it work on every block including
-/// ones whose factory does not exist. It is also therefore a reserved
-/// word in the attribute grammar: a component that wants an attribute
-/// called `context` for something else will find this one shadowing it
-/// on the hit layer, and should pick another name.
+/// **`context` and `drag` are the attributes the element layer reads and
+/// no factory sees**, which is what lets them work on every block
+/// including ones whose factory does not exist. They are therefore
+/// reserved words in the attribute grammar: a component that wants an
+/// attribute called `context` or `drag` for something else will find
+/// this one shadowing it on the hit layer, and should pick another
+/// name.
+fn contextAttr(attrs: []const components.Attr) ?[]const u8 {
+    return reservedAttr(attrs, "context");
+}
+
+/// The `drag="…"` attribute of a `:::` block, or null — what a press on
+/// it picks up. Reserved on exactly the same terms as `context`, read at
+/// the same place, and empty means "not a drag source" for the same
+/// reason: a carry with no payload is a gesture the host cannot act on.
+fn dragAttr(attrs: []const components.Attr) ?[]const u8 {
+    return reservedAttr(attrs, "drag");
+}
+
+/// The last value for a reserved attribute key, or null when it is
+/// absent or empty.
 ///
 /// Last one wins, matching how every component in this library reads a
-/// repeated attribute — a linear scan that keeps assigning.
-fn contextAttr(attrs: []const components.Attr) ?[]const u8 {
+/// repeated attribute — a linear scan that keeps assigning. Empty is
+/// null: `context=""` is "no subject" and `drag=""` is "not draggable",
+/// never "the empty one" — a record naming nothing is worse than no
+/// record, because the host cannot tell it from a claim it does not
+/// recognise.
+///
+/// One scanner rather than two, because the two DID diverge in draft:
+/// the second copy was written without the empty check and a
+/// `drag=""` block became a source carrying nothing.
+fn reservedAttr(attrs: []const components.Attr, key: []const u8) ?[]const u8 {
     var found: ?[]const u8 = null;
     for (attrs) |a| {
-        if (std.mem.eql(u8, a.key, "context")) found = a.value;
+        if (std.mem.eql(u8, a.key, key)) found = a.value;
     }
-    // An empty `context=""` is "no subject", not "the empty subject".
-    // A record naming nothing is worse than no record: the host cannot
-    // tell it from a claim it does not recognise.
     if (found) |s| if (s.len == 0) return null;
     return found;
 }

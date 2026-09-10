@@ -63,11 +63,16 @@ const PARALLEL_MIN_WALKS: usize = 2;
 /// that is inert to the pointer but that a document wants
 /// right-clickable — is never asked if it has no box on this layer.
 /// Same silence, same function, one more line.
+///
+/// The drag question is a FIFTH, and it is the same argument again: a
+/// block that is inert to the pointer but that a document wants to be
+/// PICKED UP needs a box for the press to land in.
 pub fn wantsHitBox(vtable: *const element.ElementVTable) bool {
     return vtable.on_input != null or
         vtable.on_scroll != null or
         vtable.on_hover != null or
-        vtable.context_subject != null;
+        vtable.context_subject != null or
+        vtable.drag_payload != null;
 }
 
 /// Does this `custom` element need a box on the hit layer?
@@ -79,7 +84,7 @@ pub fn wantsHitBox(vtable: *const element.ElementVTable) bool {
 /// whole case, and it is the one that makes any document
 /// right-clickable without a line of host code.
 fn customWantsHitBox(cu: anytype) bool {
-    return wantsHitBox(cu.vtable) or cu.context != null;
+    return wantsHitBox(cu.vtable) or cu.context != null or cu.drag != null;
 }
 
 pub const Error = error{
@@ -404,6 +409,8 @@ pub fn layoutAndRender(
                     // (`:::nodegraph`) answers through the vtable hook
                     // instead, which is the door with the local point.
                     .context_subject = cu.context,
+                    // The author's `drag="…"`, on the same terms.
+                    .drag_payload = cu.drag,
                 });
             }
             // Effects-spec Phase A.6.a + B.2/B.3 — pass-graph

@@ -754,6 +754,16 @@ pub const Spark = struct {
     /// inert about the things its host has not wired, not broken.
     context_path: ?[]u8 = null,
 
+    /// The payload in flight, or nothing. See `Carry`.
+    carry: ?Carry = null,
+
+    /// Where a drop that LEFT the document is reported, or nothing.
+    /// Owned; duped in `setDropPath`, freed in `deinit`. Same shape and
+    /// same argument as `context_path` one field up: a host that named
+    /// no path gets no record, and a document that is dragged on such a
+    /// host is inert rather than broken.
+    drop_path: ?[]u8 = null,
+
     /// Construct a Spark and all engine resources. The host gives
     /// raw Vulkan handles (via opts.vk_ctx + opts.color_format), an
     /// owned FontRegistry, a borrowed Theme + root State, and
@@ -953,6 +963,12 @@ pub const Spark = struct {
             self.allocator.free(p);
             self.context_path = null;
         }
+        if (self.drop_path) |p| {
+            self.allocator.free(p);
+            self.drop_path = null;
+        }
+        // A Spark torn down mid-gesture still owns the payload it copied.
+        self.endCarry();
 
         // 1. Components — must run with full engine alive.
         self.registry.deinit();
@@ -4046,6 +4062,101 @@ pub const Spark = struct {
     /// with nowhere to write down where it came from.
     pub const CONTEXT_BUTTON: u8 = 1;
 
+    /// Which button picks a payload up.
+    ///
+    /// **The left one, and only it.** A right-press on a draggable block
+    /// must still ask the context question — "what can I do to this" is
+    /// not "pick this up" — and a middle-press is the pan button on the
+    /// one component that has interior structure worth dragging. Left is
+    /// the drag button on every platform this library targets, and the
+    /// two other buttons already mean something else here.
+    ///
+    /// Same reasoning as `CONTEXT_BUTTON` for why it is a named constant:
+    /// the index is a fact about the host's array, not about spark.
+    pub const DRAG_BUTTON: u8 = 0;
+
+    /// **A payload in flight** — what a press picked up, where it is now,
+    /// and where it came from.
+    ///
+    /// spark never reads `payload`. It carries it, answers `carrying()`
+    /// with it while the button is held, and hands it back at the
+    /// release. What the string MEANS is between the document that wrote
+    /// it and the host that receives it — the same contract a context
+    /// subject has, and for the same reason: a library that understood
+    /// the payload would need to be changed for every new kind of thing
+    /// a host wants to drag.
+    ///
+    /// **spark owns `payload`.** This is the one place a carried string
+    /// is copied rather than borrowed, and the difference from
+    /// `context_subject` is the gesture's LENGTH: a subject is answered
+    /// and consumed inside one dispatch, where a carry spans as many
+    /// frames as the user holds the button. A HUD that regenerates a
+    /// document mid-drag — which matryoshka's does, on any state change
+    /// — frees the arena the payload was a slice of, and a borrowed
+    /// carry would then be reporting freed memory to the host every
+    /// frame. That is the `forgetHits` bug (a component freed while
+    /// spark still pointed at it) with a longer fuse, so it is closed
+    /// here by construction rather than by remembering.
+    ///
+    /// **The carry outlives its source.** It holds no `Hit` and no
+    /// `ctx`, only bytes and four floats, so `forgetHits` clearing the
+    /// capture does not end it and neither does the source panel
+    /// closing. That is deliberate: once a payload is airborne the
+    /// gesture belongs to the user, and the thing they grabbed it from
+    /// is no longer part of the question.
+    pub const Carry = struct {
+        /// Owned by the Spark. Freed when the carry ends.
+        payload: []u8,
+        /// Where the press that started it landed, world coords. The
+        /// host wants this for a drag threshold and for drawing a line
+        /// back to the source.
+        from: [2]f32,
+        /// Where the pointer is now, world coords.
+        at: [2]f32,
+    };
+
+    /// **What is being dragged right now**, or nothing.
+    ///
+    /// The host's per-frame question, and deliberately a QUESTION rather
+    /// than a record written into state: a host drawing a ghost asks it
+    /// every frame anyway, and a record would mean a write at 60 Hz —
+    /// which this library has already been bitten by once, when a menu
+    /// re-opened every frame off a state value that changed every frame.
+    /// A discrete event gets a record (`emitDrop` below); a continuous
+    /// one gets a getter.
+    ///
+    /// `over_document` is the half a host cannot work out for itself:
+    /// whether spark has an interactive element under the pointer RIGHT
+    /// NOW, ignoring the capture the drag itself holds. A host ghosting
+    /// a drop into a 3D scene must not ghost it through a panel that is
+    /// in front of the scene, and `claimsPointer` cannot answer that
+    /// during a drag — it returns true unconditionally while anything is
+    /// captured, which is exactly the state a carry is in.
+    pub const CarryInfo = struct {
+        payload: []const u8,
+        from: [2]f32,
+        at: [2]f32,
+        over_document: bool,
+    };
+
+    pub fn carrying(self: *const Spark) ?CarryInfo {
+        const c = self.carry orelse return null;
+        return .{
+            .payload = c.payload,
+            .from = c.from,
+            .at = c.at,
+            .over_document = findHit(self.hitScope(), c.at[0], c.at[1]) != null,
+        };
+    }
+
+    /// Where a drop that left the document is reported. Duped; the
+    /// previous path is freed. See `drop_path` and `emitDrop`.
+    pub fn setDropPath(self: *Spark, path: []const u8) !void {
+        const dup = try self.allocator.dupe(u8, path);
+        if (self.drop_path) |old| self.allocator.free(old);
+        self.drop_path = dup;
+    }
+
     /// How long a gap still counts as part of the same click run. GLFW
     /// does not report double-clicks, so somebody has to count them;
     /// 400ms is where every toolkit's default lands. It was
@@ -4190,6 +4301,13 @@ pub const Spark = struct {
     pub fn dispatchMouseMove(self: *Spark, x: f32, y: f32) !void {
         self.mouse_x = x;
         self.mouse_y = y;
+        // A payload in flight follows the pointer whether or not anything
+        // still holds the capture — the carry is not the capture's, and
+        // the source may already have been torn down. See `Carry`.
+        if (self.carry) |*c| {
+            c.at = .{ x, y };
+            self.redraw_requested = true;
+        }
         if (self.mouse_down) {
             if (self.captured) |hit| {
                 // The button is the one that took the capture, not 0.
@@ -4544,12 +4662,62 @@ pub const Spark = struct {
             // pointer, and the convention for that press is "cancel the
             // drag", not "and also open a menu".
             if (button == CONTEXT_BUTTON) try self.emitContext(x, y);
+
+            // ── The drag question ───────────────────────────────────
+            //
+            // Beside the context question and last for the same reason:
+            // the press has fully settled, so a host reacting to the
+            // carry cannot corrupt a dispatch still in progress.
+            //
+            // It is asked on the same terms and NOT reached in the same
+            // place: a press while something already holds the capture
+            // returned at the top of this branch, so a second button
+            // during a drag starts no second carry.
+            if (button == DRAG_BUTTON) {
+                if (self.dragPayloadAt(x, y)) |p| try self.beginCarry(p, x, y);
+            }
         } else {
             if (self.captured) |hit| {
                 try dispatchHit(self, hit, .{
                     .mouse_up = self.mouseEventFor(hit, x, y, button, false),
                 }, self.host_state);
                 if (button == self.capture_button) self.captured = null;
+            }
+
+            // ── The drop ────────────────────────────────────────────
+            //
+            // OUTSIDE the `captured` branch above, and that is the point:
+            // a carry holds no Hit, so it survives its source being torn
+            // down mid-gesture (`forgetHits` clears the capture; a HUD
+            // that regenerates a document does exactly that). Landing the
+            // drop inside that branch would mean a panel closing mid-drag
+            // silently ate the gesture.
+            //
+            // **Only the button that picked it up can put it down.** A
+            // right-click during a drag is the cancel convention and
+            // reaches the component; releasing it must not also drop the
+            // payload, or the gesture dies in the user's hand — the same
+            // rule `capture_button` enforces one line up, for the same
+            // reason.
+            //
+            // **A release INSIDE the document cancels.** Nothing in a
+            // spark document accepts a payload yet, so a drop that lands
+            // on the page is a drop with no receiver, and the honest
+            // answer to that is "nothing happened" rather than reporting
+            // it to the host as though it had left. When a component can
+            // accept one, this branch splits: over a receiver, deliver;
+            // over the document but not a receiver, still cancel.
+            // Recorded, not built — the trigger is the toolbar-to-canvas
+            // drag, whose whole subject is a receiver inside spark.
+            if (button == DRAG_BUTTON) {
+                if (self.carry) |c| {
+                    const inside = findHit(self.hitScope(), x, y) != null;
+                    // The payload is freed either way, and the copy
+                    // outlives the emit because `endCarry` runs after it.
+                    if (!inside) try self.emitDrop(c.payload, x, y);
+                    self.endCarry();
+                    self.redraw_requested = true;
+                }
             }
             // The hand let go: whatever is under the pointer is hovered
             // again, now, rather than on whichever later frame the mouse
@@ -4691,6 +4859,121 @@ pub const Spark = struct {
         else
             self.host_state;
         try target.set(path, buf.items);
+    }
+
+    /// What a press at `(x, y)` would pick up, or null.
+    ///
+    /// Innermost-out, first answer wins, hook before attribute — the
+    /// same walk and the same precedence as `contextClaimAt`, because it
+    /// is the same question asked about a different verb, and two walks
+    /// that disagreed about which element is "under" a point would be a
+    /// bug nobody could see.
+    fn dragPayloadAt(self: *const Spark, x: f32, y: f32) ?[]const u8 {
+        const hits = self.hitScope();
+        var i = hits.len;
+        while (i > 0) {
+            i -= 1;
+            const h = hits[i];
+            if (x < h.box.x or x >= h.box.x + h.box.w) continue;
+            if (y < h.box.y or y >= h.box.y + h.box.h) continue;
+            if (h.vtable.drag_payload) |ask| {
+                if (ask(h.ctx, .{ x - h.box.x, y - h.box.y })) |p| {
+                    if (p.len > 0) return p;
+                }
+            }
+            if (h.drag_payload) |p| {
+                if (p.len > 0) return p;
+            }
+        }
+        return null;
+    }
+
+    /// Take a copy of `payload` and put it in flight from `(x, y)`.
+    ///
+    /// Copying is the whole of the safety story — see `Carry`. An
+    /// allocation failure ends the gesture before it starts rather than
+    /// carrying a borrowed slice as a fallback: a carry that sometimes
+    /// owns its bytes and sometimes does not is the shape of a
+    /// use-after-free nobody reproduces.
+    fn beginCarry(self: *Spark, payload: []const u8, x: f32, y: f32) !void {
+        self.endCarry();
+        self.carry = .{
+            .payload = try self.allocator.dupe(u8, payload),
+            .from = .{ x, y },
+            .at = .{ x, y },
+        };
+    }
+
+    /// Drop whatever is in flight and free it. Idempotent.
+    fn endCarry(self: *Spark) void {
+        const c = self.carry orelse return;
+        self.allocator.free(c.payload);
+        self.carry = null;
+    }
+
+    /// Write the drop record for a payload released at `(x, y)` OUTSIDE
+    /// the document, if the host named a path.
+    ///
+    /// The grammar, one line, the same `kind key=value …` shape as the
+    /// context record:
+    ///
+    ///     drop payload=op:lerp x=412.0 y=233.5 shift=0 ctrl=0 alt=0
+    ///
+    /// `x`/`y` are world coordinates, the same frame `openOverlay` and
+    /// the context record use, so a host passes them straight back with
+    /// no conversion of its own.
+    ///
+    /// **A record, where the drag itself is a getter.** A drop happens
+    /// once and a host must not miss it; carrying is continuous and a
+    /// host samples it. Writing a record per frame is what made a menu
+    /// re-open sixty times a second on 2026-09-10, and reading a getter
+    /// for an edge is how a host misses the one frame it mattered. Each
+    /// question gets the shape that fits it.
+    ///
+    /// **Routed to the host's root state, not to a claiming element's.**
+    /// The context record goes to whoever claimed the point, which it
+    /// can do because something always claims it — that is what made the
+    /// record. A drop that reaches here is by definition a drop that
+    /// NOTHING in the document claimed, so there is no element's state
+    /// to prefer and the host's own is the only honest answer.
+    fn emitDrop(self: *Spark, payload: []const u8, x: f32, y: f32) !void {
+        const path = self.drop_path orelse return;
+
+        // Loud, never a guess — the identical rule and the identical
+        // reasoning as `emitContext`'s check on a subject: the record is
+        // whitespace-delimited, so a payload with a space in it does not
+        // break the record, it produces a VALID record that means
+        // something else and the host never learns there was more. `warn`
+        // rather than `err` for the same reason too: Zig's test runner
+        // counts a `std.log.err` as a failure, and a refusal no gate can
+        // prove is worse than a diagnostic one level quieter.
+        for (payload) |ch| {
+            if (ch <= ' ' or ch == '"' or ch == 0x7f) {
+                std.log.warn(
+                    "spark: refusing a drag payload that is not one word: \"{s}\" " ++
+                        "(no spaces, tabs, newlines, quotes or control bytes — see " ++
+                        "ElementVTable.drag_payload)",
+                    .{payload},
+                );
+                return error.DragPayloadNotOneWord;
+            }
+        }
+
+        const mods = self.pointer_mods;
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        try buf.writer().print(
+            "drop payload={s} x={d:.1} y={d:.1} shift={d} ctrl={d} alt={d}",
+            .{
+                payload,
+                x,
+                y,
+                @intFromBool(mods & MOD_SHIFT != 0),
+                @intFromBool(mods & MOD_CONTROL != 0),
+                @intFromBool(mods & MOD_ALT != 0),
+            },
+        );
+        try self.host_state.set(path, buf.items);
     }
 
     /// Dispatch a keyboard event to the focused hit (no-op when no
@@ -5318,6 +5601,13 @@ const InputProbe = struct {
     subject: ?[]const u8 = null,
     subject_zone: ?element.Box = null,
 
+    /// What this probe answers the DRAG question with, and where — the
+    /// exact twin of `subject`/`subject_zone` above, because the drag
+    /// question has the exact same two doors and a probe that could only
+    /// express one of them would let the fall-through arm go untested.
+    payload: ?[]const u8 = null,
+    payload_zone: ?element.Box = null,
+
     /// Keys delivered to this probe. A count, because the question the
     /// Escape gate asks is "did this key reach the component at all" and
     /// the version counter cannot answer it — `focus_lost` bumps that
@@ -5336,6 +5626,15 @@ const InputProbe = struct {
         if (local[0] < z.x or local[0] >= z.x + z.w) return null;
         if (local[1] < z.y or local[1] >= z.y + z.h) return null;
         return s;
+    }
+
+    fn dragPayload(ctx: *anyopaque, local: [2]f32) ?[]const u8 {
+        const self: *const InputProbe = @ptrCast(@alignCast(ctx));
+        const pl = self.payload orelse return null;
+        const z = self.payload_zone orelse return pl;
+        if (local[0] < z.x or local[0] >= z.x + z.w) return null;
+        if (local[1] < z.y or local[1] >= z.y + z.h) return null;
+        return pl;
     }
 
     fn contentVersion(ctx: *anyopaque) u64 {
@@ -5434,6 +5733,21 @@ const probe_context = element.ElementVTable{
 const probe_context_only = element.ElementVTable{
     .layout_and_render = InputProbe.layoutAndRender,
     .context_subject = InputProbe.contextSubject,
+};
+/// Takes input AND answers the drag question — the shape a palette
+/// button or a crosshair has.
+const probe_drag = element.ElementVTable{
+    .layout_and_render = InputProbe.layoutAndRender,
+    .on_input = InputProbe.onInput,
+    .drag_payload = InputProbe.dragPayload,
+};
+/// Answers the drag question and NOTHING else. The fifth channel's own
+/// case, exactly as `probe_context_only` is the fourth's: a block that
+/// is inert to the pointer but that a document wants picked up still
+/// needs a box for the press to land in.
+const probe_drag_only = element.ElementVTable{
+    .layout_and_render = InputProbe.layoutAndRender,
+    .drag_payload = InputProbe.dragPayload,
 };
 
 fn probeHit(p: *InputProbe, vt: *const element.ElementVTable, x: f32, y: f32, w: f32, h: f32) element.Hit {
@@ -6867,4 +7181,330 @@ test "spark: forgetHits drops every pointer a torn-down document left behind" {
     try testing.expect(sp.captured == null);
     try testing.expect(sp.hovered == null);
     try testing.expect(sp.focused == null);
+}
+
+// ── The payload drag ────────────────────────────────────────────────
+//
+// A press declares an opaque payload, spark carries it, and whoever is
+// under the release gets it — today that is only the host, because
+// nothing inside a document accepts a drop yet. The gestures these gates
+// pin are the ones the graph editor's crosshair and its toolbar both
+// need, and the ownership one is the one that would otherwise be found
+// by a segfault on somebody's real HUD.
+
+test "drag: a press on a payload picks it up, and the carry is spark's own copy" {
+    // The bug this exists for, before it happens: a carry spans as many
+    // frames as the user holds the button, and matryoshka's HUD
+    // regenerates its document — freeing the arena a payload is a slice
+    // of — on any state change. A borrowed payload is then a dangling
+    // slice reported to the host every frame.
+    //
+    // The gate frees the source and scribbles the freed bytes, which is
+    // what a real allocator's reuse does and what Debug's poison fill
+    // does anyway.
+    //
+    // Mutation: `.payload = payload` instead of the dupe in `beginCarry`
+    // (drop the free in `endCarry` to keep it leak-clean). Compiles, and
+    // the payload reads back as the scribble — red.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+    defer sp.endCarry();
+
+    const source = try testing.allocator.dupe(u8, "op:lerp");
+    var p = InputProbe{ .payload = source };
+    try sp.drawlist.hits.append(probeHit(&p, &probe_drag, 0, 0, 100, 50));
+
+    try sp.dispatchMouseButtonN(20, 20, true, Spark.DRAG_BUTTON);
+    try testing.expect(sp.carrying() != null);
+    try testing.expectEqualStrings("op:lerp", sp.carrying().?.payload);
+    try testing.expectEqual(@as(f32, 20), sp.carrying().?.from[0]);
+
+    // The document goes away underneath the gesture, exactly as a HUD
+    // regenerating one does.
+    @memset(source, 0xAA);
+    testing.allocator.free(source);
+    p.payload = null;
+    sp.forgetHits();
+
+    // Still airborne, still readable, still saying what was grabbed.
+    try testing.expect(sp.carrying() != null);
+    try testing.expectEqualStrings("op:lerp", sp.carrying().?.payload);
+}
+
+test "drag: the carry outlives the capture, so a source torn down mid-drag still drops" {
+    // `forgetHits` clears `captured`, which is right — the Hit it held
+    // may have been freed. The carry must NOT go with it: once a payload
+    // is airborne the gesture belongs to the user, and the panel they
+    // grabbed it from is no longer part of the question.
+    //
+    // Mutation: put the release's drop handling INSIDE the
+    // `if (self.captured)` branch. Compiles, and no record is written —
+    // the panel closing silently ate the gesture. Red.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+    defer sp.endCarry();
+    defer if (sp.drop_path) |q| sp.allocator.free(q);
+    try sp.setDropPath("ui.drop");
+
+    var p = InputProbe{ .payload = "op:lerp" };
+    try sp.drawlist.hits.append(probeHit(&p, &probe_drag, 0, 0, 100, 50));
+    try sp.dispatchMouseButtonN(20, 20, true, Spark.DRAG_BUTTON);
+
+    sp.forgetHits();
+    try testing.expect(sp.captured == null);
+    try sp.dispatchMouseMove(600, 400);
+    try sp.dispatchMouseButtonN(600, 400, false, Spark.DRAG_BUTTON);
+
+    const rec = st.get("ui.drop") orelse return error.NoRecord;
+    try testing.expectEqualStrings(
+        "drop payload=op:lerp x=600.0 y=400.0 shift=0 ctrl=0 alt=0",
+        rec,
+    );
+    try testing.expect(sp.carrying() == null);
+}
+
+test "drag: a release INSIDE the document cancels; only one that left is reported" {
+    // Nothing in a spark document accepts a payload yet, so a drop that
+    // lands on the page has no receiver. Reporting it to the host anyway
+    // would spawn a node wherever the user changed their mind — the
+    // gesture's own cancel.
+    //
+    // Mutation: drop the `!inside` guard and emit unconditionally.
+    // Compiles, and the release over the probe writes a record — red.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+    defer sp.endCarry();
+    defer if (sp.drop_path) |q| sp.allocator.free(q);
+    try sp.setDropPath("ui.drop");
+
+    var p = InputProbe{ .payload = "op:lerp" };
+    try sp.drawlist.hits.append(probeHit(&p, &probe_drag, 0, 0, 100, 50));
+
+    // Picked up, moved somewhere else on the page, released there.
+    try sp.dispatchMouseButtonN(20, 20, true, Spark.DRAG_BUTTON);
+    try sp.dispatchMouseMove(60, 30);
+    try sp.dispatchMouseButtonN(60, 30, false, Spark.DRAG_BUTTON);
+    try testing.expect(st.get("ui.drop") == null);
+    try testing.expect(sp.carrying() == null);
+
+    // And the same gesture that leaves the document IS reported, so the
+    // gate above is about `inside` and not about drops being broken.
+    try sp.dispatchMouseButtonN(20, 20, true, Spark.DRAG_BUTTON);
+    try sp.dispatchMouseMove(600, 400);
+    try sp.dispatchMouseButtonN(600, 400, false, Spark.DRAG_BUTTON);
+    try testing.expect(st.get("ui.drop") != null);
+}
+
+test "drag: only the left button picks up, and only it puts down" {
+    // A right-press on a draggable block must still ask the context
+    // question — "what can I do to this" is not "pick this up" — and a
+    // right-release during a drag is the cancel convention: it reaches
+    // the component, and it must not also drop the payload, or the
+    // gesture dies in the user's hand.
+    //
+    // Mutation A: delete `if (button == DRAG_BUTTON)` on the press. The
+    // right-press starts a carry — red on the first expect.
+    // Mutation B: delete it on the release. The right-release drops the
+    // payload mid-gesture — red on the last expect.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+    defer sp.endCarry();
+    defer if (sp.drop_path) |q| sp.allocator.free(q);
+    try sp.setDropPath("ui.drop");
+
+    var p = InputProbe{ .payload = "op:lerp" };
+    try sp.drawlist.hits.append(probeHit(&p, &probe_drag, 0, 0, 100, 50));
+
+    // A. The right button does not pick up.
+    try sp.dispatchMouseButtonN(20, 20, true, Spark.CONTEXT_BUTTON);
+    try testing.expect(sp.carrying() == null);
+    try sp.dispatchMouseButtonN(20, 20, false, Spark.CONTEXT_BUTTON);
+
+    // B. A right press+release DURING a left drag leaves it airborne.
+    try sp.dispatchMouseButtonN(20, 20, true, Spark.DRAG_BUTTON);
+    try sp.dispatchMouseMove(600, 400);
+    try sp.dispatchMouseButtonN(600, 400, true, Spark.CONTEXT_BUTTON);
+    try sp.dispatchMouseButtonN(600, 400, false, Spark.CONTEXT_BUTTON);
+    try testing.expect(sp.carrying() != null);
+    try testing.expect(st.get("ui.drop") == null);
+}
+
+test "drag: over_document ignores the capture, which is what claimsPointer cannot do" {
+    // The half a host cannot work out for itself. A host ghosting a drop
+    // into a 3D scene must not ghost it through a panel in front of the
+    // scene — and `claimsPointer` answers TRUE unconditionally while
+    // anything is captured, which is exactly the state a carry is in. A
+    // host that asked it would never ghost at all.
+    //
+    // Mutation: `.over_document = self.claimsPointer(c.at[0], c.at[1])`.
+    // Compiles, and the point far outside every box answers true — red.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+    defer sp.endCarry();
+
+    var p = InputProbe{ .payload = "op:lerp" };
+    try sp.drawlist.hits.append(probeHit(&p, &probe_drag, 0, 0, 100, 50));
+
+    try sp.dispatchMouseButtonN(20, 20, true, Spark.DRAG_BUTTON);
+    try testing.expect(sp.carrying().?.over_document); // still on its source
+
+    try sp.dispatchMouseMove(600, 400);
+    try testing.expect(!sp.carrying().?.over_document);
+    // The capture is real and claimsPointer says so — the two answers
+    // differ, which is the whole reason `over_document` exists.
+    try testing.expect(sp.captured != null);
+    try testing.expect(sp.claimsPointer(600, 400));
+
+    // Back over the document and it flips again, so this tracks the
+    // pointer rather than latching once.
+    try sp.dispatchMouseMove(50, 25);
+    try testing.expect(sp.carrying().?.over_document);
+}
+
+test "drag: the hook is asked first and a decline falls to the author's attribute" {
+    // The same precedence as the context question, and the same reason:
+    // the hook varies with the point and the attribute is a constant, so
+    // a component with interior structure names what is under the cursor
+    // and the ground between falls through to the block's own `drag=`.
+    //
+    // Mutation: swap the two arms in `dragPayloadAt` so the attribute
+    // wins. Compiles, and the press inside the zone picks up the
+    // attribute's payload instead of the hook's — red.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+    defer sp.endCarry();
+
+    // A component whose hook answers only in its top-left 20×20, sitting
+    // in a block the author marked draggable as a whole.
+    var p = InputProbe{
+        .payload = "node:near1",
+        .payload_zone = .{ .x = 0, .y = 0, .w = 20, .h = 20 },
+    };
+    var hit = probeHit(&p, &probe_drag, 0, 0, 100, 50);
+    hit.drag_payload = "canvas";
+    try sp.drawlist.hits.append(hit);
+
+    try sp.dispatchMouseButtonN(5, 5, true, Spark.DRAG_BUTTON);
+    try testing.expectEqualStrings("node:near1", sp.carrying().?.payload);
+    try sp.dispatchMouseButtonN(5, 5, false, Spark.DRAG_BUTTON);
+
+    try sp.dispatchMouseButtonN(60, 40, true, Spark.DRAG_BUTTON);
+    try testing.expectEqualStrings("canvas", sp.carrying().?.payload);
+}
+
+test "drag: a payload that is not one word is refused by name, not emitted" {
+    // The record is whitespace-delimited. A payload with a space in it
+    // does not produce a BROKEN record — it produces a valid one that
+    // means something else, and the host reads `payload=op` and never
+    // learns there was more. Same rule, same reasoning and same `warn`
+    // level as the context subject's check.
+    //
+    // Mutation: delete the loop in `emitDrop`. Compiles, and the release
+    // returns no error while writing a record that lies — red twice.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+    defer sp.endCarry();
+    defer if (sp.drop_path) |q| sp.allocator.free(q);
+    try sp.setDropPath("ui.drop");
+
+    var p = InputProbe{ .payload = "op lerp" };
+    try sp.drawlist.hits.append(probeHit(&p, &probe_drag, 0, 0, 100, 50));
+
+    try sp.dispatchMouseButtonN(20, 20, true, Spark.DRAG_BUTTON);
+    try sp.dispatchMouseMove(600, 400);
+    try testing.expectError(
+        error.DragPayloadNotOneWord,
+        sp.dispatchMouseButtonN(600, 400, false, Spark.DRAG_BUTTON),
+    );
+    try testing.expect(st.get("ui.drop") == null);
+}
+
+test "drag: a host that named no drop path gets no record and no crash" {
+    // Same shape and same argument as the context record's: a document
+    // carried between hosts should be inert about what its host has not
+    // wired, not broken. The carry still runs its whole life — picked
+    // up, tracked, released — so this is "nothing is reported", not
+    // "nothing happens".
+    //
+    // Mutation: `const path = self.drop_path orelse "drop";` — the
+    // record lands in a path the host never asked for. Compiles, and
+    // `ui.drop` stays null while `drop` appears — red on the second.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+    defer sp.endCarry();
+
+    var p = InputProbe{ .payload = "op:lerp" };
+    try sp.drawlist.hits.append(probeHit(&p, &probe_drag, 0, 0, 100, 50));
+
+    try sp.dispatchMouseButtonN(20, 20, true, Spark.DRAG_BUTTON);
+    try testing.expect(sp.carrying() != null);
+    try sp.dispatchMouseMove(600, 400);
+    try sp.dispatchMouseButtonN(600, 400, false, Spark.DRAG_BUTTON);
+    try testing.expect(sp.carrying() == null);
+    try testing.expect(st.get("drop") == null);
+}
+
+test "drag: the press still reaches the component that was picked up" {
+    // Picking something up is IN ADDITION to pressing it, never instead
+    // of it — the same rule the context record follows one branch up. A
+    // palette button that is also a drag source must still light on
+    // press, and a click that never becomes a drag must still be a
+    // click.
+    //
+    // Mutation: move the drag question INSIDE `if (maybe_hit)`, before
+    // `dispatchHit`, and `return` from it — picking up INSTEAD of
+    // pressing. Compiles, and the probe records no press: `expected 1,
+    // found 0`. (A `return` where the question actually sits is not a
+    // mutation at all — it is already the last statement in the branch,
+    // and the first sweep recorded it as a survivor before that was
+    // noticed. A mutation that changes nothing is not a mutation.)
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+    defer sp.endCarry();
+
+    var p = InputProbe{ .payload = "op:lerp" };
+    try sp.drawlist.hits.append(probeHit(&p, &probe_drag, 0, 0, 100, 50));
+
+    try sp.dispatchMouseButtonN(20, 20, true, Spark.DRAG_BUTTON);
+    try testing.expectEqual(@as(usize, 1), p.n);
+    try testing.expectEqual(InputProbe.Kind.down, p.recs[0].kind);
+    try sp.dispatchMouseButtonN(20, 20, false, Spark.DRAG_BUTTON);
+    try testing.expectEqual(@as(usize, 2), p.n);
+    try testing.expectEqual(InputProbe.Kind.up, p.recs[1].kind);
 }

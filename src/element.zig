@@ -280,6 +280,16 @@ pub const Element = union(enum) {
         /// lifetime story for the substituted string at the same time,
         /// which is the actual work.
         context: ?[]const u8 = null,
+        /// The `drag="…"` attribute this block was written with, if any.
+        /// Read off the `Spec` beside `context` and for the same reason —
+        /// no factory learns about it, so any block becomes a drag source
+        /// without a line of host code. See `Hit.drag_payload`.
+        ///
+        /// Literal, not templated, exactly as `context` is, and with the
+        /// same recorded-not-built note: a live `${…}` payload wants a
+        /// lifetime story for the substituted string. The trigger is the
+        /// first host that wants one.
+        drag: ?[]const u8 = null,
     },
 
     /// Inline-context component. Flows alongside text in a
@@ -463,6 +473,29 @@ pub const ElementVTable = struct {
     /// author writes both structs in the same file, and a fourth living
     /// somewhere else would buy nothing but an exception to remember.
     context_subject: ?*const fn (
+        ctx: *anyopaque,
+        local: [2]f32,
+    ) ?[]const u8 = null,
+    /// **What a press at this point PICKS UP**, or null for a point that
+    /// is not a drag source.
+    ///
+    /// The same two-door shape as `context_subject`, asked at the same
+    /// moment for the same reason: this hook varies with the point and
+    /// the author's `drag="…"` attribute is a constant, so a component
+    /// with interior structure names what is under the cursor and falls
+    /// back to the attribute wherever it declines.
+    ///
+    /// The string is an OPAQUE PAYLOAD. spark never reads it — it carries
+    /// it, publishes it while it is in flight, and hands it back at the
+    /// release. What it means is between the document that wrote it and
+    /// the host that receives it, exactly as a context subject is.
+    ///
+    /// **Unlike a context subject, spark COPIES it.** A subject is
+    /// answered and consumed inside one dispatch; a payload outlives the
+    /// press by however long the gesture lasts, and a HUD that rebuilds
+    /// its document mid-drag would leave the carry pointing into a freed
+    /// arena. `Spark.carry` owns its copy — see `Spark.beginCarry`.
+    drag_payload: ?*const fn (
         ctx: *anyopaque,
         local: [2]f32,
     ) ?[]const u8 = null,
@@ -820,6 +853,18 @@ pub const Hit = struct {
     /// `Spec` the tree was built from, which lives as long as the tree.
     /// A `Hit` never outlives the frame it was emitted in.
     context_subject: ?[]const u8 = null,
+    /// **The author's door to the drag question**, the twin of
+    /// `context_subject` above: a `:::` block carrying `drag="op:lerp"`
+    /// is picked up by a left-press in this box, with no factory and no
+    /// host code.
+    ///
+    /// The vtable's `drag_payload` hook is asked FIRST and this is the
+    /// fallback, so a component with interior structure answers per point
+    /// and falls back to the author's constant wherever it declines.
+    ///
+    /// Lifetime is the document arena's, like `context_subject` — but the
+    /// carry that results does NOT borrow it. See the hook.
+    drag_payload: ?[]const u8 = null,
 };
 
 /// Parent-imposed bounds. Stage 1 walker mostly ignores these — text
