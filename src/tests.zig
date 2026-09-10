@@ -82,6 +82,7 @@ test {
     _ = @import("layout/kiwi/row.zig");
     _ = @import("layout/kiwi/solver.zig");
     _ = @import("layout/context.zig");
+    _ = @import("overlay.zig");
     _ = @import("state.zig");
     _ = @import("svg.zig");
     _ = @import("svg_tessellate.zig");

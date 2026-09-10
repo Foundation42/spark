@@ -365,6 +365,15 @@ fn mapBlock(
                     // the factory-supplied vtable + ctx — the cached
                     // instance state lives in the registry's
                     // allocator, stable across many parses.
+                    // `context="…"` is read HERE rather than inside the
+                    // factory, and that is the point of it: no factory
+                    // has to know about it, no existing component
+                    // changed, and a block whose factory is missing
+                    // entirely still answers the context question
+                    // through the placeholder below. The slice is the
+                    // spec's own, and the spec lives in the same arena
+                    // as the Element tree.
+                    const context_attr = contextAttr(spec_ptr.attrs);
                     if (mc.registry) |reg| {
                         if (try reg.resolve(spec_ptr, idx, mc.state, mc.scope)) |inst| {
                             return .{ .custom = .{
@@ -372,6 +381,7 @@ fn mapBlock(
                                 .ctx = inst.ctx,
                                 .pass_kind = inst.pass_kind,
                                 .shader_id = inst.shader_id,
+                                .context = context_attr,
                             } };
                         }
                     }
@@ -383,6 +393,7 @@ fn mapBlock(
                     return .{ .custom = .{
                         .vtable = &components.placeholder_vtable,
                         .ctx = @ptrCast(@constCast(spec_ptr)),
+                        .context = context_attr,
                     } };
                 }
             }
@@ -395,6 +406,29 @@ fn mapBlock(
 
         else => return error.UnsupportedNodeKind,
     }
+}
+
+/// The `context="…"` attribute of a `:::` block, or null.
+///
+/// **`context` is the one attribute the element layer reads and no
+/// factory sees**, which is what lets it work on every block including
+/// ones whose factory does not exist. It is also therefore a reserved
+/// word in the attribute grammar: a component that wants an attribute
+/// called `context` for something else will find this one shadowing it
+/// on the hit layer, and should pick another name.
+///
+/// Last one wins, matching how every component in this library reads a
+/// repeated attribute — a linear scan that keeps assigning.
+fn contextAttr(attrs: []const components.Attr) ?[]const u8 {
+    var found: ?[]const u8 = null;
+    for (attrs) |a| {
+        if (std.mem.eql(u8, a.key, "context")) found = a.value;
+    }
+    // An empty `context=""` is "no subject", not "the empty subject".
+    // A record naming nothing is worse than no record: the host cannot
+    // tell it from a claim it does not recognise.
+    if (found) |s| if (s.len == 0) return null;
+    return found;
 }
 
 /// Wrap a CODE_BLOCK or HTML_BLOCK literal in a preformatted
@@ -1170,4 +1204,39 @@ test "markdown: our own `:::` sentinel is a comment and must NOT be dropped" {
     // comment" every component in every document silently vanishes.
     try std.testing.expect(isComment("<!--te:0-->"));
     try std.testing.expect(components.extractSentinelIndex("<!--te:0-->") != null);
+}
+
+test "context attribute: read off the spec, and empty means no subject" {
+    // `context="…"` is the author's door to the right-click question,
+    // and it is the one attribute the ELEMENT layer reads while no
+    // factory ever sees it — which is what makes it work on a block
+    // whose factory does not exist. See `contextAttr`.
+    //
+    // Mutation: return `found` unconditionally, dropping the
+    // `s.len == 0` rule. Compiles, and `context=""` then claims the
+    // point with an empty subject — red on the third case. That matters
+    // because a record naming nothing is worse than no record: a host
+    // cannot tell it from a claim it does not recognise, and the whole
+    // point of the channel is that "nobody claims this" routes to the
+    // 3D scene.
+    const with = [_]components.Attr{
+        .{ .key = "w", .value = "120" },
+        .{ .key = "context", .value = "sphere:12" },
+    };
+    try std.testing.expectEqualStrings("sphere:12", contextAttr(&with).?);
+
+    const without = [_]components.Attr{.{ .key = "w", .value = "120" }};
+    try std.testing.expect(contextAttr(&without) == null);
+
+    const empty = [_]components.Attr{.{ .key = "context", .value = "" }};
+    try std.testing.expect(contextAttr(&empty) == null);
+
+    // Last one wins, the same rule every component in this library
+    // applies to a repeated attribute. Asserting it here keeps the
+    // answer from being "whichever the scan happened to stop on".
+    const twice = [_]components.Attr{
+        .{ .key = "context", .value = "first" },
+        .{ .key = "context", .value = "second" },
+    };
+    try std.testing.expectEqualStrings("second", contextAttr(&twice).?);
 }

@@ -266,6 +266,20 @@ pub const Element = union(enum) {
         /// sanity check.
         pass_kind: u8 = 0,
         shader_id: [16]u8 = [_]u8{0} ** 16,
+        /// The `context="…"` attribute this block was written with, if
+        /// any. Read straight off the `Spec` at element-construction
+        /// time and copied onto the emitted `Hit` — see
+        /// `Hit.context_subject` for what it is for.
+        ///
+        /// **Literal, not templated.** The registry substitutes `${…}`
+        /// in attributes on its way into a factory; this is read beside
+        /// that path, from the spec, so `context="${state.sel}"` arrives
+        /// as those nine characters. Recorded, not built: routing it
+        /// through `component.Resolved` so a live subject works. The
+        /// trigger is the first host that wants one — and it will want a
+        /// lifetime story for the substituted string at the same time,
+        /// which is the actual work.
+        context: ?[]const u8 = null,
     },
 
     /// Inline-context component. Flows alongside text in a
@@ -412,6 +426,46 @@ pub const ElementVTable = struct {
         event: HoverEvent,
         state: *anyopaque,
     ) anyerror!void = null,
+    /// Optional. **What is under this point, in the host's own words?**
+    /// Answer with an opaque subject string, or null to decline.
+    ///
+    /// This is the question a right-click asks, and it is deliberately
+    /// only a question: spark does not open anything, does not know what
+    /// a menu is, and does not interpret the answer. `Spark`'s
+    /// dispatcher walks the hit layer innermost-out, asks each component
+    /// whose box contains the point, and emits ONE record naming the
+    /// first non-null answer. Nobody answering emits nothing at all —
+    /// which is the distinction a host with a 3D scene under the
+    /// document needs, because "the canvas claims this point" and "no
+    /// element claims this point" have to route differently.
+    ///
+    /// `local` is the point in the component's own box coordinates, the
+    /// same frame `on_input` and `on_hover` get, so a component with
+    /// interior structure can distinguish a node from a pin from its own
+    /// background — `node:near1`, `pin:near1.tight`, `canvas`.
+    ///
+    /// **The returned slice must outlive the call and must be one
+    /// word**: no spaces, tabs, newlines or double quotes. The record is
+    /// line-oriented `key=value` text, and a subject with a space in it
+    /// would silently produce a record that parses as something else, so
+    /// `Spark` refuses it by name rather than emitting it. In practice
+    /// the answer is a literal or a buffer the component owns.
+    ///
+    /// **On the vtable rather than on `component.Factory`.** The
+    /// dispatcher holds a `Hit`, and a `Hit` carries a vtable and an
+    /// opaque `ctx`; there is no path from that `ctx` back to a Factory
+    /// — the registry is keyed by instance id, so it would take a linear
+    /// reverse scan whose answer is simply absent for every component
+    /// built outside the registry (`document.wrapElement`'s trees,
+    /// `ansi.zig`'s, and every gate in this library that hand-builds a
+    /// vtable). The three other "ask the component about a point" hooks
+    /// — `on_input`, `on_scroll`, `on_hover` — are all here, a component
+    /// author writes both structs in the same file, and a fourth living
+    /// somewhere else would buy nothing but an exception to remember.
+    context_subject: ?*const fn (
+        ctx: *anyopaque,
+        local: [2]f32,
+    ) ?[]const u8 = null,
     /// True if this component wants keyboard focus on click. The
     /// element_layout walker stamps this onto the emitted `Hit` so
     /// the host's input dispatcher can wire focus correctly.
@@ -749,6 +803,23 @@ pub const Hit = struct {
     /// holder (which gets a `.focus_lost`); subsequent key + char
     /// events route here until focus moves again.
     focusable: bool = false,
+    /// **The author's door to the context question.** A `:::` block
+    /// carrying `context="sphere:12"` gets that string stamped here by
+    /// the walker, and a right-click landing in this box names it — with
+    /// no factory, no hook and no host code, which is what makes any
+    /// block in any document right-clickable.
+    ///
+    /// The vtable's `context_subject` hook is asked FIRST and this is
+    /// the fallback, so a component with interior structure answers per
+    /// point and falls back to the author's constant wherever it
+    /// declines. `:::nodegraph {context="canvas"}` is exactly that
+    /// shape: the hook names a node or a pin, and the empty ground
+    /// between them takes the attribute.
+    ///
+    /// Lifetime is the document arena's — the value is a slice of the
+    /// `Spec` the tree was built from, which lives as long as the tree.
+    /// A `Hit` never outlives the frame it was emitted in.
+    context_subject: ?[]const u8 = null,
 };
 
 /// Parent-imposed bounds. Stage 1 walker mostly ignores these — text

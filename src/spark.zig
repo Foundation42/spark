@@ -71,7 +71,29 @@ const display_mod = @import("gpu/display.zig");
 const element_layout = @import("element_layout.zig");
 const document_mod = @import("document.zig");
 const pass_mod = @import("pass/root.zig");
+const overlay_mod = @import("overlay.zig");
 const io = io_channel_mod;
+
+/// Which corner of an overlay document sits at the point it was opened
+/// at. Re-exported so a host names it as `spark.Corner` rather than
+/// reaching into `overlay.zig`; see that file for why a menu is a
+/// document and not a component.
+pub const Corner = overlay_mod.Corner;
+
+/// GLFW's escape keycode. `element.KeyEvent.key` is a raw GLFW code by
+/// contract (see `KeyEvent`), and spark links no GLFW — so the one
+/// number the dispatcher itself has an opinion about is written here,
+/// once, with its provenance, rather than appearing bare at the site.
+pub const KEY_ESCAPE: i32 = 256;
+
+/// The three modifier bits the context record reports, as GLFW numbers
+/// them. `:::textarea` and `:::input` each keep their own copy of these
+/// for their own keymaps; this is the dispatcher's, and it is here
+/// rather than borrowed from a component because a component is the
+/// wrong place for a library-wide fact.
+const MOD_SHIFT: u32 = 0x0001; // GLFW_MOD_SHIFT
+const MOD_CONTROL: u32 = 0x0002; // GLFW_MOD_CONTROL
+const MOD_ALT: u32 = 0x0004; // GLFW_MOD_ALT
 
 /// Per-frame info supplied by the host at `beginFrame`. Stored on
 /// the Spark instance until `endFrame`; `layoutAndRender` calls
@@ -366,6 +388,10 @@ pub const PaintLayer = struct {
     quads: [2]u32,
     tri_indices: [2]u32,
     images: [2]u32,
+    /// This layer is the OVERLAY's, and `endFrame` paints it after every
+    /// other layer whatever order the host called `layoutAndRender` in.
+    /// See `orderOverlayLast`.
+    overlay: bool = false,
 
     /// The whole frame as one layer — what a host that never called
     /// `layoutAndRender` gets, and what one call produces anyway. Keeps
@@ -434,6 +460,35 @@ pub const BackgroundSpan = struct {
 /// smaller, or the starts tie and its index is larger. Disjoint siblings
 /// never tie, and the earlier one's start is smaller, so document order
 /// survives untouched. Both facts are gated below.
+/// Put the overlay's paint layer last, keeping every other layer in the
+/// order the host rendered it.
+///
+/// **Above all page content, and not by convention.** A layer paints
+/// after every layer before it — background, triangles, images, quads
+/// and glyphs together — so "last" IS "on top", and the whole of the
+/// overlay's above-ness is this one sort. The alternative was to tell
+/// hosts "call `layoutAndRenderOverlay` last": that is a rule that
+/// cannot be checked at the call site, and a host that renders two
+/// panels in a loop and a menu before the loop would get a menu
+/// underneath the second panel, which reads as a rendering bug and is
+/// actually a call-order bug three files away.
+///
+/// `std.sort.insertion` because it is STABLE and the array is tiny (one
+/// entry per `layoutAndRender` this frame — one to a handful). Stability
+/// is load-bearing, not incidental: two panels that overlap are ordered
+/// by the host's call order and that ordering must survive untouched.
+///
+/// Idempotent, which matters on the `beginFrame(.reset = false)` path
+/// where the previous frame's `paint_layers` are replayed and sorted
+/// again.
+pub fn orderOverlayLast(layers: []PaintLayer) void {
+    std.sort.insertion(PaintLayer, layers, {}, struct {
+        fn lt(_: void, a: PaintLayer, b: PaintLayer) bool {
+            return !a.overlay and b.overlay;
+        }
+    }.lt);
+}
+
 pub fn orderBackgrounds(spans: []BackgroundSpan) void {
     std.mem.sort(BackgroundSpan, spans, {}, struct {
         fn lt(_: void, a: BackgroundSpan, b: BackgroundSpan) bool {
@@ -685,6 +740,20 @@ pub const Spark = struct {
     /// for why this is a flag rather than a `bool` off each dispatcher.
     redraw_requested: bool = false,
 
+    /// The one open overlay, or nothing. A document drawn over the page
+    /// at a point, taking the pointer while it is up — see
+    /// `overlay.zig` for why a context menu is a document rather than a
+    /// component, and `openOverlay` for the whole contract.
+    overlay: ?overlay_mod.Overlay = null,
+
+    /// Where a right-click's context record is written, or nothing.
+    /// Owned; duped in `setContextPath`, freed in `deinit`. Null until
+    /// the host names a path, and a right-click on a host that named
+    /// none emits nothing — the same shape as `command_sink_fn`, and
+    /// for the same reason: a document carried between hosts should be
+    /// inert about the things its host has not wired, not broken.
+    context_path: ?[]u8 = null,
+
     /// Construct a Spark and all engine resources. The host gives
     /// raw Vulkan handles (via opts.vk_ctx + opts.color_format), an
     /// owned FontRegistry, a borrowed Theme + root State, and
@@ -871,6 +940,20 @@ pub const Spark = struct {
         //      doesn't corrupt the read in time).
         //   5. Remaining engine resources reverse-of-init.
 
+        // 0. The overlay, if one is up. BEFORE `registry.deinit`,
+        //    because `closeOverlay` calls `deinitScope` — which destroys
+        //    the overlay's Bindings while the State they are subscribed
+        //    to is still alive — and only then frees that State. Left to
+        //    step 1 the registry would tear the same instances down in a
+        //    different order and the document's State would outlive
+        //    nothing at all; left to the host, a host that forgot would
+        //    leak a whole document with no way to notice.
+        self.closeOverlay();
+        if (self.context_path) |p| {
+            self.allocator.free(p);
+            self.context_path = null;
+        }
+
         // 1. Components — must run with full engine alive.
         self.registry.deinit();
         self.allocator.destroy(self.registry);
@@ -967,6 +1050,44 @@ pub const Spark = struct {
     pub fn setCommandSink(self: *Spark, ctx: *anyopaque, f: CommandSink) void {
         self.command_sink_ctx = ctx;
         self.command_sink_fn = f;
+    }
+
+    /// Name the state path a right-click writes its context record to.
+    ///
+    /// The record is one `State.set`, in the line-oriented `key=value`
+    /// grammar the rest of spark uses:
+    ///
+    ///     context subject=node:near1 x=412.0 y=233.5 shift=0 ctrl=0 alt=0
+    ///
+    /// A host subscribes to `path`, reads the subject, decides what the
+    /// menu for it contains, and calls `openOverlay`. **spark opens
+    /// nothing on right-click**, and that asymmetry is the design: the
+    /// same host code serves a right-click on a graph node and one on a
+    /// sphere in a 3D viewport where no spark element is under the
+    /// cursor at all.
+    ///
+    /// A right-click that nobody claims writes NOTHING — not an empty
+    /// subject, not a record with a blank field. The host has to be able
+    /// to tell "the canvas claims this point" from "no element claims
+    /// this point", because those route differently: one opens a canvas
+    /// menu, the other is the 3D scene's click.
+    ///
+    /// **A path rather than a callback**, unlike `setCommandSink`,
+    /// because the answer is DATA a document may also want to read. A
+    /// panel that shows what was last right-clicked is a document
+    /// binding `${state.ui.context}` and no host code at all; a callback
+    /// would make that impossible and would buy nothing — the host
+    /// subscribes to the path and gets its callback back.
+    ///
+    /// Rejected names: `bindContext` (spark's "binding" vocabulary means
+    /// `${…}` attribute templating, and this is not that),
+    /// `setContextSink` (a Sink in this file is a function pointer —
+    /// `CommandSink` — and calling a path one would lie), `setMenuPath`
+    /// (spark does not know what a menu is, and must not learn).
+    pub fn setContextPath(self: *Spark, path: []const u8) !void {
+        const dup = try self.allocator.dupe(u8, path);
+        if (self.context_path) |old| self.allocator.free(old);
+        self.context_path = dup;
     }
 
     /// Install the host's clipboard. Both directions at once, because a
@@ -1268,6 +1389,284 @@ pub const Spark = struct {
         const bytes = try std.fs.cwd().readFileAlloc(self.allocator, path, 32 * 1024 * 1024);
         defer self.allocator.free(bytes);
         return try self.loadDocument(bytes, opts);
+    }
+
+    // ── The overlay ─────────────────────────────────────────────────
+    //
+    // A document drawn over the page at a point. Three properties, and
+    // the host gets none of them for free by rendering a second
+    // document itself: it is ABOVE everything (`orderOverlayLast`), it
+    // takes the pointer FIRST (`hitScope`), and it FLIPS rather than
+    // clamping near an edge (`overlay.place`). Everything else about a
+    // menu — what is in it, what the items do, whether there is a
+    // search box — is the host's document and none of spark's business.
+    // See `overlay.zig`.
+
+    /// Open `doc` (markdown source) as the overlay, anchored so that
+    /// `corner` of it sits at `at` — flipping to the other side of an
+    /// axis if that would run it off the surface.
+    ///
+    /// `at` is in WORLD coordinates: the same ones `dispatchMouseButton`
+    /// takes and the same ones the `context` record reports, so a host
+    /// answering a right-click passes the numbers straight back.
+    ///
+    /// **Nothing here assumes a preceding right-click.** A host that
+    /// picked a mesh in its own 3D scene, where no spark element is
+    /// under the cursor at all, calls exactly this with a point it
+    /// computed itself. That symmetry is the design: the same code path
+    /// serves a right-click on a graph node and a right-click on a
+    /// sphere in the viewport.
+    ///
+    /// **A second open replaces the first**, tearing down the previous
+    /// document and its components. There is one overlay, not a stack —
+    /// see `overlay.zig` for what a stack would change.
+    ///
+    /// The overlay document gets its own `State` (frontmatter seeds it)
+    /// and the fixed registry scope `overlay.SCOPE`. Pass
+    /// `LoadOpts.shared_state` through `opts` to have a menu read and
+    /// write the host's own state, which is what a menu with a live
+    /// `:::checkbox` in it wants.
+    ///
+    /// Rejected names: `showOverlay` (spark has no show/hide anywhere —
+    /// a thing is rendered or it is not), `popup` (see `overlay.zig`),
+    /// `openMenu` (the whole design is that spark does not know what a
+    /// menu is).
+    pub fn openOverlay(
+        self: *Spark,
+        doc: []const u8,
+        at: [2]f32,
+        corner: Corner,
+        opts: document_mod.LoadOpts,
+    ) !void {
+        // **Close BEFORE loading, and it is not the obvious order.**
+        // Building the replacement first would be the careful-looking
+        // version — a parse failure would leave the previous menu up and
+        // working. It is wrong here, and the reason is the shared
+        // registry scope: both documents resolve their `:::` blocks
+        // under `overlay.SCOPE`, so the new parse lands on the OLD
+        // document's cached instances (same `#id`, same `auto:N`) and
+        // adopts them, and the `deinitScope` in the close that followed
+        // would then free components the new document's Element tree
+        // points straight at. A dangling vtable pointer beats a lost
+        // menu by a distance.
+        //
+        // So a failed open leaves nothing open. Say so rather than let a
+        // host discover it: `openOverlay` returning an error means there
+        // is no overlay, not that the old one survived.
+        self.closeOverlay();
+
+        var load = opts;
+        load.scope = overlay_mod.SCOPE;
+        var fresh = try self.loadDocument(doc, load);
+        errdefer fresh.deinit();
+        var scratch = element.DrawList.init(self.allocator);
+        errdefer scratch.deinit();
+
+        // **An overlay opening takes the pointer AND the keyboard.**
+        // `dispatchMouseMove` routes to `captured` without consulting
+        // the overlay at all, so a page gesture still holding it would
+        // keep being dragged under an open menu; and `dispatchKey`
+        // delivers to `focused`, so a text field on the page would
+        // swallow everything typed while a menu was up — right-click
+        // while editing, and the menu's own keystrokes land in the field
+        // behind it. One rule for all three, stated here, rather than a
+        // guard in each dispatcher that one of them forgets.
+        //
+        // The focus clear fires `focus_lost` on the previous holder
+        // while it is still alive, which is what `clearFocus` is for.
+        self.clearFocus();
+        self.captured = null;
+        self.hovered = null;
+
+        self.overlay = .{
+            .doc = fresh,
+            .at = at,
+            .corner = corner,
+            .scratch = scratch,
+        };
+    }
+
+    /// Dismiss the overlay. A no-op when none is open, so a host can
+    /// call it on any "the gesture is over" edge without asking first.
+    ///
+    /// **Three pointers and a slice of the hit layer have to go with
+    /// it.** `captured`, `focused` and `hovered` hold `Hit`s by value,
+    /// and a Hit inside the overlay points at a component this call is
+    /// about to destroy; so does every entry in the overlay's range of
+    /// `drawlist.hits`, which otherwise survives until the next
+    /// `beginFrame` and would be hit-tested by any input arriving in
+    /// between. A menu item whose handler closes the menu is the
+    /// ordinary case, not an exotic one — that is what a menu item DOES
+    /// — so this is the path, not the corner.
+    ///
+    /// The three are cleared unconditionally rather than only when they
+    /// point into the overlay. Comparing would mean trusting a pointer
+    /// into freed memory to still be comparable, and the blunt version
+    /// costs nothing real: `openOverlay` cleared all three on the way
+    /// in, so there is no page gesture left for this to interrupt.
+    pub fn closeOverlay(self: *Spark) void {
+        var ov = self.overlay orelse return;
+        self.overlay = null;
+
+        // `focus_lost` goes out while the component is still alive.
+        self.clearFocus();
+        self.captured = null;
+        self.hovered = null;
+
+        const hits = &self.drawlist.hits;
+        const lo: usize = @min(ov.hits[0], hits.items.len);
+        const hi: usize = @min(ov.hits[1], hits.items.len);
+        if (hi > lo) {
+            // `replaceRange` with nothing shifts the tail down; it
+            // cannot fail for a shrink, and the tail is page hits that
+            // stay perfectly valid at their new indices — nothing
+            // anywhere stores a hit INDEX.
+            hits.replaceRange(lo, hi - lo, &.{}) catch {};
+        }
+
+        // Components before the document, mirroring
+        // `:::embedded-document`'s teardown: `deinitScope` destroys each
+        // instance's Binding, and a Binding unsubscribes from the State
+        // the document is about to free.
+        self.registry.deinitScope(overlay_mod.SCOPE);
+        ov.scratch.deinit();
+        ov.doc.deinit();
+    }
+
+    /// Is an overlay up? A host asks before deciding whether a key or a
+    /// click is the document's business.
+    pub fn overlayOpen(self: *const Spark) bool {
+        return self.overlay != null;
+    }
+
+    /// The width an overlay document is laid out against.
+    ///
+    /// A menu has a width; prose in spark claims whatever `max_w` it is
+    /// offered, so an overlay given the surface width would be a menu as
+    /// wide as the screen. This is the number that makes a menu look
+    /// like one, and a host wanting another shape says so inside its own
+    /// document (a `:::flex` with a fixed width, a `:::box`).
+    ///
+    /// Recorded, not built: per-open control of it. The trigger is the
+    /// first host that wants two overlay shapes in one application — a
+    /// narrow context menu and a wide inspector — at which point it
+    /// becomes a field on `LoadOpts`-shaped options rather than a
+    /// constant.
+    pub const OVERLAY_MAX_W: f32 = 260;
+
+    /// Measure the overlay, place it, and walk it into this frame's
+    /// DrawList as its own paint layer. No-op when nothing is open.
+    ///
+    /// **Where in the frame this goes.** After the host's own
+    /// `layoutAndRender` calls and BEFORE `dispatchOffscreenPasses` —
+    /// not inside `endFrame`, which is the tempting place. By `endFrame`
+    /// the offscreen phase may already have recorded descriptor binds
+    /// against the pipelines' buffers, and appending to the drawlist
+    /// there can demand a grow that `endFrame` is obliged to refuse
+    /// (`error.DrawlistGrewAfterDispatch`) — and, because the refusal
+    /// happens before `reserveForDrawlist`, the buffers never grow and
+    /// the refusal repeats every frame. A menu that opens and
+    /// permanently blacks out a document with an effect in it is a much
+    /// worse trade than one call the host has to make.
+    ///
+    /// Calling this out of order does NOT put the menu under the page —
+    /// `orderOverlayLast` handles that — and does not misroute input:
+    /// the overlay records its own slice of the hit layer rather than
+    /// relying on being last in it.
+    ///
+    /// **Laid out twice, on purpose.** The flip needs the document's
+    /// size and spark cannot know it without walking: `measureBlock`
+    /// answers zero height for a paragraph (it is a wrap-time question),
+    /// so there is no cheap measure for prose. The first walk goes into
+    /// a scratch DrawList the overlay owns and keeps — reused frame to
+    /// frame, so the cost is a walk and not an allocation — and only its
+    /// returned Box is used. The layout cache makes the second walk
+    /// mostly a replay of the first. The alternative, placing from last
+    /// frame's size, shows as a menu that jumps on its first frame.
+    ///
+    /// The measure walk is given `pass_dispatches = null` so a menu
+    /// containing an effect does not emit its dispatches twice. Not
+    /// tried, and recorded here rather than discovered: a document whose
+    /// layout REGISTERS constraints with the kiwi solver (`:::grid`) is
+    /// walked through one `LayoutContext.beginPass` twice by this, and
+    /// nobody has put a grid in a menu. The fix if it bites is a
+    /// measure-only walk that does not touch the solver.
+    pub fn layoutAndRenderOverlay(self: *Spark) !void {
+        // `&self.overlay.?`, not `&(self.overlay orelse return)` — the
+        // latter takes the address of a COPY of the payload, and every
+        // write below (`box`, `hits`, the scratch list's capacity) would
+        // land on a temporary and vanish. It compiles, and the symptom
+        // is a menu that is drawn but that no click can ever reach.
+        if (self.overlay == null) return;
+        const ov = &self.overlay.?;
+
+        const constraints: element.Constraints = .{ .max_w = OVERLAY_MAX_W };
+
+        // Pass 1 — measure. Scratch list, no pass dispatches, result
+        // discarded except for the box.
+        ov.scratch.clearRetainingCapacity();
+        const effective_theme = ov.doc.theme orelse self.theme;
+        const effective_state = ov.doc.state orelse self.host_state;
+        var measure_lc = element.LayoutCtx{
+            .allocator = self.allocator,
+            .fonts = self.fonts,
+            .cache = &self.glyph_cache,
+            .mono_atlas = &self.mono_atlas,
+            .color_atlas = &self.color_atlas,
+            .theme = effective_theme,
+            .state = @ptrCast(effective_state),
+            .cache_blocks = &self.layout_cache,
+            .job_system = self.compute_jobs,
+            .glyph_cache_lock = &self.glyph_cache_lock,
+            .zoom = self.frame_info.zoom,
+            .layout_context = self.layout_context,
+            .pass_dispatches = null,
+        };
+        const measured = try element_layout.layoutAndRenderCached(
+            ov.doc.root,
+            .{ 0, 0 },
+            constraints,
+            &measure_lc,
+            &ov.scratch,
+        );
+
+        // Pass 2 — place, then render for real.
+        const origin = overlay_mod.place(
+            ov.at,
+            .{ measured.w, measured.h },
+            ov.corner,
+            self.surfaceRectWorld(),
+        );
+        const hits_before: u32 = @intCast(self.drawlist.hits.items.len);
+        const box = try self.layoutAndRender(&ov.doc, origin, constraints);
+        ov.box = box;
+        ov.hits = .{ hits_before, @intCast(self.drawlist.hits.items.len) };
+        // The layer this call just appended is the overlay's. Marked
+        // here rather than threaded through `layoutAndRender` because
+        // that signature is one matryoshka calls and one the whole
+        // library's gates call; a parameter on it would have to be
+        // written at forty call sites to say "no" at each.
+        if (self.paint_layers.items.len > 0) {
+            self.paint_layers.items[self.paint_layers.items.len - 1].overlay = true;
+        }
+    }
+
+    /// The part of the world the host can actually see this frame.
+    ///
+    /// `screen = (world - scroll) * zoom`, so the visible world rect
+    /// starts at `scroll` and is `extent / zoom` across. An overlay
+    /// flips against THIS and not against `(0, 0, extent)`: a host that
+    /// has scrolled the page 500px down has a menu near the bottom at
+    /// world y ≈ 1200, a number that says nothing at all when compared
+    /// to a 720px surface height.
+    fn surfaceRectWorld(self: *const Spark) element.Box {
+        const z = if (self.frame_info.zoom > 0) self.frame_info.zoom else 1.0;
+        return .{
+            .x = self.frame_info.scroll_offset[0],
+            .y = self.frame_info.scroll_offset[1],
+            .w = @as(f32, @floatFromInt(self.frame_info.extent.width)) / z,
+            .h = @as(f32, @floatFromInt(self.frame_info.extent.height)) / z,
+        };
     }
 
     /// Recovery hook: drop every cached glyph, reset both atlases,
@@ -3145,6 +3544,15 @@ pub const Spark = struct {
             // put every document's text above every document's glass. See
             // `PaintLayer`. A host that renders one document gets exactly
             // one layer and the identical sequence of commands.
+            //
+            // …with one exception, and it is the only one: the OVERLAY's
+            // layer goes last whatever order the host called
+            // `layoutAndRender` in. See `orderOverlayLast` for why that
+            // is a sort here rather than a rule the host is asked to
+            // keep. In place, so the `.reset = false` replay path sees
+            // the same order next frame — and idempotent, so seeing it
+            // twice costs one pass of an already-sorted insertion sort.
+            orderOverlayLast(self.paint_layers.items);
             var only = [_]PaintLayer{PaintLayer.whole(dl, pd_len)};
             const layers: []const PaintLayer = if (self.paint_layers.items.len > 0)
                 self.paint_layers.items
@@ -3503,6 +3911,27 @@ pub const Spark = struct {
     /// the platform can report and there is nothing to grow into.
     pub const MAX_MOUSE_BUTTONS: u8 = 8;
 
+    /// Which button asks the context question.
+    ///
+    /// **One, and it is the right button.** Verified rather than
+    /// assumed, because the numbering is the host's and not spark's:
+    /// this library's reference host builds its `POLLED_BUTTONS` array
+    /// as `{GLFW_MOUSE_BUTTON_LEFT, _RIGHT, _MIDDLE}` and dispatches the
+    /// array INDEX (`src/main.zig`, `processInput`), so index 1 is
+    /// right and index 2 is middle. `:::nodegraph`'s `PAN_BUTTON = 2`
+    /// is the middle button and agrees.
+    ///
+    /// matryoshka does not dispatch this button to spark at all yet —
+    /// its `processInput` still sends only button 0, and its own note
+    /// beside `.mouse_right` says so — so the host work for this beat
+    /// starts by widening that, exactly the way the reference host
+    /// already did.
+    ///
+    /// A named constant rather than a bare `1` at the site: the number
+    /// is a fact about somebody else's array, and a bare 1 is a fact
+    /// with nowhere to write down where it came from.
+    pub const CONTEXT_BUTTON: u8 = 1;
+
     /// How long a gap still counts as part of the same click run. GLFW
     /// does not report double-clicks, so somebody has to count them;
     /// 400ms is where every toolkit's default lands. It was
@@ -3694,7 +4123,11 @@ pub const Spark = struct {
             return;
         }
 
-        const hits = self.drawlist.hits.items;
+        // `hitScope`, not the whole hit layer: while an overlay is open
+        // the page under it must not light up as the pointer crosses it
+        // on its way to a menu item. Hover is where that reads worst —
+        // a button under an open menu glowing through it.
+        const hits = self.hitScope();
         const target: ?element.Hit = blk: {
             const h = findHit(hits, x, y) orelse break :blk null;
             // Deepest-hit-only, no bubbling: see `on_hover`'s contract.
@@ -3767,10 +4200,44 @@ pub const Spark = struct {
     /// is still being dragged, and a host that stopped yielding halfway
     /// through would hand the rest of the gesture to the scene.
     ///
+    /// **Always true while an overlay is open**, wherever the pointer is.
+    /// A click outside an open menu is spent dismissing it — spark
+    /// consumes it and nothing under it ever sees it — so a host that
+    /// answered "not mine" for the area outside the menu would hand that
+    /// click to its 3D scene as well, and dismissing a menu would also
+    /// re-pick the world behind it.
+    ///
     /// Coordinates are world coords, the same ones `dispatchMouseMove` takes.
     pub fn claimsPointer(self: *const Spark, x: f32, y: f32) bool {
+        if (self.overlay != null) return true;
         if (self.captured != null) return true;
         return findHit(self.drawlist.hits.items, x, y) != null;
+    }
+
+    /// The hits a pointer may reach right now.
+    ///
+    /// With no overlay open that is the whole hit layer, exactly as it
+    /// always was. With one open it is the overlay's own range and
+    /// nothing else — **the overlay takes input first**, and it does so
+    /// by narrowing what can be hit rather than by being last in the
+    /// array. Order would be the tempting mechanism and it is the wrong
+    /// one: `layoutAndRenderOverlay` need not be the host's last layout
+    /// call (see its note on where in the frame it goes), so a page hit
+    /// emitted after the menu's would otherwise win the backwards scan
+    /// and a click would go straight through the menu into it.
+    ///
+    /// The range can be stale for exactly one window — between a
+    /// `beginFrame(.reset = true)` that cleared the drawlist and the
+    /// `layoutAndRenderOverlay` that refills it — and an input dispatch
+    /// in that window would index past the end. Clamped to empty rather
+    /// than clamped to "everything": during that window the overlay has
+    /// no hits, and answering with the page's would let a click through
+    /// the very menu that is meant to be blocking it.
+    fn hitScope(self: *const Spark) []const element.Hit {
+        const hits = self.drawlist.hits.items;
+        const ov = self.overlay orelse return hits;
+        if (ov.hits[1] > hits.len or ov.hits[0] > ov.hits[1]) return &.{};
+        return hits[ov.hits[0]..ov.hits[1]];
     }
 
     /// Offer a wheel notch to the components under `(x, y)`, innermost
@@ -3791,7 +4258,11 @@ pub const Spark = struct {
     pub fn dispatchScroll(self: *Spark, x: f32, y: f32, dy: f32, dx: f32) !bool {
         self.mouse_x = x;
         self.mouse_y = y;
-        const hits = self.drawlist.hits.items;
+        // Scoped to the overlay while one is open — a wheel notch over a
+        // menu belongs to the menu (a long operator list scrolls), and a
+        // notch outside it must not scroll the page out from under the
+        // thing the menu is about.
+        const hits = self.hitScope();
         var i = hits.len;
         while (i > 0) {
             i -= 1;
@@ -3814,6 +4285,12 @@ pub const Spark = struct {
                 return true;
             }
         }
+        // Nobody in the menu wanted it — and it still does not fall
+        // through. `false` here means "the host should scroll the page",
+        // and a page scrolling under an open menu moves the very thing
+        // the menu is about out from under it while leaving the menu
+        // where it was.
+        if (self.overlay != null) return true;
         return false;
     }
 
@@ -3863,6 +4340,36 @@ pub const Spark = struct {
         if (down) self.buttons_down |= bit else self.buttons_down &= ~bit;
         self.mouse_down = self.buttons_down != 0;
 
+        // ── The overlay takes the press first ───────────────────────
+        //
+        // **A dismissing click is SWALLOWED, not delivered.** Every
+        // menu on this machine swallows it — Win32's, NSMenu, GTK and
+        // Qt all grab the pointer for the life of the menu, and Bitwig,
+        // Blender and Photoshop all behave that way because of it. The
+        // web's ad-hoc menus are the odd one out, and they are the ones
+        // that feel wrong.
+        //
+        // The argument, though, is not precedent. The user's intent in
+        // a dismissing click is "not this menu"; it is not "not this
+        // menu, AND do whatever is at the point I happened to aim at".
+        // Delivering it makes one click both close a menu and delete
+        // the node under the cursor — an irreversible action nobody
+        // chose. The cost of swallowing is one extra click to reach the
+        // thing underneath, which is the cheaper of the two errors by a
+        // wide margin.
+        //
+        // **Only a PRESS dismisses.** A right-click that opens a menu
+        // is followed by its own release before any frame has drawn, so
+        // the overlay's box is still zero at that moment; a release that
+        // dismissed would close every menu in the gesture that opened
+        // it. Releases outside are swallowed and do nothing.
+        if (self.overlay) |ov| {
+            if (!ov.contains(x, y)) {
+                if (down) self.closeOverlay();
+                return;
+            }
+        }
+
         if (down) {
             if (self.captured) |hit| {
                 try dispatchHit(self, hit, .{
@@ -3878,7 +4385,7 @@ pub const Spark = struct {
 
             self.click = stepClickRun(self.click, self.nowMs(), x, y, button);
 
-            const maybe_hit = findHit(self.drawlist.hits.items, x, y);
+            const maybe_hit = findHit(self.hitScope(), x, y);
             // Focus management.
             const new_focus_ctx: ?*anyopaque = blk: {
                 if (maybe_hit) |h| if (h.focusable) break :blk h.ctx;
@@ -3897,6 +4404,32 @@ pub const Spark = struct {
                     .mouse_down = self.mouseEventFor(hit, x, y, button, true),
                 }, self.host_state);
             }
+
+            // ── The context question ────────────────────────────────
+            //
+            // LAST in the press path, and deliberately so. `State.set`
+            // notifies its subscribers SYNCHRONOUSLY (see spark's
+            // CLAUDE.md), so the host's answer to this record — very
+            // likely an `openOverlay`, which clears the capture and the
+            // focus — re-enters this dispatcher mid-call. Emitting
+            // before the press dispatch would mean the component under
+            // the cursor received its `mouse_down` after the world had
+            // already changed under it. Emitting here means the press is
+            // fully settled and there is nothing left for the re-entry
+            // to corrupt.
+            //
+            // The press ALSO went to the component, unchanged: a right
+            // press is still an event a component may act on, and
+            // `:::nodegraph` reads `mev.button` today. The context
+            // record is in addition to that, not instead of it.
+            //
+            // And note where this is NOT reached: a right press while
+            // something already holds the capture returns at the top of
+            // this branch, so a right-click during a left-drag asks no
+            // context question. That is right — the gesture owns the
+            // pointer, and the convention for that press is "cancel the
+            // drag", not "and also open a menu".
+            if (button == CONTEXT_BUTTON) try self.emitContext(x, y);
         } else {
             if (self.captured) |hit| {
                 try dispatchHit(self, hit, .{
@@ -3915,10 +4448,160 @@ pub const Spark = struct {
         }
     }
 
+    /// What claims the point `(x, y)`, in whatever words the document or
+    /// the component chose — or null when nobody claims it.
+    ///
+    /// Public because the ANSWER, not just the record, is something a
+    /// host router wants: matryoshka's `PointerRouter` has to decide
+    /// whether a right-click belongs to the document or to the 3D scene
+    /// behind it, and "no element claims this point" is the whole of
+    /// that decision. Asking costs one backwards scan of the hit layer,
+    /// the same one `claimsPointer` already pays.
+    ///
+    /// **Innermost-out, first answer wins.** Backwards through the hit
+    /// layer, which is deepest-first — the same order `dispatchScroll`
+    /// bubbles in and for the same reason: the pointer is very often
+    /// over something small inside something large, and the small thing
+    /// is the more specific answer.
+    ///
+    /// **Within one hit, the vtable hook is asked before the author's
+    /// attribute.** The hook varies with the point and the attribute is
+    /// a constant, so the hook is the more specific of the two; and a
+    /// hook that DECLINES falls through to the attribute, which is what
+    /// makes `:::nodegraph {context="canvas"}` work exactly as an author
+    /// would guess — nodes and pins name themselves, the empty ground
+    /// between them takes the attribute.
+    pub fn contextSubjectAt(self: *const Spark, x: f32, y: f32) ?[]const u8 {
+        const claim = self.contextClaimAt(x, y) orelse return null;
+        return claim.subject;
+    }
+
+    /// The subject AND the state to report it in. Private because the
+    /// state pointer is a routing detail; `contextSubjectAt` is the
+    /// question a host asks.
+    const ContextClaim = struct { subject: []const u8, state: ?*anyopaque };
+
+    fn contextClaimAt(self: *const Spark, x: f32, y: f32) ?ContextClaim {
+        const hits = self.hitScope();
+        var i = hits.len;
+        while (i > 0) {
+            i -= 1;
+            const h = hits[i];
+            if (x < h.box.x or x >= h.box.x + h.box.w) continue;
+            if (y < h.box.y or y >= h.box.y + h.box.h) continue;
+            if (h.vtable.context_subject) |ask| {
+                if (ask(h.ctx, .{ x - h.box.x, y - h.box.y })) |s| {
+                    if (s.len > 0) return .{ .subject = s, .state = h.state };
+                }
+            }
+            if (h.context_subject) |s| {
+                if (s.len > 0) return .{ .subject = s, .state = h.state };
+            }
+        }
+        return null;
+    }
+
+    /// Write the context record for a right-press at `(x, y)`, if
+    /// anything claims the point and the host named a path.
+    ///
+    /// The grammar, one line, same `kind key=value …` shape as every
+    /// other line-oriented payload in this library:
+    ///
+    ///     context subject=node:near1 x=412.0 y=233.5 shift=0 ctrl=0 alt=0
+    ///
+    /// `x`/`y` are the WORLD coordinates of the press — the same frame
+    /// `openOverlay` takes, so a host passes them straight back with no
+    /// conversion of its own. One decimal place, which is finer than a
+    /// pointer can aim and coarse enough to read.
+    ///
+    /// `shift`/`ctrl`/`alt` come from the ambient `pointer_mods` mask.
+    /// Super is deliberately absent: three is what a menu ever branches
+    /// on, and a fourth field in every record for a modifier no host has
+    /// asked for is a field every parser has to skip forever. Recorded,
+    /// not built — the trigger is the first host that wants Cmd.
+    ///
+    /// **Routed to the claiming element's State**, falling back to the
+    /// host's root — the same rule `dispatchHit` uses for input, so a
+    /// host running one document per panel does not have to learn a
+    /// second one. Nothing is emitted for an unclaimed point, so there
+    /// is never an ambiguous "which state was that for".
+    fn emitContext(self: *Spark, x: f32, y: f32) !void {
+        const path = self.context_path orelse return;
+        const claim = self.contextClaimAt(x, y) orelse return;
+
+        // Loud, never a guess. The record is whitespace-delimited, so a
+        // subject with a space in it does not produce a broken record —
+        // it produces a VALID record that means something else, and the
+        // host reads `subject=node` and never learns there was more. A
+        // quoted form would be the other answer and it is the wrong one
+        // here: it would make every host's parser handle quoting to
+        // support a subject nobody should be writing.
+        //
+        // The REFUSAL is the returned error; the log line is the
+        // diagnostic that names the offender, and it is `warn` rather
+        // than `err` for one reason worth writing down: Zig's test
+        // runner counts any `std.log.err` during a test as a failure, so
+        // an `err` here would make the gate that proves this refusal
+        // fires impossible to write. An untestable refusal is worse than
+        // a diagnostic one level quieter — the error still propagates
+        // out of `dispatchMouseButtonN`, and no record is written.
+        for (claim.subject) |c| {
+            if (c <= ' ' or c == '"' or c == 0x7f) {
+                std.log.warn(
+                    "spark: refusing a context subject that is not one word: \"{s}\" " ++
+                        "(no spaces, tabs, newlines, quotes or control bytes — see " ++
+                        "ElementVTable.context_subject)",
+                    .{claim.subject},
+                );
+                return error.ContextSubjectNotOneWord;
+            }
+        }
+
+        const mods = self.pointer_mods;
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+        try buf.writer().print(
+            "context subject={s} x={d:.1} y={d:.1} shift={d} ctrl={d} alt={d}",
+            .{
+                claim.subject,
+                x,
+                y,
+                @intFromBool(mods & MOD_SHIFT != 0),
+                @intFromBool(mods & MOD_CONTROL != 0),
+                @intFromBool(mods & MOD_ALT != 0),
+            },
+        );
+
+        const target: *state_mod.State = if (claim.state) |s|
+            @ptrCast(@alignCast(s))
+        else
+            self.host_state;
+        try target.set(path, buf.items);
+    }
+
     /// Dispatch a keyboard event to the focused hit (no-op when no
     /// focus). Host translates platform keysym → element.KeyEvent
     /// (raw GLFW keycode + mods).
+    ///
+    /// **Escape closes an open overlay and goes no further.** It is the
+    /// one key the dispatcher itself has an opinion about, and the
+    /// opinion is universal — every menu everywhere closes on Esc — so
+    /// making each host wire it would be making each host reimplement
+    /// the same three lines and one of them forget. The key is consumed
+    /// rather than also delivered, for the same reason a dismissing
+    /// click is: the press meant "not this menu", not "not this menu AND
+    /// clear the caret in the field behind it".
     pub fn dispatchKey(self: *Spark, ev: element.KeyEvent) !void {
+        if (self.overlay != null and ev.key == KEY_ESCAPE) {
+            self.closeOverlay();
+            self.redraw_requested = true;
+            // Belt-and-braces: `closeOverlay` has already cleared the
+            // focus, so there is nobody below to deliver to today. The
+            // `return` states the contract — the key is CONSUMED —
+            // rather than leaving it to be re-derived from that
+            // coupling every time someone reads this.
+            return;
+        }
         if (self.focused) |hit| {
             try dispatchHit(self, hit, .{ .key_down = ev }, self.host_state);
         }
@@ -4512,8 +5195,33 @@ const InputProbe = struct {
     /// draw. A real component decides this per event; a probe is told.
     moves: bool = true,
 
+    /// What this probe answers the context question with, and where.
+    /// `subject_zone`, when set, is a rect in the probe's own LOCAL
+    /// coordinates: inside it the probe answers, outside it declines.
+    /// That is what a component with interior structure does — a node
+    /// here, a pin there, nothing on the empty canvas — and declining is
+    /// the case that lets the author's `context=` attribute through.
+    subject: ?[]const u8 = null,
+    subject_zone: ?element.Box = null,
+
+    /// Keys delivered to this probe. A count, because the question the
+    /// Escape gate asks is "did this key reach the component at all" and
+    /// the version counter cannot answer it — `focus_lost` bumps that
+    /// too, and closing an overlay clears the focus.
+    keys: [8]element.KeyEvent = undefined,
+    kn: usize = 0,
+
     fn bump(self: *InputProbe) void {
         if (self.moves) self.version +%= 1;
+    }
+
+    fn contextSubject(ctx: *anyopaque, local: [2]f32) ?[]const u8 {
+        const self: *const InputProbe = @ptrCast(@alignCast(ctx));
+        const s = self.subject orelse return null;
+        const z = self.subject_zone orelse return s;
+        if (local[0] < z.x or local[0] >= z.x + z.w) return null;
+        if (local[1] < z.y or local[1] >= z.y + z.h) return null;
+        return s;
     }
 
     fn contentVersion(ctx: *anyopaque) u64 {
@@ -4542,6 +5250,13 @@ const InputProbe = struct {
             .mouse_down => |m| .{ .kind = .down, .ev = m },
             .mouse_up => |m| .{ .kind = .up, .ev = m },
             .mouse_move => |m| .{ .kind = .move, .ev = m },
+            .key_down => |k| {
+                if (p.kn < p.keys.len) {
+                    p.keys[p.kn] = k;
+                    p.kn += 1;
+                }
+                return;
+            },
             else => return,
         };
         if (p.n >= p.recs.len) return;
@@ -4591,6 +5306,21 @@ const probe_versioned_no_hover = element.ElementVTable{
     .on_input = InputProbe.onInput,
     .content_version = InputProbe.contentVersion,
 };
+/// Takes input AND answers the context question — the shape
+/// `:::nodegraph` will have.
+const probe_context = element.ElementVTable{
+    .layout_and_render = InputProbe.layoutAndRender,
+    .on_input = InputProbe.onInput,
+    .context_subject = InputProbe.contextSubject,
+};
+/// Answers the context question and NOTHING else: no input, no wheel,
+/// no hover. This is the component that only exists on the hit layer
+/// because `wantsHitBox` counts the fourth channel, and the gate below
+/// that names that mutation is the only thing keeping it there.
+const probe_context_only = element.ElementVTable{
+    .layout_and_render = InputProbe.layoutAndRender,
+    .context_subject = InputProbe.contextSubject,
+};
 
 fn probeHit(p: *InputProbe, vt: *const element.ElementVTable, x: f32, y: f32, w: f32, h: f32) element.Hit {
     return .{
@@ -4599,6 +5329,22 @@ fn probeHit(p: *InputProbe, vt: *const element.ElementVTable, x: f32, y: f32, w:
         .ctx = @ptrCast(p),
         .state = @ptrCast(p), // never dereferenced; keeps `host_state` out of it
     };
+}
+
+/// `probeHit` with the state pointer left NULL — "use the dispatcher's
+/// default", which is the host's root State.
+///
+/// The input gates put the probe itself in that slot precisely because
+/// it is never dereferenced there. A context gate needs the opposite: a
+/// context record IS written through that pointer, so a probe sitting in
+/// it is a `*State` that is not a State, and the write lands in the
+/// middle of the probe. That is not a hypothetical — it is what the
+/// first run of these gates did, and it aborted rather than failing,
+/// which is the honest outcome for a bad cast.
+fn contextProbeHit(p: *InputProbe, vt: *const element.ElementVTable, x: f32, y: f32, w: f32, h: f32) element.Hit {
+    var hit = probeHit(p, vt, x, y, w, h);
+    hit.state = null;
+    return hit;
 }
 
 test "dispatch: the event carries the button that was actually pressed" {
@@ -5356,4 +6102,615 @@ test "hostWindow: a zero-sized span does not divide by zero" {
     // surface rather than a bad divisor.
     const w = Spark.hostWindow(.{ .x = 10, .y = 10, .w = 100, .h = 100 }, 0, 0, .screen);
     for (w) |v| try testing.expect(!std.math.isNan(v));
+}
+
+// ── The overlay, and the context question ───────────────────────────
+//
+// Three things this beat added, and the gates below are grouped by
+// which: the paint order that puts an overlay above the page, the input
+// scoping that gives it the pointer, and the right-click that asks the
+// host what is under a point without deciding anything itself.
+//
+// Every gate names the mutation it was paid for, and each of those
+// mutations was executed and watched go red. The overlay's PLACEMENT is
+// gated in `overlay.zig` — it is pure arithmetic and belongs beside the
+// function. Its RENDER is not gated anywhere: walking a document needs
+// fonts, an atlas and a device, and none of the decisions this beat made
+// live in the walk.
+
+/// A theme whose styles never reach the font registry — enough to parse
+/// a document of plain prose, which is what every overlay gate below
+/// opens. Same stub `markdown.zig`'s parse tests use, restated here
+/// rather than exported: a test fixture that two files share is a third
+/// thing to keep in step.
+fn stubTheme() element.Theme {
+    const s: element.Style = .{ .font_id = 0, .color = .{ 1, 1, 1, 1 } };
+    return .{
+        .body = s,
+        .heading = .{ s, s, s, s, s, s },
+        .code_block = s,
+        .list_marker = s,
+        .emphasis_font_id = 0,
+        .strong_font_id = 0,
+        .bold_italic_font_id = 0,
+        .code_inline_font_id = 0,
+    };
+}
+
+/// Pretend a frame has drawn the overlay at `box`, claiming the hits in
+/// `[first, last)`. `layoutAndRenderOverlay` does this for real and
+/// cannot run without a device; what the gates below are about is what
+/// the DISPATCHER does once it has been done, so they do it by hand and
+/// say so.
+fn placeOverlayForTest(sp: *Spark, box: element.Box, first: u32, last: u32) void {
+    sp.overlay.?.box = box;
+    sp.overlay.?.hits = .{ first, last };
+}
+
+test "overlay: the paint layer goes last whatever order it was rendered in" {
+    // The whole of "above all page content". A layer paints after every
+    // layer before it — ground, triangles, images, quads and glyphs
+    // together — so last IS on top, and a menu rendered before a second
+    // panel would otherwise be painted underneath it.
+    //
+    // Mutation: `fn lt(...) bool { return false; }` in
+    // `orderOverlayLast`. Compiles, sorts nothing, and the overlay stays
+    // where it was emitted — red on the first expectEqual (the overlay's
+    // marker is still at index 1).
+    const mk = struct {
+        fn layer(mark: u32, is_overlay: bool) PaintLayer {
+            return .{
+                .dispatches = .{ mark, mark },
+                .glyphs = .{ mark, mark },
+                .quads = .{ mark, mark },
+                .tri_indices = .{ mark, mark },
+                .images = .{ mark, mark },
+                .overlay = is_overlay,
+            };
+        }
+    };
+
+    // Panel A, then the menu, then panel B — a host that renders its
+    // menu in the middle of its panel loop.
+    var layers = [_]PaintLayer{
+        mk.layer(10, false),
+        mk.layer(20, true),
+        mk.layer(30, false),
+    };
+    orderOverlayLast(&layers);
+    try testing.expectEqual(@as(u32, 10), layers[0].glyphs[0]);
+    try testing.expectEqual(@as(u32, 30), layers[1].glyphs[0]);
+    try testing.expectEqual(@as(u32, 20), layers[2].glyphs[0]);
+    try testing.expect(layers[2].overlay);
+
+    // Stability is load-bearing and not incidental: two overlapping
+    // panels are ordered by the host's call order, and a sort that
+    // reshuffled them would put the wrong panel on top for reasons
+    // nothing in the host explains. `10` still precedes `30`, above.
+    //
+    // And it is idempotent, which is what the `.reset = false` replay
+    // path needs — the same array is sorted again next frame.
+    orderOverlayLast(&layers);
+    try testing.expectEqual(@as(u32, 10), layers[0].glyphs[0]);
+    try testing.expectEqual(@as(u32, 30), layers[1].glyphs[0]);
+    try testing.expectEqual(@as(u32, 20), layers[2].glyphs[0]);
+}
+
+test "overlay: opens with no input event at all" {
+    // The host-initiated door, and the reason the API takes a point
+    // rather than reading one off the dispatcher. matryoshka picks a
+    // mesh in its own 3D scene, computes a screen point itself, and
+    // opens a menu there — with no spark element under the cursor and
+    // no right-click anywhere in the story.
+    //
+    // Note what this gate does NOT do: there is no press, no release, no
+    // hit on the layer and no `setPointerMods` anywhere in it. The door
+    // is exercised rather than asserted — a dispatcher that had to have
+    // seen a right-click would not reach the second line.
+    //
+    // Mutation: transpose the point — `.at = .{ at[1], at[0] }`. The
+    // first draft of `openOverlay` did read `self.mouse_x/mouse_y`
+    // instead of the argument, which is the mutation this gate was
+    // really written for; that one does not COMPILE (the `at` parameter
+    // goes unused, and Zig refuses), and a mutation that does not
+    // compile is not a mutation. The transposition is the same slip one
+    // step later and it compiles: red on the `at` assertion.
+    var theme = stubTheme();
+    var reg = component_mod.Registry.init(testing.allocator);
+    defer reg.deinit();
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+    sp.theme = &theme;
+    sp.registry = &reg;
+    defer sp.closeOverlay();
+
+    try testing.expect(!sp.overlayOpen());
+    try sp.openOverlay("Rename\n\nDelete\n", .{ 412, 233 }, .top_left, .{});
+    try testing.expect(sp.overlayOpen());
+    try testing.expectEqual([2]f32{ 412, 233 }, sp.overlay.?.at);
+
+    // A second open replaces the first rather than stacking. If it
+    // leaked the previous document the testing allocator says so at
+    // teardown, which is the real assertion here.
+    try sp.openOverlay("Duplicate\n", .{ 10, 10 }, .bottom_right, .{});
+    try testing.expectEqual([2]f32{ 10, 10 }, sp.overlay.?.at);
+    try testing.expectEqual(Corner.bottom_right, sp.overlay.?.corner);
+}
+
+test "overlay: a press inside it reaches the overlay and never the page" {
+    // "It takes input first", and the gate is deliberately built so that
+    // being last in the hit array cannot be what makes it work: the
+    // OVERLAY's hit is appended first and the page's second, so
+    // `findHit`'s backwards scan would pick the page. Only the scoping
+    // gets this right.
+    //
+    // That arrangement is not contrived — `layoutAndRenderOverlay` need
+    // not be the host's last layout call (see its note), so a host that
+    // renders a menu before its panels produces exactly this array.
+    //
+    // Mutation: `fn hitScope(self) []const element.Hit { return
+    // self.drawlist.hits.items; }`. Compiles, and the press lands on the
+    // page probe — red on both counts.
+    var theme = stubTheme();
+    var reg = component_mod.Registry.init(testing.allocator);
+    defer reg.deinit();
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+    sp.theme = &theme;
+    sp.registry = &reg;
+    defer sp.closeOverlay();
+
+    var menu = InputProbe{};
+    var page = InputProbe{};
+    try sp.drawlist.hits.append(probeHit(&menu, &probe_input_only, 100, 100, 60, 40));
+    try sp.drawlist.hits.append(probeHit(&page, &probe_input_only, 0, 0, 400, 400));
+
+    try sp.openOverlay("Rename\n", .{ 100, 100 }, .top_left, .{});
+    placeOverlayForTest(&sp, .{ .x = 100, .y = 100, .w = 60, .h = 40 }, 0, 1);
+
+    try sp.dispatchMouseButtonN(120, 110, true, 0);
+    try testing.expectEqual(@as(usize, 1), menu.n);
+    try testing.expectEqual(@as(usize, 0), page.n);
+}
+
+test "overlay: a press outside dismisses it and is swallowed" {
+    // The decision, stated in `dispatchMouseButtonN`: a dismissing click
+    // closes the menu and goes no further. Delivering it too would make
+    // one click both close a menu and do whatever is under the point it
+    // was aimed at — an irreversible action nobody chose. Every native
+    // menu on this machine swallows it.
+    //
+    // Mutation: drop the `return` after `closeOverlay()` so the press
+    // falls through to the ordinary path. Compiles. The page probe
+    // records one press — red on the second expectEqual, which is the
+    // whole of the decision.
+    var theme = stubTheme();
+    var reg = component_mod.Registry.init(testing.allocator);
+    defer reg.deinit();
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+    sp.theme = &theme;
+    sp.registry = &reg;
+    defer sp.closeOverlay();
+
+    var menu = InputProbe{};
+    var page = InputProbe{};
+    try sp.drawlist.hits.append(probeHit(&menu, &probe_input_only, 100, 100, 60, 40));
+    try sp.drawlist.hits.append(probeHit(&page, &probe_input_only, 0, 0, 400, 400));
+
+    try sp.openOverlay("Rename\n", .{ 100, 100 }, .top_left, .{});
+    placeOverlayForTest(&sp, .{ .x = 100, .y = 100, .w = 60, .h = 40 }, 0, 1);
+
+    try sp.dispatchMouseButtonN(10, 10, true, 0);
+    try testing.expect(!sp.overlayOpen());
+    try testing.expectEqual(@as(usize, 0), page.n);
+    try testing.expectEqual(@as(usize, 0), menu.n);
+
+    // And the menu's hits went with it, rather than sitting in the array
+    // pointing at a freed component until the next `beginFrame`. A menu
+    // item whose handler closes the menu is what a menu item DOES, so
+    // this is the path and not the corner.
+    try testing.expectEqual(@as(usize, 1), sp.drawlist.hits.items.len);
+}
+
+test "overlay: the release of the click that opened it does not dismiss it" {
+    // A right-click opens a menu; its own RELEASE arrives before any
+    // frame has drawn, so the overlay has no rect yet and `contains`
+    // answers false for every point. If a release dismissed, every menu
+    // opened by right-click would close in the gesture that opened it —
+    // and it would look like the menu never opened at all.
+    //
+    // Mutation: change the guard to `if (!ov.contains(x, y)) {
+    // self.closeOverlay(); return; }` — dismissing on either edge. It
+    // compiles and it is the obvious way to write it. Red on the
+    // `overlayOpen` assertion.
+    var theme = stubTheme();
+    var reg = component_mod.Registry.init(testing.allocator);
+    defer reg.deinit();
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+    sp.theme = &theme;
+    sp.registry = &reg;
+    defer sp.closeOverlay();
+
+    var page = InputProbe{};
+    try sp.drawlist.hits.append(probeHit(&page, &probe_input_only, 0, 0, 400, 400));
+
+    // The press that opens it. `dispatchMouseButtonN` has to see the
+    // press so the button's bit is set and the release is a transition.
+    try sp.dispatchMouseButtonN(200, 200, true, Spark.CONTEXT_BUTTON);
+    try sp.openOverlay("Rename\n", .{ 200, 200 }, .top_left, .{});
+
+    // …and its release, with the overlay still unplaced.
+    try sp.dispatchMouseButtonN(200, 200, false, Spark.CONTEXT_BUTTON);
+    try testing.expect(sp.overlayOpen());
+}
+
+test "overlay: Escape closes it and does not reach the focused component" {
+    // Every menu everywhere closes on Esc, so wiring it per host would
+    // be making each host reimplement three lines and one of them
+    // forget. Consumed rather than also delivered, for the same reason a
+    // dismissing click is: the press meant "not this menu", not "not
+    // this menu AND clear the caret in the field behind it".
+    //
+    // Three mutations, all run. Delete the whole `if (self.overlay …)`
+    // arm: Escape stops closing anything and instead reaches the focused
+    // probe, red on both halves. Drop the `ev.key == KEY_ESCAPE` half of
+    // the condition: every key then dismisses, and typing with a menu up
+    // becomes impossible — red on the second half. Or delete the
+    // `clearFocus()` from `openOverlay`: the field behind the menu keeps
+    // the keyboard, which is the right-click-while-editing bug — red on
+    // the `sp.focused == null` assertion.
+    //
+    // Note what is NOT gated, because it cannot be: the `return` that
+    // consumes the key is belt-and-braces today, since `closeOverlay`
+    // clears the focus and there is nobody left to deliver to. It stays
+    // because "the key is consumed" is the contract and the focus clear
+    // is a coupling that could change.
+    var theme = stubTheme();
+    var reg = component_mod.Registry.init(testing.allocator);
+    defer reg.deinit();
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+    sp.theme = &theme;
+    sp.registry = &reg;
+    defer sp.closeOverlay();
+
+    var field = InputProbe{};
+    try sp.drawlist.hits.append(probeHit(&field, &probe_input_only, 0, 0, 400, 400));
+    sp.focused = sp.drawlist.hits.items[0];
+
+    // Opening TAKES the keyboard, which is a decision of its own: a
+    // right-click while editing must not leave the field behind the menu
+    // swallowing everything typed into it.
+    try sp.openOverlay("Rename\n", .{ 100, 100 }, .top_left, .{});
+    try testing.expect(sp.focused == null);
+
+    // Now give focus to something INSIDE the menu — a focusable item is
+    // the ordinary case — so what follows tests the Escape and not the
+    // clear above.
+    sp.focused = sp.drawlist.hits.items[0];
+    try sp.dispatchKey(.{ .key = KEY_ESCAPE, .mods = 0 });
+    try testing.expect(!sp.overlayOpen());
+    // The KEY count, not the version counter: closing an overlay also
+    // clears the focus, and `focus_lost` bumps the version. A gate on
+    // the version would have gone green against a dispatcher that
+    // delivered the Escape as well.
+    try testing.expectEqual(@as(usize, 0), field.kn);
+
+    // Any other key still reaches the focused component with a menu up,
+    // so this is one key's exception and not a keyboard blackout.
+    try sp.openOverlay("Rename\n", .{ 100, 100 }, .top_left, .{});
+    sp.focused = sp.drawlist.hits.items[0];
+    try sp.dispatchKey(.{ .key = 65, .mods = 0 });
+    try testing.expect(sp.overlayOpen());
+    try testing.expectEqual(@as(usize, 1), field.kn);
+    try testing.expectEqual(@as(i32, 65), field.keys[0].key);
+}
+
+test "overlay: spark claims the pointer everywhere while one is open" {
+    // A click outside an open menu is spent dismissing it, and spark
+    // consumes it. A host that asked `claimsPointer` and got false for
+    // the area outside would hand that same click to its 3D scene, so
+    // dismissing a menu would also re-pick the world behind it —
+    // matryoshka's `PointerRouter` asks exactly this question.
+    //
+    // Mutation: delete the `if (self.overlay != null) return true;` line.
+    // Compiles, and the point far outside every hit box answers false —
+    // red.
+    var theme = stubTheme();
+    var reg = component_mod.Registry.init(testing.allocator);
+    defer reg.deinit();
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+    sp.theme = &theme;
+    sp.registry = &reg;
+    defer sp.closeOverlay();
+
+    // Nothing on the hit layer at all, so the only thing that can make
+    // this true is the overlay.
+    try testing.expect(!sp.claimsPointer(900, 900));
+    try sp.openOverlay("Rename\n", .{ 100, 100 }, .top_left, .{});
+    placeOverlayForTest(&sp, .{ .x = 100, .y = 100, .w = 60, .h = 40 }, 0, 0);
+    try testing.expect(sp.claimsPointer(900, 900));
+    try testing.expect(sp.claimsPointer(120, 110));
+}
+
+// ── The context question ────────────────────────────────────────────
+
+test "context: a right-press writes one record naming the subject under it" {
+    // The grammar, and the fact that spark opens NOTHING — it asks a
+    // question and the host answers. `subject`, the world point, and the
+    // three modifiers, in one line-oriented record on the bound path.
+    //
+    // Mutation: emit on every button rather than on `CONTEXT_BUTTON` —
+    // delete the `button == CONTEXT_BUTTON` half of the guard. Compiles.
+    // The left press at the end then overwrites the record with its own,
+    // and the final assertion (that a left press changes nothing) goes
+    // red. That is the mutation that matters: a menu that opened on
+    // every click would be found in a second, but a record written on
+    // every click is invisible until something downstream acts on it.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+    defer if (sp.context_path) |p| sp.allocator.free(p);
+    try sp.setContextPath("ui.context");
+
+    // The box has to CONTAIN the press — `contextClaimAt` tests the
+    // rect before it asks, exactly as every other channel does.
+    var p = InputProbe{ .subject = "node:near1" };
+    try sp.drawlist.hits.append(contextProbeHit(&p, &probe_context, 0, 0, 600, 600));
+
+    sp.setPointerMods(MOD_CONTROL);
+    try sp.dispatchMouseButtonN(412, 233.5, true, Spark.CONTEXT_BUTTON);
+    try testing.expectEqualStrings(
+        "context subject=node:near1 x=412.0 y=233.5 shift=0 ctrl=1 alt=0",
+        st.get("ui.context").?,
+    );
+
+    // The press still reached the component. The record is in ADDITION
+    // to the ordinary dispatch, not instead of it — `:::nodegraph` reads
+    // `mev.button` today and must keep seeing the press.
+    try testing.expectEqual(@as(usize, 1), p.n);
+    try testing.expectEqual(Spark.CONTEXT_BUTTON, p.recs[0].ev.button);
+
+    // A LEFT press over the same subject writes nothing new.
+    try sp.dispatchMouseButtonN(412, 233.5, false, Spark.CONTEXT_BUTTON);
+    try sp.dispatchMouseButtonN(1, 1, true, 0);
+    try testing.expectEqualStrings(
+        "context subject=node:near1 x=412.0 y=233.5 shift=0 ctrl=1 alt=0",
+        st.get("ui.context").?,
+    );
+}
+
+test "context: an unclaimed right-press emits nothing at all" {
+    // The distinction matryoshka's router is built on: "the canvas
+    // claims this point" and "no element claims this point" have to
+    // route differently, because the second one is the 3D scene's click.
+    // A record with a blank subject would collapse them.
+    //
+    // Mutation: in `emitContext`, give the claim a default instead of
+    // returning — `orelse ContextClaim{ .subject = "", .state = null }`.
+    // Compiles, and it is the plausible design: "always tell the host
+    // where the right-click was, and let it decide". A record then
+    // appears for both presses below and both `expect(… == null)` go
+    // red. Which is the whole argument: with that record written, a host
+    // cannot distinguish an unclaimed point from a claimed one without
+    // parsing the subject and special-casing the empty string.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+    defer if (sp.context_path) |p| sp.allocator.free(p);
+    try sp.setContextPath("ui.context");
+
+    // A probe that takes input and DECLINES the context question — the
+    // ordinary case for every component in the library today.
+    var p = InputProbe{ .subject = null };
+    try sp.drawlist.hits.append(contextProbeHit(&p, &probe_context, 0, 0, 400, 400));
+
+    try sp.dispatchMouseButtonN(50, 50, true, Spark.CONTEXT_BUTTON);
+    try testing.expect(st.get("ui.context") == null);
+
+    // And a point with nothing under it at all.
+    try sp.dispatchMouseButtonN(50, 50, false, Spark.CONTEXT_BUTTON);
+    try sp.dispatchMouseButtonN(900, 900, true, Spark.CONTEXT_BUTTON);
+    try testing.expect(st.get("ui.context") == null);
+}
+
+test "context: innermost wins, and a hook that declines falls to the attribute" {
+    // Two rules in one arrangement, because they are the same walk.
+    //
+    // Innermost-out: the pointer is very often over something small
+    // inside something large, and the small thing is the more specific
+    // answer. The hit layer is deepest-last, so the scan runs backwards
+    // — the same direction `dispatchScroll` bubbles in.
+    //
+    // Within one hit, the vtable hook is asked before the author's
+    // `context=`: the hook varies with the point and the attribute does
+    // not, and a hook that DECLINES falling through to the attribute is
+    // what makes `:::nodegraph {context="canvas"}` behave the way an
+    // author would guess — nodes name themselves, the empty ground
+    // between them takes the attribute.
+    //
+    // Mutation: swap the two arms in `contextClaimAt` so the attribute
+    // is tested first. Compiles. The point inside the hook's zone then
+    // answers `canvas` instead of `node:near1` — red on the first
+    // assertion, and the second (the decline case) still passes, which
+    // is exactly why both are here.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+
+    // Outer: a plain element carrying only the author's attribute.
+    var outer = InputProbe{};
+    var outer_hit = probeHit(&outer, &probe_input_only, 0, 0, 400, 400);
+    outer_hit.context_subject = "panel";
+    try sp.drawlist.hits.append(outer_hit);
+
+    // Inner: a component whose hook answers inside a 20×20 zone and
+    // declines outside it, AND which carries an attribute of its own.
+    var inner = InputProbe{
+        .subject = "node:near1",
+        .subject_zone = .{ .x = 0, .y = 0, .w = 20, .h = 20 },
+    };
+    var inner_hit = probeHit(&inner, &probe_context, 100, 100, 200, 200);
+    inner_hit.context_subject = "canvas";
+    try sp.drawlist.hits.append(inner_hit);
+
+    // Inside the hook's zone: the hook wins over both attributes.
+    try testing.expectEqualStrings("node:near1", sp.contextSubjectAt(105, 105).?);
+    // Inside the inner box but outside the hook's zone: the hook
+    // declines and the INNER attribute answers — not the outer one,
+    // which would mean a decline had escaped the element entirely.
+    try testing.expectEqualStrings("canvas", sp.contextSubjectAt(200, 200).?);
+    // Outside the inner box: the outer element's attribute.
+    try testing.expectEqualStrings("panel", sp.contextSubjectAt(10, 10).?);
+    // Outside everything: nobody claims it.
+    try testing.expect(sp.contextSubjectAt(900, 900) == null);
+}
+
+test "context: a subject that is not one word is refused, not emitted" {
+    // The record is whitespace-delimited, so a subject with a space in
+    // it does not produce a BROKEN record — it produces a valid one that
+    // means something else, and the host reads `subject=my` and never
+    // learns there was more. Loud, and the log line names the offending
+    // text so the refusal lands on the component that wrote it.
+    //
+    // Mutation: delete the validation loop. Compiles, and the record is
+    // written as `context subject=my node x=… y=…` — the
+    // `expectError` goes red, and so does the assertion that nothing was
+    // written.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+    defer if (sp.context_path) |p| sp.allocator.free(p);
+    try sp.setContextPath("ui.context");
+
+    var p = InputProbe{ .subject = "my node" };
+    try sp.drawlist.hits.append(contextProbeHit(&p, &probe_context, 0, 0, 400, 400));
+
+    try testing.expectError(
+        error.ContextSubjectNotOneWord,
+        sp.dispatchMouseButtonN(50, 50, true, Spark.CONTEXT_BUTTON),
+    );
+    try testing.expect(st.get("ui.context") == null);
+}
+
+test "context: a host that named no path is inert, not broken" {
+    // Same shape as `command_sink_fn`, and for the same reason: a
+    // document carried between hosts should do nothing about the things
+    // its host has not wired, rather than fail.
+    //
+    // Mutation: `const path = self.context_path orelse "context";` — a
+    // plausible "sensible default". Compiles, and a host that never
+    // asked for context records starts finding one in its root state
+    // under a key it never chose. Red on the `count` assertion.
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &st;
+
+    var p = InputProbe{ .subject = "node:near1" };
+    try sp.drawlist.hits.append(contextProbeHit(&p, &probe_context, 0, 0, 400, 400));
+
+    try sp.dispatchMouseButtonN(50, 50, true, Spark.CONTEXT_BUTTON);
+    try testing.expectEqual(@as(usize, 0), st.map.count());
+}
+
+test "context: a component that answers only the context question still gets a box" {
+    // `wantsHitBox` is what puts a component on the hit layer, and a
+    // component that is inert to the pointer but answers `context` — a
+    // decorative block an author made right-clickable — is never asked
+    // if it is not on it. The failure is silence, which is the same
+    // failure the inline/block copies of that test used to have.
+    //
+    // This gate asserts the RULE rather than a walk, because the walk
+    // needs a device. The mutation is in `element_layout.wantsHitBox`:
+    // drop the `vtable.context_subject != null` clause. Compiles, and
+    // `probe_context_only` stops being interactive — red.
+    try testing.expect(element_layout.wantsHitBox(&probe_context_only));
+    // …and a vtable with none of the four channels is still not.
+    const inert = element.ElementVTable{ .layout_and_render = InputProbe.layoutAndRender };
+    try testing.expect(!element_layout.wantsHitBox(&inert));
+}
+
+test "context: the record lands in the state of the element that claimed it" {
+    // Same routing rule `dispatchHit` uses for input: an element inside
+    // an `:::embedded-document` — or a panel that is its own Document —
+    // carries that document's State on its Hit, and the record follows
+    // it. A host running one Document per panel already has to know
+    // this rule for input; making the context channel use a second one
+    // would be two answers to "whose state is this".
+    //
+    // Mutation: write to `self.host_state` unconditionally — delete the
+    // `if (claim.state)` branch. Compiles, and it is what the first
+    // draft of `emitContext` did. The panel's own state stays empty and
+    // the root gains a record it should never have seen: red on both
+    // assertions.
+    var root = state_mod.State.init(testing.allocator);
+    defer root.deinit();
+    var panel = state_mod.State.init(testing.allocator);
+    defer panel.deinit();
+
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.host_state = &root;
+    defer if (sp.context_path) |p| sp.allocator.free(p);
+    try sp.setContextPath("ui.context");
+
+    var p = InputProbe{ .subject = "sphere:12" };
+    var hit = probeHit(&p, &probe_context, 0, 0, 400, 400);
+    hit.state = @ptrCast(&panel);
+    try sp.drawlist.hits.append(hit);
+
+    try sp.dispatchMouseButtonN(50, 50, true, Spark.CONTEXT_BUTTON);
+    // Presence first, then content: the mutation below writes to the
+    // root instead, and an unwrap of the panel'''s missing value would
+    // abort rather than fail — red either way, but only one of those
+    // says what went wrong.
+    try testing.expect(panel.get("ui.context") != null);
+    try testing.expectEqualStrings(
+        "context subject=sphere:12 x=50.0 y=50.0 shift=0 ctrl=0 alt=0",
+        panel.get("ui.context").?,
+    );
+    try testing.expect(root.get("ui.context") == null);
 }

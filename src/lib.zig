@@ -26,8 +26,14 @@
 //!   * Per frame: `Spark.tick()` → `Spark.attachCmd(cmd, 0, 0)` →
 //!     `Spark.beginFrame(FrameInfo)` → one or more
 //!     `Spark.layoutAndRender(doc, origin, constraints)` →
-//!     `Spark.endFrame()`, called inside the host's
-//!     `vkCmdBeginRendering` scope.
+//!     `Spark.layoutAndRenderOverlay()` → `Spark.endFrame()`, called
+//!     inside the host's `vkCmdBeginRendering` scope.
+//!   * `layoutAndRenderOverlay` is a no-op unless a menu is open, and a
+//!     host that never calls it simply never draws one — but it must be
+//!     called AFTER the host's own layout calls and BEFORE
+//!     `dispatchOffscreenPasses`. That method says why it cannot live
+//!     inside `endFrame`, and `orderOverlayLast` says why calling it
+//!     early still paints the menu on top.
 
 const std = @import("std");
 
@@ -52,6 +58,15 @@ pub const document = @import("document.zig");
 pub const Document = document.Document;
 pub const LoadOpts = document.LoadOpts;
 pub const wrapElement = document.wrapElement;
+
+// ── The overlay ────────────────────────────────────────────────────
+/// A document drawn over the page at a point — which is what a context
+/// menu is here, and why there is no menu component. `Spark.openOverlay`
+/// / `closeOverlay` / `overlayOpen` / `layoutAndRenderOverlay` are the
+/// whole of the API; `Corner` names which corner of it the caller wants
+/// at the point. See `overlay.zig` for the argument.
+pub const overlay = @import("overlay.zig");
+pub const Corner = overlay.Corner;
 
 // ── Element contract — for components built outside the library ───
 pub const element = @import("element.zig");

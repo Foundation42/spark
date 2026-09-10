@@ -57,10 +57,29 @@ const PARALLEL_MIN_WALKS: usize = 2;
 /// that it WAS written at each site and the two copies disagreed — the
 /// inline arm tested `on_input` alone, so an inline component wanting
 /// the wheel got no box and no error, just silence.
+///
+/// The context question is a FOURTH channel and it counts too: a
+/// component that answers `context_subject` and nothing else — a block
+/// that is inert to the pointer but that a document wants
+/// right-clickable — is never asked if it has no box on this layer.
+/// Same silence, same function, one more line.
 pub fn wantsHitBox(vtable: *const element.ElementVTable) bool {
     return vtable.on_input != null or
         vtable.on_scroll != null or
-        vtable.on_hover != null;
+        vtable.on_hover != null or
+        vtable.context_subject != null;
+}
+
+/// Does this `custom` element need a box on the hit layer?
+///
+/// `wantsHitBox` asks the vtable, which is the COMPONENT's answer. The
+/// author has a second door — `context="…"` written on the block — and
+/// a block whose factory declares no channel at all still needs a box
+/// when the author asked for one. `:::box {context="sphere:12"}` is the
+/// whole case, and it is the one that makes any document
+/// right-clickable without a line of host code.
+fn customWantsHitBox(cu: anytype) bool {
+    return wantsHitBox(cu.vtable) or cu.context != null;
 }
 
 pub const Error = error{
@@ -333,7 +352,7 @@ pub fn layoutAndRender(
             // backwards. A container that returns a box covering its
             // children therefore swallows every one of them. See
             // `ElementVTable.emits_own_hits`.
-            if (wantsHitBox(cu.vtable) and !cu.vtable.emits_own_hits) {
+            if (customWantsHitBox(cu) and !cu.vtable.emits_own_hits) {
                 try out.hits.append(.{
                     .box = box,
                     .vtable = cu.vtable,
@@ -350,6 +369,13 @@ pub fn layoutAndRender(
                     // a component emitted itself — meaning a text
                     // field's own focusable=true would be lost.
                     .focusable = cu.vtable.focusable,
+                    // The author's `context="…"`, carried from the Spec
+                    // to the dispatcher. A component that sets
+                    // `emits_own_hits` never passes through here, so it
+                    // owns this too — and the one that does
+                    // (`:::nodegraph`) answers through the vtable hook
+                    // instead, which is the door with the local point.
+                    .context_subject = cu.context,
                 });
             }
             // Effects-spec Phase A.6.a + B.2/B.3 — pass-graph
@@ -2560,6 +2586,11 @@ fn emitInlineObject(
     // `:::clip` and `:::textarea` are the only two that want the wheel
     // and both take input as well — which is exactly why it was safe to
     // unify rather than leave a trap for the third one.
+    // `customWantsHitBox`'s second door — the author's `context="…"` —
+    // has no counterpart here: an `inline_object` carries no Spec
+    // attribute of its own, so the vtable hook is the only way an inline
+    // component answers the context question. Adding the attribute would
+    // mean inline `:::` syntax, which markdown does not have.
     if (wantsHitBox(obj.vtable) and !obj.vtable.emits_own_hits) {
         try out.hits.append(.{
             .box = box,
