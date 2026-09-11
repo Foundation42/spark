@@ -477,7 +477,8 @@ const Component = struct {
             // a scrub the field is its own writer anyway, so what comes
             // back is its own number a moment later.
             const moved = !std.mem.eql(u8, init_text, self.last_initial);
-            if (first_seed or (moved and !self.editing())) {
+            const took = first_seed or (moved and !self.editing());
+            if (took) {
                 // Read the precision off the seed, ONCE, on the FIRST one —
                 // and only there. Re-deriving it from a synced value would
                 // drop a digit the moment the knob happened to land on a
@@ -505,7 +506,13 @@ const Component = struct {
                 try self.buffer.appendSlice(a, shown);
                 self.cursor = self.buffer.items.len;
             }
-            try component_mod.adoptString(a, &self.last_initial, init_text);
+            // **Adopted only when TAKEN.** It used to be adopted on every
+            // ingest, including the ones the guard above skipped — so a value
+            // that arrived while the field was busy was remembered as "seen",
+            // and when the field came free `moved` was false and it never
+            // caught up. Skipping the adopt leaves the difference standing,
+            // and the first ingest after the field is free syncs it.
+            if (took) try component_mod.adoptString(a, &self.last_initial, init_text);
         }
 
         // `adoptString`, not free-and-dupe: a field with
@@ -1672,4 +1679,50 @@ test "input: rounding the display is for NUMERIC fields with numbers in them" {
     const dc: *Component = @ptrCast(@alignCast(di.ctx));
     try testing.expectEqual(@as(u8, 3), dc.decimals);
     try testing.expectEqualStrings("0.019", dc.buffer.items);
+}
+
+test "input: a value refused while the field was busy is not FORGOTTEN" {
+    // The gate above proves a mid-edit value waits. This proves it is still
+    // waiting — which it was not until 2026-09-11.
+    //
+    // `last_initial` was adopted on EVERY ingest, including the ones the guard
+    // skipped, so a value that arrived while the field was busy was recorded
+    // as "seen". When the field came free, `moved` compared the attribute
+    // against the value it had refused, found them equal, and never synced.
+    // The field sat there showing a number that was no longer true, for ever,
+    // unless the binding happened to move AGAIN.
+    //
+    // The gate above cannot see this: its second half sends a THIRD, different
+    // value (10 → 99 → 42), so the catch-up it observes is a fresh change
+    // rather than the refused one landing. Here the value goes 10 → 99 and
+    // stops, which is what a knob nobody is touching does.
+    //
+    // Mutation: adopt `last_initial` unconditionally again. The last line goes
+    // red with "10" — the field frozen at the value it opened on.
+    const a0 = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.speed" },
+        .{ .key = "initial", .value = "10" },
+    };
+    const inst = try create(&_test_spark, testing.allocator, &.{ .name = "input", .attrs = &a0 });
+    defer deinit_(inst.ctx, testing.allocator);
+    const c: *Component = @ptrCast(@alignCast(inst.ctx));
+    try testing.expectEqualStrings("10", c.buffer.items);
+
+    try onInput(inst.ctx, .focus_gained, @ptrCast(_test_spark.host_state));
+    const a1 = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.speed" },
+        .{ .key = "initial", .value = "99" },
+    };
+    // It arrives twice while busy, as a knob under a mouse would.
+    try update(inst.ctx, &.{ .name = "input", .attrs = &a1 });
+    try update(inst.ctx, &.{ .name = "input", .attrs = &a1 });
+    try testing.expectEqualStrings("10", c.buffer.items);
+
+    // Let go. The SAME value — nothing new has happened to the knob — and the
+    // field catches up, because it never pretended to have seen it.
+    try onInput(inst.ctx, .focus_lost, @ptrCast(_test_spark.host_state));
+    try update(inst.ctx, &.{ .name = "input", .attrs = &a1 });
+    try testing.expectEqualStrings("99", c.buffer.items);
 }
