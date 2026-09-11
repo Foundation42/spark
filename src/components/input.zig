@@ -397,8 +397,17 @@ const Component = struct {
     /// A focused field with an untouched buffer is not being edited. It is
     /// merely where the caret happens to be, and the knob it mirrors has every
     /// right to keep speaking.
+    ///
+    /// **And `.pending` is not a scrub.** A press on a numeric field latches
+    /// `.pending` immediately and only becomes `.scrubbing` past the slop, so a
+    /// plain CLICK leaves the gesture pending until a release clears it. Take
+    /// the release away — a host that routes it elsewhere, a pointer that left
+    /// the window, a capture that went to somebody else — and the latch stays
+    /// set for ever, with exactly the same symptom bare focus had. Only
+    /// `.scrubbing` means the field is its own writer; `.pending` means nobody
+    /// yet knows what this press is.
     fn editing(self: *const Component) bool {
-        return self.gesture != .none or self.typed;
+        return self.gesture == .scrubbing or self.typed;
     }
 
     fn ingest(self: *Component, spec: *const components.Spec) !void {
@@ -1860,4 +1869,56 @@ test "input: FOCUS alone does not stop a field following its binding" {
     };
     try update(inst.ctx, &.{ .name = "input", .attrs = &a1 });
     try testing.expectEqualStrings("5.0", c.buffer.items);
+}
+
+test "input: a PENDING press does not stop a field following its binding either" {
+    // The second latch, and it fails exactly like the first one did.
+    //
+    // A press on a numeric field sets `.pending` at once and only becomes
+    // `.scrubbing` past the slop — so a plain click sits pending until a
+    // release clears it. If the release never arrives (a host that routes it
+    // elsewhere, a pointer that left the window, a capture granted to somebody
+    // else) the latch is set for ever, and the field stops following its
+    // binding with no scrub in sight.
+    //
+    // Mutation: `self.gesture != .none` instead of `== .scrubbing`. This goes
+    // red at the last line, which is the click-then-nothing case a person
+    // produces by tapping a box and looking away.
+    const a0 = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.x" },
+        .{ .key = "initial", .value = "0.9" },
+    };
+    const inst = try create(&_test_spark, testing.allocator, &.{ .name = "input", .attrs = &a0 });
+    defer deinit_(inst.ctx, testing.allocator);
+    const c: *Component = @ptrCast(@alignCast(inst.ctx));
+
+    var state = state_mod.State.init(testing.allocator);
+    defer state.deinit();
+
+    // A press, and no release — the gesture is pending, nothing has moved.
+    try onInput(inst.ctx, .{ .mouse_down = .{ .local = .{ 30, 8 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try testing.expectEqual(Gesture.pending, c.gesture);
+
+    const a1 = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.x" },
+        .{ .key = "initial", .value = "5" },
+    };
+    try update(inst.ctx, &.{ .name = "input", .attrs = &a1 });
+    try testing.expectEqualStrings("5.0", c.buffer.items);
+
+    // …and a REAL scrub still holds the field, which is the half that must
+    // not be lost: past the slop it is its own writer.
+    try onInput(inst.ctx, .{ .mouse_move = .{ .local = .{ 130, 8 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try testing.expectEqual(Gesture.scrubbing, c.gesture);
+    const mid = try testing.allocator.dupe(u8, c.buffer.items);
+    defer testing.allocator.free(mid);
+    const a2 = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.x" },
+        .{ .key = "initial", .value = "99" },
+    };
+    try update(inst.ctx, &.{ .name = "input", .attrs = &a2 });
+    try testing.expectEqualStrings(mid, c.buffer.items);
 }
