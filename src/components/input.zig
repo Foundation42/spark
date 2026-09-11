@@ -360,6 +360,10 @@ const Component = struct {
     press_x: f32 = 0,
     press_y: f32 = 0,
     press_value: f32 = 0,
+    /// The buffer holds keystrokes nobody has committed. Set by every edit,
+    /// cleared when the buffer is dispatched and when focus goes. This is what
+    /// `editing` means by "being edited" — see there.
+    typed: bool = false,
 
     /// The last `initial=` text seen, so a change can be told from a
     /// repeat. See the seed-and-sync note in `ingest`.
@@ -373,8 +377,28 @@ const Component = struct {
 
     /// Whether the field is in the user's hands right now. A synced value
     /// must not land while it is.
+    /// **Is the field being EDITED right now** — in the sense that a value
+    /// arriving from its binding would take something away from the person?
+    ///
+    /// Two things qualify. A live scrub: the field is its own writer and what
+    /// comes back is its own number a moment later. And typing that has not
+    /// been committed: a sync would yank the text out from under the caret.
+    ///
+    /// **Bare focus does NOT, and that was a bug.** It read `self.focused or
+    /// …` until 2026-09-11. Focus is event-driven — a field gains it on a
+    /// press and keeps it until something else takes it — and in a 3D host
+    /// nothing necessarily does. So ONE CLICK on a numeric field stopped it
+    /// following its binding for the rest of the session: it opened correct,
+    /// then silently froze the first time you touched it, while the thing it
+    /// was bound to went on moving. Chris, on a placed light's position boxes:
+    /// *"I can move the light gizmo with the mouse and the values don't update
+    /// either."*
+    ///
+    /// A focused field with an untouched buffer is not being edited. It is
+    /// merely where the caret happens to be, and the knob it mirrors has every
+    /// right to keep speaking.
     fn editing(self: *const Component) bool {
-        return self.focused or self.gesture != .none;
+        return self.gesture != .none or self.typed;
     }
 
     fn ingest(self: *Component, spec: *const components.Spec) !void {
@@ -788,10 +812,14 @@ fn onInput(
         },
         .focus_lost => {
             c.focused = false;
+            // Whatever was half-typed is over: the field goes back to
+            // following its binding at the next value it is offered.
+            c.typed = false;
             if (c.spark) |sp| sp.host_state.dirty = true;
         },
         .char_input => |cp| {
             try insertCodepoint(c, cp);
+            c.typed = true;
             if (c.spark) |sp| sp.host_state.dirty = true;
         },
         .key_down => |k| {
@@ -885,6 +913,7 @@ fn handleKey(c: *Component, k: element.KeyEvent, state_ptr: *anyopaque) !void {
     switch (k.key) {
         KEY_BACKSPACE => {
             if (c.cursor == 0) return;
+            c.typed = true;
             const start = prevCodepointStart(c.buffer.items, c.cursor);
             const drop = c.cursor - start;
             std.mem.copyForwards(
@@ -936,6 +965,10 @@ fn handleKey(c: *Component, k: element.KeyEvent, state_ptr: *anyopaque) !void {
 /// function — a scrub that reached the plane by a second route would be a
 /// second thing to keep in step with `target=`'s two arms.
 fn dispatchBuffer(c: *Component, state_ptr: *anyopaque) void {
+    // Sent is sent: buffer and binding agree again, so the field goes back to
+    // following it. Cleared even with no target — a field nobody bound has
+    // nothing to disagree WITH.
+    c.typed = false;
     if (c.target.len == 0) return;
 
     // State-target: `target=state.path` writes the buffer into
@@ -1588,15 +1621,19 @@ test "input: a value arriving mid-edit does not yank the text out from under the
     defer deinit_(inst.ctx, testing.allocator);
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
 
-    // Focused: the field is being typed into, so a moved value waits.
+    // **Being typed into** — focus AND an uncommitted keystroke. Focus alone
+    // is not enough and must not be: a field keeps focus until something else
+    // takes it, and in a host where nothing does, bare focus froze the field
+    // for the rest of the session. See `Component.editing`.
     try onInput(inst.ctx, .focus_gained, @ptrCast(_test_spark.host_state));
+    try onInput(inst.ctx, .{ .char_input = '1' }, @ptrCast(_test_spark.host_state));
     const a1 = [_]components.Attr{
         .{ .key = "numeric", .value = "" },
         .{ .key = "target", .value = "state.speed" },
         .{ .key = "initial", .value = "99" },
     };
     try update(inst.ctx, &.{ .name = "input", .attrs = &a1 });
-    try testing.expectEqualStrings("10", c.buffer.items);
+    try testing.expectEqualStrings("101", c.buffer.items); // the keystroke survived
 
     // Let go, and the NEXT change lands — the field is not stuck, it was
     // only waiting its turn.
@@ -1709,7 +1746,9 @@ test "input: a value refused while the field was busy is not FORGOTTEN" {
     const c: *Component = @ptrCast(@alignCast(inst.ctx));
     try testing.expectEqualStrings("10", c.buffer.items);
 
+    // Busy means BEING EDITED, not merely focused — see `Component.editing`.
     try onInput(inst.ctx, .focus_gained, @ptrCast(_test_spark.host_state));
+    try onInput(inst.ctx, .{ .char_input = '5' }, @ptrCast(_test_spark.host_state));
     const a1 = [_]components.Attr{
         .{ .key = "numeric", .value = "" },
         .{ .key = "target", .value = "state.speed" },
@@ -1718,11 +1757,107 @@ test "input: a value refused while the field was busy is not FORGOTTEN" {
     // It arrives twice while busy, as a knob under a mouse would.
     try update(inst.ctx, &.{ .name = "input", .attrs = &a1 });
     try update(inst.ctx, &.{ .name = "input", .attrs = &a1 });
-    try testing.expectEqualStrings("10", c.buffer.items);
+    try testing.expectEqualStrings("105", c.buffer.items); // the keystroke survived
 
     // Let go. The SAME value — nothing new has happened to the knob — and the
     // field catches up, because it never pretended to have seen it.
     try onInput(inst.ctx, .focus_lost, @ptrCast(_test_spark.host_state));
     try update(inst.ctx, &.{ .name = "input", .attrs = &a1 });
     try testing.expectEqualStrings("99", c.buffer.items);
+}
+
+test "input: the GENERATED inspector's own field scrubs, and re-ingest does not undo it" {
+    // **Christian's bug, as the exact attribute set that produces it.**
+    // matryoshka's generated light panel writes
+    //   `:::input {#p_x numeric target=state.x initial=${state.x} width=120}`
+    // and he reported: the sliders beside it work both ways, the box moves the
+    // light when scrubbed, and the NUMBER in the box does not change.
+    //
+    // No `min`, no `max`, no `decimals` — a world has no edges, so the
+    // generator declares no range for a position — which is the one shape none
+    // of the scrub gates above covers: every one of them declares a range.
+    //
+    // The re-entrancy is the part worth reproducing rather than reasoning
+    // about. `commitNumeric` writes the buffer and then dispatches, and
+    // `dispatchBuffer` re-enters `ingest` synchronously through `State.set`;
+    // that re-ingest sees an `initial` that has MOVED and must not take it,
+    // because the field is mid-gesture and is its own writer.
+    var state = state_mod.State.init(testing.allocator);
+    defer state.deinit();
+    try state.set("x", "0.9");
+
+    const attrs = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.x" },
+        .{ .key = "initial", .value = "0.9" },
+        .{ .key = "width", .value = "120" },
+    };
+    const inst = try create(&_test_spark, testing.allocator, &.{ .name = "input", .attrs = &attrs });
+    defer deinit_(inst.ctx, testing.allocator);
+    const c: *Component = @ptrCast(@alignCast(inst.ctx));
+    try testing.expectEqualStrings("0.9", c.buffer.items);
+
+    // Press, then drag well past the slop.
+    try onInput(inst.ctx, .focus_gained, @ptrCast(&state));
+    try onInput(inst.ctx, .{ .mouse_down = .{ .local = .{ 60, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try onInput(inst.ctx, .{ .mouse_move = .{ .local = .{ 140, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+
+    // The number in the box moved…
+    try testing.expect(!std.mem.eql(u8, "0.9", c.buffer.items));
+    // …and it reached the state, which is what carries it to the plane.
+    const sent = state.get("x") orelse return error.NothingSent;
+    try testing.expect(!std.mem.eql(u8, "0.9", sent));
+
+    // Now the host echoes the plane's new value back as `initial`, mid-scrub,
+    // which is what a light publishing its position once a frame does. The box
+    // must keep showing what the hand is doing.
+    const during = try testing.allocator.dupe(u8, c.buffer.items);
+    defer testing.allocator.free(during);
+    const echoed = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.x" },
+        .{ .key = "initial", .value = "7.25" },
+        .{ .key = "width", .value = "120" },
+    };
+    try update(inst.ctx, &.{ .name = "input", .attrs = &echoed });
+    try testing.expectEqualStrings(during, c.buffer.items);
+
+    // And the scrub keeps working after that echo — the field is not wedged.
+    try onInput(inst.ctx, .{ .mouse_move = .{ .local = .{ 200, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try testing.expect(!std.mem.eql(u8, during, c.buffer.items));
+}
+
+test "input: FOCUS alone does not stop a field following its binding" {
+    // Chris, 2026-09-11, on a generated panel for a placed light: *"I can move
+    // the light gizmo with the mouse and the values don't update either."*
+    //
+    // `editing()` read `self.focused or self.gesture != .none`, and focus is
+    // event-driven — a field gains it on a press and keeps it until something
+    // else takes it. In a 3D host nothing necessarily does, so one click on a
+    // position box froze it for the rest of the session while the light went
+    // on moving. The box was right when the panel opened and wrong from the
+    // first time he touched it, which is the worst way for a readout to fail.
+    //
+    // Mutation: put `self.focused or` back. This goes red at the last line.
+    const a0 = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.x" },
+        .{ .key = "initial", .value = "0.9" },
+    };
+    const inst = try create(&_test_spark, testing.allocator, &.{ .name = "input", .attrs = &a0 });
+    defer deinit_(inst.ctx, testing.allocator);
+    const c: *Component = @ptrCast(@alignCast(inst.ctx));
+
+    // Clicked once, and never typed into: the caret is here, nothing is
+    // half-written, and the knob has every right to keep speaking.
+    try onInput(inst.ctx, .focus_gained, @ptrCast(_test_spark.host_state));
+    try testing.expect(c.focused);
+
+    const a1 = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.x" },
+        .{ .key = "initial", .value = "5" },
+    };
+    try update(inst.ctx, &.{ .name = "input", .attrs = &a1 });
+    try testing.expectEqualStrings("5.0", c.buffer.items);
 }
