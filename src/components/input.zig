@@ -900,7 +900,14 @@ fn onInput(
                 c.gesture = .scrubbing;
             }
             const travel = travelOn(c.axis, dx, dy);
-            const v = scrubTo(c.press_value, travel, stepFor(c.step, c.min, c.max), c.min, c.max);
+            const step_units = stepFor(c.step, c.min, c.max);
+            const v = scrubTo(c.press_value, travel, step_units, c.min, c.max);
+            if (std.posix.getenv("SPARK_INPUT_PROBE") != null) {
+                std.debug.print(
+                    "[scrub {s}] local=({d:.1},{d:.1}) press=({d:.1},{d:.1}) dx={d:.1} dy={d:.1} travel={d:.1} step={d:.4} press_v={d:.4} -> v={d:.4} decimals={d}\n",
+                    .{ if (c.target.len > 0) c.target else "?", m.local[0], m.local[1], c.press_x, c.press_y, dx, dy, travel, step_units, c.press_value, v, c.decimals },
+                );
+            }
             try commitNumeric(c, state_ptr, v);
         },
         .mouse_up => |m| {
