@@ -523,12 +523,19 @@ const Component = struct {
             // instead of reasoning about it.
             if ((moved or self.focused or self.gesture != .none) and std.posix.getenv("SPARK_INPUT_PROBE") != null) {
                 std.debug.print(
-                    "[input {s}] init='{s}' last='{s}' buf='{s}' focused={} gesture={s} typed={} -> {s}\n",
+                    "[input {s}] init='{s}' last='{s}' buf='{s}' dec={d}{s} focused={} gesture={s} typed={} -> {s}\n",
                     .{
                         if (self.target.len > 0) self.target else "?",
                         init_text,
                         self.last_initial,
                         self.buffer.items,
+                        self.decimals,
+                        // Whether the DOCUMENT said so, or the widget guessed
+                        // from the first value it was handed. A guess is right
+                        // for a declared default and wrong for a live reading,
+                        // so this is the difference between a box that tracks
+                        // and one that rounds every change to the same text.
+                        if (self.decimals_explicit) "!" else "?",
                         self.focused,
                         @tagName(self.gesture),
                         self.typed,
