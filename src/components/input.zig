@@ -198,6 +198,21 @@ pub const SCRUB_SLOP: f32 = 3.0;
 /// range is its width; a field has no width to speak of, so it borrows a
 /// notional one — far enough that the ends are reachable in one gesture,
 /// short enough that the middle is not a marathon.
+/// **`SPARK_INPUT_PROBE`, read once.**
+///
+/// The probes below sit in the ingest path of every field on screen and in
+/// every mouse-move of a scrub, and `getenv` walks the environment block. Read
+/// per call it would be a linear scan per field per frame to answer a question
+/// whose answer cannot change while the process runs.
+var probe_state: ?bool = null;
+
+fn probing() bool {
+    if (probe_state) |on| return on;
+    const on = std.posix.getenv("SPARK_INPUT_PROBE") != null;
+    probe_state = on;
+    return on;
+}
+
 pub const SPAN_PX: f32 = 240;
 
 /// How much of the linear gain survives at the centre of the gesture.
@@ -521,7 +536,7 @@ const Component = struct {
             // `.pending`) each froze a field with the same symptom, and each
             // time the fastest route to the truth was watching this decision
             // instead of reasoning about it.
-            if ((moved or self.focused or self.gesture != .none) and std.posix.getenv("SPARK_INPUT_PROBE") != null) {
+            if (probing() and (moved or self.focused or self.gesture != .none)) {
                 std.debug.print(
                     "[input {s}] init='{s}' last='{s}' buf='{s}' dec={d}{s} focused={} gesture={s} typed={} -> {s}\n",
                     .{
@@ -941,7 +956,7 @@ fn onInput(
             const travel = travelOn(c.axis, dx, dy);
             const step_units = stepFor(c.step, c.min, c.max);
             const v = scrubTo(c.press_value, travel, step_units, c.min, c.max);
-            if (std.posix.getenv("SPARK_INPUT_PROBE") != null) {
+            if (probing()) {
                 std.debug.print(
                     "[scrub {s}] local=({d:.1},{d:.1}) press=({d:.1},{d:.1}) dx={d:.1} dy={d:.1} travel={d:.1} step={d:.4} press_v={d:.4} -> v={d:.4} decimals={d}\n",
                     .{ if (c.target.len > 0) c.target else "?", m.local[0], m.local[1], c.press_x, c.press_y, dx, dy, travel, step_units, c.press_value, v, c.decimals },
