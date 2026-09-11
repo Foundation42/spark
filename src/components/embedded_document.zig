@@ -97,6 +97,7 @@ const spark_mod = @import("../spark.zig");
 const markdown = @import("../markdown.zig");
 const state_mod = @import("../state.zig");
 const io = @import("../io_channel.zig");
+const layout_cache = @import("../layout_cache.zig");
 const text_layout = @import("../text/layout.zig");
 const shape = @import("../font/shape.zig");
 
@@ -489,14 +490,44 @@ fn parseBoolAttr(attrs: []const components.Attr, key: []const u8, default: bool)
     return true;
 }
 
+/// **The inner document's version, folded up** — what an OUTER cache needs, as
+/// distinct from what `disable_cache` below arranges.
+///
+/// The two answer different questions and assuming otherwise cost a day
+/// (2026-09-11, `:::input`). `disable_cache` keeps this element out of the
+/// retained layout cache so the inner snapshot is never frozen by a cache entry
+/// of its own. It says nothing about an ANCESTOR that is cached — and
+/// `layout_cache.versionFor` contributes ZERO for a vtable with no
+/// `content_version`, so an embedded document inside a `:::frosted_glass` left
+/// the effect's aggregate unmoved and the effect replayed its recorded
+/// drawlist: an inner tree updating perfectly, behind pixels from minutes ago.
+///
+/// Found by the audit after the `:::input` fix, which walked every component
+/// with the flag and no version; `:::textarea` was the other.
+///
+/// The answer is the child tree's own aggregate, which is the same walk the
+/// cache would have done had this block been cacheable — so an inner slider
+/// moving moves this, and a still inner document costs a walk of version reads.
+/// The PHASE rides along because it changes what is drawn (a loading document
+/// is a placeholder) while the root stays whatever it was.
+fn contentVersion(ctx: *anyopaque) u64 {
+    const c: *const Component = @ptrCast(@alignCast(ctx));
+    var h = std.hash.Wyhash.init(@intFromEnum(c.phase));
+    if (c.phase == .ready) h.update(std.mem.asBytes(&layout_cache.aggregateRootVersion(c.root)));
+    return h.final();
+}
+
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
+    .content_version = contentVersion,
     // Embedded-doc composes a whole inner tree whose state can mutate
     // without the outer wrapper seeing it (the child State's dirty
     // bubble wakes the renderer but doesn't bump us). Caching the
     // outer block as a unit would freeze the inner snapshot. Disable
     // outer caching; the inner stack_v walk caches its own children,
     // which is where the savings live anyway.
+    //
+    // Never a reason to omit `content_version` — see there.
     .disable_cache = true,
 };
 
@@ -735,4 +766,79 @@ test "parseBoolAttr: defaults + truthy/falsy parsing" {
     // Missing key returns default.
     try testing.expectEqual(true, parseBoolAttr(&a, "missing", true));
     try testing.expectEqual(false, parseBoolAttr(&a, "missing", false));
+}
+
+test "embedded document: a cached ANCESTOR is told when the inner tree moves" {
+    // **The same bug as `:::input` and `:::textarea`, one container out.**
+    //
+    // `disable_cache` keeps this element out of the retained layout cache so the
+    // inner snapshot is never frozen by an entry of its own. It says NOTHING
+    // about an ancestor that IS cached: `layout_cache.versionFor` contributes
+    // zero for a vtable with no `content_version`, so an embedded document
+    // inside a `:::frosted_glass` left the effect's aggregate unmoved and the
+    // effect replayed its recorded drawlist — an inner tree updating perfectly,
+    // behind pixels from minutes ago.
+    //
+    // Found by the audit after the `:::input` fix (2026-09-11), which walked
+    // every component carrying the flag without a version. There were two.
+    //
+    // Mutation A: drop `.content_version` from the vtable — red on the first
+    // line. Mutation B: return a constant (`return 0;`) — red on the inner
+    // bump, which is the half that makes this about propagation rather than
+    // about the field merely existing.
+    //
+    // **A SHAPE gate, by construction**, and the limit is worth stating: it
+    // builds a `Component` by hand with a fake inner tree, because standing up
+    // a real embedded document needs a `Spark`, an arena, a child `State` and a
+    // parsed source, and this file's other tests are all on pure helpers for
+    // that reason. `contentVersion` reads exactly two fields and both are set;
+    // the rest are `undefined` and never touched. The trigger for a real one is
+    // the first host that puts a `:::document` inside an effect — nothing does
+    // today, which is why this hole survived unnoticed in the first place.
+    var inner_v: u64 = 7;
+    const Fake = struct {
+        fn version(ctx: *anyopaque) u64 {
+            return @as(*const u64, @ptrCast(@alignCast(ctx))).*;
+        }
+        const vt: element.ElementVTable = .{
+            .layout_and_render = undefined,
+            .content_version = version,
+        };
+    };
+    const child = element.Element{ .custom = .{ .ctx = @ptrCast(&inner_v), .vtable = &Fake.vt } };
+    const kids = [_]element.Element{child};
+
+    var c: Component = undefined;
+    c.root = element.Element{ .paragraph = &kids };
+    c.phase = .ready;
+
+    try std.testing.expect(vtable.content_version != null);
+    const before = vtable.content_version.?(@ptrCast(&c));
+
+    // The inner document changed — a slider inside it moved, say.
+    inner_v = 8;
+    try std.testing.expect(before != vtable.content_version.?(@ptrCast(&c)));
+
+    // Idempotent: a still inner tree is a still version, or the ancestor
+    // re-records its drawlist every frame and the cache is a costly no-op.
+    const now = vtable.content_version.?(@ptrCast(&c));
+    try std.testing.expectEqual(now, vtable.content_version.?(@ptrCast(&c)));
+
+    // The PHASE moves it too, and separately: a loading document draws a
+    // placeholder over a root that has not changed by a byte, so a version
+    // taken from the tree alone would have the placeholder and the document
+    // sharing one number.
+    c.phase = .loading;
+    const loading = vtable.content_version.?(@ptrCast(&c));
+    try std.testing.expect(now != loading);
+
+    // …and `failed` is not `loading`, which is the half that needs the phase in
+    // the SEED rather than only in the `if` guard. Both of them skip the tree
+    // walk, so with the seed dropped they hash identically — a red "fetch
+    // failed" panel replacing a "loading…" one with the ancestor told nothing.
+    //
+    // Mutation: `Wyhash.init(0)`. It SURVIVED the draft that only checked
+    // ready-vs-loading, because the guard alone distinguishes those two.
+    c.phase = .failed;
+    try std.testing.expect(loading != vtable.content_version.?(@ptrCast(&c)));
 }

@@ -694,10 +694,46 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     allocator.destroy(c);
 }
 
+/// **What the box is showing**, as a number an ancestor's cache can compare.
+///
+/// `disable_cache` below is NOT a substitute for this, and the day it was
+/// assumed to be cost a whole one (2026-09-11, `:::input`). The flag keeps THIS
+/// element out of the retained layout cache; it says nothing about an ancestor
+/// that IS cached. A `:::frosted_glass` effect aggregates its children's
+/// `content_version`s, `layout_cache.versionFor` contributes ZERO for a vtable
+/// that has none, so a textarea whose text changed leaves its parent's
+/// aggregate unmoved and the effect replays the drawlist it recorded — pixels
+/// from before you typed, under a component that is walking perfectly.
+///
+/// `layout_cache.aggregateRootVersion`'s own doc already described this exact
+/// failure for a slider inside an effect. It was true of every component with
+/// the flag and no version, and an audit after the `:::input` fix found this one
+/// and `:::embedded_document` still carrying it.
+///
+/// The SELECTION is in the hash as well as the text: dragging a highlight
+/// changes what is on screen and changes no byte of the buffer. So is the
+/// scroll, for the same reason — `on_scroll` moves the view over unchanged
+/// text. What is deliberately NOT here is the caret blink: it rides a wall
+/// clock, and hashing it would bump the parent's aggregate twice a second for
+/// ever, which is the cost `disable_cache` exists to avoid paying twice.
+fn contentVersion(ctx: *anyopaque) u64 {
+    const c: *const Component = @ptrCast(@alignCast(ctx));
+    var h = std.hash.Wyhash.init(0);
+    h.update(c.buffer.items);
+    h.update(std.mem.asBytes(&c.cursor));
+    h.update(std.mem.asBytes(&c.anchor));
+    h.update(std.mem.asBytes(&c.focused));
+    h.update(std.mem.asBytes(&c.scroll_x));
+    h.update(std.mem.asBytes(&c.scroll_y));
+    h.update(c.placeholder);
+    return h.final();
+}
+
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .on_input = onInput,
     .on_scroll = onScroll,
+    .content_version = contentVersion,
     .focusable = true,
     // The caret blinks on a wall clock and the box re-walks on every
     // keystroke. Same trade `:::input` makes: cheap to walk, and a
@@ -705,6 +741,9 @@ const vtable: element.ElementVTable = .{
     // blink. `:::clip`'s reason applies on top — this component pushes a
     // clip, and a cached subtree's clip index points into the clip table
     // of the frame that recorded it.
+    //
+    // It is not, and never was, a reason to omit `content_version` — see
+    // there. The two answer different questions.
     .disable_cache = true,
 };
 
@@ -2564,4 +2603,116 @@ test "textarea: a synced seed does not land while the box is being typed in" {
     const spec4: components.Spec = .{ .name = "textarea", .attrs = &later };
     try update(inst.ctx, &spec4);
     try testing.expectEqualStrings("third value", c.buffer.items);
+}
+
+test "textarea: a cached ANCESTOR is told when the text changes" {
+    // **The bug that ate 2026-09-11, in the component next door.**
+    //
+    // `disable_cache` keeps this element out of the retained layout cache. It
+    // says NOTHING about an ancestor that is cached — and a `:::frosted_glass`
+    // effect aggregates its children's `content_version`s, where
+    // `layout_cache.versionFor` contributes zero for a vtable that has none. So
+    // a textarea inside a panel body took every keystroke, re-walked
+    // faithfully, left the effect's aggregate unmoved, and the effect replayed
+    // the drawlist it had recorded: a box you can type into that never changes
+    // on screen.
+    //
+    // `:::input` was the one that shipped it, because a generated inspector put
+    // a numeric field inside a panel body for the first time. This component
+    // carried the identical hole and had simply never been put inside an
+    // effect; an audit of every component with the flag and no version found it
+    // and `:::embedded_document`.
+    //
+    // Mutation: drop `.content_version` from the vtable. Red here, and on
+    // screen it is a textarea that swallows typing.
+    defer resetState();
+    const attrs = [_]components.Attr{.{ .key = "target", .value = "state.prog" }};
+    const inst = try makeBox(&attrs, "");
+    defer deinit_(inst.ctx, testing.allocator);
+    const c: *Component = @ptrCast(@alignCast(inst.ctx));
+
+    try testing.expect(vtable.content_version != null);
+    const v0 = vtable.content_version.?(inst.ctx);
+
+    // Focus is visible — border, background, caret — so it moves the version.
+    try onInput(inst.ctx, .focus_gained, @ptrCast(&_test_state));
+    const v_focused = vtable.content_version.?(inst.ctx);
+    try testing.expect(v0 != v_focused);
+
+    // Typing moves it.
+    try typeStr(inst, "hello");
+    const v1 = vtable.content_version.?(inst.ctx);
+    try testing.expect(v_focused != v1);
+
+    // Idempotent: nothing happening is the same version, or an ancestor would
+    // re-record its drawlist every frame — which is the cost `disable_cache`
+    // exists to avoid paying twice.
+    try testing.expectEqual(v1, vtable.content_version.?(inst.ctx));
+
+    // **The caret is deliberately NOT in the hash**, and this is the line that
+    // says so: the blink rides a wall clock, and hashing it would bump the
+    // parent's aggregate twice a second for ever.
+    c.last_edit_ms += 10_000;
+    try testing.expectEqual(v1, vtable.content_version.?(inst.ctx));
+
+    // Moving the CARET moves it, though — the caret's position is drawn even
+    // when the text has not changed by a byte. Same for a selection, which is
+    // why `anchor` is in the hash: dragging a highlight changes the picture and
+    // changes no byte of the buffer.
+    try press(inst, KEY_LEFT, 0);
+    const v2 = vtable.content_version.?(inst.ctx);
+    try testing.expect(v1 != v2);
+
+    // …and so does a SELECTION, which needs the field set directly rather than
+    // a keystroke. Every key gesture that moves the anchor moves the cursor in
+    // the same press — `shift+left` does both — so a gate driven by keys passes
+    // with `anchor` missing from the hash: the mutation "drop anchor" SURVIVED
+    // exactly that draft. A mouse drag over already-placed text is the gesture
+    // this stands for, and the claim is about the hash rather than about how
+    // the field came to hold what it holds.
+    const before_sel = vtable.content_version.?(inst.ctx);
+    c.anchor = 0;
+    try testing.expect(before_sel != vtable.content_version.?(inst.ctx));
+
+    // …and so does SCROLLING, which needs the same treatment for a different
+    // reason: `onScroll` clamps to `maxScrollY()`, which is zero until the box
+    // has been laid out against real content, so a scroll event in a gate is a
+    // no-op and the mutation "drop scroll_y" SURVIVED the draft that tried one.
+    // A person scrolling a long document sees different lines and not one byte
+    // of the buffer has changed — which is precisely the case a version derived
+    // from the text alone would miss.
+    const before_scroll = vtable.content_version.?(inst.ctx);
+    c.scroll_y = 40;
+    try testing.expect(before_scroll != vtable.content_version.?(inst.ctx));
+    const before_x = vtable.content_version.?(inst.ctx);
+    c.scroll_x = 12;
+    try testing.expect(before_x != vtable.content_version.?(inst.ctx));
+
+    // **And the TEXT itself, isolated** — which the draft above does not do,
+    // because typing moves the caret in the same press and `cursor` carries the
+    // change. The mutation "drop `buffer` from the hash" SURVIVED a gate that
+    // typed `hello`, which is as weak as a gate about a text box can be.
+    //
+    // So: a value arriving from a BINDING with nobody typing, at the same
+    // length, so the caret lands in the same place both times and the buffer is
+    // the only thing that moved. It is also the exact case `:::input` was fixed
+    // for — a gizmo drag delivering `0.900` then `0.905`.
+    {
+        const seeded = [_]components.Attr{
+            .{ .key = "target", .value = "state.y" },
+            .{ .key = "initial", .value = "aaaa" },
+        };
+        const box = try makeBox(&seeded, "");
+        defer deinit_(box.ctx, testing.allocator);
+        const bc: *Component = @ptrCast(@alignCast(box.ctx));
+        const before_text = vtable.content_version.?(box.ctx);
+
+        const changed = [_]components.Attr{
+            .{ .key = "target", .value = "state.y" },
+            .{ .key = "initial", .value = "bbbb" },
+        };
+        try update(box.ctx, &.{ .name = "textarea", .attrs = &changed });
+        try testing.expectEqualStrings("bbbb", bc.buffer.items);
+        try testing.expect(before_text != vtable.content_version.?(box.ctx));
+    }
 }
