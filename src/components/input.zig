@@ -511,6 +511,31 @@ const Component = struct {
             // back is its own number a moment later.
             const moved = !std.mem.eql(u8, init_text, self.last_initial);
             const took = first_seed or (moved and !self.editing());
+            // **A probe, because this decision is invisible and has now been
+            // wrong twice.** Off unless `SPARK_INPUT_PROBE` is set, and only
+            // when something actually MOVED — a field that agrees with its
+            // binding says nothing, so a real session prints a line per change
+            // rather than one per frame.
+            //
+            // Kept rather than deleted: two latches (`focused`, then
+            // `.pending`) each froze a field with the same symptom, and each
+            // time the fastest route to the truth was watching this decision
+            // instead of reasoning about it.
+            if ((moved or self.focused or self.gesture != .none) and std.posix.getenv("SPARK_INPUT_PROBE") != null) {
+                std.debug.print(
+                    "[input {s}] init='{s}' last='{s}' buf='{s}' focused={} gesture={s} typed={} -> {s}\n",
+                    .{
+                        if (self.target.len > 0) self.target else "?",
+                        init_text,
+                        self.last_initial,
+                        self.buffer.items,
+                        self.focused,
+                        @tagName(self.gesture),
+                        self.typed,
+                        if (took) "TOOK" else "refused",
+                    },
+                );
+            }
             if (took) {
                 // Read the precision off the seed, ONCE, on the FIRST one —
                 // and only there. Re-deriving it from a synced value would
