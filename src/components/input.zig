@@ -625,9 +625,41 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     allocator.destroy(c);
 }
 
+/// **What this field is showing**, so a cached ANCESTOR knows to re-draw.
+///
+/// `disable_cache` below stops this element being served from the cache. It
+/// does nothing about a parent that is: `:::frosted_glass` and friends
+/// aggregate their children's `content_version` and replay a cached drawlist
+/// when the total is unchanged, and `layout_cache.versionFor` contributes 0
+/// for a vtable with no getter. So a field inside a panel body reported "I have
+/// not changed" on every frame, for ever, and its cached pixels were replayed
+/// over a buffer that was moving underneath.
+///
+/// Chris found it on a placed light's position boxes: the probe showed the
+/// field TAKING every value — `buf='0.905'`, `'0.910'`, `'0.919'` — while the
+/// screen sat still. `aggregateRootVersion`'s own doc describes the identical
+/// failure for a slider inside an effect, fixed there and never given to this
+/// component, because nothing shipped had a numeric field inside a panel body
+/// until a generated inspector did.
+///
+/// The caret is deliberately NOT in here. It blinks on a wall-clock timer, so
+/// including it would bump the version every frame and defeat the ancestor
+/// cache for everything else in the panel — which is the cost `disable_cache`
+/// was chosen to avoid in the first place.
+fn contentVersion(ctx: *anyopaque) u64 {
+    const c: *const Component = @ptrCast(@alignCast(ctx));
+    var h = std.hash.Wyhash.init(0);
+    h.update(c.buffer.items);
+    h.update(std.mem.asBytes(&c.cursor));
+    h.update(std.mem.asBytes(&c.focused));
+    h.update(c.placeholder);
+    return h.final();
+}
+
 const vtable: element.ElementVTable = .{
     .layout_and_render = layoutAndRender,
     .on_input = onInput,
+    .content_version = contentVersion,
     .focusable = true,
     // Caret blinks on a wall-clock timer + the field re-renders every
     // keystroke. Either could be plumbed through a version counter,
@@ -1960,4 +1992,61 @@ test "input: a PENDING press does not stop a field following its binding either"
     };
     try update(inst.ctx, &.{ .name = "input", .attrs = &a2 });
     try testing.expectEqualStrings(mid, c.buffer.items);
+}
+
+test "input: its content version moves with what it SHOWS, so a cached parent re-draws" {
+    // **The bug this is for, and it is not this component's own cache.**
+    // `disable_cache` keeps the field out of the cache; it says nothing about
+    // an ANCESTOR that is cached. `:::frosted_glass` and every other effect
+    // aggregate their children's `content_version` and replay a cached
+    // drawlist when the total has not moved, and `layout_cache.versionFor`
+    // contributes 0 for a vtable with no getter. A field inside a panel body
+    // therefore reported "unchanged" on every frame while its buffer moved
+    // underneath, and the stale pixels were replayed over it.
+    //
+    // `aggregateRootVersion`'s doc in `layout_cache.zig` describes the exact
+    // same failure for a slider inside an effect. It was fixed there and never
+    // given to this component, because nothing shipped had a numeric field
+    // inside a panel body until a generated inspector did.
+    //
+    // Mutation: drop `.content_version` from the vtable. `versionFor` goes
+    // back to 0, this gate goes red, and a box inside a panel freezes on
+    // screen while faithfully taking every value.
+    const attrs = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.x" },
+        .{ .key = "initial", .value = "0.900" },
+        .{ .key = "decimals", .value = "3" },
+    };
+    const inst = try create(&_test_spark, testing.allocator, &.{ .name = "input", .attrs = &attrs });
+    defer deinit_(inst.ctx, testing.allocator);
+    const c: *Component = @ptrCast(@alignCast(inst.ctx));
+
+    try testing.expect(vtable.content_version != null);
+    const v0 = vtable.content_version.?(inst.ctx);
+
+    // A value arrives from the binding — the gizmo-drag case, with nothing
+    // focused and no gesture.
+    const moved = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.x" },
+        .{ .key = "initial", .value = "0.905" },
+        .{ .key = "decimals", .value = "3" },
+    };
+    try update(inst.ctx, &.{ .name = "input", .attrs = &moved });
+    try testing.expectEqualStrings("0.905", c.buffer.items);
+
+    const v1 = vtable.content_version.?(inst.ctx);
+    try testing.expect(v0 != v1);
+
+    // Idempotent: the same value again is the same version, or an ancestor
+    // would re-draw every frame for nothing — which is the cost the cache
+    // exists to avoid.
+    try update(inst.ctx, &.{ .name = "input", .attrs = &moved });
+    try testing.expectEqual(v1, vtable.content_version.?(inst.ctx));
+
+    // Focus is visible (border, background, caret), so it moves the version
+    // too — otherwise clicking a field inside a panel would not light it.
+    try onInput(inst.ctx, .focus_gained, @ptrCast(_test_spark.host_state));
+    try testing.expect(v1 != vtable.content_version.?(inst.ctx));
 }
