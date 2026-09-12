@@ -71,6 +71,37 @@ pub const Paragraph = struct {
 /// buffer. Pass `null` for the serial path — no locking overhead.
 /// Stage 14b's parallel stack_v walker hands the same mutex to every
 /// worker thread.
+/// Snap a glyph's world-space corner to the pixel grid it will actually
+/// be SAMPLED on, which is `zoom` world units per pixel.
+///
+/// **A plain `@round` here quantises to a WHOLE WORLD UNIT, and every
+/// caller then scales that offset up.** `Spark.endFrame` multiplies
+/// every glyph's `dst_pos` by the host zoom, and `:::nodegraph` scales
+/// its labels by the graph's zoom on top of that — so at 3× the rounding
+/// grid is three screen pixels, and each glyph in a word snaps to it
+/// independently, by its own bearing's fractional part. The word comes
+/// out with its letters sitting on different lines. Christian,
+/// 2026-09-12, on a node title: *"why does the text rendering glyph
+/// baseline jump around many pixels, even when zoomed in? … it's like
+/// the sub-pixel offsets get scaled with the zoom."* They were: the
+/// rounding grid was.
+///
+/// Rounding is still wanted — it is what puts a bitmap on a pixel
+/// boundary so it samples 1:1 — but it has to be done in the space where
+/// a unit IS a pixel, and `zoom` is exactly that number. At `zoom = 1`
+/// this is `@round` to the bit, so the unzoomed document path is
+/// untouched.
+///
+/// What it does NOT do is put the run at a whole pixel: `baseline_y`
+/// carries its own fraction and every glyph inherits it. That is the
+/// correct trade — a run shifted a third of a pixel is sub-pixel
+/// positioning, which is what everybody wants; a run whose letters are
+/// shifted a third of a pixel FROM EACH OTHER is the bug.
+pub fn snapToPixel(v: f32, zoom: f32) f32 {
+    if (!(zoom > 0)) return @round(v);
+    return @round(v * zoom) / zoom;
+}
+
 pub fn appendShapedRun(
     out: *std.ArrayList(tp.GlyphInstance),
     /// Parallel target-routing array (effects-spec Phase B.4.a).
@@ -183,8 +214,8 @@ pub fn appendShapedRun(
             // in BASE units → `base_scale`. At zoom=1 the two collapse
             // (same entry) and produce identical output to the
             // pre-crisp-zoom path.
-            const dx = @round(x + bx * eff_world_scale + g.x_offset * base_scale);
-            const dy = @round(baseline_y - by * eff_world_scale + g.y_offset * base_scale);
+            const dx = snapToPixel(x + bx * eff_world_scale + g.x_offset * base_scale, zoom);
+            const dy = snapToPixel(baseline_y - by * eff_world_scale + g.y_offset * base_scale, zoom);
 
             const aw: f32 = if (entry.kind == .color) color_w else mono_w;
             const ah: f32 = if (entry.kind == .color) color_h else mono_h;
@@ -327,4 +358,77 @@ pub fn layoutParagraph(
         y += max_lh;
     }
     return y;
+}
+
+// ── gates ───────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "layout: the rounding grid is a PIXEL, not a world unit scaled by zoom" {
+    // The bug, stated as the invariant it broke: two glyphs whose true
+    // baseline offsets differ by δ must come out differing by δ give or
+    // take ONE SCREEN PIXEL — at any zoom. A `@round` in world space
+    // gives ± one world unit instead, which is `zoom` screen pixels, and
+    // each glyph in a word snaps to that grid by its own bearing's
+    // fraction. Christian, 2026-09-12: *"the text rendering glyph
+    // baseline jump[s] around many pixels… it's like the sub-pixel
+    // offsets get scaled with the zoom."*
+    //
+    // Mutation: `return @round(v);`. Red at every zoom above 1, by
+    // exactly the zoom — at 4 the worst pair is 4 screen pixels apart,
+    // which is the ragged word in his screenshot.
+    //
+    // The offsets are a real word's: the bearings of `write6 row.u2` at
+    // 14px, divided by the effective raster scale the way
+    // `appendShapedRun` does it.
+    const ideal = [_]f32{ 7.0 / 3.0, 10.0 / 3.0, 9.5 / 3.0, 7.25 / 3.0, 10.75 / 3.0, 4.0 / 3.0 };
+    for ([_]f32{ 1, 1.5, 2, 3, 4, 7.3 }) |zoom| {
+        var worst: f32 = 0;
+        for (ideal, 0..) |a, i| {
+            for (ideal[i + 1 ..]) |b| {
+                const want = (a - b) * zoom;
+                const got = (snapToPixel(a, zoom) - snapToPixel(b, zoom)) * zoom;
+                worst = @max(worst, @abs(got - want));
+            }
+        }
+        // One pixel is the most a snap can move a glyph relative to its
+        // neighbour, and that is the whole claim.
+        try testing.expect(worst <= 1.0 + 1e-4);
+    }
+}
+
+test "layout: at zoom 1 the snap IS @round, so unzoomed text did not move" {
+    // A fix to the zoomed path that shifted every glyph in every
+    // document by a fraction of a pixel would be a worse bug than the
+    // one it fixed, and nothing else in the suite would say so.
+    //
+    // Mutation: drop the `/ zoom` — `@round(v * zoom)`. Still fine at
+    // zoom 1 for the values below and wrong by a factor of `zoom`
+    // everywhere else, which the gate above then catches. Two gates, one
+    // mechanism, and neither alone is enough.
+    for ([_]f32{ 0, 0.4, 0.5, 0.6, 1.5, -0.5, -0.6, 12.3, -7.7, 100.5 }) |v| {
+        try testing.expectEqual(@round(v), snapToPixel(v, 1.0));
+    }
+    // And a zoom of zero or less cannot divide — a degenerate frame must
+    // not produce inf coordinates that poison the whole draw list.
+    try testing.expectEqual(@as(f32, 3), snapToPixel(2.7, 0));
+    try testing.expectEqual(@as(f32, 3), snapToPixel(2.7, -1));
+}
+
+test "layout: a snapped coordinate lands ON the pixel grid it was given" {
+    // What the rounding is FOR: a bitmap sampled 1:1 needs its corner on
+    // a texel boundary, and after `endFrame` multiplies by the zoom that
+    // means `v * zoom` must be a whole number.
+    //
+    // Mutation: `return v;` — no snap at all. Every glyph then samples
+    // between texels and the whole point of the crisp-zoom path (a fresh
+    // face per zoom level) is thrown away on a blur.
+    for ([_]f32{ 1, 2, 3, 4 }) |zoom| {
+        for ([_]f32{ 0.1, 7.777, -3.33, 41.5 }) |v| {
+            const snapped = snapToPixel(v, zoom) * zoom;
+            try testing.expectApproxEqAbs(@round(snapped), snapped, 1e-3);
+            // …and it moved by less than half a pixel getting there.
+            try testing.expect(@abs(snapped - v * zoom) <= 0.5 + 1e-4);
+        }
+    }
 }
