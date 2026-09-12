@@ -310,7 +310,33 @@ const GRID_MAJOR: u32 = 4;
 const GRID_MIN_PX: f32 = 7.0;
 
 const NODE_BG: [4]f32 = .{ 0.16, 0.175, 0.205, 1.0 };
+/// How much of its tint a node's title bar keeps.
+///
+/// **A node the host RINGED keeps all of it**, and that is the rule with
+/// its own reason applied rather than an exception to it. The darken
+/// exists so a header sits WITH the body panel under it instead of
+/// shouting over it; a ringed node is bare, has no body to sit with, and
+/// has been named by the host as something other than an operator — a
+/// connector, which is exactly the thing on a canvas that should shout.
+///
+/// **Keyed to the ring and not to bareness**, which the first draft got
+/// wrong and the picture caught: `spawn1` and `perish1` are bare too —
+/// operators that happen to declare no ports — and at full strength they
+/// became the loudest things on the canvas while meaning nothing of the
+/// sort.
+///
+/// It is also the only thing that makes a yellow chip possible. Chris
+/// asked for bright yellow and got *"more like a mustard yellow"*:
+/// yellow is a hue that only exists at high luminance, and 0.55 of any
+/// yellow is olive. Red and blue survive the darken, so the palette
+/// looked fine and no hex value could have fixed it. *"Well why can't we
+/// turn up the luminance?"* — nothing could; that is the whole fix.
 const NODE_HEADER_TINT: f32 = 0.55;
+/// Text for a bar too light to read light text on, and the luminance at
+/// which it takes over. A full-strength yellow or green chip needs dark
+/// letters; a red or blue one does not.
+const NODE_LABEL_DARK: [4]f32 = .{ 0.10, 0.10, 0.12, 1.0 };
+const LABEL_DARK_ABOVE: f32 = 0.55;
 const NODE_RING: [4]f32 = .{ 0.0, 0.0, 0.0, 0.55 };
 const NODE_RING_HOVER: [4]f32 = .{ 1.0, 1.0, 1.0, 0.30 };
 const NODE_RING_SELECTED: [4]f32 = .{ 1.0, 0.78, 0.32, 0.95 };
@@ -1889,6 +1915,22 @@ const vtable: element.ElementVTable = .{
 
 // ── Render ──────────────────────────────────────────────────────────
 
+/// The colour of a node's title bar. See `NODE_HEADER_TINT`.
+fn headerColor(n: Node) [4]f32 {
+    return if (n.ring != null) n.tint else tinted(n.tint, NODE_HEADER_TINT);
+}
+
+/// Text that can be read on `bg`: the caller's own colour, unless the
+/// bar is light enough to swallow it.
+///
+/// Rec. 709 luminance, which weights green six times red's and ten times
+/// blue's — the reason a full green or yellow bar needs dark letters and
+/// a full royal blue one does not, even though all three are "saturated".
+fn labelOn(bg: [4]f32, light: [4]f32) [4]f32 {
+    const l = 0.2126 * bg[0] + 0.7152 * bg[1] + 0.0722 * bg[2];
+    return if (l > LABEL_DARK_ABOVE) NODE_LABEL_DARK else light;
+}
+
 fn tinted(c: [4]f32, f: f32) [4]f32 {
     return .{ c[0] * f, c[1] * f, c[2] * f, c[3] };
 }
@@ -2141,11 +2183,20 @@ fn drawCanvas(
         // and the outline reads as a wedge.
         const ring_nose = if (nose > 0) nose * (sh + 2 * ring_pad) / sh else 0;
 
+        // **A tapered node has SQUARE left corners**, which costs nothing
+        // to say because the taper has already cut the right pair off —
+        // `radius` only ever reaches the left two on one of these. Chris,
+        // 2026-09-12: *"can we make the left hand edge not have rounded
+        // corners — it's the last thing to match EDA tools."* A part on a
+        // schematic is a rectangle with a pin on it; the rounding was the
+        // one thing still saying "panel".
+        const corner = if (nose > 0) 0 else r;
+
         try out.appendQuad(lc, .{
             .dst_pos = .{ tl[0] - ring_pad, tl[1] - ring_pad },
             .dst_size = .{ sw + 2 * ring_pad, sh + 2 * ring_pad },
             .color = ring,
-            .radius = r + ring_pad,
+            .radius = if (nose > 0) 0 else r + ring_pad,
             .nose = ring_nose,
         });
         // No body under a bare node — the header quad below is the whole
@@ -2159,8 +2210,8 @@ fn drawCanvas(
         try out.appendQuad(lc, .{
             .dst_pos = .{ tl[0], tl[1] },
             .dst_size = .{ sw, @min(HEADER_H * z, sh) },
-            .color = tinted(n.tint, NODE_HEADER_TINT),
-            .radius = r,
+            .color = headerColor(n),
+            .radius = corner,
             .nose = nose,
         });
     }
@@ -2411,7 +2462,8 @@ fn drawLabels(c: *Component, canvas: Rect, lc: *element.LayoutCtx, out: *element
         if (tl[0] + sw < canvas.x or tl[0] > canvas.x + canvas.w) continue;
         if (tl[1] + HEADER_H * z < canvas.y or tl[1] > canvas.y + canvas.h) continue;
         const baseline = centredBaseline(m, tl[1] + HEADER_H * z * 0.5, z);
-        _ = try appendLabel(lc, out, n.label, style.font_id, style.color, tl[0] + LABEL_PAD_X * z, baseline, z, .left);
+        const ink = labelOn(headerColor(n), style.color);
+        _ = try appendLabel(lc, out, n.label, style.font_id, ink, tl[0] + LABEL_PAD_X * z, baseline, z, .left);
     }
 
     for (c.desc.pins.items, 0..) |p, i| {
@@ -3851,6 +3903,20 @@ test "nodegraph: a bare node emits no body quad, and a tapered one says so in th
     const chip_ring = dl.quads.items[0];
     const chip_bar = dl.quads.items[1];
     try testing.expect(chip_bar.nose > 0);
+
+    // **Square left corners**, because the taper has already cut the
+    // right pair off — `radius` only ever reaches the left two on one of
+    // these. Chris, 2026-09-12: *"can we make the left hand edge not
+    // have rounded corners — it's the last thing to match EDA tools."*
+    //
+    // Mutation: `const corner = r;`. It draws, and the part goes back to
+    // looking like a panel instead of a component on a schematic. This
+    // gate exists because that mutation SURVIVED the first sweep — the
+    // shape was checked and the corner was not.
+    try testing.expectEqual(@as(f32, 0), chip_bar.radius);
+    try testing.expectEqual(@as(f32, 0), chip_ring.radius);
+    // …and a node with a body keeps its rounding.
+    try testing.expect(dl.quads.items[3].radius > 0);
     try testing.expect(chip_ring.nose > chip_bar.nose);
     try testing.expectApproxEqAbs(
         chip_bar.nose / chip_bar.dst_size[1],
@@ -3866,6 +3932,72 @@ test "nodegraph: a bare node emits no body quad, and a tapered one says so in th
     // arrows that mean nothing.
     try testing.expect(c.desc.nodes.items[1].bare);
     try testing.expectEqual(@as(f32, 0), dl.quads.items[3].nose);
+}
+
+test "nodegraph: a ringed node wears its WHOLE tint, and its label stays readable on it" {
+    // Two halves of one change, and neither works without the other.
+    //
+    // A connector shouts — it is bare, has no body panel for its header
+    // to sit quietly with, and the host has named it as something other
+    // than an operator. That is what makes a yellow chip possible at
+    // all: yellow only exists at high luminance, and 0.55 of any yellow
+    // is olive, so no palette edit could have produced the bright yellow
+    // Chris asked for.
+    //
+    // Mutation: `return tinted(n.tint, NODE_HEADER_TINT);` for every
+    // node. Red on the first pair — and the constant chips go back to
+    // the mustard he rejected.
+    const c = try makeGraph(
+        \\node id=sun x=0 y=0 label="c" tint=#f2e02f ring=#c2c8d4
+        \\node id=op x=200 y=0 label="o" tint=#f2e02f
+        \\pin node=sun id=o0 dir=out
+        \\pin node=op id=i0 dir=in label="a"
+    , &.{});
+    defer dropGraph(c);
+
+    const chip = c.desc.nodes.items[0];
+    const op = c.desc.nodes.items[1];
+    try testing.expectEqual(chip.tint, headerColor(chip));
+    try testing.expect(headerColor(op)[1] < op.tint[1]);
+
+    // **Keyed to the RING, not to bareness** — which the first draft got
+    // wrong and only the picture caught. `spawn1` and `perish1` are bare
+    // too, operators that happen to declare no ports, and at full
+    // strength they became the loudest things on the canvas.
+    //
+    // Mutation: `if (n.bare)`. Green on everything above, because the
+    // chip is bare as well; red only here.
+    const plain = try makeGraph(
+        \\node id=quiet x=0 y=0 label="spawn1" tint=#d94f86
+    , &.{});
+    defer dropGraph(plain);
+    const q = plain.desc.nodes.items[0];
+    try testing.expect(q.bare);
+    try testing.expect(headerColor(q)[0] < q.tint[0]);
+
+    // And the ink follows the bar. Rec. 709 weights green six times
+    // red's and ten times blue's, which is why a full green or yellow
+    // chip needs dark letters and a full royal blue one does not — all
+    // three are equally "saturated" and that is not the question being
+    // asked.
+    //
+    // Mutation: weight the three channels equally. Royal blue's
+    // luminance then reads 0.44 instead of 0.41 — still light, so most
+    // of this passes — but GREEN drops from 0.58 to 0.40 and its chip
+    // goes back to unreadable white-on-green. Red is what makes an even
+    // weighting look right for the wrong reason.
+    const light = [4]f32{ 0.9, 0.9, 0.92, 1 };
+    const row_red = [4]f32{ 0xd8.0 / 255.0, 0x32.0 / 255.0, 0x2f.0 / 255.0, 1 };
+    const royal = [4]f32{ 0x41.0 / 255.0, 0x69.0 / 255.0, 0xe1.0 / 255.0, 1 };
+    const slate = [4]f32{ 0x2f.0 / 255.0, 0xb8.0 / 255.0, 0x4a.0 / 255.0, 1 };
+    const yellow = [4]f32{ 0xf2.0 / 255.0, 0xe0.0 / 255.0, 0x2f.0 / 255.0, 1 };
+    try testing.expectEqual(light, labelOn(row_red, light));
+    try testing.expectEqual(light, labelOn(royal, light));
+    try testing.expectEqual(NODE_LABEL_DARK, labelOn(slate, light));
+    try testing.expectEqual(NODE_LABEL_DARK, labelOn(yellow, light));
+    // A body-panel node is always dark enough to keep the theme's ink,
+    // whatever its tag colour — the darken guarantees it.
+    try testing.expectEqual(light, labelOn(tinted(yellow, NODE_HEADER_TINT), light));
 }
 
 test "nodegraph: `ring=` is the HOST's word, and selection still wins over it" {

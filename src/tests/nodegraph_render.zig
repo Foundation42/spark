@@ -98,6 +98,71 @@ fn renderDoc(allocator: std.mem.Allocator, fx: *fixture.Fixture, doc_src: []cons
     };
 }
 
+test "nodegraph: a bright chip's label goes DARK, and the canvas is what wires that up" {
+    // `labelOn` has its own gates in the component; this one exists
+    // because they were not enough. A mutation that simply stopped
+    // CALLING it — `const ink = style.color;` — passed the entire suite,
+    // because every gate tested the function and none tested the wiring.
+    // A full-strength yellow chip then wears the theme's near-white
+    // letters on it and the label is gone.
+    //
+    // It needs a real font, so it is here rather than beside `labelOn`:
+    // the component's device-free gates hand `drawCanvas` an
+    // uninitialised LayoutCtx that no glyph path may touch, which is
+    // also why they all run under the label-zoom floor.
+    const allocator = testing.allocator;
+    var fx = try fixture.Fixture.init(allocator);
+    defer fx.deinit();
+
+    const doc =
+        \\:::nodegraph {#g width=600 height=300 zoom=1}
+        \\node id=sun x=0 y=0 label="YELLOW" tint=#f2e02f ring=#c2c8d4
+        \\node id=deep x=0 y=120 label="BLUE" tint=#4169e1 ring=#c2c8d4
+        \\pin node=sun id=o0 dir=out
+        \\pin node=deep id=o0 dir=out
+        \\:::
+        \\
+    ;
+
+    const fonts = try fixture.makeFonts(allocator, fx.ft);
+    const theme = fixture.makeTheme(fonts);
+    var state = spark.State.init(allocator);
+    defer state.deinit();
+
+    var sp = try spark.Spark.init(allocator, .{
+        .vk_ctx = &fx.ctx,
+        .color_format = fx.swapchain.format,
+        .theme = &theme,
+        .fonts = fonts.registry,
+        .host_state = &state,
+    });
+    defer {
+        sp.deinit();
+        allocator.destroy(fonts.registry);
+    }
+    sp.attachToRegistry();
+    try spark.installCoreComponents(&sp);
+
+    var d = try sp.loadDocument(doc, .{ .shared_state = &state });
+    defer d.deinit();
+    try sp.beginFrame(
+        .{ .extent = .{ .width = 1280, .height = 900 }, .zoom = 1.0, .scroll_offset = .{ 0, 0 } },
+        .{ .reset = true },
+    );
+    _ = try sp.layoutAndRender(&d, .{ 20, 20 }, .{ .max_w = 1240 });
+
+    // Luminance of every glyph drawn. Two labels, two answers: the
+    // yellow bar's letters are dark and the royal blue bar's are not.
+    var dark: usize = 0;
+    var light: usize = 0;
+    for (sp.drawlist.glyphs.items) |g| {
+        const l = 0.2126 * g.color[0] + 0.7152 * g.color[1] + 0.0722 * g.color[2];
+        if (l < 0.3) dark += 1 else light += 1;
+    }
+    try testing.expect(dark > 0);
+    try testing.expect(light > 0);
+}
+
 test "nodegraph: fifty nodes cost what the report says they cost" {
     const allocator = testing.allocator;
     var fx = try fixture.Fixture.init(allocator);
