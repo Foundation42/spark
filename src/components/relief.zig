@@ -176,6 +176,180 @@ pub fn stroke(
     }
 }
 
+/// How far a mitre may stretch a joint before it is given up on, as the
+/// cosine of half the turn. Below this the joint is drawn square to the
+/// incoming segment instead.
+///
+/// A mitre's half-width is `half / cos(θ/2)`, which goes to infinity as
+/// a polyline doubles back on itself — a wire in hand dragged back over
+/// its own pin makes exactly that cusp, and an unclamped mitre there
+/// throws a spike across the canvas. 0.35 is a turn of about 139°, well
+/// past anything a flattened cubic produces (a 9px chord on the
+/// tightest wire turns single digits), so the clamp only ever catches
+/// the degenerate case it is there for.
+const MITRE_MIN_COS: f32 = 0.35;
+
+/// A continuous ribbon of `width` through every point of `pts`,
+/// feathered on both sides and at both ends.
+///
+/// **Why this exists and `stroke` in a loop does not do.** A curve
+/// flattened into N pieces and drawn as N separate strokes pays for
+/// every joint twice. Butted exactly, two feathered caps meet and leave
+/// a half-alpha seam across the wire. Overlapped past the feather to
+/// cure that, the two strokes' bodies BLEND: at alpha 0.85 a doubled
+/// joint comes out at 0.98, so every joint is a bead 15% brighter than
+/// the wire, evenly spaced down its length. Chris, 2026-09-12, on the
+/// node graph: *"the wires are a bit janky right now — lots of straight
+/// lines with dots where they connect."* The dots were the overlap
+/// working exactly as designed.
+///
+/// A ribbon has no joints to pay for. Each point contributes ONE column
+/// of four vertices on the MITRE — the bisector of the two segments
+/// meeting there — and consecutive columns are stitched. Every pixel is
+/// covered exactly once, so there is no seam to hide and nothing to
+/// double-blend, at any alpha.
+///
+/// It is also cheaper per segment, which is what buys the smoothness
+/// back: 4 vertices and 3 quads against `stroke`'s 16 and 9. A caller
+/// can roughly triple its segment count and still emit fewer triangles
+/// than it did.
+///
+/// The two end CAPS are `stroke`'s: a fifth and sixth column a feather
+/// beyond each end, at alpha 0, so a free end ramps out instead of
+/// stopping on a hard rectangle.
+pub fn polyline(
+    out: *element.DrawList,
+    lc: *element.LayoutCtx,
+    pts: []const [2]f32,
+    width: f32,
+    col: [4]f32,
+) !void {
+    if (pts.len < 2 or !(width > 0)) return;
+
+    // A polyline may carry repeated points — a flattened curve whose
+    // ends coincide, a clip that trimmed a segment to nothing — and a
+    // repeat has no direction. Seed from the first pair that does, and
+    // let every degenerate segment afterwards inherit the last real
+    // one. With no real pair at all there is nothing to draw.
+    var seed: ?[2]f32 = null;
+    for (0..pts.len - 1) |i| {
+        if (unitBetween(pts[i], pts[i + 1])) |u| {
+            seed = u;
+            break;
+        }
+    }
+    var d_in = seed orelse return;
+
+    const half = width * 0.5;
+    const clear = withAlpha(col, 0);
+    const base: u32 = @intCast(out.tris.items.len);
+
+    try out.ensureUnusedTriCapacity((pts.len + 2) * 4);
+
+    // The point columns, in order. `d_in` enters column `i` and `d_out`
+    // leaves it; at the two ends they are the same vector, which makes
+    // the end columns square to their own segment with no special case.
+    var first_dir = d_in;
+    var last_dir = d_in;
+    for (pts, 0..) |p, i| {
+        const d_out = if (i + 1 < pts.len)
+            (unitBetween(p, pts[i + 1]) orelse d_in)
+        else
+            d_in;
+        if (i == 0) {
+            d_in = d_out;
+            first_dir = d_out;
+        }
+        last_dir = d_out;
+
+        const m = mitre(d_in, d_out);
+        for ([4]f32{ -(half + FEATHER) * m.scale, -half * m.scale, half * m.scale, (half + FEATHER) * m.scale }, 0..) |off, row| {
+            out.appendTriAssumeCapacity(lc, .{
+                .pos = .{ p[0] + m.n[0] * off, p[1] + m.n[1] * off },
+                .color = if (row == 1 or row == 2) col else clear,
+            });
+        }
+        d_in = d_out;
+    }
+
+    // The caps, appended after the run so the loop above stays one pass
+    // — the stitch reaches them by index, which does not care what
+    // order they were written in.
+    const cap0 = base + @as(u32, @intCast(pts.len)) * 4;
+    const cap1 = cap0 + 4;
+    try appendCap(out, lc, pts[0], first_dir, -FEATHER, half, clear);
+    try appendCap(out, lc, pts[pts.len - 1], last_dir, FEATHER, half, clear);
+
+    try out.tri_indices.ensureUnusedCapacity((pts.len + 1) * 3 * 6);
+    stitch(out, cap0, base);
+    for (0..pts.len - 1) |i| {
+        const a: u32 = base + @as(u32, @intCast(i)) * 4;
+        stitch(out, a, a + 4);
+    }
+    stitch(out, base + @as(u32, @intCast(pts.len - 1)) * 4, cap1);
+}
+
+/// A column of four transparent vertices a feather beyond an end, square
+/// to the end segment. Same four offsets as a point column with no
+/// mitre, so the stitch between them is a plain quad.
+fn appendCap(
+    out: *element.DrawList,
+    lc: *element.LayoutCtx,
+    p: [2]f32,
+    dir: [2]f32,
+    along: f32,
+    half: f32,
+    clear: [4]f32,
+) !void {
+    const n = [2]f32{ -dir[1], dir[0] };
+    const c = [2]f32{ p[0] + dir[0] * along, p[1] + dir[1] * along };
+    for ([4]f32{ -(half + FEATHER), -half, half, half + FEATHER }) |off| {
+        out.appendTriAssumeCapacity(lc, .{
+            .pos = .{ c[0] + n[0] * off, c[1] + n[1] * off },
+            .color = clear,
+        });
+    }
+}
+
+/// Three quads joining two four-vertex columns, wound like `stroke`'s.
+fn stitch(out: *element.DrawList, a: u32, b: u32) void {
+    for (0..3) |r| {
+        const ar = a + @as(u32, @intCast(r));
+        const br = b + @as(u32, @intCast(r));
+        for ([6]u32{ ar, br, ar + 1, br, br + 1, ar + 1 }) |idx| {
+            out.tri_indices.appendAssumeCapacity(idx);
+        }
+    }
+}
+
+/// The unit vector from `a` to `b`, or null if there is no distance
+/// between them to take a direction from.
+fn unitBetween(a: [2]f32, b: [2]f32) ?[2]f32 {
+    const dx = b[0] - a[0];
+    const dy = b[1] - a[1];
+    const len = @sqrt(dx * dx + dy * dy);
+    if (!(len > 1e-6)) return null;
+    return .{ dx / len, dy / len };
+}
+
+/// The joint between two directions: the bisector normal, and how far
+/// an offset along it must stretch to keep the ribbon's edges parallel
+/// to each segment.
+fn mitre(d_in: [2]f32, d_out: [2]f32) struct { n: [2]f32, scale: f32 } {
+    const n_in = [2]f32{ -d_in[1], d_in[0] };
+    const n_out = [2]f32{ -d_out[1], d_out[0] };
+    const sx = n_in[0] + n_out[0];
+    const sy = n_in[1] + n_out[1];
+    const len = @sqrt(sx * sx + sy * sy);
+    // Exactly reversed: the bisector is undefined, and there is no
+    // mitre that means anything. Square to the incoming segment.
+    if (!(len > 1e-6)) return .{ .n = n_in, .scale = 1 };
+    const m = [2]f32{ sx / len, sy / len };
+    const c = m[0] * n_in[0] + m[1] * n_in[1];
+    if (!(c > MITRE_MIN_COS)) return .{ .n = n_in, .scale = 1 };
+    return .{ .n = m, .scale = 1 / c };
+}
+
 /// A vertical line with both edges faded, so a 1px mark lands crisply
 /// wherever it falls instead of snapping to a pixel boundary.
 ///
@@ -963,5 +1137,128 @@ test "stroke: degenerate inputs emit nothing rather than a fold" {
     var lc = testCtx();
     try stroke(&dl, &lc, .{ 5, 5 }, .{ 5, 5 }, 2, .{ 1, 1, 1, 1 }); // zero length
     try stroke(&dl, &lc, .{ 0, 0 }, .{ 10, 0 }, 0, .{ 1, 1, 1, 1 }); // zero width
+    try testing.expectEqual(@as(usize, 0), dl.tris.items.len);
+}
+
+test "polyline: a joint is covered ONCE, which is the whole reason it exists" {
+    // Two strokes overlapped past a joint both paint it, and premultiplied
+    // `over` at alpha 0.85 comes out at 0.98 — a bead 15% brighter than the
+    // wire, once per joint, evenly spaced down its length. That is what Chris
+    // saw: *"lots of straight lines with dots where they connect."*
+    //
+    // A ribbon cannot do it: the vertices AT a joint are shared by the quad
+    // before and the quad after, so the solid band has no interior edge to
+    // paint twice.
+    //
+    // Mutation: emit each span as its own four columns rather than sharing —
+    // `stitch(out, a, a + 4)` against a freshly appended pair. Red by vertex
+    // count (4 per point becomes 8), which is the geometric statement of the
+    // bead.
+    var dl = element.DrawList.init(testing.allocator);
+    defer dl.deinit();
+    var lc = testCtx();
+
+    const pts = [_][2]f32{ .{ 0, 0 }, .{ 10, 0 }, .{ 20, 4 }, .{ 30, 12 } };
+    try polyline(&dl, &lc, &pts, 2, .{ 1, 1, 1, 0.85 });
+
+    // One column of 4 per point, plus a cap column at each end.
+    try testing.expectEqual(@as(usize, (pts.len + 2) * 4), dl.tris.items.len);
+    // Three quads per span, and there are pts+1 spans counting the two caps.
+    try testing.expectEqual(@as(usize, (pts.len + 1) * 3 * 6), dl.tri_indices.items.len);
+
+    // Every index a real vertex, and every vertex reached: a stitch that
+    // walks off the end is a garbage triangle across the canvas, and one
+    // that skips a column is a hole in the wire.
+    var seen = [_]bool{false} ** ((pts.len + 2) * 4);
+    for (dl.tri_indices.items) |idx| {
+        try testing.expect(idx < dl.tris.items.len);
+        seen[idx] = true;
+    }
+    for (seen) |v| try testing.expect(v);
+}
+
+test "polyline: the two solid rows carry the colour and the outer two do not" {
+    // The feather is IN the mesh — four rows per column, alpha 0 on the
+    // outside — which is the same trick `stroke` uses and the only
+    // anti-aliasing the triangle layer has.
+    //
+    // Mutation: `.color = col` for every row. It draws a wire, and every wire
+    // in the graph gets the hard staircase edge the whole module exists to
+    // avoid.
+    var dl = element.DrawList.init(testing.allocator);
+    defer dl.deinit();
+    var lc = testCtx();
+
+    const pts = [_][2]f32{ .{ 0, 0 }, .{ 20, 0 } };
+    try polyline(&dl, &lc, &pts, 2, .{ 1, 1, 1, 1 });
+
+    // Columns 0 and 1 are the points; 2 and 3 are the caps.
+    for (0..2) |c| {
+        const b = c * 4;
+        try testing.expectEqual(@as(f32, 0), dl.tris.items[b].color[3]);
+        try testing.expectEqual(@as(f32, 1), dl.tris.items[b + 1].color[3]);
+        try testing.expectEqual(@as(f32, 1), dl.tris.items[b + 2].color[3]);
+        try testing.expectEqual(@as(f32, 0), dl.tris.items[b + 3].color[3]);
+    }
+    // Both caps are wholly transparent — a free end ramps out rather than
+    // stopping on a hard rectangle.
+    for (8..16) |i| try testing.expectEqual(@as(f32, 0), dl.tris.items[i].color[3]);
+    // And they sit a feather BEYOND their ends, on the line's own axis.
+    try testing.expectApproxEqAbs(-FEATHER, dl.tris.items[8].pos[0], 1e-4);
+    try testing.expectApproxEqAbs(20 + FEATHER, dl.tris.items[12].pos[0], 1e-4);
+}
+
+test "polyline: a bend MITRES, so the ribbon keeps its width through the turn" {
+    // At a joint the two segments' edges meet at an angle, and an offset of
+    // half the width along the bisector leaves a notch on the outside of
+    // every bend — visible on a wire as a scalloped edge. The bisector offset
+    // has to grow by 1/cos(θ/2).
+    //
+    // Mutation: return `.scale = 1` from `mitre`. Red here by the width
+    // measured across the joint, which is what a notch IS.
+    var dl = element.DrawList.init(testing.allocator);
+    defer dl.deinit();
+    var lc = testCtx();
+
+    // A right angle: θ/2 is 45°, so the mitre is √2 times half the width.
+    const pts = [_][2]f32{ .{ 0, 0 }, .{ 10, 0 }, .{ 10, 10 } };
+    const w: f32 = 2;
+    try polyline(&dl, &lc, &pts, w, .{ 1, 1, 1, 1 });
+
+    const inner = dl.tris.items[4 + 1].pos;
+    const outer = dl.tris.items[4 + 2].pos;
+    const dx = outer[0] - inner[0];
+    const dy = outer[1] - inner[1];
+    try testing.expectApproxEqAbs(w * @sqrt(2.0), @sqrt(dx * dx + dy * dy), 1e-3);
+}
+
+test "polyline: a cusp is clamped instead of throwing a spike" {
+    // A mitre goes to INFINITY as a polyline doubles back on itself, and a
+    // wire in hand dragged back over its own pin makes exactly that. At 180°
+    // the bisector is not even defined.
+    //
+    // Mutation: drop both guards in `mitre` and return `1 / c` whatever `c`
+    // is. Red — and on screen a triangle across the whole canvas.
+    var dl = element.DrawList.init(testing.allocator);
+    defer dl.deinit();
+    var lc = testCtx();
+
+    const pts = [_][2]f32{ .{ 0, 0 }, .{ 10, 0 }, .{ 0, 0.0001 } };
+    try polyline(&dl, &lc, &pts, 2, .{ 1, 1, 1, 1 });
+    for (dl.tris.items) |v| {
+        try testing.expect(@abs(v.pos[0]) < 40);
+        try testing.expect(@abs(v.pos[1]) < 40);
+    }
+}
+
+test "polyline: nothing to draw draws nothing" {
+    var dl = element.DrawList.init(testing.allocator);
+    defer dl.deinit();
+    var lc = testCtx();
+    const one = [_][2]f32{.{ 0, 0 }};
+    const same = [_][2]f32{ .{ 5, 5 }, .{ 5, 5 }, .{ 5, 5 } };
+    try polyline(&dl, &lc, &one, 2, .{ 1, 1, 1, 1 }); // one point
+    try polyline(&dl, &lc, &same, 2, .{ 1, 1, 1, 1 }); // no direction anywhere
+    try polyline(&dl, &lc, &.{ .{ 0, 0 }, .{ 9, 0 } }, 0, .{ 1, 1, 1, 1 }); // no width
     try testing.expectEqual(@as(usize, 0), dl.tris.items.len);
 }

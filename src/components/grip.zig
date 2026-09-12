@@ -30,6 +30,11 @@
 //!   fraction across a smaller span. See "Units" below.
 //! - `min` / `max` (optional) — clamp on the written value. Defaults 0
 //!   and 1, because a normalised pin is what this exists to drive.
+//! - `x_min` / `x_max` / `y_min` / `y_max` (optional) — a clamp for ONE
+//!   axis, overriding the shared pair on that axis only. A RESIZE grip
+//!   needs these: a panel's width and its height do not share a range,
+//!   and one pair either lets the width collapse to the height's floor
+//!   or stops it short of the height's ceiling.
 //! - `width` / `height` (optional) — the grip's own box. Defaults to the
 //!   full available width and 22px, i.e. a title bar.
 //! - `color` (optional) — fill. Default: a faint neutral that reads on
@@ -100,8 +105,21 @@ const Component = struct {
     /// surface extent at drag time.
     x_span: ?f32,
     y_span: ?f32,
+    /// The clamp on a written value. `x_`/`y_` when the document gave
+    /// one for that axis, else the shared pair.
+    ///
+    /// **Two axes with one range cannot express a resize**, which is the
+    /// gesture this grew for: a panel is 300–2000 wide and 160–1400
+    /// tall, and a single pair either lets the width collapse to the
+    /// height's floor or stops it short of the height's ceiling. A
+    /// normalised pin — what the shared pair was written for — wants the
+    /// same 0..1 on both and still gets it.
     min: f32,
     max: f32,
+    x_min: ?f32 = null,
+    x_max: ?f32 = null,
+    y_min: ?f32 = null,
+    y_max: ?f32 = null,
     width: box_helpers.Length,
     height: f32,
     color: [4]f32,
@@ -159,6 +177,14 @@ const Component = struct {
                 if (std.fmt.parseFloat(f32, attr.value)) |v| self.min = v else |_| {}
             } else if (std.mem.eql(u8, attr.key, "max")) {
                 if (std.fmt.parseFloat(f32, attr.value)) |v| self.max = v else |_| {}
+            } else if (std.mem.eql(u8, attr.key, "x_min")) {
+                if (std.fmt.parseFloat(f32, attr.value)) |v| self.x_min = v else |_| {}
+            } else if (std.mem.eql(u8, attr.key, "x_max")) {
+                if (std.fmt.parseFloat(f32, attr.value)) |v| self.x_max = v else |_| {}
+            } else if (std.mem.eql(u8, attr.key, "y_min")) {
+                if (std.fmt.parseFloat(f32, attr.value)) |v| self.y_min = v else |_| {}
+            } else if (std.mem.eql(u8, attr.key, "y_max")) {
+                if (std.fmt.parseFloat(f32, attr.value)) |v| self.y_max = v else |_| {}
             } else if (std.mem.eql(u8, attr.key, "width")) {
                 if (box_helpers.parseLength(attr.value)) |l| self.width = l;
             } else if (std.mem.eql(u8, attr.key, "height")) {
@@ -352,14 +378,14 @@ fn applyDrag(c: *Component, state: *state_mod.State, local: [2]f32) !void {
     };
 
     if (c.x_path.len > 0) {
-        const v = clampToRange(c, c.drag_start_value[0] + delta[0] / spanX(c));
+        const v = clampRange(c.drag_start_value[0] + delta[0] / spanX(c), c.x_min orelse c.min, c.x_max orelse c.max);
         if (v != c.last_written[0]) {
             try writePath(state, c.x_path, v);
             c.last_written[0] = v;
         }
     }
     if (c.y_path.len > 0) {
-        const v = clampToRange(c, c.drag_start_value[1] + delta[1] / spanY(c));
+        const v = clampRange(c.drag_start_value[1] + delta[1] / spanY(c), c.y_min orelse c.min, c.y_max orelse c.max);
         if (v != c.last_written[1]) {
             try writePath(state, c.y_path, v);
             c.last_written[1] = v;
@@ -389,10 +415,6 @@ pub fn clampRange(v: f32, min: f32, max: f32) f32 {
     // document typo.
     if (max < min) return min;
     return std.math.clamp(v, min, max);
-}
-
-fn clampToRange(c: *const Component, v: f32) f32 {
-    return clampRange(v, c.min, c.max);
 }
 
 fn readPath(state: *const state_mod.State, path: []const u8) ?f32 {

@@ -36,7 +36,9 @@ struct QuadInstance {
                     // think in RGBA without doing the multiplication
                     // by hand.
     float radius;   // corner radius in pixels (0 = sharp corners).
-    float _pad0;
+    float nose;     // taper on the RIGHT end, in pixels (0 = square).
+                    // Took a pad slot, so the 48-byte std430 stride is
+                    // unchanged and no other instance had to be touched.
     float _pad1;
     float _pad2;
 };
@@ -49,6 +51,7 @@ layout(location = 0) out vec2 v_local;     // pixel offset within quad
 layout(location = 1) out vec2 v_size;
 layout(location = 2) out vec4 v_color;
 layout(location = 3) flat out float v_radius;
+layout(location = 4) flat out float v_nose;
 
 const vec2 CORNERS[6] = vec2[6](
     vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
@@ -65,4 +68,5 @@ void main() {
     v_size = q.dst_size;
     v_color = q.color;
     v_radius = q.radius;
+    v_nose = q.nose;
 }

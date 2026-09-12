@@ -51,9 +51,12 @@
 //!
 //! Records:
 //!
-//!   * `node id= x= y= [w=] [h=] [label=] [tint=]` — declares a node at a
-//!     graph-space top-left. `w`/`h` override the size the pin count
-//!     would otherwise pick.
+//!   * `node id= x= y= [w=] [h=] [label=] [tint=] [ring=]` — declares a
+//!     node at a graph-space top-left. `w`/`h` override the size the pin
+//!     count would otherwise pick; `ring` overrides its resting outline,
+//!     which is how a host marks the few nodes in a graph that are not
+//!     operators. A node with no LABELLED pin and at most one row is
+//!     drawn as its title bar alone, with no body.
 //!   * `pin node= id= dir=in|out [label=] [type=<token>]` — hangs a pin
 //!     on a declared node. Order within a direction is the order the
 //!     lines appear in. `type` is an OPAQUE token; see below.
@@ -277,6 +280,17 @@ const PIN_BOTTOM: f32 = 12;
 /// A node with no pins at all is still a node you can grab.
 const NODE_MIN_H: f32 = HEADER_H + 18;
 const NODE_RADIUS: f32 = 5;
+/// How far the right end of a bare node tapers to a point, in graph
+/// units.
+///
+/// **Only a node that OUTPUTS gets one.** Chris, 2026-09-12, once the
+/// externals had lost their bodies: *"they do resemble edge connector
+/// pins on circuit diagrams quite a lot now. I'm wondering can we make
+/// the output port side on the right of these 'pins' slightly
+/// triangular."* A taper is an arrow, and an arrow on a node with
+/// nothing leaving it points at nothing — `spawn1` and `perish1` are
+/// bare too, and they stay rectangular.
+const NOSE_W: f32 = 12;
 /// How far the selection / hover ring stands out past the body.
 const RING_PAD: f32 = 2.0;
 
@@ -340,22 +354,33 @@ const LINK_W: f32 = 1.8;
 const LINK_TANGENT_FRAC: f32 = 0.55;
 const LINK_TANGENT_MIN: f32 = 24;
 const LINK_TANGENT_MAX: f32 = 180;
-/// Roughly how many screen pixels of arc one flattened segment covers,
-/// and the bounds either side. The count is derived from the SCREEN
-/// chord, so a zoomed-out graph costs proportionally less.
-const LINK_PX_PER_SEG: f32 = 22.0;
-const LINK_MIN_SEGS: usize = 3;
-const LINK_MAX_SEGS: usize = 24;
-/// How far past each joint a segment is extended, in screen pixels.
+/// How far, in SCREEN pixels, a flattened wire may stray from the curve
+/// it stands for. The flattening spends points to hold this, so it is
+/// the only tuning knob the shape of a wire has.
 ///
-/// `relief.stroke` feathers its CAPS as well as its sides, so two
-/// segments that butt exactly leave a seam of half-alpha down the join —
-/// the same "two edge treatments a pixel apart" artefact the trackball's
-/// rims had. `:::curve` hides its joints under pucks; a wire has no
-/// pucks, so the segments have to overlap instead. It must exceed
-/// `relief.FEATHER`, or the overlap lands inside the feather and the
-/// seam survives.
-const LINK_JOINT_OVERLAP: f32 = relief.FEATHER + 0.75;
+/// **This replaced a segment COUNT, and the difference is where the
+/// points go.** A count spread evenly over `t` puts most of them in a
+/// cubic's straight middle and starves its ends, which is exactly
+/// backwards — a wire's curvature is all in the two bends where it
+/// leaves and arrives. Chris, 2026-09-12: *"it's not just the dots —
+/// should probably do adaptive refinement of line segment length based
+/// on curvature."*
+///
+/// A pixel tolerance also makes the zoom rule disappear rather than be
+/// implemented: flatness is measured on the SCREEN curve, so a graph
+/// zoomed out to a fifth is a smaller curve and flattens to fewer
+/// points for free. The old `segmentCount` had to multiply by zoom by
+/// hand to get that.
+///
+/// 0.2px against a 1.8px wire with a 1px feather: a fifth of the fade,
+/// which is not a thing anyone can see.
+const LINK_FLATNESS: f32 = 0.2;
+/// The ceiling on one wire's flattened points, and so on its cost.
+///
+/// Reached only by a curve far longer than a viewport — see
+/// `flattenCubic`, which gets COARSER at the far end rather than
+/// stopping short of the pin.
+const LINK_MAX_PTS: usize = 192;
 
 /// Below this zoom a label is a smudge, and rasterising it at that size
 /// costs a fresh face per zoom level. So labels have a floor and simply
@@ -444,6 +469,18 @@ pub const Node = struct {
     h_given: bool = false,
     in_count: u32 = 0,
     out_count: u32 = 0,
+    /// Drawn as its title bar alone, with no body under it — see
+    /// `finalise`, which is the only place this is decided.
+    bare: bool = false,
+    /// The resting ring, when the description asked for one.
+    ///
+    /// **The host's word about which nodes are special, and spark never
+    /// guesses it.** A graph usually has a handful of nodes that are not
+    /// operators — a constant, a subscription to something outside, a
+    /// note — and only the host knows which. Hover and selection still
+    /// win over it: a ring that cannot say "this one is selected" is a
+    /// ring that has taken the state channel for decoration.
+    ring: ?[4]f32 = null,
 };
 
 pub const Pin = struct {
@@ -633,64 +670,110 @@ fn cubicAt(p0: [2]f32, c0: [2]f32, c1: [2]f32, p1: [2]f32, t: f32) [2]f32 {
     };
 }
 
-/// Flatten a cubic into `n` straight segments, each **extended past both
-/// of its joints by `overlap`** along its own direction.
+/// Flatten a cubic to a polyline that is nowhere further than `tol`
+/// from the true curve, **spending points where the curve BENDS**.
 ///
-/// The extension is the whole point and is why this is not three lines
-/// inline at the call site. `relief.stroke` feathers its caps, so
-/// segments that butt exactly leave a half-alpha seam down every joint —
-/// visible as a dotted line along a wire. Extending both ends puts each
-/// segment's solid body over its neighbour's feather.
+/// Recursive de Casteljau subdivision, the standard one: a piece whose
+/// control points lie within `tol` of its own chord is emitted as that
+/// chord, and anything else is split in half and both halves asked
+/// again. So a wire's two bends get a point every few pixels and its
+/// straight middle gets none — which is the whole difference from
+/// sampling `t` uniformly, where the count is set by the bends and then
+/// paid for over the straight part as well.
 ///
-/// Called in SCREEN space, because `overlap` has to be compared against
-/// `relief.FEATHER`, which is a pixel.
+/// Called in SCREEN space. `tol` is a pixel tolerance, and that is what
+/// makes the zoom rule fall out instead of being written: a graph
+/// zoomed out is a smaller curve, closer to its chords, and flattens to
+/// fewer points on its own.
 ///
-/// Returns the prefix of `buf` that was written. `n` is clamped to what
-/// `buf` can hold, so a caller cannot overrun by asking for more.
-pub fn linkSegments(
-    buf: []Seg,
+/// **The flatness test is not only perpendicular distance.** A control
+/// point may sit close to the chord's LINE while projecting far off its
+/// ends, and that is a curve doubling back, not a flat one. It is
+/// reachable here, not theoretical: a wire whose consumer is LEFT of
+/// its producer leaves rightwards, comes back, and leaves rightwards
+/// again, and its chord points the other way. So the projection is
+/// bounded too.
+///
+/// Returns the prefix of `buf` written, `p0` first and `p1` last. If
+/// `buf` runs out the flattening gets COARSER at the far end and the
+/// last point is still `p1` — a wire that stopped short of its pin
+/// would be a worse failure than a visible chord.
+pub fn flattenCubic(
+    buf: [][2]f32,
     p0: [2]f32,
     c0: [2]f32,
     c1: [2]f32,
     p1: [2]f32,
-    n_in: usize,
-    overlap: f32,
-) []Seg {
-    const n = @min(@max(n_in, 1), buf.len);
-    var prev = p0;
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        const t: f32 = @as(f32, @floatFromInt(i + 1)) / @as(f32, @floatFromInt(n));
-        const next = if (i + 1 == n) p1 else cubicAt(p0, c0, c1, p1, t);
-        const dx = next[0] - prev[0];
-        const dy = next[1] - prev[1];
-        const len = @sqrt(dx * dx + dy * dy);
-        if (len > 1e-6) {
-            const ux = dx / len * overlap;
-            const uy = dy / len * overlap;
-            buf[i] = .{
-                .a = .{ prev[0] - ux, prev[1] - uy },
-                .b = .{ next[0] + ux, next[1] + uy },
-            };
-        } else {
-            buf[i] = .{ .a = prev, .b = next };
+    tol: f32,
+) []const [2]f32 {
+    if (buf.len < 2) return buf[0..0];
+    buf[0] = p0;
+    var n: usize = 1;
+
+    const Piece = struct { p0: [2]f32, c0: [2]f32, c1: [2]f32, p1: [2]f32, depth: u8 };
+    // A binary tree walked depth-first holds at most depth+1 pieces,
+    // because each step pops one and pushes two.
+    const MAX_DEPTH: u8 = 16;
+    var stack: [MAX_DEPTH + 2]Piece = undefined;
+    stack[0] = .{ .p0 = p0, .c0 = c0, .c1 = c1, .p1 = p1, .depth = 0 };
+    var sp: usize = 1;
+
+    while (sp > 0) {
+        sp -= 1;
+        const q = stack[sp];
+        // Splitting needs a free slot for the extra point and room for
+        // the half that is not walked next. Out of either, this piece
+        // is taken as flat — the coarsening the doc comment promises.
+        const may_split = n + 1 < buf.len and sp + 2 <= stack.len and q.depth < MAX_DEPTH;
+        if (may_split and !flatEnough(q.p0, q.c0, q.c1, q.p1, tol)) {
+            const m0 = mid(q.p0, q.c0);
+            const m1 = mid(q.c0, q.c1);
+            const m2 = mid(q.c1, q.p1);
+            const m3 = mid(m0, m1);
+            const m4 = mid(m1, m2);
+            const m5 = mid(m3, m4);
+            // Right first, so the LEFT half is the next one popped and
+            // the points come out in order along the curve.
+            stack[sp] = .{ .p0 = m5, .c0 = m4, .c1 = m2, .p1 = q.p1, .depth = q.depth + 1 };
+            stack[sp + 1] = .{ .p0 = q.p0, .c0 = m0, .c1 = m3, .p1 = m5, .depth = q.depth + 1 };
+            sp += 2;
+            continue;
         }
-        prev = next;
+        buf[n] = q.p1;
+        n += 1;
+        if (n == buf.len) break;
     }
+    // Whatever was dropped, the wire ends on its pin.
+    buf[n - 1] = p1;
     return buf[0..n];
 }
 
-/// How many segments a link is worth, from its SCREEN chord. A wire
-/// stretched across the viewport gets more than a stub between adjacent
-/// nodes, and a graph zoomed out to fit pays proportionally less.
-pub fn segmentCount(p0: [2]f32, p1: [2]f32, zoom: f32) usize {
-    const dx = (p1[0] - p0[0]) * zoom;
-    const dy = (p1[1] - p0[1]) * zoom;
-    const chord = @sqrt(dx * dx + dy * dy);
-    const n: f32 = @round(chord / LINK_PX_PER_SEG);
-    if (!(n > @as(f32, @floatFromInt(LINK_MIN_SEGS)))) return LINK_MIN_SEGS;
-    if (n > @as(f32, @floatFromInt(LINK_MAX_SEGS))) return LINK_MAX_SEGS;
-    return @intFromFloat(n);
+fn mid(a: [2]f32, b: [2]f32) [2]f32 {
+    return .{ (a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5 };
+}
+
+/// Is this cubic within `tol` of its own chord, both across and along?
+///
+/// Conservative on purpose: the curve's own deviation is at most
+/// three-quarters of its control points', so holding the control points
+/// to `tol` holds the curve to less.
+fn flatEnough(p0: [2]f32, c0: [2]f32, c1: [2]f32, p1: [2]f32, tol: f32) bool {
+    const ux = p1[0] - p0[0];
+    const uy = p1[1] - p0[1];
+    const len2 = ux * ux + uy * uy;
+    // A chord of no length is a loop closing on itself, never flat.
+    // The depth cap, not this, is what stops the recursion.
+    if (!(len2 > 1e-12)) return false;
+    const len = @sqrt(len2);
+    const slack = tol / len;
+    for ([2][2]f32{ c0, c1 }) |c| {
+        const vx = c[0] - p0[0];
+        const vy = c[1] - p0[1];
+        if (@abs(vx * -uy + vy * ux) / len > tol) return false;
+        const t = (vx * ux + vy * uy) / len2;
+        if (t < -slack or t > 1 + slack) return false;
+    }
+    return true;
 }
 
 /// Liang–Barsky. Trim a segment to `r`, or report that none of it is
@@ -728,6 +811,67 @@ pub fn clipSegment(seg: Seg, r: Rect) ?Seg {
         .a = .{ seg.a[0] + t0 * dx, seg.a[1] + t0 * dy },
         .b = .{ seg.a[0] + t1 * dx, seg.a[1] + t1 * dy },
     };
+}
+
+/// Every maximal run of `pts` that is inside `r`, one run per `next`.
+///
+/// A polyline cannot be handed to `clipSegment` a segment at a time and
+/// stroked piecewise — that is the per-segment drawing this file gave
+/// up, and it would bring the seams back at the canvas edge. So the
+/// CLIP produces polylines too: a run ends where a segment leaves the
+/// rectangle or is wholly outside it, and the next run begins where one
+/// comes back.
+///
+/// `buf` is where a run is assembled and is only valid until the next
+/// call. It bounds a run's length; a run longer than it simply breaks
+/// into two, which costs one joint and no correctness.
+pub const RunIter = struct {
+    pts: []const [2]f32,
+    r: Rect,
+    buf: [][2]f32,
+    i: usize = 0,
+
+    pub fn next(self: *RunIter) ?[]const [2]f32 {
+        var n: usize = 0;
+        while (self.i + 1 < self.pts.len) {
+            const vis = clipSegment(.{ .a = self.pts[self.i], .b = self.pts[self.i + 1] }, self.r);
+            if (vis) |v| {
+                if (n == 0) {
+                    if (self.buf.len < 2) return null;
+                    self.buf[0] = v.a;
+                    self.buf[1] = v.b;
+                    n = 2;
+                } else if (n < self.buf.len and joins(self.buf[n - 1], v.a)) {
+                    self.buf[n] = v.b;
+                    n += 1;
+                } else {
+                    // This piece starts somewhere the run did not end —
+                    // the previous segment was trimmed at its far edge —
+                    // or the buffer is full. Hand back what there is and
+                    // reconsider this same segment next time, WITHOUT
+                    // advancing, so it opens the next run.
+                    return self.buf[0..n];
+                }
+            } else if (n > 0) {
+                self.i += 1;
+                return self.buf[0..n];
+            }
+            self.i += 1;
+        }
+        return if (n > 0) self.buf[0..n] else null;
+    }
+};
+
+/// Did a clipped segment begin exactly where the last one ended?
+///
+/// `clipSegment` returns an untrimmed end as `a + 0 * d`, which is
+/// bit-identical to `a`, so this could be equality. It is a tolerance
+/// instead because the alternative to a false join is a false BREAK,
+/// and a break puts a seam in the middle of a wire; a quarter of a
+/// pixel cannot merge two runs that are really apart, since runs are
+/// separated by a canvas edge crossing.
+fn joins(a: [2]f32, b: [2]f32) bool {
+    return @abs(a[0] - b[0]) < 0.25 and @abs(a[1] - b[1]) < 0.25;
 }
 
 // ── The description, and the public door to it ──────────────────────
@@ -906,6 +1050,8 @@ pub const Description = struct {
                         }
                     } else if (std.mem.eql(u8, f.key, "tint")) {
                         if (box_helpers.parseColor(f.value)) |c| n.tint = c;
+                    } else if (std.mem.eql(u8, f.key, "ring")) {
+                        if (box_helpers.parseColor(f.value)) |c| n.ring = c;
                     }
                 }
                 if (n.id.len == 0) {
@@ -1033,14 +1179,45 @@ pub const Description = struct {
     /// description is read, because the pin count that drives the height
     /// is not known until then.
     fn finalise(self: *Description) void {
-        for (self.nodes.items) |*n| {
+        for (self.nodes.items, 0..) |*n, i| {
             if (!n.w_given) n.size[0] = NODE_W;
-            if (!n.h_given) {
+            n.bare = !n.h_given and self.isBare(@intCast(i));
+            if (n.bare) {
+                n.size[1] = HEADER_H;
+            } else if (!n.h_given) {
                 const rows: f32 = @floatFromInt(@max(n.in_count, n.out_count));
                 const h = HEADER_H + PIN_TOP + @max(rows - 1, 0) * PIN_PITCH + PIN_BOTTOM;
                 n.size[1] = @max(h, NODE_MIN_H);
             }
         }
+    }
+
+    /// Has this node anything to put in a body?
+    ///
+    /// A body exists to hold labelled pin rows. A node with none — a
+    /// host's chip standing for a constant or a plane path, a sink or a
+    /// source whose ports are all implied — currently draws an empty
+    /// dark panel under its title bar, which says "there is something
+    /// here" about nothing. Chris, 2026-09-12: *"the externals don't
+    /// need a body panel. the port can connect straight to the RGB
+    /// titlebar. That makes them even more distinct looking on the
+    /// graph."*
+    ///
+    /// **A row count of one is part of the test, not a shortcut.** Two
+    /// unlabelled pins would be two rows, and collapsing their node to a
+    /// 26px bar stacks them on top of each other. So the rule is what it
+    /// says: nothing to write, and nowhere it would have to go.
+    ///
+    /// This is structural and spark stays out of what a node MEANS — it
+    /// has no idea which of these is an external. A host that wants a
+    /// body keeps one by labelling a pin, which it had to do anyway for
+    /// the label to appear.
+    fn isBare(self: *const Description, node: u32) bool {
+        if (@max(self.nodes.items[node].in_count, self.nodes.items[node].out_count) > 1) return false;
+        for (self.pins.items) |p| {
+            if (p.node == node and p.label.len > 0) return false;
+        }
+        return true;
     }
 
     /// The link, if any, feeding this INPUT pin.
@@ -1198,7 +1375,13 @@ pub const Description = struct {
     pub fn pinCentre(self: *const Description, pin: u32) [2]f32 {
         const p = self.pins.items[pin];
         const n = self.nodes.items[p.node];
-        const y = n.pos[1] + HEADER_H + PIN_TOP + @as(f32, @floatFromInt(p.slot)) * PIN_PITCH;
+        // A bare node IS its title bar, so its one pin sits on the bar's
+        // centre line. Anywhere else and the wire arrives below a node
+        // that stops above it.
+        const y = if (n.bare)
+            n.pos[1] + HEADER_H * 0.5
+        else
+            n.pos[1] + HEADER_H + PIN_TOP + @as(f32, @floatFromInt(p.slot)) * PIN_PITCH;
         const x = if (p.dir == .in) n.pos[0] else n.pos[0] + n.size[0];
         return .{ x, y };
     }
@@ -1756,14 +1939,12 @@ fn drawWireInHand(
     // leaves and arrives the way a finished one would and the wire does
     // not change shape at the instant it lands.
     const far_dir: Dir = if (anchor_dir == .out) .in else .out;
-    var seg_buf: [LINK_MAX_SEGS]Seg = undefined;
-    try strokeWire(lc, out, &seg_buf, canvas, c.desc.view.zoom, .{
+    var scratch: WireScratch = .{};
+    try strokeWire(lc, out, &scratch, canvas, c.desc.view.zoom, .{
         .p0 = c.desc.view.toScreen(origin, g_anchor),
         .p1 = c.desc.view.toScreen(origin, far_g),
         .from_dir = anchor_dir,
         .to_dir = far_dir,
-        .g0 = g_anchor,
-        .g1 = far_g,
         .color = col,
     });
 }
@@ -1810,6 +1991,24 @@ fn layoutAndRender(
     return .{ .x = canvas.x, .y = canvas.y, .w = w, .h = h, .baseline = canvas.y + h };
 }
 
+/// The two control points of a wire's cubic, in screen space.
+///
+/// Tangents follow the PIN's direction rather than the wire's, so a
+/// description that wires an output to an output still draws a curve
+/// that reads, instead of a knot.
+///
+/// Its own function so a gate can ask what a wire's curve IS without
+/// re-deriving the clamp — a second copy of this arithmetic is a second
+/// answer able to drift from the one on screen.
+fn wireControls(p0: [2]f32, p1: [2]f32, from_dir: Dir, to_dir: Dir, z: f32) [2][2]f32 {
+    const gap = @abs(p1[0] - p0[0]);
+    const k = std.math.clamp(gap * LINK_TANGENT_FRAC, LINK_TANGENT_MIN * z, LINK_TANGENT_MAX * z);
+    return .{
+        .{ p0[0] + (if (from_dir == .out) k else -k), p0[1] },
+        .{ p1[0] + (if (to_dir == .out) k else -k), p1[1] },
+    };
+}
+
 /// One wire, from screen point to screen point, curved and clipped and
 /// stroked.
 ///
@@ -1821,7 +2020,7 @@ fn layoutAndRender(
 fn strokeWire(
     lc: *element.LayoutCtx,
     out: *element.DrawList,
-    seg_buf: []Seg,
+    scratch: *WireScratch,
     canvas: Rect,
     z: f32,
     w: struct {
@@ -1829,11 +2028,6 @@ fn strokeWire(
         p1: [2]f32,
         from_dir: Dir,
         to_dir: Dir,
-        /// Graph-space ends, used only to choose how many segments the
-        /// curve is worth. Screen-space would make the count depend on
-        /// where the canvas happens to sit on the page.
-        g0: [2]f32,
-        g1: [2]f32,
         color: [4]f32,
     },
 ) !void {
@@ -1843,21 +2037,26 @@ fn strokeWire(
     if (@max(w.p0[0], w.p1[0]) < canvas.x - pad or @min(w.p0[0], w.p1[0]) > canvas.x + canvas.w + pad) return;
     if (@max(w.p0[1], w.p1[1]) < canvas.y - pad or @min(w.p0[1], w.p1[1]) > canvas.y + canvas.h + pad) return;
 
-    // Tangents follow the PIN's direction rather than the wire's, so a
-    // description that wires an output to an output still draws a curve
-    // that reads, instead of a knot.
-    const gap = @abs(w.p1[0] - w.p0[0]);
-    const k = std.math.clamp(gap * LINK_TANGENT_FRAC, LINK_TANGENT_MIN * z, LINK_TANGENT_MAX * z);
-    const c0: [2]f32 = .{ w.p0[0] + (if (w.from_dir == .out) k else -k), w.p0[1] };
-    const c1: [2]f32 = .{ w.p1[0] + (if (w.to_dir == .out) k else -k), w.p1[1] };
+    const cs = wireControls(w.p0, w.p1, w.from_dir, w.to_dir, z);
+    const c0 = cs[0];
+    const c1 = cs[1];
 
-    const n = segmentCount(w.g0, w.g1, z);
-    const segs = linkSegments(seg_buf, w.p0, c0, c1, w.p1, n, LINK_JOINT_OVERLAP);
-    for (segs) |sg| {
-        const vis = clipSegment(sg, canvas) orelse continue;
-        try relief.stroke(out, lc, vis.a, vis.b, LINK_W, w.color);
+    const pts = flattenCubic(&scratch.pts, w.p0, c0, c1, w.p1, LINK_FLATNESS);
+    // One ribbon per visible run, and no joint paid for twice — see
+    // `relief.polyline`, which is where the beads down every wire came
+    // from and went.
+    var runs = RunIter{ .pts = pts, .r = canvas, .buf = &scratch.run };
+    while (runs.next()) |run| {
+        try relief.polyline(out, lc, run, LINK_W, w.color);
     }
 }
+
+/// The two buffers one wire is flattened and clipped through, held by
+/// the caller so a canvas full of wires allocates none of it per wire.
+const WireScratch = struct {
+    pts: [LINK_MAX_PTS][2]f32 = undefined,
+    run: [LINK_MAX_PTS][2]f32 = undefined,
+};
 
 fn drawCanvas(
     c: *Component,
@@ -1888,7 +2087,7 @@ fn drawCanvas(
         .wire => |w| w.detached,
         else => null,
     };
-    var seg_buf: [LINK_MAX_SEGS]Seg = undefined;
+    var scratch: WireScratch = .{};
     for (c.desc.links.items, 0..) |l, li| {
         if (held_link) |h| if (h == li) continue;
         const g0 = c.desc.pinCentre(l.from);
@@ -1899,13 +2098,11 @@ fn drawCanvas(
         const p0 = c.desc.view.toScreen(origin, g0);
         const p1 = c.desc.view.toScreen(origin, g1);
 
-        try strokeWire(lc, out, &seg_buf, canvas, z, .{
+        try strokeWire(lc, out, &scratch, canvas, z, .{
             .p0 = p0,
             .p1 = p1,
             .from_dir = from_dir,
             .to_dir = to_dir,
-            .g0 = g0,
-            .g1 = g1,
             .color = l.tint,
         });
     }
@@ -1930,16 +2127,30 @@ fn drawCanvas(
             .none => false,
         };
         const is_sel = c.selected != null and c.selected.? == i;
-        const ring: [4]f32 = if (is_sel) NODE_RING_SELECTED else if (lit) NODE_RING_HOVER else NODE_RING;
+        const ring: [4]f32 = if (is_sel) NODE_RING_SELECTED else if (lit) NODE_RING_HOVER else n.ring orelse NODE_RING;
         const ring_pad = RING_PAD * z;
+
+        // A taper is the shader's, not geometry's: the quad layer draws
+        // over the triangle layer no matter who emitted what first, so a
+        // diagonal made of triangles would sink under every wire on the
+        // canvas. `quad.frag` takes the nose as a distance and the
+        // anti-aliasing it already does covers it.
+        const nose = if (n.bare and n.out_count > 0) NOSE_W * z else 0;
+        // The ring is the same shape grown by `ring_pad`, so its taper
+        // has to grow with its height or the two edges are not parallel
+        // and the outline reads as a wedge.
+        const ring_nose = if (nose > 0) nose * (sh + 2 * ring_pad) / sh else 0;
 
         try out.appendQuad(lc, .{
             .dst_pos = .{ tl[0] - ring_pad, tl[1] - ring_pad },
             .dst_size = .{ sw + 2 * ring_pad, sh + 2 * ring_pad },
             .color = ring,
             .radius = r + ring_pad,
+            .nose = ring_nose,
         });
-        try out.appendQuad(lc, .{
+        // No body under a bare node — the header quad below is the whole
+        // of it, and it already covers the same rectangle.
+        if (!n.bare) try out.appendQuad(lc, .{
             .dst_pos = .{ tl[0], tl[1] },
             .dst_size = .{ sw, sh },
             .color = NODE_BG,
@@ -1950,6 +2161,7 @@ fn drawCanvas(
             .dst_size = .{ sw, @min(HEADER_H * z, sh) },
             .color = tinted(n.tint, NODE_HEADER_TINT),
             .radius = r,
+            .nose = nose,
         });
     }
 
@@ -3176,81 +3388,216 @@ test "nodegraph: the wheel zooms, and gives the notch back at the clamp" {
 
 // ── Link geometry ──────────────────────────────────────────────────
 
-test "nodegraph: consecutive link segments OVERLAP past the joint" {
-    // `relief.stroke` feathers its caps as well as its sides, so two
-    // segments that butt exactly leave a seam of half-alpha down the
-    // join — a wire that looks dotted. `:::curve` hides its joints under
-    // pucks; a wire has none.
-    //
-    // Mutation: in `linkSegments`, write `.a = prev, .b = next` and drop
-    // the `ux`/`uy` extension. Red on every joint, by exactly the
-    // overlap.
-    var buf: [LINK_MAX_SEGS]Seg = undefined;
-    const segs = linkSegments(
-        &buf,
-        .{ 0, 0 },
-        .{ 60, 0 },
-        .{ 140, 100 },
-        .{ 200, 100 },
-        8,
-        LINK_JOINT_OVERLAP,
-    );
-    try testing.expectEqual(@as(usize, 8), segs.len);
-    var i: usize = 0;
-    while (i + 1 < segs.len) : (i += 1) {
-        const cur = segs[i];
-        const nxt = segs[i + 1];
-        // How far `cur` reaches PAST where `nxt` begins, measured along
-        // `nxt`'s own direction. Butt-jointed this is 0; it has to
-        // exceed a feather or the overlap lands inside the fade.
-        const dx = nxt.b[0] - nxt.a[0];
-        const dy = nxt.b[1] - nxt.a[1];
-        const len = @sqrt(dx * dx + dy * dy);
-        const ux = dx / len;
-        const uy = dy / len;
-        const reach = (cur.b[0] - nxt.a[0]) * ux + (cur.b[1] - nxt.a[1]) * uy;
-        try testing.expect(reach > relief.FEATHER);
-    }
-    // The ends are still the ends, give or take the same overlap — a
-    // wire that stopped short of its pin would be worse than a seam.
-    try testing.expect(@abs(segs[0].a[0] - 0) <= LINK_JOINT_OVERLAP + 1e-3);
-    try testing.expect(@abs(segs[segs.len - 1].b[0] - 200) <= LINK_JOINT_OVERLAP + 1e-3);
-}
-
-test "nodegraph: the flattened curve tracks the cubic it came from" {
-    // Mutation: evaluate the cubic at `t = i / n` instead of
-    // `(i + 1) / n` — the last segment then never reaches `p1` and the
-    // wire stops a joint short of its pin.
-    var buf: [LINK_MAX_SEGS]Seg = undefined;
-    const p0 = [2]f32{ 0, 0 };
-    const c0 = [2]f32{ 50, 0 };
-    const c1 = [2]f32{ 50, 100 };
-    const p1 = [2]f32{ 100, 100 };
-    const segs = linkSegments(&buf, p0, c0, c1, p1, 12, 0);
-    try testing.expectApproxEqAbs(p0[0], segs[0].a[0], 1e-3);
-    try testing.expectApproxEqAbs(p1[1], segs[segs.len - 1].b[1], 1e-3);
-    // Every joint sits on the curve.
-    for (segs[0 .. segs.len - 1], 1..) |s, i| {
-        const t: f32 = @as(f32, @floatFromInt(i)) / 12.0;
+/// Worst distance from a flattened polyline to the cubic it stands for,
+/// measured by walking the CURVE densely and asking the polyline. The
+/// gates below use it because the claim being made is about the picture
+/// — how far the drawn wire is from the real one — and not about how
+/// either was built.
+fn maxDeviation(pts: []const [2]f32, p0: [2]f32, c0: [2]f32, c1: [2]f32, p1: [2]f32) f32 {
+    var worst: f32 = 0;
+    for (0..2001) |i| {
+        const t = @as(f32, @floatFromInt(i)) / 2000.0;
         const on = cubicAt(p0, c0, c1, p1, t);
-        try testing.expectApproxEqAbs(on[0], s.b[0], 1e-3);
-        try testing.expectApproxEqAbs(on[1], s.b[1], 1e-3);
+        var near: f32 = std.math.floatMax(f32);
+        for (pts[0 .. pts.len - 1], pts[1..]) |a, b| {
+            near = @min(near, distToSeg(on, a, b));
+        }
+        worst = @max(worst, near);
+    }
+    return worst;
+}
+
+fn distToSeg(p: [2]f32, a: [2]f32, b: [2]f32) f32 {
+    const dx = b[0] - a[0];
+    const dy = b[1] - a[1];
+    const len2 = dx * dx + dy * dy;
+    const t = if (len2 > 1e-12)
+        std.math.clamp(((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len2, 0, 1)
+    else
+        0;
+    const qx = a[0] + t * dx - p[0];
+    const qy = a[1] + t * dy - p[1];
+    return @sqrt(qx * qx + qy * qy);
+}
+
+/// The wire shapes the gates below measure, and what each one is for.
+/// Every one of them is a curve `strokeWire` can be asked to draw: the
+/// tangents are horizontal because that is what `wireControls` makes,
+/// and the clamp to `LINK_TANGENT_MIN` is why a short hop still bulges.
+const wire_shapes = [_][4][2]f32{
+    // An ordinary wire between two columns of nodes.
+    .{ .{ 0, 0 }, .{ 130, 0 }, .{ 70, 140 }, .{ 200, 140 } },
+    // A short hop between stacked nodes: a tight bulge on a small chord.
+    .{ .{ 0, 0 }, .{ 24, 0 }, .{ -24, 60 }, .{ 0, 60 } },
+    // A BACK EDGE — the consumer is left of the producer, so the curve
+    // swings out, returns, and swings out again over a 10px chord.
+    .{ .{ 0, 0 }, .{ 150, 0 }, .{ -140, 0 }, .{ 10, 0 } },
+    // A long back edge across the canvas.
+    .{ .{ 0, 0 }, .{ 180, 0 }, .{ -180, 300 }, .{ 20, 300 } },
+    // A long, nearly straight run — the cheap case.
+    .{ .{ 0, 0 }, .{ 400, 0 }, .{ 500, 20 }, .{ 900, 20 } },
+    // A short, nearly straight one.
+    .{ .{ 0, 0 }, .{ 24, 0 }, .{ 76, 8 }, .{ 100, 8 } },
+};
+
+test "nodegraph: every wire shape is drawn within a pixel tolerance" {
+    // The guarantee the adaptive flattener exists to make, checked
+    // against the CURVE rather than against how the polyline was built.
+    //
+    // Mutation: the rule this replaced — segments from the screen chord
+    // at 22px each, clamped to [3, 24], sampled uniformly in `t`.
+    // Measured, worst deviation per shape above:
+    //
+    //   shape   chord   adaptive            chord-derived
+    //   0        244    29 pts  0.13 px     11 segs  0.90 px
+    //   1         60    21 pts  0.12 px      3 segs  4.90 px
+    //   2         10    11 pts  0.00 px      3 segs  8.56 px
+    //   3        301    49 pts  0.14 px     14 segs  1.69 px
+    //   4        900    13 pts  0.13 px     24 segs  0.03 px
+    //   5        100     7 pts  0.07 px      5 segs  0.16 px
+    //
+    // Eight and a half pixels on shape 2 IS the report — Chris,
+    // 2026-09-12: *"the wires are a bit janky right now"*. And shape 4
+    // is the same rule's other half: twenty-four segments spent to land
+    // within a fortieth of a pixel, which nobody has ever seen.
+    for (wire_shapes, 0..) |sh, i| {
+        var buf: [LINK_MAX_PTS][2]f32 = undefined;
+        const pts = flattenCubic(&buf, sh[0], sh[1], sh[2], sh[3], LINK_FLATNESS);
+        errdefer std.debug.print("shape {d}\n", .{i});
+        try testing.expect(maxDeviation(pts, sh[0], sh[1], sh[2], sh[3]) <= LINK_FLATNESS);
+        // The ends are the pins, exactly — a wire that lands near its
+        // pin reads as a wire that is not connected.
+        try testing.expectApproxEqAbs(sh[0][0], pts[0][0], 1e-4);
+        try testing.expectApproxEqAbs(sh[0][1], pts[0][1], 1e-4);
+        try testing.expectApproxEqAbs(sh[3][0], pts[pts.len - 1][0], 1e-4);
+        try testing.expectApproxEqAbs(sh[3][1], pts[pts.len - 1][1], 1e-4);
     }
 }
 
-test "nodegraph: segment count follows the SCREEN chord, not the graph one" {
-    // Mutation: drop the `* zoom` in `segmentCount`. Red — a graph
-    // zoomed out to a tenth still pays full price for every wire, which
-    // is the cost that matters at fifty nodes.
-    const a = [2]f32{ 0, 0 };
-    const b = [2]f32{ 400, 0 };
-    try testing.expect(segmentCount(a, b, 1.0) > segmentCount(a, b, 0.2));
-    try testing.expectEqual(LINK_MIN_SEGS, segmentCount(a, .{ 4, 0 }, 1.0));
-    try testing.expectEqual(LINK_MAX_SEGS, segmentCount(a, .{ 9000, 0 }, 1.0));
-    // And `linkSegments` never writes past the buffer, whatever it is
-    // told.
-    var buf: [4]Seg = undefined;
-    try testing.expectEqual(@as(usize, 4), linkSegments(&buf, a, a, b, b, 99, 0).len);
+test "nodegraph: a wire's points follow its CURVATURE, not its length" {
+    // The inversion that no chord-derived count can produce, and the
+    // reason this is adaptive rather than better-tuned: shape 1 is a
+    // 60px hop with a tight bulge and shape 4 is a 900px run that is
+    // nearly straight. The short one needs MORE points.
+    //
+    // Mutation: any count taken from the chord — the old
+    // `@round(chord / LINK_PX_PER_SEG)` — which gives 3 and 24. Red by
+    // the ordering, not by a tuning constant.
+    var tight_buf: [LINK_MAX_PTS][2]f32 = undefined;
+    var gentle_buf: [LINK_MAX_PTS][2]f32 = undefined;
+    const tight = flattenCubic(&tight_buf, wire_shapes[1][0], wire_shapes[1][1], wire_shapes[1][2], wire_shapes[1][3], LINK_FLATNESS);
+    const gentle = flattenCubic(&gentle_buf, wire_shapes[4][0], wire_shapes[4][1], wire_shapes[4][2], wire_shapes[4][3], LINK_FLATNESS);
+    try testing.expect(tight.len > gentle.len);
+
+    // And WITHIN one wire the spacing is uneven, because the bends took
+    // the points. A uniform flattener holding the same tolerance would
+    // pass everything above except this.
+    var shortest: f32 = std.math.floatMax(f32);
+    var longest: f32 = 0;
+    for (tight[0 .. tight.len - 1], tight[1..]) |a, b| {
+        const d = distToSeg(a, b, b);
+        shortest = @min(shortest, d);
+        longest = @max(longest, d);
+    }
+    try testing.expect(longest > shortest * 4);
+}
+
+test "nodegraph: a cubic that doubles back is not mistaken for a flat one" {
+    // Both control points sit exactly ON the chord's line, so a flatness
+    // test made only of perpendicular distance calls this flat at depth
+    // zero and draws a 10px straight line where the curve swings 60px
+    // right and back. Reachable, not theoretical: a wire whose consumer
+    // is LEFT of its producer leaves rightwards, returns, and leaves
+    // again, and its chord points the other way.
+    //
+    // Mutation: drop the `t < -slack or t > 1 + slack` arm of
+    // `flatEnough`. Red — two points instead of twenty-odd.
+    const p0 = [2]f32{ 0, 0 };
+    const c0 = [2]f32{ 150, 0 };
+    const c1 = [2]f32{ -140, 0 };
+    const p1 = [2]f32{ 10, 0 };
+
+    var buf: [LINK_MAX_PTS][2]f32 = undefined;
+    const pts = flattenCubic(&buf, p0, c0, c1, p1, LINK_FLATNESS);
+    try testing.expect(pts.len > 8);
+    try testing.expect(maxDeviation(pts, p0, c0, c1, p1) <= LINK_FLATNESS);
+}
+
+test "nodegraph: flatness is measured on the SCREEN curve, so zoom pays for itself" {
+    // The same curve at a fifth of the size is a fifth as far from its
+    // chords, so it flattens to fewer points with nothing written down
+    // about zoom. The old segment count had to multiply by it by hand.
+    //
+    // Mutation: make the tolerance relative — `tol * len` in
+    // `flatEnough` — which is the tempting scale-free spelling. Red:
+    // the two counts become equal, and a fifty-node graph zoomed out to
+    // fit pays full price for every wire in it.
+    const p0 = [2]f32{ 0, 0 };
+    const c0 = [2]f32{ 130, 0 };
+    const c1 = [2]f32{ 70, 140 };
+    const p1 = [2]f32{ 200, 140 };
+    const k: f32 = 0.2;
+
+    var big: [LINK_MAX_PTS][2]f32 = undefined;
+    var small: [LINK_MAX_PTS][2]f32 = undefined;
+    const a = flattenCubic(&big, p0, c0, c1, p1, LINK_FLATNESS);
+    const b = flattenCubic(&small, .{ p0[0] * k, p0[1] * k }, .{ c0[0] * k, c0[1] * k }, .{ c1[0] * k, c1[1] * k }, .{ p1[0] * k, p1[1] * k }, LINK_FLATNESS);
+    try testing.expect(b.len < a.len);
+}
+
+test "nodegraph: a wire out of buffer gets coarser, never shorter" {
+    // Mutation: drop the `buf[n - 1] = p1` after the walk. Red — and on
+    // screen a wire that stops in mid-air near its pin, which reads as
+    // a broken connection rather than a rough one.
+    const p0 = [2]f32{ 0, 0 };
+    const c0 = [2]f32{ 400, -300 };
+    const c1 = [2]f32{ -400, 300 };
+    const p1 = [2]f32{ 900, 40 };
+    var tiny: [6][2]f32 = undefined;
+    const pts = flattenCubic(&tiny, p0, c0, c1, p1, LINK_FLATNESS);
+    try testing.expect(pts.len <= tiny.len);
+    try testing.expectApproxEqAbs(p1[0], pts[pts.len - 1][0], 1e-4);
+    try testing.expectApproxEqAbs(p1[1], pts[pts.len - 1][1], 1e-4);
+    // And a buffer too small to hold a line at all is refused, not
+    // overrun.
+    var one: [1][2]f32 = undefined;
+    try testing.expectEqual(@as(usize, 0), flattenCubic(&one, p0, c0, c1, p1, 1).len);
+}
+
+test "nodegraph: clipping a wire yields RUNS, not loose segments" {
+    // A polyline clipped segment-at-a-time and stroked piecewise brings
+    // back the per-segment drawing this file gave up — seams and all —
+    // at the canvas edge. So the clip produces polylines: one run per
+    // visit, broken only where the wire actually leaves the rectangle.
+    //
+    // Mutation: in `RunIter.next`, return after every segment. Red — 5
+    // runs of 2 points instead of 1 run of 6, which is 5 ribbons with
+    // 4 feathered caps butting inside the canvas.
+    const r = Rect{ .x = 0, .y = 0, .w = 100, .h = 100 };
+    var run: [LINK_MAX_PTS][2]f32 = undefined;
+
+    const inside = [_][2]f32{ .{ 10, 10 }, .{ 20, 20 }, .{ 30, 30 }, .{ 40, 40 }, .{ 50, 50 }, .{ 60, 60 } };
+    var it = RunIter{ .pts = &inside, .r = r, .buf = &run };
+    const whole = it.next().?;
+    try testing.expectEqual(inside.len, whole.len);
+    try testing.expectEqual(@as(?[]const [2]f32, null), it.next());
+
+    // Out and back: two runs, each trimmed at the edge it crossed, and
+    // nothing in between.
+    const out_and_back = [_][2]f32{ .{ 10, 50 }, .{ 40, 50 }, .{ 200, 50 }, .{ 400, 50 }, .{ 200, 50 }, .{ 40, 60 }, .{ 10, 60 } };
+    var it2 = RunIter{ .pts = &out_and_back, .r = r, .buf = &run };
+    const first = it2.next().?;
+    try testing.expectApproxEqAbs(@as(f32, 10), first[0][0], 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 100), first[first.len - 1][0], 1e-3);
+    const second = it2.next().?;
+    try testing.expectApproxEqAbs(@as(f32, 100), second[0][0], 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 10), second[second.len - 1][0], 1e-3);
+    try testing.expectEqual(@as(?[]const [2]f32, null), it2.next());
+
+    // A wire nowhere near the canvas draws nothing at all.
+    const far = [_][2]f32{ .{ 500, 500 }, .{ 600, 600 } };
+    var it3 = RunIter{ .pts = &far, .r = r, .buf = &run };
+    try testing.expectEqual(@as(?[]const [2]f32, null), it3.next());
 }
 
 test "nodegraph: a label centres on its row, descender and all" {
@@ -3320,14 +3667,21 @@ test "nodegraph: links are TRIANGLES and node chrome is QUADS" {
     const canvas = Rect{ .x = 0, .y = 0, .w = 600, .h = 400 };
     try drawCanvas(c, canvas, &lc, &dl);
 
+    // What the one link costs, asked of the same arithmetic that drew
+    // it: a ribbon is a column of 4 vertices per point plus two end
+    // caps, and three quads between each pair of columns.
     const l = c.desc.links.items[0];
-    const segs = segmentCount(c.desc.pinCentre(l.from), c.desc.pinCentre(l.to), c.desc.view.zoom);
+    const origin = [2]f32{ canvas.x, canvas.y };
+    const wp0 = c.desc.view.toScreen(origin, c.desc.pinCentre(l.from));
+    const wp1 = c.desc.view.toScreen(origin, c.desc.pinCentre(l.to));
+    const cs = wireControls(wp0, wp1, c.desc.pins.items[l.from].dir, c.desc.pins.items[l.to].dir, c.desc.view.zoom);
+    var pt_buf: [LINK_MAX_PTS][2]f32 = undefined;
+    const pts = flattenCubic(&pt_buf, wp0, cs[0], cs[1], wp1, LINK_FLATNESS).len;
 
-    // Triangles: the ground's 4 vertices and 16 per link segment. No
-    // grid at this zoom, no labels, and — the point — nothing from a
-    // node.
-    try testing.expectEqual(@as(usize, 4 + 16 * segs), dl.tris.items.len);
-    try testing.expectEqual(@as(usize, 6 + 54 * segs), dl.tri_indices.items.len);
+    // Triangles: the ground's 4 vertices and the wire's. No grid at this
+    // zoom, no labels, and — the point — nothing from a node.
+    try testing.expectEqual(@as(usize, 4 + (pts + 2) * 4), dl.tris.items.len);
+    try testing.expectEqual(@as(usize, 6 + (pts + 1) * 18), dl.tri_indices.items.len);
 
     // Quads: ring + body + header per node, one per pin.
     try testing.expectEqual(
@@ -3408,6 +3762,147 @@ test "nodegraph: selection and hover reach the picture" {
         const owner = c.desc.pins.items[1].node;
         try testing.expectEqual(NODE_RING_HOVER, dl.quads.items[3 * owner].color);
     }
+}
+
+test "nodegraph: a node with nothing to say draws as its title bar alone" {
+    // A body exists to hold labelled pin rows. A node with none — a
+    // host's chip standing for a constant or an outside value — drew an
+    // empty dark panel saying "there is something here" about nothing.
+    // Chris, 2026-09-12: *"the externals don't need a body panel. the
+    // port can connect straight to the RGB titlebar."*
+    //
+    // Mutation: `n.bare = false` in `finalise`. Red three ways at once —
+    // the height, the pin's y, and the body quad — which is the point:
+    // they are one decision and they must not be able to disagree.
+    const c = try makeGraph(
+        \\node id=chip x=0 y=0 label="row.seed"
+        \\node id=sink x=200 y=0 label="Sink"
+        \\node id=pair x=400 y=0 label="Pair"
+        \\pin node=chip id=o0 dir=out
+        \\pin node=sink id=a dir=in label="a"
+        \\pin node=pair id=o0 dir=out
+        \\pin node=pair id=o1 dir=out
+    , &.{});
+    defer dropGraph(c);
+
+    const chip = c.desc.nodes.items[0];
+    const sink = c.desc.nodes.items[1];
+    const pair = c.desc.nodes.items[2];
+
+    try testing.expect(chip.bare);
+    try testing.expectApproxEqAbs(HEADER_H, chip.size[1], 1e-4);
+    // Its one pin sits on the bar's centre line — anywhere else and the
+    // wire arrives below a node that stops above it.
+    try testing.expectApproxEqAbs(chip.pos[1] + HEADER_H * 0.5, c.desc.pinCentre(0)[1], 1e-4);
+
+    // A LABELLED pin is something to write, so that node keeps its body.
+    try testing.expect(!sink.bare);
+    try testing.expect(sink.size[1] > HEADER_H);
+
+    // **Two unlabelled pins are two ROWS**, and collapsing their node to
+    // a 26px bar would stack them on each other. The row count is part
+    // of the test, not a shortcut.
+    //
+    // Mutation: drop the `> 1` arm of `isBare`. Red here, and on screen
+    // two pins in the same place.
+    try testing.expect(!pair.bare);
+    try testing.expect(c.desc.pinCentre(2)[1] != c.desc.pinCentre(3)[1]);
+}
+
+test "nodegraph: a bare node emits no body quad, and a tapered one says so in the SHADER" {
+    // Two claims that have to be checked on the draw list, because both
+    // are about what reaches the GPU.
+    //
+    // The taper is the shader's and not geometry's, and that is forced:
+    // the quad layer draws OVER the triangle layer whatever order things
+    // were emitted in, so a diagonal built from triangles would sink
+    // under every wire on the canvas. Chris, 2026-09-12: *"can we do it
+    // mathematically in the shader?"*
+    //
+    // Mutation: drop `.nose` from the two `appendQuad` calls. It
+    // compiles and draws rectangles, and the connector look Chris asked
+    // for is silently gone with no gate to say so.
+    const c = try makeGraph(
+        \\node id=chip x=0 y=0 label="row.seed" ring=#c2c8d4
+        \\node id=quiet x=200 y=0 label="spawn1"
+        \\pin node=chip id=o0 dir=out
+    , &.{});
+    defer dropGraph(c);
+    // Under the label floor: `testCtx` hands out a LayoutCtx with no
+    // device behind it, and any glyph path touching it aborts.
+    c.desc.view = .{ .pan = .{ 0, 0 }, .zoom = GRIDLESS_ZOOM };
+
+    var dl = element.DrawList.init(testing.allocator);
+    defer dl.deinit();
+    var lc = testCtx();
+    try drawCanvas(c, .{ .x = 0, .y = 0, .w = 600, .h = 400 }, &lc, &dl);
+
+    // Ring + header for each bare node — no body between them — plus one
+    // pin. Three quads per node would be a body drawn under a bar that
+    // covers it exactly, which costs a quad to look identical.
+    try testing.expectEqual(@as(usize, 2 + 2 + 1), dl.quads.items.len);
+
+    // The chip outputs, so it tapers; its ring's taper grows with the
+    // ring's height, or the two edges are not parallel and the outline
+    // reads as a wedge rather than an outline.
+    //
+    // Mutation: `.nose = nose` on the ring quad too. Red by the ratio,
+    // and on screen a ring that pinches in at the tip.
+    const chip_ring = dl.quads.items[0];
+    const chip_bar = dl.quads.items[1];
+    try testing.expect(chip_bar.nose > 0);
+    try testing.expect(chip_ring.nose > chip_bar.nose);
+    try testing.expectApproxEqAbs(
+        chip_bar.nose / chip_bar.dst_size[1],
+        chip_ring.nose / chip_ring.dst_size[1],
+        1e-4,
+    );
+
+    // **A node with nothing leaving it does not taper.** An arrow on a
+    // node with no output points at nothing — `spawn1` and `perish1` are
+    // bare too, and they stay rectangular.
+    //
+    // Mutation: drop `and n.out_count > 0`. Red, and the graph grows
+    // arrows that mean nothing.
+    try testing.expect(c.desc.nodes.items[1].bare);
+    try testing.expectEqual(@as(f32, 0), dl.quads.items[3].nose);
+}
+
+test "nodegraph: `ring=` is the HOST's word, and selection still wins over it" {
+    // A graph has a handful of nodes that are not operators, and only
+    // the host knows which — spark must not guess. But a ring that
+    // cannot say "this one is selected" has taken the state channel for
+    // decoration, so hover and selection override it.
+    //
+    // Mutation: `else n.ring orelse NODE_RING` moved ahead of the
+    // selected/hover arms. Red on the second half — and on screen a
+    // reader can no longer tell which external they just clicked.
+    const c = try makeGraph(
+        \\node id=chip x=0 y=0 label="c" ring=#d8ab52
+        \\node id=plain x=200 y=0 label="p"
+        \\pin node=chip id=o0 dir=out
+        \\pin node=plain id=o0 dir=out
+    , &.{});
+    defer dropGraph(c);
+    c.desc.view = .{ .pan = .{ 0, 0 }, .zoom = GRIDLESS_ZOOM };
+
+    try testing.expect(c.desc.nodes.items[0].ring != null);
+    try testing.expectApproxEqAbs(@as(f32, 0xd8) / 255.0, c.desc.nodes.items[0].ring.?[0], 0.01);
+    // Said nothing, so spark's own — not a ring of transparent black,
+    // which is what a non-optional field defaulting to zero would give.
+    try testing.expectEqual(@as(?[4]f32, null), c.desc.nodes.items[1].ring);
+
+    var dl = element.DrawList.init(testing.allocator);
+    defer dl.deinit();
+    var lc = testCtx();
+    const canvas = Rect{ .x = 0, .y = 0, .w = 600, .h = 400 };
+    try drawCanvas(c, canvas, &lc, &dl);
+    try testing.expectApproxEqAbs(@as(f32, 0xd8) / 255.0, dl.quads.items[0].color[0], 0.01);
+
+    c.selected = 0;
+    dl.clearRetainingCapacity();
+    try drawCanvas(c, canvas, &lc, &dl);
+    try testing.expectEqual(NODE_RING_SELECTED, dl.quads.items[0].color);
 }
 
 test "nodegraph: a node panned off the canvas costs nothing" {

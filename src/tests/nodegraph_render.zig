@@ -107,28 +107,29 @@ test "nodegraph: fifty nodes cost what the report says they cost" {
     defer allocator.free(src);
     const c = try renderDoc(allocator, &fx, src);
 
-    // Measured 2026-09-09, all fifty on screen at zoom 1:
+    // Measured 2026-09-12, all fifty on screen at zoom 1:
     //
     //   quads   300     = 3 per node (ring, body, header) + 1 per pin.
-    //   tris    6132    = 4 ground + 4 per grid rule + 16 per link
-    //                     SEGMENT. The wires are ~5900 of it; the grid
-    //                     and the ground are the rest.
-    //   indices 20208   = 6 ground + 6 per rule + 54 per segment.
+    //   tris    1584    = 4 ground + 4 per grid rule + one RIBBON per
+    //                     link: 4 vertices per flattened point, plus two
+    //                     end caps.
+    //   indices 5466    = 6 ground + 6 per rule + 18 per ribbon span.
     //   glyphs  440     = a node title plus three one-character pin
     //                     labels each, spaces excluded (a space has no
     //                     bitmap, so `appendShapedRun` emits nothing).
     //
-    // One link is ~10 segments here, so ~160 vertices — which is why the
-    // segment count comes off the SCREEN chord and not the graph one
-    // (`segmentCount`), and why the labels have a zoom floor. Both are
-    // the difference between a graph that gets cheaper as you pull back
-    // and one that does not.
+    // **This was 6132 tris and 20208 indices the day before**, when a
+    // wire was N separate `relief.stroke` calls at 16 vertices each. A
+    // quarter of the cost, and the wires are smoother: the flattening
+    // is adaptive now, and these links are short and nearly straight,
+    // so they are worth a handful of points each instead of a fixed ten
+    // segments. See `flattenCubic`.
     //
     // These are envelopes, not fingerprints: a colour change or one more
     // rule of grid must not fail a cost gate. A doubling must.
     try testing.expect(c.quads > 150 and c.quads < 450);
-    try testing.expect(c.tris > 3_000 and c.tris < 14_000);
-    try testing.expect(c.tri_indices > 10_000 and c.tri_indices < 48_000);
+    try testing.expect(c.tris > 800 and c.tris < 4_000);
+    try testing.expect(c.tri_indices > 2_500 and c.tri_indices < 14_000);
     try testing.expect(c.glyphs > 300 and c.glyphs < 2_000);
 
     // One hit for the whole canvas, and it is the component's own —
@@ -165,8 +166,19 @@ test "nodegraph: zooming out drops the labels, and most of the cost with them" {
     // comparison and not an expectation of zero.
     try testing.expect(c_far.glyphs < c_near.glyphs);
     try testing.expect(c_far.glyphs * 4 < c_near.glyphs);
-    // And each wire is worth fewer segments at a quarter of the scale.
-    try testing.expect(c_far.tris < c_near.tris);
+
+    // **There is deliberately no triangle assertion here.** There used
+    // to be one — "each wire is worth fewer segments at a quarter of
+    // the scale" — and it passed for two days while measuring something
+    // else: at zoom 1 most of a fifty-node graph is off-canvas and
+    // rejected by a rect test, and at 0.25 it all fits. The old count
+    // was expensive enough per wire to swamp that; the adaptive one is
+    // not, and the measured totals went 1584 near against 2012 far.
+    // More wires, each cheaper.
+    //
+    // The per-wire claim is real and is gated where it can be measured
+    // alone: `nodegraph: flatness is measured on the SCREEN curve, so
+    // zoom pays for itself`. A total over a canvas cannot see it.
 }
 
 /// One node, one input label and one output label, and nothing else in

@@ -31,6 +31,10 @@ const c = vk.c;
 ///     output so theme authors can think in straight RGBA when
 ///     declaring `quote_bar_color = .{ R, G, B, A }`.
 ///   * `radius` is corner radius in display pixels; 0 = sharp.
+///   * `nose` tapers the RIGHT end to a point over that many display
+///     pixels; 0 = square. It took one of the three pad floats, so the
+///     stride is unchanged and no caller that never asks for a taper
+///     had to learn the field exists.
 ///   * std430 pads the struct to a multiple of 16 (the vec4
 ///     alignment). Total stride: 48 bytes (16 + 16 + 16).
 pub const QuadInstance = extern struct {
@@ -38,7 +42,7 @@ pub const QuadInstance = extern struct {
     dst_size: [2]f32,
     color: [4]f32,
     radius: f32,
-    _pad0: f32 = 0,
+    nose: f32 = 0,
     _pad1: f32 = 0,
     _pad2: f32 = 0,
 };
