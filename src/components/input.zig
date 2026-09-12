@@ -328,6 +328,24 @@ const Component = struct {
     allocator: std.mem.Allocator,
     target: []u8, // stripped of leading `#`
     action: []u8,
+    /// `scrubbing=state.<key>` — where to SAY that a scrub is in progress.
+    ///
+    /// **A gesture, not a value, and that is the whole point.** A host with one
+    /// control over many objects needs a scrub to be RELATIVE (nudge them all)
+    /// and a typed value to be ABSOLUTE (set them all), and the two arrive here
+    /// as the same thing: a number in `target`. Chris, 2026-09-12, on three
+    /// selected lights: *"if I scrub X, Y, Z, it snaps all three to that X
+    /// position. That is correct for entering values, but scrub is relative."*
+    ///
+    /// This field does NOT send a delta. A scrub is measured from the press
+    /// precisely so it does not integrate its own rounding (see `press_value`),
+    /// and a stream of per-frame deltas would throw that away and round every
+    /// one of them to `decimals`. So the field keeps sending absolutes and
+    /// merely says which gesture produced them — the host already knows what it
+    /// last published, and the difference is exact.
+    ///
+    /// Empty when the document did not ask, and then nothing is ever written.
+    scrub_target: []u8,
     placeholder: []u8,
     width: box_helpers.Length,
     height: f32,
@@ -431,6 +449,7 @@ const Component = struct {
         var action_raw: ?[]const u8 = null;
         var placeholder_raw: []const u8 = "";
         var initial_raw: ?[]const u8 = null;
+        var scrub_raw: []const u8 = "";
         var width_opt: box_helpers.Length = self.width;
         var height_opt: f32 = self.height;
 
@@ -443,6 +462,8 @@ const Component = struct {
                 placeholder_raw = attr.value;
             } else if (std.mem.eql(u8, attr.key, "initial")) {
                 initial_raw = attr.value;
+            } else if (std.mem.eql(u8, attr.key, "scrubbing")) {
+                scrub_raw = attr.value;
             } else if (std.mem.eql(u8, attr.key, "color")) {
                 if (box_helpers.parseColor(attr.value)) |v| self.color = v;
             } else if (std.mem.eql(u8, attr.key, "border")) {
@@ -602,6 +623,7 @@ const Component = struct {
         // holding a slice of `self.target`. See `component.adoptString`.
         try component_mod.adoptString(a, &self.target, target);
         try component_mod.adoptString(a, &self.action, action);
+        try component_mod.adoptString(a, &self.scrub_target, scrub_raw);
         try component_mod.adoptString(a, &self.placeholder, placeholder_raw);
         self.width = width_opt;
         self.height = height_opt;
@@ -616,6 +638,7 @@ fn create(spark: *spark_mod.Spark, allocator: std.mem.Allocator, spec: *const co
         .spark = spark,
         .target = try allocator.dupe(u8, ""),
         .action = try allocator.dupe(u8, ""),
+        .scrub_target = try allocator.dupe(u8, ""),
         .placeholder = try allocator.dupe(u8, ""),
         .last_initial = try allocator.dupe(u8, ""),
         .width = .{ .pixels = 480 },
@@ -634,6 +657,7 @@ fn deinit_(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     const c: *Component = @ptrCast(@alignCast(ctx));
     allocator.free(c.target);
     allocator.free(c.action);
+    allocator.free(c.scrub_target);
     allocator.free(c.placeholder);
     allocator.free(c.last_initial);
     c.buffer.deinit(allocator);
@@ -952,6 +976,12 @@ fn onInput(
                 if (@max(@abs(dx), @abs(dy)) < SCRUB_SLOP) return;
                 c.axis = axisFor(dx, dy);
                 c.gesture = .scrubbing;
+                // Said BEFORE the first value of the gesture goes out, because
+                // a host that learns "that was a scrub" one write late has
+                // already applied the first one the wrong way. `gesture` is set
+                // first so the re-entrant `ingest` this can cause sees a field
+                // that is being edited and refuses to sync over it.
+                sayScrubbing(c, state_ptr, true);
             }
             const travel = travelOn(c.axis, dx, dy);
             const step_units = stepFor(c.step, c.min, c.max);
@@ -965,9 +995,33 @@ fn onInput(
             try commitNumeric(c, state_ptr, v);
         },
         .mouse_up => |m| {
-            if (m.button == 0) c.gesture = .none;
+            if (m.button != 0) return;
+            const was_scrubbing = c.gesture == .scrubbing;
+            c.gesture = .none;
+            // LAST, and nothing may touch `c` after it — `State.set` notifies
+            // synchronously and re-enters `ingest`, which is `dispatchBuffer`'s
+            // rule and it is this one too.
+            if (was_scrubbing) sayScrubbing(c, state_ptr, false);
         },
     }
+}
+
+/// **Say whether a scrub is in progress**, for a host that needs to tell one
+/// gesture from the other.
+///
+/// A no-op unless the document asked with `scrubbing=state.<key>`. State
+/// targets only: a component target would need an `action=` of its own, and
+/// nothing has wanted one — `dispatchBuffer`'s two arms are already the place
+/// where "where does this field write" is decided, and a second copy of that
+/// decision is a second thing to keep in step.
+fn sayScrubbing(c: *Component, state_ptr: *anyopaque, on: bool) void {
+    if (!std.mem.startsWith(u8, c.scrub_target, "state.")) return;
+    const key = c.scrub_target["state.".len..];
+    if (key.len == 0) return;
+    const state: *state_mod.State = @ptrCast(@alignCast(state_ptr));
+    state.set(key, if (on) "1" else "0") catch |e| {
+        std.log.warn(":::input: scrubbing state.set failed: err={s}", .{@errorName(e)});
+    };
 }
 
 /// Put `value` in the buffer and send it wherever the field points.
@@ -2007,6 +2061,72 @@ test "input: a PENDING press does not stop a field following its binding either"
     };
     try update(inst.ctx, &.{ .name = "input", .attrs = &a2 });
     try testing.expectEqualStrings(mid, c.buffer.items);
+}
+
+test "input: a scrub announces itself, a click does not, and the release takes it back" {
+    // **Why a host needs this at all.** One control over many objects has to
+    // treat a SCRUB as relative (nudge them all, keeping their spread) and a
+    // TYPED value as absolute (set them all) — and both arrive at the host as
+    // the same thing, a number in `target`. Chris, 2026-09-12, on three
+    // selected lights: *"if I scrub X, Y, Z, it snaps all three to that X
+    // position. That is correct for entering values, but scrub is relative."*
+    //
+    // The field says which gesture it was and sends absolutes either way. It
+    // deliberately does NOT send deltas: a scrub is measured from the press so
+    // that it cannot integrate its own rounding, and a per-frame delta stream
+    // would round every step to `decimals` and lose a slow drag entirely.
+    //
+    // Mutation A: announce on `mouse_down` rather than on the promotion to
+    // `.scrubbing`. Every CLICK on a number box then tells the host a scrub has
+    // begun, and the next typed value is applied as a nudge — the bug this is
+    // meant to fix, with the two gestures swapped.
+    // Mutation B: drop the `mouse_up` arm. The flag sticks at 1 for the rest of
+    // the session and every later edit is relative for ever.
+    // Mutation C: announce even when `scrub_target` is empty. Every numeric
+    // field in every existing document starts writing a state key it never
+    // declared.
+    const a0 = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.x" },
+        .{ .key = "scrubbing", .value = "state.live" },
+        .{ .key = "initial", .value = "0.9" },
+    };
+    const inst = try create(&_test_spark, testing.allocator, &.{ .name = "input", .attrs = &a0 });
+    defer deinit_(inst.ctx, testing.allocator);
+    const c: *Component = @ptrCast(@alignCast(inst.ctx));
+
+    var state = state_mod.State.init(testing.allocator);
+    defer state.deinit();
+
+    // A press is not a scrub — nobody yet knows what this gesture is, and a
+    // host told otherwise would misread the value a plain click leaves behind.
+    try onInput(inst.ctx, .{ .mouse_down = .{ .local = .{ 30, 8 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try testing.expectEqual(Gesture.pending, c.gesture);
+    try testing.expect(state.get("live") == null);
+
+    // Past the slop it IS one, and it says so before the first value goes out.
+    try onInput(inst.ctx, .{ .mouse_move = .{ .local = .{ 130, 8 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    try testing.expectEqual(Gesture.scrubbing, c.gesture);
+    try testing.expectEqualStrings("1", state.get("live").?);
+
+    // And the release takes it back, or every later edit is relative for ever.
+    try onInput(inst.ctx, .{ .mouse_up = .{ .local = .{ 130, 8 }, .button = 0, .button_down = false } }, @ptrCast(&state));
+    try testing.expectEqualStrings("0", state.get("live").?);
+
+    // A field that never asked says nothing, ever — otherwise every numeric
+    // box in every shipped document starts writing a key it did not declare.
+    const a1 = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "target", .value = "state.y" },
+        .{ .key = "initial", .value = "0.9" },
+    };
+    const quiet = try create(&_test_spark, testing.allocator, &.{ .name = "input", .attrs = &a1 });
+    defer deinit_(quiet.ctx, testing.allocator);
+    var s2 = state_mod.State.init(testing.allocator);
+    defer s2.deinit();
+    try onInput(quiet.ctx, .{ .mouse_down = .{ .local = .{ 30, 8 }, .button = 0, .button_down = true } }, @ptrCast(&s2));
+    try onInput(quiet.ctx, .{ .mouse_move = .{ .local = .{ 130, 8 }, .button = 0, .button_down = true } }, @ptrCast(&s2));
+    try testing.expect(s2.get("live") == null);
 }
 
 test "input: its content version moves with what it SHOWS, so a cached parent re-draws" {
