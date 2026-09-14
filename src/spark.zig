@@ -4212,7 +4212,10 @@ pub const Spark = struct {
         };
     }
 
-    fn nowMs(self: *const Spark) i64 {
+    /// The dispatcher's clock, in ms — the wall clock, or `click_clock_ms`
+    /// when a gate has set one. `pub` since the numeric field's rubber scrub
+    /// integrates against it (`input.zig`), for the same testability.
+    pub fn nowMs(self: *const Spark) i64 {
         return self.click_clock_ms orelse std.time.milliTimestamp();
     }
 

@@ -257,6 +257,38 @@ pub fn scrubOffset(dx: f32, step: f32) f32 {
 /// the more annoying failure.
 pub const DEFAULT_STEP: f32 = 0.01;
 
+/// **The rubber scrub** (`rubber` on a numeric field): the value RUNS while
+/// the pointer is held off-centre, at a rate set by how far it is pulled,
+/// and stops when the pull comes back inside the dead zone. Chris,
+/// 2026-09-14, remembering Blade3D's gallery editors: *"it started rotating
+/// as you pulled sideways and kept rotating. The further away you pulled,
+/// the faster it rotated."* Blade3D's numbers: a 20 px dead zone, then a
+/// rate linear in the pull past it, ticked on a timer. Here it ticks on the
+/// moves the host sends — matryoshka's pointer router sends the held
+/// position every frame, still or not — and integrates against the
+/// dispatcher's clock, capped so a stalled frame cannot leap.
+///
+/// The ordinary scrub is a POSITION: the value follows the pointer's offset
+/// and returns home with it. The rubber scrub is a VELOCITY: the offset is a
+/// speed, and the value goes where the time takes it. Both keep `step` as
+/// the gain — units per pixel for one, units per pixel per second for the
+/// other — so a row's declared pace means the same thing under either.
+pub const RUBBER_DEAD_PX: f32 = 20.0;
+/// The longest step of time a single move may integrate. A frame that
+/// stalled for a second (a load, a hitch) would otherwise apply a second's
+/// travel in one jump; a tenth is the most a hand can miss.
+pub const RUBBER_MAX_DT_MS: i64 = 100;
+
+/// Units per SECOND for a pull of `pull` pixels along the gesture's axis:
+/// zero inside the dead zone, then `step` per pixel past it, signed. Linear
+/// on purpose — the dead zone is the fine end, and a value that will not
+/// stop is worse than one that starts slowly.
+pub fn rubberRate(pull: f32, step: f32) f32 {
+    const beyond = @abs(pull) - RUBBER_DEAD_PX;
+    if (beyond <= 0) return 0;
+    return step * beyond * (if (pull < 0) @as(f32, -1) else 1);
+}
+
 /// The number in `text`, or null when it is not one. Null is the answer
 /// for an empty field and for prose: a scrub needs somewhere to start
 /// from, and inventing zero would silently discard whatever was there.
@@ -374,6 +406,13 @@ const Component = struct {
     max: ?f32 = null,
     /// Units per pixel of drag. Null means derive — see `stepFor`.
     step: ?f32 = null,
+    /// `rubber` — the scrub is a velocity, not a position. See `RUBBER_DEAD_PX`.
+    rubber: bool = false,
+    /// The rubber scrub's accumulator, unrounded: what the box shows is this
+    /// to `decimals`, and integrating the rounded text would walk.
+    rubber_value: f32 = 0,
+    /// When the accumulator last advanced, on the dispatcher's clock.
+    rubber_last_ms: i64 = 0,
     decimals: u8 = 2,
     /// Whether `decimals` came from the document. When it did not, the
     /// seeding branch reads it off `initial` instead of leaving the
@@ -485,6 +524,9 @@ const Component = struct {
                 self.max = parseNumber(attr.value);
             } else if (std.mem.eql(u8, attr.key, "step")) {
                 self.step = parseNumber(attr.value);
+            } else if (std.mem.eql(u8, attr.key, "rubber")) {
+                // A bare flag, `numeric`'s shape: `rubber=0` turns it off.
+                self.rubber = attr.value.len == 0 or !std.mem.eql(u8, attr.value, "0");
             } else if (std.mem.eql(u8, attr.key, "decimals")) {
                 if (parseNumber(attr.value)) |d| {
                     if (d >= 0 and d <= 3) {
@@ -962,6 +1004,8 @@ fn onInput(
             c.press_x = m.local[0];
             c.press_y = m.local[1];
             c.press_value = v;
+            c.rubber_value = v;
+            c.rubber_last_ms = clockMs(c);
             c.gesture = .pending;
         },
         .mouse_move => |m| {
@@ -985,6 +1029,25 @@ fn onInput(
             }
             const travel = travelOn(c.axis, dx, dy);
             const step_units = stepFor(c.step, c.min, c.max);
+            if (c.rubber) {
+                // A velocity: this move's pull, for the time since the last
+                // one. The clock advances even inside the dead zone, so time
+                // spent at rest does not arrive as a jump when the pull
+                // resumes; the value is committed only when it moved, so a
+                // held-still pointer does not write the same number sixty
+                // times a second.
+                const now = clockMs(c);
+                const dt_ms = @min(@max(now - c.rubber_last_ms, 0), RUBBER_MAX_DT_MS);
+                c.rubber_last_ms = now;
+                const rate = rubberRate(travel, step_units);
+                if (rate == 0 or dt_ms == 0) return;
+                var rv = c.rubber_value + rate * @as(f32, @floatFromInt(dt_ms)) / 1000.0;
+                if (c.min) |lo| rv = @max(rv, lo);
+                if (c.max) |hi| rv = @min(rv, hi);
+                c.rubber_value = rv;
+                try commitNumeric(c, state_ptr, rv);
+                return;
+            }
             const v = scrubTo(c.press_value, travel, step_units, c.min, c.max);
             if (probing()) {
                 std.debug.print(
@@ -1030,6 +1093,12 @@ fn sayScrubbing(c: *Component, state_ptr: *anyopaque, on: bool) void {
 /// the buffer is written FIRST, because `dispatchBuffer` may re-enter
 /// `ingest` through a synchronous `State.set`, and nothing may touch `c`
 /// after that call.
+/// The dispatcher's clock — injectable by a gate — or the wall clock when
+/// the field was built without one.
+fn clockMs(c: *const Component) i64 {
+    return if (c.spark) |sp| sp.nowMs() else std.time.milliTimestamp();
+}
+
 fn commitNumeric(c: *Component, state_ptr: *anyopaque, value: f32) !void {
     var buf: [32]u8 = undefined;
     const text = meter.formatValue(&buf, value, c.decimals, "");
@@ -1514,6 +1583,86 @@ test "input: a click is not a scrub — the slop, end to end" {
     // the same twelve pixels are worth about one and a half.
     try onInput(inst.ctx, .{ .mouse_move = .{ .local = .{ 62, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
     try testing.expectEqualStrings("12", state.get("speed").?);
+}
+
+test "input: a rubber field runs while the pull holds — faster the further, still inside the dead zone, and a stalled frame cannot leap" {
+    // **The nit this is paid for.** Chris, 2026-09-14, on the transform
+    // rows of a scene inspector: *"I think in Blade3D I did the scrub in
+    // rubber band mode on the edit boxes. So it started rotating as you
+    // pulled sideways and kept rotating."* A position scrub asks the hand
+    // to travel the whole way; a velocity scrub asks it to hold a pull.
+    //
+    // Mutation A: advance `c.rubber_last_ms` only on a commit (move the
+    // assignment below the dead-zone return). Time at rest then arrives
+    // as a jump when the pull resumes: the "holds" lines still pass and
+    // the resume line reads 3.0, not 3.5. The rests are FIFTY ms apart on
+    // purpose — the first draft rested in tenths and the clamp below hid
+    // exactly this mutation.
+    // Mutation B: drop the `RUBBER_MAX_DT_MS` clamp. The stall line reads
+    // 46.0.
+    // Mutation C: commit `c.press_value + …` (a position scrub with the
+    // rate's gain). The first held move reads 10.0 and the second 10.0
+    // again — a value that does not run.
+    const attrs = [_]components.Attr{
+        .{ .key = "numeric", .value = "" },
+        .{ .key = "rubber", .value = "" },
+        .{ .key = "target", .value = "state.yaw" },
+        .{ .key = "initial", .value = "0" },
+        .{ .key = "step", .value = "0.5" },
+        .{ .key = "decimals", .value = "1" },
+    };
+    const spec: components.Spec = .{ .name = "input", .attrs = &attrs };
+    const inst = try create(&_test_spark, testing.allocator, &spec);
+    defer deinit_(inst.ctx, testing.allocator);
+    var state = state_mod.State.init(testing.allocator);
+    defer state.deinit();
+    _test_spark.click_clock_ms = 1000;
+    defer _test_spark.click_clock_ms = null;
+
+    const held = struct {
+        fn at(x: f32) element.InputEvent {
+            return .{ .mouse_move = .{ .local = .{ x, 10 }, .button = 0, .button_down = true } };
+        }
+    };
+    try onInput(inst.ctx, .{ .mouse_down = .{ .local = .{ 50, 10 }, .button = 0, .button_down = true } }, @ptrCast(&state));
+    // Forty pixels: twenty past the dead zone. No time has passed, so
+    // nothing has happened yet — the gesture is promoted and that is all.
+    try onInput(inst.ctx, held.at(90), @ptrCast(&state));
+    try testing.expect(state.get("yaw") == null);
+    // A tenth of a second at that pull: 0.5 × 20 × 0.1 = one degree. And
+    // another tenth, another degree — the pointer has not moved.
+    _test_spark.click_clock_ms = 1100;
+    try onInput(inst.ctx, held.at(90), @ptrCast(&state));
+    try testing.expectEqualStrings("1.0", state.get("yaw").?);
+    _test_spark.click_clock_ms = 1200;
+    try onInput(inst.ctx, held.at(90), @ptrCast(&state));
+    try testing.expectEqualStrings("2.0", state.get("yaw").?);
+    // Forty past the dead zone: twice as fast.
+    _test_spark.click_clock_ms = 1300;
+    try onInput(inst.ctx, held.at(110), @ptrCast(&state));
+    try testing.expectEqualStrings("4.0", state.get("yaw").?);
+    // Back inside the dead zone: holds. Two hundred ms pass there, in
+    // fifties.
+    _test_spark.click_clock_ms = 1400;
+    try onInput(inst.ctx, held.at(60), @ptrCast(&state));
+    try testing.expectEqualStrings("4.0", state.get("yaw").?);
+    _test_spark.click_clock_ms = 1450;
+    try onInput(inst.ctx, held.at(60), @ptrCast(&state));
+    _test_spark.click_clock_ms = 1500;
+    try onInput(inst.ctx, held.at(60), @ptrCast(&state));
+    try testing.expectEqualStrings("4.0", state.get("yaw").?);
+    // Pulled the other way, twenty past, fifty ms later: half a degree
+    // back — and the rest did not come along for the ride.
+    _test_spark.click_clock_ms = 1550;
+    try onInput(inst.ctx, held.at(10), @ptrCast(&state));
+    try testing.expectEqualStrings("3.5", state.get("yaw").?);
+    // A stalled frame: 4.3 s pass at the same pull. Capped at a tenth.
+    _test_spark.click_clock_ms = 5900;
+    try onInput(inst.ctx, held.at(10), @ptrCast(&state));
+    try testing.expectEqualStrings("2.5", state.get("yaw").?);
+    // Release: the value stays where the time took it.
+    try onInput(inst.ctx, .{ .mouse_up = .{ .local = .{ 10, 10 }, .button = 0, .button_down = false } }, @ptrCast(&state));
+    try testing.expectEqualStrings("2.5", state.get("yaw").?);
 }
 
 test "input: a scrub is absolute from the press — out and back returns the value it started with" {
