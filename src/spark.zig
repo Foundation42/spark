@@ -3274,12 +3274,14 @@ pub const Spark = struct {
 
         // Hand both images back: the attachment to the host, which is about
         // to open its rendering scope on it, and the target to whatever
-        // samples it next (a chain's steps, or Phase 2's compose).
+        // samples it next (a chain's steps, or Phase 2's compose). The host
+        // LOADs that attachment: WRITE alone misses the load-op read. Found
+        // by sync validation during Matryoshka's depth-document pass.
         barrierImageLayout(cmd, src_image, .{
             .src_stage = vk.c.VK_PIPELINE_STAGE_2_TRANSFER_BIT,
             .dst_stage = vk.c.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
             .src_access = vk.c.VK_ACCESS_2_TRANSFER_READ_BIT,
-            .dst_access = vk.c.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            .dst_access = vk.c.VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | vk.c.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
             .old_layout = vk.c.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             .new_layout = vk.c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         });
