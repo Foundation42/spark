@@ -23,6 +23,9 @@ layout(push_constant) uniform PC {
     vec2 dst_pos;
     vec2 dst_size;
     vec2 display;
+    vec2 uv_origin;
+    vec2 uv_size;
+    float premultiplied;
 } pc;
 
 void main() {
@@ -30,6 +33,7 @@ void main() {
     // Display transform before the premultiply — see display.glsl. Images
     // are authored SDR artwork like every other bit of chrome, so they map
     // to paperwhite too rather than blazing at the PQ ceiling.
-    vec3 rgb = sparkDisplay(c.rgb, pc.display);
+    vec3 straight_rgb = pc.premultiplied > 0.5 ? (c.a > 0.00001 ? c.rgb / c.a : vec3(0.0)) : c.rgb;
+    vec3 rgb = sparkDisplay(straight_rgb, pc.display);
     out_color = vec4(rgb * c.a, c.a);
 }

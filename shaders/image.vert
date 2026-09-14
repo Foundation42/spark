@@ -26,6 +26,9 @@ layout(push_constant) uniform PC {
     // constant block is one range shared by the stages, and the fragment
     // shader is where it is read. See shaders/display.glsl.
     vec2 display;
+    vec2 uv_origin;
+    vec2 uv_size;
+    float premultiplied;
 } pc;
 
 layout(location = 0) out vec2 v_uv;
@@ -40,5 +43,5 @@ void main() {
     vec2 px = (pc.dst_pos - pc.world_offset) + corner * pc.dst_size;
     vec2 ndc = (px / pc.viewport_size) * 2.0 - 1.0;
     gl_Position = vec4(ndc, 0.0, 1.0);
-    v_uv = corner;
+    v_uv = pc.uv_origin + corner * pc.uv_size;
 }

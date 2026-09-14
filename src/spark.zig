@@ -1348,6 +1348,18 @@ pub const Spark = struct {
         origin: [2]f32,
         constraints: element.Constraints,
     ) !element.Box {
+        return self.layoutAndRenderClipped(doc, origin, constraints, null);
+    }
+
+    /// A host rendering independent documents into atlas cells can bound
+    /// each walk to its cell, including glyphs and component geometry.
+    pub fn layoutAndRenderClipped(
+        self: *Spark,
+        doc: *const document_mod.Document,
+        origin: [2]f32,
+        constraints: element.Constraints,
+        clip: ?element.ClipRect,
+    ) !element.Box {
         const effective_theme = doc.theme orelse self.theme;
         const effective_state = doc.state orelse self.host_state;
         var lc = element.LayoutCtx{
@@ -1365,6 +1377,7 @@ pub const Spark = struct {
             .layout_context = self.layout_context,
             .pass_dispatches = &self.pass_dispatches,
         };
+        if (clip) |rect| lc.current_clip = try self.drawlist.pushClip(element.NO_CLIP, rect);
         // Mark this document's slice of the frame. Everything the walk
         // below appends is one layer, and layers paint in call order.
         const dl = &self.drawlist;

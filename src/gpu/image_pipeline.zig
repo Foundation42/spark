@@ -46,12 +46,15 @@ pub const ImagePushConsts = extern struct {
     /// (which is always `.offscreen`, because encoding into an
     /// intermediate would encode twice).
     display: display_mod.Push,
+    uv_origin: [2]f32,
+    uv_size: [2]f32,
+    premultiplied: f32,
 };
 
 comptime {
     // Lock the std430 push-constant block size — mirrors the GLSL
     // `PC` in image.vert.
-    std.debug.assert(@sizeOf(ImagePushConsts) == 40);
+    std.debug.assert(@sizeOf(ImagePushConsts) == 60);
     // `display` is the tail of the block in the GLSL too. A drift here
     // is silent GPU garbage, which is why it is pinned by offset and
     // not only by total size.
@@ -325,12 +328,34 @@ pub const ImagePipeline = struct {
         dst_size: [2]f32,
         disp: display_mod.Push,
     ) void {
+        self.recordRegion(cmd, extent, world_offset, ds, dst_pos, dst_size, disp, .{0, 0}, .{1, 1}, false);
+    }
+
+    /// Sample a sub-rectangle of a host render target. RTT images already
+    /// contain premultiplied colour; treating them as decoded artwork would
+    /// multiply coverage twice and darken glyph edges.
+    pub fn recordRegion(
+        self: *const ImagePipeline,
+        cmd: c.VkCommandBuffer,
+        extent: c.VkExtent2D,
+        world_offset: [2]f32,
+        ds: c.VkDescriptorSet,
+        dst_pos: [2]f32,
+        dst_size: [2]f32,
+        disp: display_mod.Push,
+        uv_origin: [2]f32,
+        uv_size: [2]f32,
+        premultiplied: bool,
+    ) void {
         const pc = ImagePushConsts{
             .viewport_size = .{ @floatFromInt(extent.width), @floatFromInt(extent.height) },
             .world_offset = world_offset,
             .dst_pos = dst_pos,
             .dst_size = dst_size,
             .display = disp,
+            .uv_origin = uv_origin,
+            .uv_size = uv_size,
+            .premultiplied = if (premultiplied) 1 else 0,
         };
         c.vkCmdPushConstants(
             cmd,
