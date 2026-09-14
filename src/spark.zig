@@ -553,6 +553,12 @@ pub const Spark = struct {
     /// cross-field state to justify the struct. Revisit at A.6
     /// when the compiler ties them together.
     pass_dispatches: std.ArrayList(element.PassDispatch),
+    /// Frame scratch kept across frames (see `dispatchOffscreenPasses`,
+    /// `endFrame`): sized to the dispatch count each frame, allocating
+    /// only when it grows.
+    scratch_owned: std.ArrayListUnmanaged(bool) = .{},
+    scratch_nested: std.ArrayListUnmanaged(bool) = .{},
+    scratch_bgs: std.ArrayListUnmanaged(BackgroundSpan) = .{},
     /// One entry per `layoutAndRender` call this frame, in call order,
     /// which is paint order. See `PaintLayer`. Clears and carries over
     /// with `drawlist` and `pass_dispatches` — a skip-layout frame
@@ -1005,6 +1011,9 @@ pub const Spark = struct {
         // 5. Per-frame state + effects-side stubs.
         self.drawlist.deinit();
         self.pass_dispatches.deinit();
+        self.scratch_owned.deinit(self.allocator);
+        self.scratch_nested.deinit(self.allocator);
+        self.scratch_bgs.deinit(self.allocator);
         self.paint_layers.deinit();
         self.acquired_targets.deinit();
         self.dispatch_target_map.deinit();
@@ -1980,8 +1989,12 @@ pub const Spark = struct {
         // `phase1ProcessChain` recurse over their whole subtree before
         // anything source-specific happens. Same-shaped bitmaps, two
         // different questions.
-        const owned = try self.allocator.alloc(bool, self.pass_dispatches.items.len);
-        defer self.allocator.free(owned);
+        // Frame scratch, kept at its high-water mark across frames rather
+        // than allocated and freed each one (matryoshka's reduction pass,
+        // item 8, 2026-09-14: three allocations a frame from this file,
+        // two of them zero bytes long).
+        try self.scratch_owned.resize(self.allocator, self.pass_dispatches.items.len);
+        const owned = self.scratch_owned.items;
         markSubtreeOwned(self.pass_dispatches.items, owned);
 
         var i: u32 = 0;
@@ -3622,8 +3635,8 @@ pub const Spark = struct {
             // as nested; Phase 2 skips those (Phase 1 already
             // rendered them into the parent's offscreen target).
             const pd_len = self.pass_dispatches.items.len;
-            const is_nested = try self.allocator.alloc(bool, pd_len);
-            defer self.allocator.free(is_nested);
+            try self.scratch_nested.resize(self.allocator, pd_len);
+            const is_nested = self.scratch_nested.items;
             @memset(is_nested, false);
             for (self.pass_dispatches.items) |d| {
                 switch (d) {
@@ -3665,8 +3678,8 @@ pub const Spark = struct {
             // Scratch for the per-layer background sort. Sized once for
             // the whole frame and reused — a layer's list is a subset of
             // it, so one allocation covers every layer.
-            const bgs = try self.allocator.alloc(BackgroundSpan, pd_len);
-            defer self.allocator.free(bgs);
+            try self.scratch_bgs.resize(self.allocator, pd_len);
+            const bgs = self.scratch_bgs.items;
 
             // **One layer at a time, in call order.** Everything below —
             // the background pre-pass, the top-level composites, and the
