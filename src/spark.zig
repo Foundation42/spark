@@ -1393,6 +1393,10 @@ pub const Spark = struct {
         // layer is a document that silently does not paint.
         try self.paint_layers.ensureUnusedCapacity(1);
         const box = try element_layout.layoutAndRenderCached(doc.root, origin, constraints, &lc, dl);
+        // A cached root can append primitives without crossing a clip boundary.
+        // Seal this document under its own outer clip before the next atlas
+        // cell is walked; otherwise later cells can claim its trailing glyphs.
+        try dl.sealClips(lc.current_clip);
         self.paint_layers.appendAssumeCapacity(.{
             .dispatches = .{ first.dispatches[0], @intCast(self.pass_dispatches.items.len) },
             .glyphs = .{ first.glyphs[0], @intCast(dl.glyph_targets.items.len) },
@@ -7536,4 +7540,55 @@ test "drag: the press still reaches the component that was picked up" {
     try sp.dispatchMouseButtonN(20, 20, false, Spark.DRAG_BUTTON);
     try testing.expectEqual(@as(usize, 2), p.n);
     try testing.expectEqual(InputProbe.Kind.up, p.recs[1].kind);
+}
+
+test "clipped document: seal trailing cached primitives before the next atlas cell" {
+    // A live badge changed while the static clearing labels disappeared. An
+    // uncached tail can append without a clip transition, so the document call
+    // itself must finish its run. Removing its sealClips fails this gate.
+    const Fake = struct {
+        fn render(_: *anyopaque, origin: [2]f32, _: element.Constraints, lc: *element.LayoutCtx, dl: *element.DrawList) anyerror!element.Box {
+            try dl.appendQuad(lc, std.mem.zeroes(qp.QuadInstance));
+            return .{ .x = origin[0], .y = origin[1], .w = 32, .h = 16 };
+        }
+        fn version(_: *anyopaque) u64 {
+            return 1;
+        }
+    };
+    const vt = element.ElementVTable{ .layout_and_render = Fake.render, .content_version = Fake.version };
+    const plain = element.ElementVTable{ .layout_and_render = Fake.render, .disable_cache = true };
+    var instances = [_]u8{ 0, 0 };
+    var theme = stubTheme();
+    var state = state_mod.State.init(testing.allocator);
+    defer state.deinit();
+    var sp = Spark.testStub(testing.allocator);
+    sp.host_state = &state;
+    sp.theme = &theme;
+    var unused_jobs: jobs_mod.JobSystem = undefined; // This custom root schedules no jobs.
+    sp.compute_jobs = &unused_jobs;
+    var layout = try layout_context_mod.LayoutContext.init(testing.allocator);
+    defer layout.deinit();
+    sp.layout_context = &layout;
+    sp.frame_info = .{ .extent = .{ .width = 128, .height = 64 } };
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    sp.layout_cache = layout_cache_mod.BlockCache.init(testing.allocator);
+    defer sp.layout_cache.deinit();
+    sp.pass_dispatches = std.ArrayList(element.PassDispatch).init(testing.allocator);
+    defer sp.pass_dispatches.deinit();
+    sp.paint_layers = std.ArrayList(PaintLayer).init(testing.allocator);
+    defer sp.paint_layers.deinit();
+    for (0..3) |_| {
+        sp.drawlist.clearRetainingCapacity();
+        sp.paint_layers.clearRetainingCapacity();
+        for (&instances, 0..) |*instance, i| {
+            const doc = document_mod.Document{ .allocator = testing.allocator, .arena = undefined, .root = .{ .custom = .{ .vtable = if (i == 0) &plain else &vt, .ctx = @ptrCast(instance) } } };
+            const x: f32 = @floatFromInt(i * 64);
+            _ = try sp.layoutAndRenderClipped(&doc, .{ x, 0 }, .{ .max_w = 64, .max_h = 64 }, .{ .x = x, .y = 0, .w = 64, .h = 64 });
+            try testing.expectEqual(i + 1, sp.drawlist.quad_clips.items.len);
+            const clip = sp.drawlist.clips.items[sp.drawlist.quad_clips.items[i]];
+            try testing.expectEqual(x, clip.x);
+        }
+    }
+    try testing.expect(sp.layout_cache.hits > 0);
 }
