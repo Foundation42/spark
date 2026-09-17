@@ -1582,6 +1582,16 @@ pub const Spark = struct {
         self.focused = null;
     }
 
+    /// Suspend a host-hidden UI without completing a drag or emitting a drop.
+    /// Documents and their state remain alive for the next visible frame.
+    pub fn suspendInput(self: *Spark) void {
+        self.clearFocus();
+        self.closeOverlay();
+        self.endCarry();
+        self.forgetHits();
+        self.buttons_down = 0;
+    }
+
     pub fn closeOverlay(self: *Spark) void {
         var ov = self.overlay orelse return;
         self.overlay = null;
@@ -7593,4 +7603,17 @@ test "clipped document: seal trailing cached primitives before the next atlas ce
         }
     }
     try testing.expect(sp.layout_cache.hits > 0);
+}
+
+test "suspendInput cancels a carried payload without dropping it" {
+    var sp = Spark.testStub(testing.allocator);
+    sp.drawlist = element.DrawList.init(testing.allocator);
+    defer sp.drawlist.deinit();
+    try sp.beginCarry("mesh crate", 10, 20);
+    sp.buttons_down = 1;
+    sp.suspendInput();
+    try testing.expect(sp.carrying() == null);
+    try testing.expectEqual(@as(u32, 0), sp.buttons_down);
+    try testing.expect(!sp.claimsPointer(10, 20));
+    sp.suspendInput();
 }
